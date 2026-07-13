@@ -1,0 +1,39 @@
+# Secrets — never tracked (whitepaper §15 invariant 15, CLAUDE.md).
+# Only *.example files are committed.
+.env
+.env.*
+!.env.example
+!.env.staging.example
+!.env.production.example
+
+# Tenant object storage — PDFs and per-tenant data never enter git.
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Backups / dumps (encrypted backups live off-server — §15 invariant 14)
+*.dump
+*.sql.gz
+backups/
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local runtime
+*.log
