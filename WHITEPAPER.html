@@ -1,0 +1,828 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>الورقة البيضاء — مساعد التوظيف الشخصي على واتساب · v1.0</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Zain:wght@300;400;700;800;900&family=IBM+Plex+Sans+Arabic:wght@300;400;500;600;700&family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --paper:#f7f6f1; --card:#ffffff; --ink:#14201a; --muted:#5f6b60; --line:#dfe3d8;
+  --green:#0b6e4f; --green-deep:#0a4a37; --green-soft:#e7f1ec;
+  --amber:#a05a00; --amber-bg:#f8ecd9; --red:#a13327; --red-bg:#f7e7e3;
+  --slate:#3f5566; --slate-bg:#e8edf1; --radius:14px;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth}
+@media (prefers-reduced-motion: reduce){html{scroll-behavior:auto}}
+body{background:var(--paper);color:var(--ink);font-family:'IBM Plex Sans Arabic',sans-serif;font-size:16.5px;line-height:1.85;-webkit-font-smoothing:antialiased}
+.wrap{max-width:820px;margin:0 auto;padding:0 20px}
+a{color:var(--green);text-decoration:none}
+a:focus-visible{outline:3px solid var(--green);outline-offset:2px;border-radius:6px}
+.mono{font-family:'IBM Plex Mono',monospace;font-size:.82em;direction:ltr;unicode-bidi:embed}
+
+/* HERO */
+.hero{background:linear-gradient(160deg,#0d241c 0%,#0a4a37 100%);color:#f2f5ef;padding:56px 0 44px;position:relative;overflow:hidden}
+.hero::after{content:"";position:absolute;inset-inline-start:-80px;top:-80px;width:340px;height:340px;border:1px solid rgba(255,255,255,.08);border-radius:50%}
+.hero .eyebrow{font-size:.78rem;letter-spacing:.14em;color:#9fc6b4;font-weight:600;margin-bottom:14px}
+.hero h1{font-family:'Zain',sans-serif;font-weight:900;font-size:clamp(1.9rem,6.2vw,3rem);line-height:1.25;margin-bottom:10px;color:#fff}
+.hero .sub{color:#c8d8cf;max-width:640px;font-size:1.02rem}
+.statgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:30px}
+.stat{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);border-radius:12px;padding:14px 14px 12px}
+.stat b{display:block;font-family:'Zain',sans-serif;font-weight:800;font-size:1.12rem;color:#fff;line-height:1.4}
+.stat span{font-size:.8rem;color:#a9c3b5}
+@media (max-width:560px){.statgrid{grid-template-columns:1fr}.stat{display:flex;justify-content:space-between;align-items:center;gap:10px}.stat b{font-size:1rem}}
+
+/* NAV */
+nav{position:sticky;top:0;z-index:50;background:rgba(247,246,241,.93);backdrop-filter:blur(8px);border-bottom:1px solid var(--line)}
+nav .rail{display:flex;gap:8px;overflow-x:auto;padding:10px 20px;max-width:820px;margin:0 auto;scrollbar-width:none}
+nav .rail::-webkit-scrollbar{display:none}
+nav a{flex:0 0 auto;font-size:.8rem;font-weight:600;color:var(--muted);background:var(--card);border:1px solid var(--line);border-radius:999px;padding:6px 13px;white-space:nowrap}
+nav a:hover{color:var(--green);border-color:var(--green)}
+
+/* SECTIONS */
+section{padding:46px 0 8px}
+.secnum{font-family:'IBM Plex Mono',monospace;font-size:.8rem;color:var(--green);font-weight:600;letter-spacing:.12em}
+h2{font-family:'Zain',sans-serif;font-weight:800;font-size:clamp(1.45rem,4.4vw,1.95rem);line-height:1.35;margin:4px 0 6px}
+.gist{color:var(--muted);font-size:.95rem;border-inline-start:3px solid var(--green);padding-inline-start:12px;margin:10px 0 22px}
+h3{font-family:'Zain',sans-serif;font-weight:800;font-size:1.16rem;margin:26px 0 10px}
+h4{font-family:'Zain',sans-serif;font-weight:800;font-size:1rem;margin:18px 0 6px}
+p{margin-bottom:14px}
+.small{font-size:.86rem;color:var(--muted)}
+
+/* CARDS */
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:20px 20px 14px;margin-bottom:16px}
+.banner{background:var(--amber-bg);border:1px solid #ecd3ad;border-radius:var(--radius);padding:16px 18px;margin:18px 0}
+.banner b{color:var(--amber)}
+.panel-red{background:var(--red-bg);border:1px solid #e7c4bc}
+.panel-green{background:var(--green-soft);border:1px solid #c9dfd4}
+
+/* SEALS */
+.seal{display:inline-block;font-size:.72rem;font-weight:700;border-radius:6px;padding:2px 10px;vertical-align:middle}
+.seal-lock{background:var(--green);color:#fff}
+.seal-ok{background:transparent;color:var(--green);border:1.5px solid var(--green)}
+.seal-flip{background:var(--slate-bg);color:var(--slate)}
+.seal-wait{background:var(--amber);color:#fff}
+
+/* LISTS */
+ul.clean{list-style:none;margin:0 0 14px}
+ul.clean li{padding:9px 0;border-bottom:1px dashed var(--line);display:flex;gap:10px;align-items:flex-start}
+ul.clean li:last-child{border-bottom:none}
+ul.clean li::before{content:"—";color:var(--green);flex:0 0 auto;font-weight:700}
+ul.clean.red li::before{content:"✕";color:var(--red)}
+ul.clean.check li::before{content:"✓";color:var(--green)}
+ul.clean.warn li::before{content:"!";color:var(--amber)}
+
+/* TIERS */
+.tiers{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:18px 0}
+@media (max-width:700px){.tiers{grid-template-columns:1fr}}
+.tier{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:18px;display:flex;flex-direction:column}
+.tier.featured{border:2px solid var(--green);position:relative}
+.tier.featured::before{content:"الباقة الرئيسية";position:absolute;top:-11px;inset-inline-start:16px;background:var(--green);color:#fff;font-size:.68rem;font-weight:700;border-radius:6px;padding:2px 10px}
+.tier h4{margin:0;font-size:1.15rem}
+.tier .price{font-family:'Zain',sans-serif;font-weight:900;font-size:1.65rem;color:var(--green);line-height:1.3}
+.tier .price small{font-size:.72rem;color:var(--muted);font-weight:600}
+.tier ul{list-style:none;margin-top:10px;font-size:.87rem}
+.tier li{padding:5px 0;border-bottom:1px dashed var(--line)}
+.tier li:last-child{border:none}
+.tier .cap{font-size:.72rem;color:var(--amber);font-weight:700;margin-top:auto;padding-top:8px}
+
+/* STEPS */
+.steps{counter-reset:st;margin:14px 0}
+.step{position:relative;padding:0 44px 22px 0;counter-increment:st}
+.step::before{content:counter(st);position:absolute;inset-inline-start:0;top:0;width:30px;height:30px;border-radius:50%;background:var(--ink);color:#fff;font-family:'Zain',sans-serif;font-weight:800;font-size:.95rem;display:flex;align-items:center;justify-content:center}
+.step::after{content:"";position:absolute;inset-inline-start:14.5px;top:32px;bottom:2px;width:1.5px;background:var(--line)}
+.step:last-child::after{display:none}
+.step b{display:block;font-weight:700}
+.step .small{margin-top:2px}
+
+/* TIMELINE */
+.phase{position:relative;padding:0 56px 24px 0}
+.phase::before{content:attr(data-c);position:absolute;inset-inline-start:0;top:0;width:42px;height:30px;border-radius:8px;background:var(--green-deep);color:#fff;font-family:'IBM Plex Mono',monospace;font-weight:600;font-size:.8rem;display:flex;align-items:center;justify-content:center}
+.phase::after{content:"";position:absolute;inset-inline-start:20px;top:34px;bottom:0;width:1.5px;background:var(--line)}
+.phase:last-child::after{display:none}
+.phase.now::before{background:var(--amber)}
+.phase b{font-weight:700}
+.phase p{font-size:.9rem;color:var(--muted);margin:2px 0 0}
+.exit{font-size:.82rem;color:var(--green-deep);background:var(--green-soft);border-radius:8px;padding:6px 12px;margin-top:8px;display:inline-block}
+.exit::before{content:"شرط الخروج: ";font-weight:700}
+
+/* GRID */
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:16px 0}
+@media (max-width:620px){.grid2{grid-template-columns:1fr}}
+.risk{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+.risk b{display:block;color:var(--red);font-size:.92rem;margin-bottom:4px}
+.risk span{font-size:.84rem;color:var(--muted)}
+
+/* CHIPS */
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 16px}
+.chip{font-family:'IBM Plex Mono',monospace;font-size:.72rem;background:var(--card);border:1px solid var(--line);border-radius:6px;padding:3px 9px;color:var(--muted);direction:ltr}
+
+/* TABLES */
+table{width:100%;border-collapse:collapse;margin:14px 0 20px;font-size:.86rem;background:var(--card);border-radius:12px;overflow:hidden;border:1px solid var(--line)}
+th{background:var(--green-deep);color:#fff;font-weight:700;padding:10px 12px;text-align:right;font-size:.82rem}
+td{padding:9px 12px;border-top:1px solid var(--line);vertical-align:top}
+tr:nth-child(even) td{background:#fbfaf7}
+.tblwrap{overflow-x:auto;margin:0 -20px;padding:0 20px}
+
+/* CODE */
+pre.code{background:#101a15;color:#cfe6da;border-radius:12px;padding:14px 18px;font-family:'IBM Plex Mono',monospace;font-size:.78rem;line-height:1.7;direction:ltr;text-align:left;overflow-x:auto;margin:10px 0 18px}
+pre.code .c{color:#7ba895}
+
+/* ASK */
+.ask{background:linear-gradient(150deg,#241a08,#3c2a0a);color:#f4ead6;border-radius:var(--radius);padding:26px 22px;margin:20px 0 10px}
+.ask h3{color:#ffd58a;margin-top:0}
+.ask ol{margin:0 22px 18px 0}
+.ask ol li{padding:7px 0;border-bottom:1px dashed rgba(255,213,138,.25)}
+.ask ol li:last-child{border:none}
+.ask .quick{background:rgba(255,255,255,.06);border:1px solid rgba(255,213,138,.3);border-radius:10px;padding:14px 16px;font-size:.9rem}
+.ask .quick b{color:#ffd58a}
+.ask .quick ul{list-style:none;margin-top:6px}
+.ask .quick li{padding:4px 0}
+.ask .quick li::before{content:"☐ ";color:#ffd58a}
+
+footer{padding:34px 0 50px;color:var(--muted);font-size:.82rem;border-top:1px solid var(--line);margin-top:40px}
+.divider{border:none;border-top:1px solid var(--line);margin:34px 0 0}
+.invariant{background:var(--card);border:1px solid var(--line);border-inline-start:4px solid var(--green);border-radius:10px;padding:10px 14px;margin-bottom:8px;font-size:.9rem}
+.invariant .mono{color:var(--green-deep)}
+</style>
+</head>
+<body>
+
+<!-- ================= HERO ================= -->
+<header class="hero">
+  <div class="wrap">
+    <div class="eyebrow">الورقة البيضاء — المصدر الوحيد للحقيقة &nbsp;·&nbsp; النسخة 1.0 &nbsp;·&nbsp; الاثنين 13 يوليو 2026</div>
+    <h1>مساعد التوظيف الشخصي على واتساب</h1>
+    <p class="sub">وثيقة ملزمة تحكم المنتج التجاري كاملًا: التعريف، القرارات، المعمارية، الآليات، الخطة، والثوابت. أي كود أو قرار يخالفها يُعتبر انحرافًا حتى تُحدَّث الوثيقة أولًا. الاسم النهائي قيد الاختيار (بديل Axe).</p>
+    <div class="statgrid">
+      <div class="stat"><b>17 قسمًا</b><span>تغطي المنتج من العقد إلى السطر البرمجي</span></div>
+      <div class="stat"><b>15 ثابتًا هندسيًا</b><span>قابلة للاختبار — لا تُكسر أبدًا (قسم 15)</span></div>
+      <div class="stat"><b>6 قرارات</b><span>بانتظار الاعتماد (قسم 16)</span></div>
+    </div>
+  </div>
+</header>
+
+<!-- ================= NAV ================= -->
+<nav>
+  <div class="rail">
+    <a href="#s0">حوكمة الوثيقة</a>
+    <a href="#s1">الخلاصة</a>
+    <a href="#s2">المنتج</a>
+    <a href="#s3">القرارات</a>
+    <a href="#s4">الباقات والتسعير</a>
+    <a href="#s5">رحلة العميل</a>
+    <a href="#s6">الحلقة اليومية</a>
+    <a href="#s7">الموروث من المحرك</a>
+    <a href="#s8">واتساب</a>
+    <a href="#s9">سلة</a>
+    <a href="#s10">المعمارية والعزل</a>
+    <a href="#s11">الأمان</a>
+    <a href="#s12">الخصوصية</a>
+    <a href="#s13">الخطة C0–C9</a>
+    <a href="#s14">الموجات والقياس</a>
+    <a href="#s15">الثوابت</a>
+    <a href="#s16">بانتظارك</a>
+    <a href="#s17">سجل التغييرات</a>
+  </div>
+</nav>
+
+<main class="wrap">
+
+<!-- ================= 00 ================= -->
+<section id="s0">
+  <div class="secnum">00</div>
+  <h2>حوكمة الوثيقة — كيف تمنع الانحراف</h2>
+  <p class="gist">هذه الورقة هي العقد بين الرؤية والتنفيذ. القاعدة: <b>الوثيقة تسبق الكود</b> — لا يُبنى ما يخالفها، وما يحتاج تغييرًا يبدأ بتعديلها.</p>
+  <div class="card">
+    <ul class="clean">
+      <li><b>الموقع في المستودع:</b> <span class="mono">docs/WHITEPAPER.html</span> في جذر المشروع التجاري. الاسم ثابت لا يحمل رقم نسخة — النسخة تُدار داخل الملف وفي Git.</li>
+      <li><b>تعليمة كلود كود:</b> يُضاف في <span class="mono">CLAUDE.md</span> السطر: «اقرأ <span class="mono">docs/WHITEPAPER.html</span> قبل أي تغيير معماري أو قرار منتج. أي تعارض يُحل لصالح الورقة. أي انحراف مطلوب يتطلب تعديل الورقة ورفع نسختها وتسجيله في سجل التغييرات قبل كتابة الكود».</li>
+      <li><b>دورة التغيير:</b> اقتراح → نقاش → تعديل القسم المعني + سطر في سجل التغييرات (قسم 17) + رفع النسخة (1.0 → 1.1) → commit مستقل بعنوان <span class="mono">docs: whitepaper vX.Y — &lt;القرار&gt;</span> → ثم التنفيذ.</li>
+      <li><b>درجات القرارات:</b> <span class="seal seal-lock">مقفل</span> لا يُعاد فتحه إلا بقرار صريح منك مسجل هنا · <span class="seal seal-ok">معتمد</span> نافذ · <span class="seal seal-flip">انعكس</span> رأي أول تغيّر بالنقاش (موثق للشفافية) · <span class="seal seal-wait">بانتظارك</span> مفتوح في قسم 16.</li>
+      <li><b>مرجعية النزاع:</b> إن تعارضت هذه الورقة مع أي محادثة أو ملاحظة أو كود قديم — الورقة تفوز. وإن تعارض قسمان فيها، قسم «الثوابت» (15) يفوز على الجميع.</li>
+      <li><b>صيغة مرآة:</b> يمكن توليد <span class="mono">docs/WHITEPAPER.md</span> من هذا الملف لقراءة أسهل في GitHub — الـHTML يبقى الأصل الوحيد والمرآة تُولَّد ولا تُحرَّر يدويًا.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ================= 01 ================= -->
+<section id="s1">
+  <div class="secnum">01</div>
+  <h2>الخلاصة التنفيذية</h2>
+  <p class="gist">مشروعان منفصلان: الشخصي مكتمل ويبقى مرجعًا، والتجاري يُبنى كاملًا من سيرفر سعودي نظيف. لا شيء مؤجل من النطاق — الشيء الوحيد الذي يُقاس قبل تثبيته هو رقم السعر وعدد العملاء في كل موجة.</p>
+  <div class="card">
+    <ul class="clean check">
+      <li><b>المشروع الشخصي (تيليجرام):</b> مكتمل تشغيليًا، E2E حي ناجح (تجربة Qiddiya: توليد + تحقق + تسليم + ledger)، مثبّت على <span class="mono">cef71c3</span>. يبقى كما هو: بيئة قياس ومصدر المحرك — لا يُلمس.</li>
+      <li><b>المنتج التجاري (واتساب + سلة):</b> اشتراك شهري لمساعد بحث وظيفي شخصي. هذه الورقة تعرّفه بالكامل؛ التنفيذ يبدأ بعد قرارات قسم 16 ويتبع خطة C0–C9.</li>
+      <li><b>صيغة الحسم:</b> تُبنى كل الميزات الآن (باقات، فوترة، إعداد، منتج تحليل الـCV) — وتُثبَّت أرقام الأسعار بعد قياس 30 يومًا من الألفا. الميزات مبرمجة كصلاحيات <span class="mono">plan_entitlements</span> من اليوم الأول.</li>
+    </ul>
+  </div>
+  <div class="banner"><b>أول خطوة عملية — هذا الأسبوع، قبل أي سطر كود:</b> تجديد وثيقة العمل الحر (تنتهي <b>15 سبتمبر 2026</b> — بعد ~9 أسابيع، وتوثيق متجر سلة معتمد عليها) + الدخول لحساب سلة (Axe) وتنفيذ فحص C0 كاملًا.</div>
+</section>
+
+<!-- ================= 02 ================= -->
+<section id="s2">
+  <div class="secnum">02</div>
+  <h2>المنتج: التعريف والنطاق والتموضع النظامي</h2>
+  <p class="gist">مساعد بحث وظيفي شخصي مدفوع — يفهم العميل، يقيّم مساره بصدق، يبحث له يوميًا، ويرسل كل فرصة مختارة ومعها CV إنجليزي مخصص جاهز، والعميل يقدّم بنفسه. <b>أداة، وليست وسيط توظيف.</b></p>
+
+  <h3>التعريف الرسمي (يُستخدم في صفحة المنتج والشروط)</h3>
+  <p>«مساعد بحث وظيفي شخصي يحلل ملفك ومسارك المهني، يبحث لك دوريًا عن الفرص المناسبة داخل السعودية، ويجهز لك سيرة ذاتية إنجليزية مخصصة لكل فرصة مختارة، ثم يرسلها إليك عبر واتساب لتقدّم بنفسك.»</p>
+
+  <div class="card">
+    <h3 style="margin-top:0">ما يفعله</h3>
+    <ul class="clean check">
+      <li>يجمع بيانات العميل بموافقات صريحة منفصلة بالغرض، ويستخرج خبراته من سيرته المرفوعة، ثم يطلب تأكيد كل حقيقة قبل استخدامها.</li>
+      <li>يبني «بنك الإنجازات» — قاعدة الحقائق الوحيدة المسموح للنموذج البناء منها، مع قائمة ممنوعات لكل عميل.</li>
+      <li>يقيّم المسار الذي اختاره العميل بدرجة رقمية ونقاط قوة وفجوات، يقترح الأقرب لملفه، ويحترم إصراره إن أصر (<span class="mono">customer_override</span>).</li>
+      <li>يبحث عبر Pool مشترك يعمل يوميًا، يصفّي ببوابة خاصة بكل عميل، يمنع التكرار عبر المصادر، ويرسل حتى فرصتين مؤهلتين يوميًا (أحد–خميس) مع CV إنجليزي وبطاقة تفسير لكل فرصة.</li>
+      <li>يسجل تفاعل العميل ونتائجه (قدّم / تجاهل / مقابلة / سبب الرفض) ويستخدمها للمعايرة.</li>
+    </ul>
+  </div>
+
+  <div class="card panel-red">
+    <h3 style="margin-top:0;color:var(--red)">ما لا يفعله أبدًا — يُنشر في صفحة المنتج، الشروط، رسالة الترحيب، وسياسة الاسترداد</h3>
+    <ul class="clean red">
+      <li>لا يضمن وظيفة ولا مقابلة، ولا يقدّم بدلًا عن العميل، ولا يضغط Submit، ولا يدخل حساباته، ولا يرفع ملفه في بوابات التوظيف، ولا يتجاوز CAPTCHA.</li>
+      <li>لا يتواصل مع الشركات بصفة وسيط ولا يمثّل العميل ولا يتفاوض على عقده — لا وجود لأي مسار كود يفعل ذلك.</li>
+      <li>لا يخترع خبرة أو رقمًا أو مسمى أو شهادة في أي CV — كل ادعاء يرجع لمصدر مؤكد في بنك الإنجازات.</li>
+      <li>لا يغيّر المسار المهني الذي اعتمده العميل دون موافقته الصريحة.</li>
+    </ul>
+  </div>
+
+  <h3>النطاق الأول ولغات المنتج</h3>
+  <ul class="clean">
+    <li><b>الجمهور المعلن في الألفا:</b> الباحثون عن وظائف مهنية ومكتبية داخل السعودية ممن يستخدمون CV إنجليزيًا. عائلات البداية (3–5): تقنية المعلومات، تحليل الأعمال، إدارة المشاريع وPMO، العمليات وService Delivery، التحول الرقمي. التوسع: Beta 10–15 عائلة بعد قياس الجودة، ثم إضافة تدريجية باختبارات خاصة بكل مجال. الصياغة التسويقية: «نستقبل الجميع ونفعّل ما نضمن جودته» — لا ادعاء كل التخصصات.</li>
+    <li><b>اللغات:</b> الـCV النهائي إنجليزي دائمًا · التحليل والتقارير وواتساب بالعربية · النظام يفهم الإعلان العربي والإنجليزي والمختلط وينتج CV إنجليزيًا. مصفوفة الاختبار الإلزامية: إعلان (عربي/إنجليزي/مختلط) × CV مصدر (عربي/إنجليزي/مختلط).</li>
+    <li><b>أيام الخدمة:</b> الاكتشاف يعمل 7 أيام؛ التسليم للعملاء أحد–خميس — رسالة الأحد تشمل حصاد الجمعة والسبت.</li>
+  </ul>
+
+  <h3>التموضع النظامي — وثيقة العمل الحر</h3>
+  <div class="card">
+    <ul class="clean">
+      <li><b>الوثيقة الحالية:</b> ممارس حر — الفئة «الخدمات التخصصية»، التخصص «نظم تقنية المعلومات»، إصدار 15 سبتمبر 2023، <b>انتهاء 15 سبتمبر 2026</b>. متوافقة مبدئيًا مع تشغيل منصة تقنية وأتمتة ومعالجة بيانات ومساعد رقمي.</li>
+      <li><b>الخط الأحمر:</b> نشاط «التوسط في التوظيف» له ترخيص وضوابط منفصلة ثقيلة — المنتج لا يدخل فيه لأنه لا يتواصل مع الشركات نيابةً عن العميل ولا يقدّم عنه ولا يعده بوظيفة. هذا الفصل يُحفظ في الاسم والوصف والشروط، وأي صياغة تسويقية توحي بـ«مكتب توظيف» مرفوضة.</li>
+      <li><b>قبل أول عميل عام مدفوع:</b> تجديد الوثيقة والتحقق من بقاء النشاط فعالًا + البحث عن نشاط إضافي أدق داخل منصة العمل الحر إن توفر + مراجعة وصف المنتج بعين نظامية.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ================= 03 ================= -->
+<section id="s3">
+  <div class="secnum">03</div>
+  <h2>سجل القرارات</h2>
+  <p class="gist">كل قرار في المشروع له درجة ومكان هنا. ما ليس مسجلًا هنا ليس قرارًا.</p>
+
+  <div class="card">
+    <h3 style="margin-top:0"><span class="seal seal-lock">مقفل</span>&nbsp; لا يُعاد فتحه</h3>
+    <ul class="clean">
+      <li>التقديم يدوي من العميل دائمًا — لا أتمتة تقديم بأي شكل، ولا يُكتب كود لها أصلًا.</li>
+      <li>واتساب Cloud API <b>مباشر</b> قناة العميل (بدون BSP في الألفا؛ الانتقال لـBSP فقط لأسباب موثقة: توثيق أسرع، Inbox جاهز، دعم تشغيلي) · تيليجرام القناة الإدارية لك · سلة قناة البيع والدفع الوحيدة.</li>
+      <li>Anthropic / Claude لكل نداءات النموذج بلا استثناء — يشمل ترحيل توليد الـCV من gpt-4o إلى Claude في أول نسخة تجارية.</li>
+      <li>السيرفر التجاري داخل السعودية من اليوم الأول — لا بناء على Contabo ثم هجرة.</li>
+      <li>المشروع الشخصي يبقى كما هو على <span class="mono">cef71c3</span> ولا يُلمس؛ لا تُنسخ منه أسرار ولا بيانات — فقط الكود المتتبع في Git (قسم 07 و10).</li>
+      <li>كل فرصة مختارة تصل ومعها CV جاهز — جوهر المنتج في كل الباقات.</li>
+      <li>بنك الإنجازات هو المصدر الوحيد لمحتوى أي CV، وقائمة الممنوعات تُحترم حرفيًا.</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0"><span class="seal seal-ok">معتمد</span>&nbsp; نافذ</h3>
+    <ul class="clean">
+      <li>التموضع: أداة بحث وتحليل وتجهيز مستندات — ليست مكتب توظيف (قسم 02).</li>
+      <li>الاكتشاف 7 أيام / التسليم أحد–خميس · التسليم التكيفي على واتساب (قسم 08) · القالب اليومي يُقدَّم لـMeta بصياغتين والاقتصاديات تُبنى على التصنيف المعتمد فعليًا.</li>
+      <li>ربط الدفع بالرقم عبر Activation Token قصير العمر — حقل الرقم في سلة للتعبئة المسبقة فقط.</li>
+      <li>التفعيل حصريًا على <span class="mono">order.payment.updated = paid</span> + تعطيل الدفع عند الاستلام نهائيًا.</li>
+      <li>الاشتراك «باس 30 يوم» بتجديد يدوي برابط — لا خصم تلقائي في الألفا (Recurring API في سلة خيار لاحق موثق في قسم 09).</li>
+      <li>منع التكرار على مستوى <span class="mono">repost_group_id</span> بسياسة دمج متحفظة (قسم 06).</li>
+      <li>أنت العميل <span class="mono">TEN-0001</span> الدائم — canary يمر بالدورة قبل العملاء بساعة كل يوم.</li>
+      <li>منتج «تحليل الـCV» مستقل رخيص يُطلق للعامة قبل الموجة الثالثة، وتقريره يورّث بنك إنجازات جاهزًا عند الترقية (قسم 04).</li>
+      <li>تغيير اسم Axe · رابط سلة مؤقت لتجربة الأصدقاء · دومين مخصص + بريد <span class="mono">support@</span> و<span class="mono">privacy@</span> قبل الإطلاق العام.</li>
+      <li>نسخ احتياطي مشفّر خارج السيرفر · زر «دعم» يصعّد لتيليجرامك مع صندوق رد في لوحة الإدارة · تموضع الروبوت عند Meta كمساعد مهمة محددة · الحساب البشري: العميل يصل لإنسان بكلمة «دعم» دائمًا.</li>
+      <li>طول الـCV حسب كثافة الخبرة لا حسب الباقة: 0–5 سنوات صفحة غالبًا، 6–12 صفحة أو صفحتان، قيادي صفحتان غالبًا.</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h3 style="margin-top:0"><span class="seal seal-flip">انعكس</span>&nbsp; كان رأيًا أول وتغيّر بالنقاش — موثق للشفافية</h3>
+    <ul class="clean">
+      <li><b>10 فرص يوميًا ← حتى فرصتين:</b> 220 ملفًا شهريًا إغراق لا خدمة (تكلفة، إرهاق، حظر رقم، فرص غير جدية). السقف يرتفع إلى 3 فقط بقرار موثق بعد بيانات استخدام. الصياغة الملزمة: «نبحث لك يوميًا ونرسل حتى فرصتين مؤهلتين عند توفرها» — يوم الصفر سلوك صادق لا فشل.</li>
+      <li><b>الاحتفاظ الدائم ← 90 يومًا بعد الانتهاء ثم حذف مهني</b> (تفاصيل قسم 12) — ينتظر اعتمادك النهائي في قسم 16.</li>
+      <li><b>كل باحث عن عمل من اليوم الأول ← نطاق أول محدود</b> بعائلات محددة وتوسع مقاس.</li>
+      <li><b>إرسال كل الملفات استباقيًا ← التسليم التكيفي:</b> يحمي الرقم ويعطي إشارة استخدام (قسم 08).</li>
+      <li><b>سعر واحد 279 ← ثلاث باقات:</b> ميزاتها تُبنى الآن كاملة وأرقامها بعد القياس (قسم 04).</li>
+      <li><b>عشرة عملاء دفعة واحدة ← موجات 2 ثم 5 ثم 10:</b> أي خلل عزل ينكشف على اثنين لا عشرة (قسم 14).</li>
+      <li><b>«dry-run» بمعناه الحالي ← إعادة تسمية:</b> علمٌ اسمه dry-run ينفذ اكتشافًا حيًا وإرسالًا وكتابة ledger فخّ؛ في الكود التجاري: <span class="mono">--digest-only</span> بدلالة واضحة + وضع Preview حقيقي بلا شبكة ولا إرسال ولا كتابة.</li>
+      <li><b>بوابة اختيارية بعلم ← بوابة إلزامية هيكليًا:</b> مسار الإنتاج لا يستطيع بنيويًا تجاوز البوابة؛ التجاوز موجود فقط في Preview داخلي لا يرسل ولا يكتب.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ================= 04 ================= -->
+<section id="s4">
+  <div class="secnum">04</div>
+  <h2>الباقات والتسعير ومنتج تحليل الـCV</h2>
+  <p class="gist">الميزات تُبرمج الآن كصلاحيات <span class="mono">plan_entitlements</span> — يوم تثبيت السعر يكون لصق أرقام لا بناء. الأرقام أدناه استرشادية وتُثبَّت بعد قياس 30 يومًا.</p>
+
+  <div class="tiers">
+    <div class="tier">
+      <h4>أساسي</h4>
+      <div class="price">~149 <small>ريال / 30 يوم</small></div>
+      <ul>
+        <li>فرصة مختارة واحدة يوميًا مع CV مخصص جاهز</li>
+        <li>بوابة كاملة: راتب، مسارات، مدن، شركات محظورة</li>
+        <li>تقرير «الفرص القريبة» في أيام الصفر</li>
+        <li>سطر «الفرص الفائتة» — محرك الترقية</li>
+        <li>أوامر: وقف مؤقت · تعديل تفضيلات · حالة اشتراكي</li>
+        <li>دعم خلال 48 ساعة</li>
+      </ul>
+    </div>
+    <div class="tier featured">
+      <h4>احترافي</h4>
+      <div class="price">~279 <small>ريال / 30 يوم</small></div>
+      <ul>
+        <li>كل الأساسي + حتى فرصتين يوميًا بـCV لكل فرصة</li>
+        <li>نبذة تقديم قصيرة جاهزة للنسخ مع كل بطاقة</li>
+        <li>أولوية معالجة في الطابور</li>
+        <li>تعديل تفضيلات فوري بلا حدود</li>
+        <li>دعم خلال 24 ساعة</li>
+      </ul>
+      <div class="cap">السقف يرتفع إلى 3 فرص بقرار موثق بعد بيانات الاستخدام</div>
+    </div>
+    <div class="tier">
+      <h4>تنفيذي</h4>
+      <div class="price">~449 <small>ريال / 30 يوم</small></div>
+      <ul>
+        <li>كل الاحترافي + خطاب تقديم كامل لكل فرصة</li>
+        <li>مراجعتك البشرية للـMaster CV شهريًا (20 دقيقة)</li>
+        <li>جلسة مسار مهني 30 دقيقة عند أول اشتراك</li>
+        <li>تقرير أسبوعي: نبض السوق + إحصاءات تقديماته</li>
+      </ul>
+      <div class="cap">15 مقعدًا فقط — يحمي وقتك مع الدوام</div>
+    </div>
+  </div>
+
+  <div class="tblwrap"><table>
+    <tr><th>الصلاحية <span class="mono">entitlement</span></th><th>أساسي</th><th>احترافي</th><th>تنفيذي</th></tr>
+    <tr><td><span class="mono">daily_job_limit</span></td><td>1</td><td>2 (→3 لاحقًا)</td><td>2 (→3 لاحقًا)</td></tr>
+    <tr><td><span class="mono">monthly_cv_safety_cap</span></td><td>35</td><td>70</td><td>70</td></tr>
+    <tr><td><span class="mono">intro_blurb</span> نبذة تقديم</td><td>—</td><td>✓</td><td>✓</td></tr>
+    <tr><td><span class="mono">cover_letter</span> خطاب كامل</td><td>—</td><td>—</td><td>✓</td></tr>
+    <tr><td><span class="mono">human_review_monthly</span></td><td>—</td><td>—</td><td>✓</td></tr>
+    <tr><td><span class="mono">weekly_report</span></td><td>—</td><td>—</td><td>✓</td></tr>
+    <tr><td><span class="mono">queue_priority</span></td><td>عادي</td><td>مرتفع</td><td>مرتفع</td></tr>
+    <tr><td><span class="mono">support_sla_hours</span></td><td>48</td><td>24</td><td>24</td></tr>
+    <tr><td><span class="mono">seats_cap</span></td><td>—</td><td>—</td><td>15</td></tr>
+    <tr><td>السعر الاسترشادي</td><td>149</td><td>279</td><td>449</td></tr>
+  </table></div>
+  <p class="small">الترقية وسط الدورة: قيمة الأيام المتبقية تتحول إلى أيام مكافئة بسعر الباقة الجديدة. الوقف المؤقت يوقف البحث والإرسال ولا يمدد المدة.</p>
+
+  <h3>منتج تحليل الـCV — قمع الاكتساب</h3>
+  <div class="card">
+    <ul class="clean">
+      <li><b>ما هو:</b> شراء مستقل رخيص: العميل يرفع سيرته ويختار مساره المطلوب، ويستلم تقييمًا عربيًا رقميًا: درجة عامة + وضوح المسار + قوة الإنجازات + الملاءمة للمسار المطلوب + جودة القراءة الآلية، ثم أهم 5 ملاحظات، ثم ملاءمة مساره المختار مقابل المسار البديل المقترح بدرجتيهما، ثم ثلاث خطوات تالية (استمرار / بديل / الاشتراك في البحث اليومي).</li>
+      <li><b>ما لا يشمله:</b> إعادة كتابة كاملة، CV جديد، وعود ATS، خطاب تغطية، استشارات غير محدودة — لكنه ليس مجرد رقم؛ الملاحظات مفيدة فعلًا.</li>
+      <li><b>التسليم:</b> تقرير PDF عربي مختصر (قابل للمشاركة = أداة تسويق) + ملخص داخل واتساب.</li>
+      <li><b>الوراثة:</b> عند ترقيته للاشتراك، ملفه المستخرج يعبّئ بنك الإنجازات مسبقًا — الإعداد يصير نصف جاهز.</li>
+      <li><b>التوقيت:</b> يُطلق للعامة قبل فتح الموجة الثالثة.</li>
+    </ul>
+  </div>
+
+  <h3>إطار قياس السعر — 30 يوم ألفا</h3>
+  <ul class="clean">
+    <li><b>تكاليف مباشرة تُقاس لكل عميل:</b> الاكتشاف، الإثراء، تحليل الـCV، تقييم المسار، توليد الـCV وإعادات المحاولة، رسائل واتساب، التخزين، رسوم سلة والدفع، حصة VPS والقاعدة والنسخ والمراقبة — كلها في <span class="mono">cost_allocations</span>.</li>
+    <li><b>تكاليف بشرية:</b> دقائق مراجعتك، الدعم، تصحيح البيانات، مشاكل الدفع والواتساب، الاستردادات.</li>
+    <li><b>مؤشرات القرار:</b> ARPU · COGS لكل عميل · هامش المساهمة · CAC · الاحتفاظ والـChurn · نسبة الاسترداد · دقائق الدعم · فرص فُتحت / قُدّم عليها / مقابلات.</li>
+    <li><b>المخرَج:</b> بعد 30 يومًا تُختار الأرقام النهائية من مدى مقاس (المرساة الاسترشادية 149/279/449) وتُثبَّت هنا برفع نسخة الورقة.</li>
+    <li><b>أرقام أولية للنمذجة:</b> توليد CV بـClaude ≈ 20 هللة · التكلفة الهامشية للعميل الاحترافي ≈ 18–28 ريالًا شهريًا · التعادل التقديري ≈ 2–3 عملاء احترافي — تُستبدل جميعها بالمقاس.</li>
+  </ul>
+</section>
+
+<!-- ================= 05 ================= -->
+<section id="s5">
+  <div class="secnum">05</div>
+  <h2>رحلة العميل: من الدفع إلى النشاط</h2>
+  <p class="gist">سلة تبيع، الـwebhook الموقّع يفعّل، الرمز يثبت أن الرقم رقم الدافع نفسه، والإعداد محادثة متدرجة — والعد التنازلي يبدأ عند إكمال الإعداد لا عند الدفع.</p>
+
+  <div class="steps">
+    <div class="step"><b>الشراء في سلة</b><div class="small">منتج «باس 30 يوم» (لكل باقة منتج) + حقل رقم واتساب (تعبئة مسبقة فقط) + خانة موافقة على استقبال الرسائل وسياسة الخصوصية. الدفع عند الاستلام معطّل نهائيًا. الطلبات القديمة في المتجر تبقى تاريخية كما هي؛ المنتجات الجديدة بـSKU وتصنيفات وسياسات جديدة.</div></div>
+    <div class="step"><b>الـWebhook → الاشتراك</b><div class="small">النمط الملزم: تحقق التوقيع → تسجيل الحدث ببصمة <span class="mono">event_fingerprint</span> → منع التكرار → ردّ 200 فورًا → Worker يعالج: يتحقق من الطلب عبر Salla API ويطابق المنتج والمبلغ والعملة → ينشئ الاشتراك <span class="mono">PAID_UNCLAIMED</span> → ينشئ Activation Token. الحدث المكرر لا ينشئ اشتراكًا ثانيًا ولا يمدد مرتين ولا يرسل ترحيبين.</div></div>
+    <div class="step"><b>إثبات الرقم</b><div class="small">صفحة الشكر تعرض زر «ابدأ إعداد خدمتك على واتساب» يفتح محادثة تحمل التوكن قصير العمر → يربط: الطلب المدفوع ↔ الرقم الذي بدأ المحادثة ↔ العميل. فشل الترحيب أو رقم خاطئ = تنبيه فوري لك على تيليجرام + مراسلة عبر إيميل الطلب في سلة.</div></div>
+    <div class="step"><b>الإعداد (Onboarding) — آلة حالات</b><div class="small">
+      <span class="mono">PAID_UNCLAIMED → PHONE_VERIFIED → CONSENT_PENDING → CV_UPLOAD_PENDING → CV_PROCESSING → PROFILE_CONFIRMATION → CAREER_PATH_REVIEW → SEARCH_POLICY_REVIEW → READY_FOR_ACTIVATION → ACTIVE</span>.
+      قابلة للاستكمال في أي وقت؛ توقف &gt;24 ساعة = تذكير بقالب؛ كلمة «دعم» تصعّد لإنسان دائمًا. تفاصيل المراحل أدناه.</div></div>
+    <div class="step"><b>نشط — الحلقة اليومية</b><div class="small">قسم 06. الأوامر الدائمة: وقف مؤقت · تعديل تفضيلات · حالة اشتراكي · تصدير بياناتي · حذف بياناتي · إيقاف الرسائل · دعم.</div></div>
+    <div class="step"><b>التجديد والنهايات</b><div class="small">تذكير يوم 27 و29 برابط الشراء → الدفع يمدد 30 يومًا عبر نفس مسار الـwebhook → سماحية <span class="mono">GRACE</span> 48 ساعة → إيقاف → رسالة استرجاع بعد 7 أيام. استرداد/إلغاء/Chargeback = تعليق فوري وفق حالته.</div></div>
+  </div>
+
+  <h4>تفاصيل مراحل الإعداد</h4>
+  <ul class="clean">
+    <li><b>الموافقات (منفصلة بالغرض):</b> جمع البيانات وتحليل السيرة · استخدام مزودي تقنية خارجيين مع تجريد الهوية · استقبال الرسائل اليومية · (اختياري ومنفصل) إحصاءات مجهولة الهوية لتحسين الخدمة. تُعرض حقوق السحب والحذف والاحتفاظ ورابط السياسة.</li>
+    <li><b>البيانات الأساسية (بأزرار وقوائم، لا استبيان 30 سؤالًا):</b> اسم الـCV، المدينة، المسمى الحالي، سنوات الخبرة، فترة الإشعار، نوع الدوام، الانتقال والعمل عن بعد، الحد الأدنى المستهدف، لغة التواصل، المسار المطلوب. <b>لا رقم هوية ولا تاريخ ميلاد.</b></li>
+    <li><b>رفع السيرة:</b> PDF أو DOCX → فحص النوع والحجم → فحص أمني (قسم 11) → استخراج النص → استخراج الخبرات والتعليم والشهادات والمهارات والإنجازات → Draft Profile.</li>
+    <li><b>تأكيد الحقائق:</b> استخراج النموذج ليس حقيقة؛ كل حقيقة لها حالة: <span class="mono">EXTRACTED → CUSTOMER_CONFIRMED / CUSTOMER_CORRECTED / CUSTOMER_REJECTED / OPERATOR_VERIFIED</span> — ولا يدخل بنك الإنجازات إلا المؤكد. الأسئلة فقط عن الناقص والمتعارض.</li>
+    <li><b>تقييم المسار — ثلاث طبقات:</b> المطلوب (ما يريده) · المقترح (ما يراه النظام) · <b>المعتمد للبحث</b> (Primary / Secondary / Stretch بموافقته). صيغة التقييم: درجة ملاءمة رقمية + نقاط قوة + فجوات + أقرب 3 مسارات بدرجاتها. إن أصر على مسار ضعيف: <span class="mono">customer_override = true</span> مع إبلاغه أن الفرص ستقل والتطابق سينخفض ولن نخترع خبرات — ويمكن باتفاقه تخصيص ~80% فرص واقعية و~20% Stretch.</li>
+    <li><b>سياسة البحث:</b> المسارات المعتمدة، المدن، الراتب الأدنى، سياسة الوظائف بلا راتب (صارمة/متوازنة/واسعة)، عن بعد، القطاعات المفضلة والمرفوضة، الشركات الممنوعة، الحد اليومي حسب الباقة → بطاقة ملخص → «تأكيد وبدء البحث».</li>
+    <li><b>بداية العد:</b> الدفع ينشئ حق تفعيل؛ الثلاثون يومًا تبدأ عند إكمال الإعداد، بمهلة 7 أيام من الدفع (تذكير + دعم؛ بعدها تسري وفق الشروط) — ينتظر اعتمادك النهائي في قسم 16.</li>
+  </ul>
+
+  <p class="small"><b>حالات الاشتراك الكاملة:</b></p>
+  <div class="chips"><span class="chip">PENDING_PAYMENT</span><span class="chip">PAID_UNCLAIMED</span><span class="chip">ONBOARDING</span><span class="chip">ACTIVE</span><span class="chip">PAUSED</span><span class="chip">GRACE</span><span class="chip">EXPIRED</span><span class="chip">CANCELED</span><span class="chip">REFUNDED</span><span class="chip">CHARGEBACK</span><span class="chip">SUSPENDED</span></div>
+</section>
+
+<!-- ================= 06 ================= -->
+<section id="s6">
+  <div class="secnum">06</div>
+  <h2>الحلقة اليومية: من الاكتشاف إلى الإغلاق الصادق</h2>
+  <p class="gist">اكتشاف واحد مشترك للجميع وتقييم خاص بكل عميل — التكلفة تنمو بعدد عائلات الأدوار لا بعدد العملاء. كل مرحلة أدناه ملزمة بترتيبها.</p>
+
+  <h3>1) الـPool الليلي المشترك — كل يوم</h3>
+  <ul class="clean">
+    <li><b>التخطيط:</b> اتحاد مسارات العملاء النشطين (الأدوار، المدن، المستويات، اللغات، عن بعد) → <span class="mono">query_families</span> بمرادفات عربية وإنجليزية. مثال ملزم البنية:</li>
+  </ul>
+  <pre class="code">family: business_analysis
+aliases: [Business Analyst, Business Systems Analyst,
+          Requirements Analyst, "محلل أعمال", "محلل نظم أعمال"]
+locations: [Riyadh, Saudi Arabia, Remote]</pre>
+  <ul class="clean">
+    <li><b>الاكتشاف:</b> المصادر الحالية (SerpApi Google Jobs + JobSpy) بأسقف قابلة للضبط في الإعدادات لا في الكود؛ الأسقف الشخصية المثبتة (24 + 12 طلبًا) هي نقطة البداية. <b>تدقيق المصادر قبل البيع:</b> شروط الاستخدام التجاري، الاستقرار، API أم Scraping، سياسة عرض مقتطف + رابط أصلي، وعدم الارتهان لمصدر واحد.</li>
+    <li><b>الترشيح على مرحلتين:</b> قائمة استرجاع رخيصة 40–50 وظيفة → إثراء محدود 20–30 → البوابة والترتيب. مع تخصيص Slots في القائمة: شركات قوية، إعلانات عربية، تنوع مصادر، وظائف جديدة جدًا، وحصة استكشاف صغيرة خارج النمط.</li>
+    <li><b>الإثراء مرة واحدة بكاش:</b> صفحة الوظيفة تُقرأ مرة مهما تعدد العملاء المناسبون لها — بحماية SSRF الموروثة كاملة (قسم 07) وTimeout لكل طلب.</li>
+    <li><b>الهوية الموسعة:</b> <span class="mono">URL-v1 (joburl:v1:&lt;sha256&gt;)</span> تبقى الأساس، وتضاف: <span class="mono">source_native_id · canonical_url_identity · job_entity_id · cross_source_fingerprint · repost_group_id</span> — لأن الوظيفة نفسها تظهر بروابط مختلفة (موقع الشركة، Google Jobs، منصات، روابط تتبع).</li>
+    <li><b>سياسة الدمج متحفظة:</b> يُدمج عند تطابق canonical URL، أو تطابق (شركة + مسمى + مدينة + نافذة نشر) بعتبة عالية؛ المشكوك فيه يبقى منفصلًا — دمج خاطئ لوظيفتين أسوأ من تكرار.</li>
+  </ul>
+
+  <h3>2) بوابة كل عميل + سجل قرار</h3>
+  <ul class="clean">
+    <li><b>المحاور:</b> الراتب · تطابق المسار · المستوى · الموقع · القطاع · الشركات (تصنيف TIER) · نوع العمل · اللغة · الحد اليومي. إعدادات البوابة في <span class="mono">search_policies</span> بإصدارات — لا Constants في الكود.</li>
+    <li><b>الراتب:</b> السنوي ÷ 12 · كلمات <span class="mono">annual/yearly/per annum</span> تُعتمد بحذر وكلمة year وحدها لا تكفي (حتى لا تختلط بـ«5 years of experience») — القاعدة موروثة ومختبرة. الوظائف بلا راتب تُصنَّف: <span class="mono">EXPLICIT_CONFIRMED / EXPLICIT_AMBIGUOUS / INFERRED_HIGH / INFERRED_MEDIUM / INFERRED_LOW / UNKNOWN</span>، وسياسة العميل تقرر: صارمة (UNKNOWN ممنوعة) · متوازنة (تمر مع شركة ومستوى قويين) · واسعة (تمر بترتيب أدنى). الافتراضي السعودي: UNKNOWN لا تُحجب مباشرة.</li>
+    <li><b>سجل القرار لكل وظيفة</b> — يجيب «ليش أرسلتوها لي؟» ويغذي المعايرة:</li>
+  </ul>
+  <pre class="code">role_score: 86        salary_status: INFERRED_HIGH
+company_tier: 1       location: PASS
+seniority: PASS       final_score: 89
+decision: PASS        gate_policy_version: v1</pre>
+  <ul class="clean">
+    <li><b>الفرص القريبة (Near-miss):</b> تُسجَّل أسباب الحجب الحدّية (راتب بفارق بسيط، تطابق 76 والحد 80، مستوى أعلى، موقع) — وتتحول في يوم الصفر إلى تقرير للعميل: «3 فرص قريبة ما عبرت، السبب كذا — توسّع معاييرك؟».</li>
+  </ul>
+
+  <h3>3) الترتيب والاختيار</h3>
+  <ul class="clean">
+    <li>القواعد الحتمية تحدد الأهلية؛ النموذج لا يستطيع تمرير وظيفة تخالف الراتب أو الموقع أو الحدود، ويجوز له إعادة ترتيب المؤهل فقط. السياسة موحدة ومُصدَّرة <span class="mono">ranking_policy_version</span> مع Rank Trace لكل وظيفة.</li>
+    <li>كبت المرسل سابقًا على مستوى <span class="mono">repost_group_id</span> ضمن TTL (البداية 30 يومًا) — الإزالة قبل قص القائمة حتى لا تستهلك الوظيفة القديمة مقعدًا.</li>
+    <li>قص القائمة على <span class="mono">daily_job_limit</span> للباقة.</li>
+  </ul>
+
+  <h3>4) توليد الـCV</h3>
+  <ul class="clean">
+    <li><b>المصدر:</b> بنك الإنجازات المؤكد فقط + قائمة الممنوعات. بنية الإنجاز الملزمة: <span class="mono">achievement_id · customer_id · الشركة · المسمى · الفترة · النص الأصلي · الصياغة المنظمة · المقياس الرقمي إن وجد · المصدر · حالة التأكيد · allowed_in_cv</span>. مثال المبدأ: «Improved processes» لا تصبح «by 20%» إلا إذا قال العميل 20% وأكّدها. أمثلة الممنوعات: لا إدارة موظفين مباشرة، لا خبرة SAP، لا جنسية، لا راتب، لا مسمى Architect، لا ادعاء توظيف مباشر لدى جهة إذا كان عبر مزود.</li>
+    <li><b>شروط عدم التوليد:</b> وصف وظيفي غير كافٍ · هوية وظيفة غير مستقرة · بيانات عميل ناقصة · المسار يتطلب ادعاءات لا يملكها · فشل تحقق · تجاوز الحصة أو ميزانية التكلفة.</li>
+    <li><b>الخصوصية:</b> تجريد البيانات التعريفية قبل النداء — الاسم والجوال Placeholders تُحقن محليًا عند تجميع الـPDF؛ النموذج لا يرى PII.</li>
+    <li><b>إعادة الاستخدام:</b> Fresh generation إن لا CV صالح؛ Validated reuse فقط عند تطابق الهوية والرابط وثبات الـPDF hash وصحة الـmetadata وحالة READY — لا إعادة استخدام لمجرد تشابه اسم.</li>
+  </ul>
+
+  <h3>5) الربط والنشر — موروث حرفيًا</h3>
+  <ul class="clean">
+    <li>لكل CV زوج: <span class="mono">joburl-&lt;identity&gt;.pdf + .metadata.json</span> (الهوية، الرابط، الشركة، العنوان، SHA-256، الحجم، الملخص، بيانات الربط).</li>
+    <li><b>validate_cv_binding يجب أن يعيد ready_for_apply_upload، ويفحص:</b> تطابق هوية الوظيفة مع الـmetadata · الرابط يعيد نفس الهوية · توافق الشركة والعنوان · تطابق الـHash · اكتمال الملخص · الملف ليس قديمًا ولا من الحجر ولا temp · الرابط ليس فارغًا · الملف ليس مرتبطًا بوظيفة أخرى — والتجاوب المختبر: رابط خاطئ = blocked، رابط فارغ = blocked.</li>
+    <li><b>النشر الذري:</b> مجلد مؤقت → كتابة PDF → metadata → تحقق → fsync → os.replace — لا PDF ناقص، لا metadata بلا PDF، <span class="mono">.pub-* = 0</span> دائمًا. المشكوك فيه يذهب للحجر ولا يُرسل منه شيء أبدًا.</li>
+  </ul>
+
+  <h3>6) التسليم والإغلاق الصادق</h3>
+  <ul class="clean">
+    <li>التسليم التكيفي أحد–خميس (تفاصيل قسم 08) مع أزرار «قدّمت / تجاهل» وسبب الرفض عند التجاهل.</li>
+    <li>لا كتابة في الـledger إلا بعد اكتمال التسليم كاملًا (بطاقة + مستند)؛ الكتابة ذرية (temp → fsync → replace)؛ فشل أي جزء = لا تسجيل ولا ادعاء نجاح ولا إعادة تلقائية.</li>
+    <li>حالة صادقة لكل عميل لكل يوم: <span class="mono">DELIVERED / NO_MATCHES / PARTIAL_DELIVERY / DISCOVERY_FAILED / CV_GENERATION_FAILED / WHATSAPP_FAILED / LEDGER_FAILED</span> — لا «exit 0» صامت على فشل جزئي؛ رموز الخروج الصادقة موروثة من وضع الـPilot (0/2/3/4/5/6) وتُعمَّم.</li>
+    <li>ملخص تشغيلي يومي لك على تيليجرام برموز <span class="mono">TEN-####</span> والأرقام فقط: نتائج، تكاليف، أعطال، سلاسل أيام الصفر — بلا أي PII.</li>
+    <li>أحداث النتائج من العميل تدخل <span class="mono">outcome_events</span>: حفظ / قدّم / غير مناسبة / سبق قدّمت / اتصال / مقابلة / رفض / عرض + سبب الرفض (راتب، تخصص، موقع، مستوى، شركة) — وهي وقود المعايرة وقياس قيمة الاشتراك.</li>
+  </ul>
+</section>
+
+<!-- ================= 07 ================= -->
+<section id="s7">
+  <div class="secnum">07</div>
+  <h2>الموروث من المحرك الشخصي</h2>
+  <p class="gist">لا نعيد اختراع ما ثبت. هذا ما ينتقل حرفيًا، وما يُستخرج كحزمة مشتركة، وما يُنظَّف أثناء النقل.</p>
+  <div class="card">
+    <h3 style="margin-top:0">ينتقل حرفيًا (مُثبت بتجارب حية)</h3>
+    <ul class="clean check">
+      <li>هوية <span class="mono">URL-v1</span> واشتقاقها من الرابط القانوني، واستخدامها في منع التكرار والربط والتسمية والـledger.</li>
+      <li>سلسلة النشر الذري كاملة + الحجر + <span class="mono">validate_cv_binding</span> بقائمة فحوصه.</li>
+      <li>مبدأ «القواعد الحتمية فوق رأي النموذج» في البوابة والترتيب.</li>
+      <li>قواعد الراتب (سنوي ÷ 12، حذر كلمة year) بعد إصلاح خطأ 150,000/سنة.</li>
+      <li>حماية SSRF في الإثراء: منع localhost والشبكات الخاصة وعناوين metadata السحابية وloopback وlink-local، وفحص الرابط الأصلي <b>والوجهة النهائية بعد التحويل</b>.</li>
+      <li>نمط فلترة الأسرار في السجلات (<span class="mono">TelegramSecretRedactionFilter</span> نموذجًا) — يعمَّم على واتساب وسلة وكل القنوات، مع مستويات logging مضبوطة للمكتبات الحساسة.</li>
+      <li>الكتابة الذرية للـledger والتسجيل بعد اكتمال التسليم فقط + نموذج رموز الخروج الصادقة.</li>
+      <li>جدولة systemd كنقطة انطلاق للمجدول التجاري متعدد العملاء.</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3 style="margin-top:0">يُستخرج كحزمة مشتركة <span class="mono">career_core</span></h3>
+    <p class="small" style="margin-bottom:8px">حتى لا نصلح Salary Parser أو الـValidator مرتين: Tag للحالة الشخصية <span class="mono">cef71c3</span> → مشروع تجاري نظيف → تحديد مكونات <span class="mono">career_core</span> (التوحيد، الهوية، الراتب، البوابة، الربط، النشر الذري) → استخراج تدريجي بإصدارات → الشخصي والتجاري يستهلكان نفس النواة لاحقًا.</p>
+  </div>
+  <div class="card">
+    <h3 style="margin-top:0">يُنظَّف أثناء النقل</h3>
+    <ul class="clean warn">
+      <li>إعادة تسمية <span class="mono">--dry-run</span> إلى <span class="mono">--digest-only</span> (الاسم القديم Alias مؤقت حتى لا تنكسر systemd والاختبارات، ثم يُحذف) + بناء Preview حقيقي: لا شبكة، لا إرسال، لا كتابة.</li>
+      <li>البوابة إلزامية بنيويًا في كل مسار إنتاجي — لا علم يتجاوزها؛ التجاوز في Preview الداخلي فقط.</li>
+      <li>افتراض «عميل واحد اسمه فهد» و«مجلد عالمي واحد» يُزال: كل مسار ملفات وledger وquarantine يصبح لكل Tenant.</li>
+      <li>تسوية مخزون الـCV القديم بالتصنيف لا بالعدد: <span class="mono">VALID_PAIR / LEGACY_CV / ORPHAN_PDF / ORPHAN_METADATA / HASH_MISMATCH / INVALID_BINDING / QUARANTINED</span> — لا نقل للحجر لمجرد فرق عدد (26 PDF مقابل 21 metadata يُفسَّر بالفحص).</li>
+      <li>ترحيل توليد الـCV من gpt-4o إلى Claude ضمن أول نسخة تجارية (قرار مقفل).</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ================= 08 ================= -->
+<section id="s8">
+  <div class="secnum">08</div>
+  <h2>واتساب: النافذة، القوالب، التسليم التكيفي، والتكلفة</h2>
+  <p class="gist">نموذج Meta: رسائل حرة مجانية داخل نافذة خدمة 24 ساعة تفتح برسالة من العميل؛ خارجها قوالب معتمدة مدفوعة لكل رسالة. تصميمنا يستغل النافذة ولا يفترض تصنيفًا قبل اعتماده.</p>
+
+  <h3>التسليم التكيفي — القاعدة الملزمة</h3>
+  <ul class="clean">
+    <li><b>نافذة مفتوحة</b> (العميل تفاعل خلال 24 ساعة): البطاقات والملفات تنزل مباشرة بلا قالب وبلا ضغطة — مجانًا.</li>
+    <li><b>نافذة مقفلة:</b> قالب واحد صباحي: «لقينا لك اليوم فرصتين متوافقتين مع مسارك والـCVs جاهزة — [عرض الفرص]» → أي ضغطة أو رد يفتح النافذة → تنزل البطاقات والمستندات والأزرار مجانًا.</li>
+    <li><b>لماذا لا نرسل الملفات استباقيًا:</b> تكلفة قوالب أعلى، احتمال حظر أعلى، ملفات لا تُفتح، وفقدان إشارة التفاعل. (الـCVs نفسها تكون <b>جاهزة مسبقًا</b> دائمًا قبل رسالة الصباح — الجاهزية غير الدفع الاستباقي.)</li>
+    <li><b>خيار بديل موثق:</b> قالب برأس مستند لكل فرصة — يُختبر لاحقًا وليس الخيار الأول.</li>
+  </ul>
+
+  <h3>التصنيف والتكلفة</h3>
+  <ul class="clean">
+    <li>تصنيف قالبنا اليومي <b>غير مضمون Utility</b> — قد يُعتمد Marketing حسب الصياغة والمراجعة؛ لذلك يُقدَّم بصياغتين والاقتصاديات تُبنى على المعتمد فعليًا. القوالب الخدمية داخل نافذة مفتوحة مجانية.</li>
+    <li>أسعار السعودية للرسالة (مرجعية وقت الكتابة): خدمية ≈ $0.011–0.016 (~4–6 هللات) · تسويقية ≈ $0.046–0.050 (~17–21 هللة) — Meta عدّلت تسعير السعودية التسويقي في أبريل 2026؛ تُراجع الأرقام عند اعتماد القوالب.</li>
+    <li>قوالب أخرى مطلوبة: ترحيب/تفعيل، تذكير إعداد، تذكير تجديد (27/29)، استرجاع بعد 7 أيام (تسويقي بموافقة قائمة)، تقرير يوم الصفر إن كانت النافذة مقفلة.</li>
+  </ul>
+
+  <h3>الإعداد من الصفر والامتثال</h3>
+  <ul class="clean">
+    <li><b>التطوير أولًا:</b> Cloud API يوفر WABA تجريبيًا ورقم اختبار — يُبنى التكامل كاملًا قبل الرقم الحقيقي.</li>
+    <li><b>ثم الإنتاج:</b> Meta Business Portfolio → تطبيق مطور → WABA → توثيق النشاط → رقم مخصص جديد لم يدخل واتساب أبدًا (لا شخصي ولا رقم المتجر القديم) → Display Name → Webhooks → قوالب عربية (وإنجليزية عند الحاجة) → Billing.</li>
+    <li><b>سياسة الروبوتات:</b> Meta قيّدت أواخر 2025 روبوتات الذكاء العامة وأبقت مساعدي المهمة المحددة — تموضعنا الرسمي «مساعد توظيف لمهمة محددة» في وصف الـWABA والقوالب، مع مسار تصعيد بشري واضح (زر «دعم» → تيليجرامك + صندوق رد في اللوحة).</li>
+    <li><b>حدود الأرقام الجديدة:</b> تبدأ بسقف مراسلة يومي منخفض يرتفع مع الجودة — لا يؤثر على 10 عملاء لكنه يدخل في حسابات التوسع.</li>
+    <li><b>الإلزاميات:</b> Opt-in موثق بطابع زمني (خانة سلة + تأكيد أول رسالة) · احترام «إيقاف الرسائل» فورًا · مراقبة جودة القالب وTemplate quality rating.</li>
+  </ul>
+</section>
+
+<!-- ================= 09 ================= -->
+<section id="s9">
+  <div class="secnum">09</div>
+  <h2>سلة: المتجر، الدفع، الـWebhooks، والهوية التجارية</h2>
+  <p class="gist">المتجر القديم (Axe، مقفل منذ سنتين) يخضع لفحص إلزامي قبل أي برمجة — إعادة الاستخدام هي الأصل إن سلمت الملكية والتوثيق، وإلا فمتجر جديد.</p>
+
+  <h3>فحص C0 الإلزامي — 16 بندًا</h3>
+  <ul class="clean">
+    <li>الدخول للحساب · حالة المتجر · الباقة · الدومين الحالي · بيانات المالك · توثيق التجارة الإلكترونية (المركز السعودي للأعمال — يتطلب وثيقة عمل حر سارية وحسابًا بنكيًا مرتبطًا) · وثيقة العمل الحر المربوطة · الحساب البنكي · وسائل الدفع · الطلبات القديمة · المنتجات القديمة · السياسات القديمة · التطبيقات المثبتة · إمكانية إنشاء Partner App · الـWebhooks · إمكانية منتج رقمي/خدمي.</li>
+    <li><b>قرار متجر جديد فقط إذا:</b> ملكية أو توثيق معقد، مشاكل دفع سابقة، تاريخ لا يمكن تنظيفه، أو تعذر تقني في ربط التطبيق. الطلبات القديمة لا تُحذف ولا تُعدَّل — تبقى تاريخية، والجديد بـSKU وIDs وتصنيفات وسياسات جديدة.</li>
+  </ul>
+
+  <h3>المنتجات والدفع</h3>
+  <ul class="clean">
+    <li>أربعة منتجات: باس 30 يوم × 3 باقات + «تحليل الـCV». وأثناء الموجات: منتج مخفي بريال واحد لتجربة الصديقين.</li>
+    <li>تجديد يدوي برابط شراء (لا خصم تلقائي في الألفا). <b>ملاحظة موثقة:</b> سلة توفر Recurring Payments API لكنها تتطلب حساب Partner وتطبيقًا مسجلًا وOAuth بصلاحية <span class="mono">subscriptions.read_write</span> وتفعيلًا خاصًا — خيار ما بعد الاستقرار، لا يُبنى عليه الآن.</li>
+    <li>السياسات الثلاث (خصوصية، شروط استخدام، استرداد) تُكتب في C0 — التوثيق والنزاعات تحتاجها.</li>
+  </ul>
+
+  <h3>الـWebhooks — النمط الملزم</h3>
+  <pre class="code">events: order.created, order.payment.updated,
+        order.cancelled, order.refunded
+verify X-Salla-Signature
+  -> log event (event_fingerprint, received_at,
+     processing_status, attempt_count)
+  -> dedupe -> return 200 fast
+worker:
+  re-verify order via Salla API
+  match (product, amount, currency)
+  provision only when payment = paid   <span class="c"># COD معطل</span>
+  create subscription + activation token</pre>
+  <p class="small">الخطأ الممنوع: <span class="mono">webhook → نداء نموذج → إرسال واتساب → return</span> داخل نفس الطلب. الحدث المكرر لا ينشئ اشتراكًا ثانيًا ولا يمدد مرتين ولا يرسل ترحيبين.</p>
+
+  <h3>الهوية التجارية</h3>
+  <ul class="clean">
+    <li><b>الاسم:</b> Axe يُستبدل. معايير الاسم الجديد: سهل النطق عربيًا، لا يوحي بضمان توظيف ولا «مكتب توظيف»، قصير، دومين وحسابات متاحة، قابل للتسجيل كعلامة، لا يقيّدنا بواتساب.</li>
+    <li><b>الدومين:</b> رابط سلة مؤقت لتجربة الأصدقاء → دومين مخصص (<span class="mono">brand.sa / brand.com</span>) + بريد <span class="mono">support@</span> و<span class="mono">privacy@</span> قبل أول Alpha خارجي — المتجر يبقى على سلة والعميل يرى الدومين.</li>
+  </ul>
+</section>
+
+<!-- ================= 10 ================= -->
+<section id="s10">
+  <div class="secnum">10</div>
+  <h2>المعمارية والبيانات والعزل</h2>
+  <p class="gist">سيرفران منفصلان تمامًا، PostgreSQL بعزل صفوف إلزامي، ملفات في تخزين كائنات، وطابور لا يثق بحمولته.</p>
+
+  <h3>فصل البيئتين</h3>
+  <ul class="clean">
+    <li><b>الشخصي:</b> سيرفره الحالي كما هو — Benchmark دائم. <b>لا يُنقل:</b> <span class="mono">.env</span>، مفاتيح API، توكن تيليجرام، بياناتك، CVs، الـledger، الحجر، اللوقات، إعدادات كلود المحلية، وحدات systemd، /tmp. <b>يُنقل:</b> الكود المتتبع، الاختبارات، ملفات الاعتماديات، أمثلة إعدادات نظيفة.</li>
+    <li><b>التجاري (سعودي من اليوم الأول):</b> Reverse Proxy → Commercial API → PostgreSQL → Redis/Queue → Workers → Object Storage → Monitoring → نسخ مشفرة خارج السيرفر. حتى لو سيرفر واحد في الألفا: قواعد وتخزين وأسرار منفصلة لـstaging وproduction، وstaging لا يلمس أرقام عملاء حقيقية.</li>
+  </ul>
+
+  <h3>مجموعات الجداول</h3>
+  <p class="small" style="margin-bottom:6px">الهوية والعقود:</p>
+  <div class="chips"><span class="chip">customers</span><span class="chip">customer_channels</span><span class="chip">subscriptions</span><span class="chip">subscription_events</span><span class="chip">plan_entitlements</span><span class="chip">consent_events</span><span class="chip">privacy_requests</span><span class="chip">activation_tokens</span></div>
+  <p class="small" style="margin-bottom:6px">الملف المهني والحقائق:</p>
+  <div class="chips"><span class="chip">profile_versions</span><span class="chip">work_experiences</span><span class="chip">skills</span><span class="chip">certifications</span><span class="chip">achievements</span><span class="chip">forbidden_claims</span><span class="chip">career_targets</span><span class="chip">career_assessments</span><span class="chip">search_policies</span><span class="chip">query_families</span></div>
+  <p class="small" style="margin-bottom:6px">الوظائف والمطابقة:</p>
+  <div class="chips"><span class="chip">jobs</span><span class="chip">job_sources</span><span class="chip">job_enrichments</span><span class="chip">job_matches</span><span class="chip">match_decisions</span><span class="chip">near_misses</span><span class="chip">tenant_job_suppressions</span></div>
+  <p class="small" style="margin-bottom:6px">المستندات والتسليم والتشغيل:</p>
+  <div class="chips"><span class="chip">documents</span><span class="chip">cv_artifacts</span><span class="chip">artifact_bindings</span><span class="chip">deliveries</span><span class="chip">delivery_messages</span><span class="chip">outcome_events</span><span class="chip">run_instances</span><span class="chip">usage_events</span><span class="chip">cost_allocations</span><span class="chip">webhook_events</span><span class="chip">outbox_events</span><span class="chip">audit_events</span><span class="chip">support_events</span></div>
+  <p class="small">الـPDFs لا تُحفظ في القاعدة — Object Storage بمسار <span class="mono">tenant/&lt;customer_id&gt;/documents/&lt;document_id&gt;</span>؛ القاعدة تخزن المفتاح وSHA والنوع والحجم والمالك والحالة وتاريخ الحذف.</p>
+
+  <h3>العزل — أكثر من عمود tenant_id</h3>
+  <ul class="clean">
+    <li>Row-Level Security في PostgreSQL + قيود مركبة + Foreign Keys تتضمن الـTenant + اختبارات آلية في CI تحاول القراءة عبر الحدود وتفشل.</li>
+    <li>التخزين: Prefix منفصل لكل عميل، لا روابط عامة، Signed URLs قصيرة العمر مع تحقق ملكية قبل كل تنزيل.</li>
+    <li>كل مهمة طابور تحمل <span class="mono">tenant_id · run_id · correlation_id · idempotency_key</span> — والـWorker يعيد التحقق من الملكية من القاعدة ولا يثق بحمولة المهمة.</li>
+    <li>القناة الإدارية (تيليجرام) تعرض <span class="mono">TEN-0007 · run completed · 2 jobs · 2 CVs · 1 delivered · est. cost</span> — لا اسم، لا رقم، لا راتب، لا CV، لا نصوص مهنية.</li>
+  </ul>
+</section>
+
+<!-- ================= 11 ================= -->
+<section id="s11">
+  <div class="secnum">11</div>
+  <h2>الأمان: المخاطر الثمانية وضوابطها الكاملة</h2>
+  <p class="gist">المنتج يستقبل ملفات وروابط وwebhooks ونصوص إعلانات غير موثوقة — كل ضابط أدناه مبني في التصميم ويُختبر، لا يُترك للنوايا.</p>
+  <div class="grid2">
+    <div class="risk"><b>1 · إرسال CV العميل الخطأ</b><span>عزل Tenant صارم + Artifact binding + Hash + هوية الوظيفة + Customer ID binding + تحقق قبل الإرسال + لا تسجيل إذا فشل أي جزء.</span></div>
+    <div class="risk"><b>2 · رقم واتساب خاطئ</b><span>العميل يبدأ المحادثة بنفسه + Activation Token — لا اعتماد على حقل سلة وحده؛ فشل الترحيب = تنبيه فوري لك.</span></div>
+    <div class="risk"><b>3 · Webhook مزور أو مكرر</b><span>تحقق التوقيع الرسمي + بصمة الحدث + Idempotency + إعادة التحقق من الطلب عبر API ومطابقة المنتج والمبلغ والعملة + نافذة Replay.</span></div>
+    <div class="risk"><b>4 · PDF خبيث</b><span>MIME validation + حدود حجم وصفحات + فحص Malware + معالجة داخل Sandbox + إزالة Metadata + منع JavaScript والملفات المضمنة + Timeout.</span></div>
+    <div class="risk"><b>5 · حقن أوامر داخل إعلان الوظيفة</b><span>الوصف بيانات غير موثوقة دائمًا · نموذج التقييم بلا أدوات وبلا أسرار · فصل System Instructions · مخرجات مهيكلة · النموذج لا يتحكم في إرسال ولا قاعدة.</span></div>
+    <div class="risk"><b>6 · هلوسة في الـCV</b><span>بنك الإنجازات المؤكد + قائمة الممنوعات + Validator يفحص أن لكل ادعاء مصدرًا + مراجعتك البشرية في الألفا.</span></div>
+    <div class="risk"><b>7 · تسريب السجلات</b><span>لا PII في اللوقات + Redaction + Secret scanning + مدة احتفاظ للسجلات + لا CV ولا جوال في القناة الإدارية.</span></div>
+    <div class="risk"><b>8 · نسخ احتياطية مكشوفة</b><span>تشفير + صلاحيات منفصلة + خارج السيرفر + اختبار Restore دوري + حذف متدرج يتبع سياسة الاحتفاظ + عزل منطقي داخل النسخ.</span></div>
+  </div>
+</section>
+
+<!-- ================= 12 ================= -->
+<section id="s12">
+  <div class="secnum">12</div>
+  <h2>الخصوصية والموافقات والاحتفاظ</h2>
+  <p class="gist">بياناتنا شخصية «عادية» لا حساسة (لا هوية ولا ميلاد ولا صحية) — فالالتزامات أخف لكنها قائمة: الاسم والجوال والسيرة والرواتب كلها بيانات شخصية يغطيها النظام.</p>
+  <ul class="clean">
+    <li><b>الموافقات منفصلة بالغرض</b> وموثقة بطابع زمني في <span class="mono">consent_events</span>: التشغيل الأساسي · الرسائل اليومية · (اختياري مستقل) إحصاءات مجهولة الهوية لتحسين الخدمة — والمجهولية الحقيقية تمنع إعادة التعرف، لا حذف الاسم فقط.</li>
+    <li><b>حقوق بأوامر محادثة مباشرة:</b> تصدير بياناتي · حذف بياناتي · إيقاف الرسائل · سحب الموافقة — تنفَّذ عبر <span class="mono">privacy_requests</span> بمهلة معلنة.</li>
+    <li><b>النقل الخارجي:</b> أي نداء نموذج خارجي يمر بتجريد الهوية (Placeholders تُحقن محليًا) — النموذج لا يرى اسمًا ولا جوالًا.</li>
+  </ul>
+  <div class="tblwrap"><table>
+    <tr><th>البند</th><th>أثناء الاشتراك</th><th>90 يومًا بعد الانتهاء</th><th>بعد الـ90</th></tr>
+    <tr><td>الـCV الأصلي والمخصصة</td><td>محفوظة</td><td>محفوظة (فترة استعادة وتجديد)</td><td>تُحذف</td></tr>
+    <tr><td>الملف المهني وبنك الإنجازات وإعدادات البحث</td><td>محفوظة</td><td>محفوظة</td><td>تُحذف</td></tr>
+    <tr><td>رقم واتساب في النظام التشغيلي</td><td>محفوظ</td><td>محفوظ</td><td>يُزال</td></tr>
+    <tr><td>سجلات التسليم والتفاعل</td><td>محفوظة</td><td>محفوظة</td><td>تُحذف أو تُجهَّل فعليًا</td></tr>
+    <tr><td>الطلبات المالية وسجلات الموافقة الضرورية وسجلات أمنية محدودة</td><td>محفوظة</td><td>محفوظة</td><td><b>تبقى</b> (متطلب نظامي)</td></tr>
+    <tr><td>بيانات مجهولة الهوية فعليًا (بموافقة مستقلة)</td><td colspan="3">تبقى للتحسين — بشرط استحالة إعادة التعرف</td></tr>
+  </table></div>
+  <p class="small">هذه السياسة تنتظر اعتمادك النهائي (قسم 16). المرجع التشغيلي: تقليل البيانات، غرض محدد لكل حقل، مدة احتفاظ معلنة، إتلاف عند انتهاء الغرض — وهذه ليست استشارة قانونية؛ مراجعة مختص قبل الإطلاق العام المدفوع.</p>
+</section>
+
+<!-- ================= 13 ================= -->
+<section id="s13">
+  <div class="secnum">13</div>
+  <h2>خطة التنفيذ C0 – C9 بشروط خروج</h2>
+  <p class="gist">كل شيء يُبنى — الترتيب تبعيات لا تأجيل. لا تُفتح مرحلة قبل تحقق شرط خروج سابقتها.</p>
+  <div style="margin-top:20px">
+    <div class="phase now" data-c="C0"><b>التحقق التجاري — يبدأ هذا الأسبوع</b>
+      <p>تجديد وثيقة العمل الحر فورًا + فحص ارتباطها بتوثيق المتجر · فحص سلة الـ16 بندًا · حسم قرار (إعادة استخدام Axe / متجر جديد) · بدء Meta: بورتفوليو + تطبيق + رقم اختبار · حسم السيرفر السعودي · كتابة السياسات الثلاث · حسم الاسم · فتح أسئلة قسم 16 وإغلاقها.</p>
+      <div class="exit">وثيقة سارية مجددة، وصول كامل لسلة مع قرار متجر، WABA تجريبي يرسل ويستقبل، اسم وسيرفر محسومان.</div>
+    </div>
+    <div class="phase" data-c="C1"><b>عزل المشروع</b>
+      <p>Tag للشخصي على <span class="mono">cef71c3</span> · مستودع تجاري نظيف يضم هذه الورقة في <span class="mono">docs/</span> · سيرفر جديد بأسرار مستقلة · صفر بيانات شخصية منسوخة.</p>
+      <div class="exit">Repo تجاري يبني ويختبر على السيرفر السعودي، والشخصي لم يُمس.</div>
+    </div>
+    <div class="phase" data-c="C2"><b>قاعدة المنصة</b>
+      <p>PostgreSQL + نموذج Tenant + RLS · Object Storage · Queue + Outbox · Audit · نسخ خارجي مشفر · بيئتا staging/production منفصلتا الأسرار.</p>
+      <div class="exit">اختبارات Cross-tenant تفشل في الاختراق وتنجح في CI، وRestore تجريبي ناجح من نسخة خارجية.</div>
+    </div>
+    <div class="phase" data-c="C3"><b>سلة</b>
+      <p>منتج ريال مخفي + هياكل المنتجات الأربعة · Webhooks بالنمط الملزم · التفعيل على paid فقط · Activation Tokens · حالات الاشتراك الإحدى عشرة · مسار الاسترداد والإلغاء.</p>
+      <div class="exit">شراء حقيقي بريال ينشئ اشتراكًا واحدًا رغم تكرار الحدث، والاسترداد يعلّق فورًا.</div>
+    </div>
+    <div class="phase" data-c="C4"><b>واتساب</b>
+      <p>استقبال/إرسال على WABA التجريبي · قوالب عربية بصياغتين لاختبار التصنيف · Delivery callbacks · إيقاف الرسائل · تصعيد الدعم لتيليجرامك مع صندوق رد.</p>
+      <div class="exit">توكن التفعيل يربط طلبًا برقم، والتسليم التكيفي يعمل بالحالتين، وSTOP يوقف فورًا.</div>
+    </div>
+    <div class="phase" data-c="C5"><b>الإعداد (Onboarding)</b>
+      <p>آلة الحالات العشر · الموافقات المنفصلة · رفع الـCV وفحصه الأمني · الاستخراج وتأكيد الحقائق · بنك الإنجازات والممنوعات · تقييم المسار بثلاث طبقات · سياسة البحث · بطاقة التأكيد وبداية العد.</p>
+      <div class="exit">إعداد كامل من الدفع إلى ACTIVE بلا تدخل يدوي، وكل حقيقة في البنك لها حالة تأكيد.</div>
+    </div>
+    <div class="phase" data-c="C6"><b>المحرك التجاري</b>
+      <p>الـPool اليومي المشترك · عائلات الاستعلام · الترشيح على مرحلتين بالـSlots · الإثراء بكاش + SSRF · الهوية الموسعة ومجموعات إعادة النشر · بوابة كل عميل بسجل قرار وNear-miss · ترتيب مُصدَّر · كبت بالمجموعة · تدقيق شروط المصادر.</p>
+      <div class="exit">تشغيلة متعددة العملاء تنتج قوائم مختلفة صحيحة لعميلين من Pool واحد، مع Rank Trace وسجل قرار لكل وظيفة.</div>
+    </div>
+    <div class="phase" data-c="C7"><b>الـCV والتسليم</b>
+      <p>توليد إنجليزي بـClaude من بنك الإنجازات فقط · تجريد PII · شروط عدم التوليد · الربط والنشر الذري والحجر · التسليم التكيفي أحد–خميس · أوامر التغذية الراجعة · الحالات الصادقة والملخص الإداري وتتبع التكلفة.</p>
+      <div class="exit">E2E حي كامل لك كـTEN-0001: دفع→إعداد→فرصة→CV→تسليم→ledger→feedback، وكل حالة فشل مصطنعة تُنتج الحالة الصادقة الصحيحة.</div>
+    </div>
+    <div class="phase" data-c="C8"><b>منتج تحليل الـCV</b>
+      <p>شراء مستقل · التقرير العربي بالنقاط والملاحظات وملاءمة المسارين · PDF مختصر + ملخص واتساب · زر ترقية يورّث بنك الإنجازات.</p>
+      <div class="exit">شراء→رفع→تقرير خلال دقائق، والترقية تفتح إعدادًا نصف جاهز.</div>
+    </div>
+    <div class="phase" data-c="C9"><b>الموجات والقياس</b>
+      <p>القسم التالي — ينتهي بقياس 30 يومًا ثم تثبيت الأسعار وفتح الباقات للعامة برفع نسخة هذه الورقة.</p>
+      <div class="exit">أرقام الأسعار مثبتة في القسم 04 بنسخة جديدة، والمنتجات الثلاثة ظاهرة في المتجر.</div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= 14 ================= -->
+<section id="s14">
+  <div class="secnum">14</div>
+  <h2>موجات الإطلاق، المراجعة البشرية، ومقاييس النجاح</h2>
+  <p class="gist">أي خطأ عزل أو ربط ينكشف على اثنين تعرفهما لا على عشرة غرباء في يوم واحد. مراجعتك البشرية مكثفة في البداية وتنكمش لاستثناء أو ميزة باقة — لا عنق زجاجة دائم.</p>
+
+  <div class="tblwrap"><table>
+    <tr><th>الموجة</th><th>العملاء</th><th>السعر</th><th>الحد اليومي</th><th>المدة</th><th>مراجعتك البشرية</th></tr>
+    <tr><td><b>0 — أنت</b></td><td><span class="mono">TEN-0001</span> دائم</td><td>—</td><td>حسب إعدادك</td><td>للأبد (canary قبل العملاء بساعة)</td><td>كاملة — أنت جهاز الإنذار</td></tr>
+    <tr><td><b>1 — الصديقان</b></td><td>2</td><td>ريال (منتج مخفي)</td><td>فرصة واحدة</td><td>10–14 يومًا</td><td>الملف المستخرج + بنك الإنجازات + المسار + أول 3 CVs + وظائف الأسبوع الأول</td></tr>
+    <tr><td><b>2 — خمسة</b></td><td>5</td><td>تجريبي حقيقي</td><td>حتى فرصتين</td><td>شهر</td><td>اعتماد المسارات + حالات الثقة المنخفضة + عينة CVs + كل شكوى</td></tr>
+    <tr><td><b>3 — عشرة</b></td><td>10</td><td>التجريبي المقاس</td><td>حتى فرصتين</td><td>حتى اكتمال القياس</td><td>100% تقييمات المسار الأولى + 10–20% عينة CVs + كل فشل</td></tr>
+  </table></div>
+  <ul class="clean">
+    <li><b>تجربة الريال تثبت:</b> الدفع، الـwebhook، الاشتراك، ربط الرقم، الرفع والاستخراج، بناء الملف، اعتماد المسار، البحث، التوليد، التسليم، الإلغاء، حذف البيانات. <b>ولا تثبت:</b> الاستعداد للدفع 149/279، الاحتفاظ شهرين، التسويق، وضوح القيمة، السعر — لهذا توجد موجتا 2 و3 بسعر حقيقي.</li>
+    <li><b>منتج تحليل الـCV</b> يُطلق للعامة قبل فتح الموجة الثالثة — قمع الاكتساب.</li>
+    <li><b>بعد القياس:</b> المراجعة البشرية تصبح استثناءً، أو ميزة الباقة التنفيذية، أو خدمة منفصلة.</li>
+  </ul>
+
+  <h3>مقاييس نجاح الألفا — تُجمع آليًا</h3>
+  <ul class="clean">
+    <li><b>الإعداد:</b> نسبة الإكمال · الزمن حتى التفعيل · عدد التعارضات · عدد تدخلاتك.</li>
+    <li><b>الوظائف:</b> مكتشفة · اجتازت · نسبة الفتح · نسبة التجاهل وأسبابه.</li>
+    <li><b>الـCV:</b> المولد · الفاشل · المستخدم فعلًا · الادعاءات المصححة · زمن التوليد · التكلفة.</li>
+    <li><b>النتائج:</b> قدّم · مقابلة · رفض · عرض · لم يرد.</li>
+    <li><b>واتساب:</b> Delivered · Read · Reply · Opt-out · Block/Report · جودة القالب.</li>
+    <li><b>التشغيل:</b> تكلفة العميل · دقائق الدعم · الأعطال · تسليمات مكررة (يجب أن تكون صفرًا) · سلاسل أيام الصفر لكل عميل.</li>
+  </ul>
+</section>
+
+<!-- ================= 15 ================= -->
+<section id="s15">
+  <div class="secnum">15</div>
+  <h2>الثوابت الهندسية — 15 قاعدة قابلة للاختبار</h2>
+  <p class="gist">هذا القسم يفوز على كل ما عداه. كل ثابت يُترجم لاختبار في CI أو مراجعة إلزامية — كسر أي ثابت يوقف الدمج.</p>
+  <div class="invariant">1 · لا يوجد أي مسار كود للتقديم التلقائي — لا Playwright ولا Selenium ولا Easy Apply ولا تعبئة نماذج، حتى كتجربة.</div>
+  <div class="invariant">2 · كل إرسال إنتاجي للعميل يمر بالبوابة — بنيويًا، لا يوجد علم يتجاوزها؛ التجاوز في Preview داخلي لا يرسل ولا يكتب.</div>
+  <div class="invariant">3 · لا كتابة في delivered ledger إلا بعد اكتمال التسليم كاملًا، والكتابة ذرية دائمًا.</div>
+  <div class="invariant">4 · الاشتراك يُنشأ فقط عند <span class="mono">payment = paid</span> بعد إعادة تحقق من Salla API — والحدث المكرر لا يُحدث أثرًا ثانيًا.</div>
+  <div class="invariant">5 · كل ادعاء في أي CV يرجع لسجل مؤكد في بنك الإنجازات، وقائمة الممنوعات تُحترم حرفيًا — الـValidator يرفض ما خالف.</div>
+  <div class="invariant">6 · لا يُرسل مستند قبل نجاح <span class="mono">validate_cv_binding</span> بحالة ready — ولا يُرسل شيء من الحجر أبدًا.</div>
+  <div class="invariant">7 · النشر الذري إلزامي لكل زوج PDF/metadata — <span class="mono">.pub-* = 0</span> بعد كل تشغيلة.</div>
+  <div class="invariant">8 · كل نداء نموذج خارجي مجرّد من PII — الاسم والجوال يُحقنان محليًا فقط.</div>
+  <div class="invariant">9 · وصف الوظيفة بيانات غير موثوقة دائمًا — نموذج التقييم بلا أدوات وبلا أسرار وبمخرجات مهيكلة، ولا يتحكم في إرسال أو قاعدة.</div>
+  <div class="invariant">10 · RLS مفعّلة وكل استعلام مقيد بالـTenant — واختبارات Cross-tenant الهجومية جزء من CI.</div>
+  <div class="invariant">11 · الـWorker يعيد التحقق من ملكية العميل من القاعدة ولا يثق بحمولة الطابور.</div>
+  <div class="invariant">12 · لكل عميل لكل يوم تشغيل حالة صادقة واحدة من السبع — لا نجاح صامت على فشل جزئي، ورموز الخروج تعكس الحقيقة.</div>
+  <div class="invariant">13 · القناة الإدارية لا تعرض PII إطلاقًا — رموز <span class="mono">TEN-####</span> وأرقام فقط، وفلاتر الأسرار على كل السجلات.</div>
+  <div class="invariant">14 · النسخ الاحتياطية مشفرة، خارج السيرفر، بصلاحيات منفصلة، وتُختبر بالاسترجاع دوريًا.</div>
+  <div class="invariant">15 · أي تغيير في سلوك البوابة أو الترتيب أو الاحتفاظ أو الأسعار يبدأ بتحديث هذه الورقة (قسم 00) قبل الكود.</div>
+</section>
+
+<!-- ================= 16 ================= -->
+<section id="s16">
+  <div class="secnum">16</div>
+  <h2>بانتظارك</h2>
+  <p class="gist">ستة قرارات تفتح C0، وخمس توصيات جاهزة تعتمدها بكلمة أو تعدّلها — وبعد ردّك تُرفع الورقة إلى v1.1 وتبدأ Commercial Architecture v1 الهندسية التفصيلية.</p>
+  <div class="ask">
+    <h3>القرارات الستة الحاسمة</h3>
+    <ol>
+      <li><b>صيغة الحسم:</b> نبني كل الميزات الآن، ونثبّت أرقام الأسعار وحدها بعد قياس 30 يومًا — اعتمدها أو عدّلها.</li>
+      <li><b>تخصصا الصديقين</b> اللذين سيختبران — هما من يحدد أول عائلات الاستعلام.</li>
+      <li><b>وصولك لحساب سلة (Axe)</b> وبيانات دخوله — بوابة فحص C0 كله.</li>
+      <li><b>رقم الـWABA:</b> شريحة جديدة لم تدخل واتساب أبدًا — متوفرة أم نشتري؟</li>
+      <li><b>السيرفر السعودي:</b> stc cloud أم SCCC Alibaba؟ (مقارنة أسعار ومواصفات جاهزة بأمر منك).</li>
+      <li><b>الاسم:</b> التوصية لاتيني سهل النطق عربيًا — أرسل قائمة 10 مرشحين مفحوصين بالدومينات والحسابات؟</li>
+    </ol>
+    <div class="quick">
+      <b>اعتماد سريع — قل «اعتمد الكل» أو عدّل بندًا:</b>
+      <ul>
+        <li>بداية الثلاثين يومًا عند إكمال الإعداد، بمهلة 7 أيام من الدفع.</li>
+        <li>سياسة الاحتفاظ كما في جدول قسم 12 + الموافقة الاختيارية المنفصلة للإحصاءات المجهولة.</li>
+        <li>أوامر العميل الدائمة: تصدير بياناتي · حذف بياناتي · إيقاف الرسائل · وقف مؤقت (لا يمدد المدة).</li>
+        <li>تسليم تحليل الـCV: تقرير PDF عربي مختصر + ملخص داخل واتساب.</li>
+        <li>القالب اليومي يُقدَّم لـMeta بصياغتين والاقتصاديات على التصنيف المعتمد فعليًا.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ================= 17 ================= -->
+<section id="s17">
+  <div class="secnum">17</div>
+  <h2>سجل التغييرات</h2>
+  <p class="gist">كل نسخة سطر واحد: ماذا تغيّر، ولماذا، وبقرار من. لا تعديل بلا سطر هنا.</p>
+  <div class="card">
+    <ul class="clean">
+      <li><b>v1.0 — 13 يوليو 2026:</b> الإصدار الأول الكامل: التعريف والحدود، سجل القرارات بدرجاته، الباقات كصلاحيات وإطار قياس السعر، رحلة العميل وآلة حالات الإعداد، الحلقة اليومية بمراحلها الملزمة، الموروث من المحرك الشخصي (<span class="mono">cef71c3</span>)، واتساب والتسليم التكيفي، سلة والـwebhooks والهوية التجارية، المعمارية والعزل، الأمان الثماني، الخصوصية والاحتفاظ، خطة C0–C9 بشروط خروج، الموجات والمقاييس، والثوابت الخمسة عشر.</li>
+    </ul>
+  </div>
+</section>
+
+<hr class="divider">
+<footer class="wrap">
+  الورقة البيضاء · النسخة 1.0 · الاثنين 13 يوليو 2026 · المصدر الوحيد للحقيقة — تُحدَّث قبل الكود دائمًا · المرجع الشخصي: <span class="mono">cef71c3</span> · الموقع في المستودع: <span class="mono">docs/WHITEPAPER.html</span>
+</footer>
+
+</main>
+</body>
+</html>
