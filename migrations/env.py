@@ -13,10 +13,10 @@ from alembic import context
 from sqlalchemy import engine_from_config, pool
 
 from career.config import get_settings
-from career.db.base import Base
 
 # Import models so their tables are registered on Base.metadata.
 from career.db import models  # noqa: F401
+from career.db.base import Base
 
 config = context.config
 if config.config_file_name is not None:

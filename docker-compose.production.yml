@@ -1,0 +1,66 @@
+# PRODUCTION environment — Saudi server (moving there is a wave-2 exit gate,
+# CHANGELOG-v1.1 §2). Fully isolated from staging: own project name, volumes,
+# network, ports, database, and secrets. The two environments share NOTHING.
+#
+#   docker compose -f docker-compose.production.yml --env-file .env.production up -d
+#
+name: career_production
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${DB_OWNER_USER}
+      POSTGRES_PASSWORD: ${DB_OWNER_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+      APP_DB_USER: ${DB_USER}
+      APP_DB_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+    ports:
+      # Datastore bound to loopback only — never exposed on the public interface.
+      - "127.0.0.1:${DB_PUBLISH_PORT}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_OWNER_USER} -d ${DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}"]
+    volumes:
+      - redis_data:/data
+    ports:
+      # Loopback only — Redis is never exposed on the public interface.
+      - "127.0.0.1:${REDIS_PUBLISH_PORT}:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a ${REDIS_PASSWORD} ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    env_file: .env.production
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - storage_data:/data
+    ports:
+      - "${API_PUBLISH_PORT}:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+volumes:
+  pg_data:
+  redis_data:
+  storage_data:
