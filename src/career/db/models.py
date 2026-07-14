@@ -10,15 +10,20 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import (
     BigInteger,
     DateTime,
     ForeignKey,
+    Index,
+    Integer,
     String,
     UniqueConstraint,
     func,
+    text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -78,3 +83,69 @@ class Document(Base):
     )
 
     tenant: Mapped[Tenant] = relationship(back_populates="documents")
+
+
+class OutboxEvent(Base):
+    """Transactional outbox (§15 / whitepaper §10). Written in the same
+    transaction as the business change; a relay (owner role) publishes
+    unpublished rows to the queue and stamps ``published_at``. Payload is
+    PII-free by contract."""
+
+    __tablename__ = "outbox_events"
+    __table_args__ = (
+        # Partial index for the relay's "unpublished" scan.
+        Index(
+            "ix_outbox_events_unpublished", "created_at",
+            postgresql_where=text("published_at IS NULL"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    aggregate_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    aggregate_id: Mapped[uuid.UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), nullable=True
+    )
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    published_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
+class ProcessedMessage(Base):
+    """Idempotency ledger. A redelivered message whose (tenant_id,
+    idempotency_key) already exists is a no-op (§15.11 companion)."""
+
+    __tablename__ = "processed_messages"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "idempotency_key",
+            name="uq_processed_messages_tenant_id_idempotency_key",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(200), nullable=False)
+    processed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

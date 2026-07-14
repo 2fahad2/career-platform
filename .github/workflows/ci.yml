@@ -32,6 +32,16 @@ jobs:
           --health-timeout 5s
           --health-retries 20
 
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
     env:
       CAREER_ENV: staging
       DB_HOST: localhost
@@ -41,8 +51,11 @@ jobs:
       DB_OWNER_PASSWORD: ci_owner_pw
       DB_USER: career_app
       DB_PASSWORD: ci_app_pw
-      # Force the cross-tenant RLS tests to run (never silently skip) — this is
-      # the whitepaper §13 C2 exit condition: cross-tenant tests pass in CI.
+      REDIS_HOST: localhost
+      REDIS_PORT: "6379"
+      # Force the cross-tenant RLS tests (and the Redis queue test) to actually
+      # run — never silently skip. Whitepaper §13 C2 exit condition: cross-tenant
+      # tests pass in CI.
       CI_REQUIRE_DB: "1"
 
     steps:
@@ -68,6 +81,9 @@ jobs:
 
       - name: Apply migrations (alembic)
         run: alembic upgrade head
+
+      - name: Check migration/model drift (alembic)
+        run: alembic check
 
       - name: Test (pytest)
         run: pytest -q
