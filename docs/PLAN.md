@@ -63,7 +63,16 @@ compile+ruff+mypy+pytest أخضر قبل أي commit · تحديث `PROGRESS.md`
 2. 🤖 **فلتر تنقية الأسرار المعمَّم** `src/career/logging_filters.py` (نقل §9.2 حرفيًا وتعميمه: أنماط bot-URL، KV pairs، مفاتيح حساسة بالاسم، تعقيم exc_text/stack_info، يُركب على handlers) + `safe_exception_summary` + ضبط مستويات مكتبات httpx/httpcore — **قبل أول تكامل خارجي (C3) إلزامًا**.
 3. 🤖 **Queue + Outbox**: جداول `outbox_events` (معاملة واحدة مع الكتابة الأصلية) و`job_queue` عبر Redis؛ كل مهمة تحمل `tenant_id · run_id · correlation_id · idempotency_key`؛ worker skeleton يعيد التحقق من الملكية من القاعدة (الثابت §15.11) — اختبار: مهمة بحمولة مزورة تُرفض.
 4. 🤖 **Audit**: جدول `audit_events` (actor، action، tenant، متى، تفاصيل بلا PII) + كاتب مركزي.
-5. 👤→🤖 **نسخ احتياطي مشفر خارج السيرفر + Restore**: أجهز البنية بـrestic (تشفير، جدولة، أدوار منفصلة) — **الوجهة تحتاج قرارك (سؤال Q1 أدناه)**. اختبار Restore فعلي إلى قاعدة مؤقتة وتوثيق النتيجة.
+5. 👤→🤖 **نسخ احتياطي مشفر خارج السيرفر + Restore** — التصميم الكامل (التوصية: Backblaze B2؛ التفصيل والتسعير في PROGRESS/عرض 14 يوليو):
+   - **الأداة:** restic (تشفير AES-256 من جهة السيرفر — المزود لا يرى إلا bytes مشفرة؛ dedup + snapshots).
+   - **الوجهة:** bucket خاص `career-backups-staging` على Backblaze B2 (منطقة EU — أمستردام)، ولاحقًا bucket **منفصل تمامًا** `career-backups-production` بمفاتيح وكلمة repo منفصلة عند هجرة C9 (عزل الصلاحيات — الورقة §11 خطر 8).
+   - **ما يُنسخ:** (1) `pg_dump -Fc` ليلي لكل قاعدة بدور المالك → (2) volume الملفات `storage_data` (ملفات الـtenants). **ما لا يُنسخ:** ملفات `.env` — الأسرار لا تغادر السيرفر؛ نسخها الاحتياطي = password manager فهد يدويًا.
+   - **الجدولة:** systemd timer يومي 03:30 Riyadh (`career-backup.service`): dump → `restic backup` → `restic forget --prune` بسياسة احتفاظ **7 يومية + 4 أسبوعية + 6 شهرية**.
+   - **حماية الحذف:** B2 bucket بـversioning + lifecycle يحفظ النسخ السابقة 30 يومًا — حذف/تخريب من السيرفر المخترق قابل للاسترجاع من المزود خلال 30 يومًا.
+   - **مفتاحان:** Application Key مقيّد بالbucket الواحد فقط على السيرفر؛ الـMaster Key لا يوجد على السيرفر أبدًا (عند فهد فقط).
+   - **كلمة repo:** تُولَّد عشوائيًا، تُحفظ في `/root/.config/career-backup/password` (0600) + **نسخة إلزامية في password manager فهد** (بدونها النسخ عديمة القيمة إن ضاع السيرفر).
+   - **اختبار Restore شهري** (systemd timer): استرجاع أحدث dump → `pg_restore` في قاعدة scratch مؤقتة → فحوص سلامة (عدد الجداول، أعلام RLS، عيّنة صفوف) → إسقاط الـscratch → تسجيل النتيجة. أول Restore يُنفذ يدويًا ويوثَّق كدليل شرط خروج C2.
+   - 👤 **مطلوب من فهد (مرة واحدة، ~10 دقائق):** حساب backblaze.com + بطاقة، إنشاء الـbucket والمفتاح المقيد (أوجّهك حقلًا-حقلًا)، لصق `B2_ACCOUNT_ID/B2_ACCOUNT_KEY` وكلمة الـrepo في ملف غير متتبع، وحفظ نسخة الكلمة في password manager.
 6. 🤖 اختبارات cross-tenant تتوسع لتشمل الجداول الجديدة (outbox/audit) · PROGRESS · **تقييم شرط خروج C2 كاملًا وإغلاقه**.
 
 **شرط الخروج (الورقة):** Cross-tenant تفشل في الاختراق وتنجح في CI ✅ + Restore تجريبي ناجح من نسخة خارجية ✅.
