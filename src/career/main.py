@@ -11,7 +11,7 @@ import logging
 
 import redis
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from sqlalchemy import text
 
 from career import __version__
@@ -19,6 +19,8 @@ from career.config import get_settings
 from career.db.session import SessionLocal, app_engine
 from career.logging_filters import install_secret_redaction
 from career.salla.webhook import WebhookStatus, receive_webhook
+from career.whatsapp.signature import verify_challenge
+from career.whatsapp.webhook import WhatsAppIntakeStatus, receive_whatsapp_webhook
 
 logging.basicConfig(level=get_settings().log_level)
 # Scrub secrets from every log record before any external integration (§15.13).
@@ -85,6 +87,43 @@ async def salla_webhook(request: Request) -> JSONResponse:
         logger.warning("salla webhook rejected: invalid signature")
         return JSONResponse(status_code=401, content={"status": "invalid_signature"})
     # accepted or duplicate → 200 so Salla stops retrying (idempotent).
+    return JSONResponse(status_code=200, content={"status": result.status.value})
+
+
+@app.get("/webhooks/whatsapp")
+async def whatsapp_verify(request: Request) -> PlainTextResponse:
+    """Meta subscription handshake — echo hub.challenge if the verify token matches."""
+    q = request.query_params
+    challenge = verify_challenge(
+        mode=q.get("hub.mode"),
+        token=q.get("hub.verify_token"),
+        challenge=q.get("hub.challenge"),
+        expected_token=get_settings().whatsapp_verify_token,
+    )
+    if challenge is None:
+        return PlainTextResponse("forbidden", status_code=403)
+    return PlainTextResponse(challenge, status_code=200)
+
+
+@app.post("/webhooks/whatsapp")
+async def whatsapp_webhook(request: Request) -> JSONResponse:
+    """Fast intake: verify X-Hub-Signature-256, dedupe, persist, return 200.
+    The inbound worker (process_pending_whatsapp) does the real work."""
+    raw_body = await request.body()
+    signature = request.headers.get("X-Hub-Signature-256")
+    secret = get_settings().whatsapp_app_secret
+
+    session = SessionLocal()
+    try:
+        result = receive_whatsapp_webhook(
+            session, raw_body=raw_body, header_signature=signature, app_secret=secret,
+        )
+    finally:
+        session.close()
+
+    if result.status is WhatsAppIntakeStatus.INVALID_SIGNATURE:
+        logger.warning("whatsapp webhook rejected: invalid signature")
+        return JSONResponse(status_code=401, content={"status": "invalid_signature"})
     return JSONResponse(status_code=200, content={"status": result.status.value})
 
 

@@ -18,7 +18,8 @@
 | P-A | النواة النقية career_core + اختبارات القبول | ✅ مكتملة (14 يوليو) |
 | P-B | إغلاق C2 (CI، نسخ/Restore، Queue/Outbox، Audit، فلتر أسرار) | 🟡 P-B.1 CI ✅ · P-B.2 فلتر أسرار ✅ · P-B.3 Queue/Outbox/Worker ✅ · P-B.4 Audit ✅ · **يتبقّى فقط: النسخ/Restore (مؤجل بقرار فهد)** |
 | C3 | سلة: webhooks · اشتراكات · تفعيل | 🟡 الكود منجز ومُختبَر (25 اختبارًا) · شرط الخروج يحتاج شراء ريال حي + إعداد فهد اليدوي |
-| C4–C9 | — | لم تبدأ |
+| C4 | واتساب: تسليم تكيفي · تفعيل · دعم | 🟡 الكود منجز ومُختبَر (42 اختبارًا) · شرط الخروج يحتاج WABA حي + إعداد Meta اليدوي |
+| C5–C9 | — | لم تبدأ |
 
 ---
 
@@ -112,6 +113,22 @@
 - **الإجمالي المتراكم: 198/198 أخضر · ruff+mypy نظيفان · محاكاة CI من الصفر (0001–0004) ناجحة.**
 
 **شرط خروج C3 (§13):** المنطق مُثبت بالاختبارات، لكنه يُغلق فقط بشراء حي. يحتاج (👤 فهد): Partner App في portal.salla.partners + `SALLA_WEBHOOK_SECRET`/`SALLA_API_KEY` + منتج الريال المخفي + شراء تجريبي → عندها أُوصِّل `HttpSallaClient` وأتحقّق حيًّا.
+
+## C4 — واتساب 🟡 (15 يوليو 2026)
+
+**الكود منجز ومُختبَر (migration 0005 + 42 اختبارًا). كرّرنا معمارية C3 (سلطة intake واحدة، worker بدور المالك):**
+- **الجداول:** `customer_channels` (الرقم PII، `unique(provider, phone)`، نافذة عبر `last_inbound_at`) · `deliveries` (وحدة التسليم التكيفي، `unique(tenant, run_date)`) · `delivery_messages` · `inbound_messages` (`wa_message_id` فريد = idempotency) · `support_events`. كلها ENABLE+FORCE RLS.
+- **سلطة intake موحّدة** `webhooks.intake.persist_deduped_event` يستخدمها سلة وواتساب (لا تفرّع).
+- **المنطق النقي (now محقون):** نافذة 24 ساعة (OPEN/CLOSED/OPTED_OUT، opt-out يتجاوز) · تصنيف الوارد (STOP/دعم/activation/other، مطابقة صارمة) · مخطّط التسليم التكيفي (§08).
+- **التفعيل (جوهر شرط الخروج):** وارد `تفعيل <token>` → hash → `activation_tokens` → إنشاء channel (رقم↔tenant) + تعليم التوكن مستخدمًا + اشتراك `PAID_UNCLAIMED → ONBOARDING`. idempotent + رفض invalid/expired/used/conflict مع رد عربي وتنبيه إداري بلا PII.
+- **التسليم التكيفي:** نافذة مفتوحة → إرسال مباشر؛ مغلقة → قالب صباحي + حفظ الـbundle → **descent** عند أول تفاعل؛ opted-out → لا إرسال.
+- **الوارد:** STOP → opt-out فوري + تأكيد · دعم → `support_events` + تصعيد إداري (TEN-#### فقط) · other → descent. إيصالات التسليم تُحدِّث `delivery_messages`.
+- **الحدود المحقونة:** `WhatsAppClient`/`TelegramAdminClient` (Protocol + Fake + Http skeleton) · **توقيع Meta** `X-Hub-Signature-256` + تحدّي GET · endpoints `GET/POST /webhooks/whatsapp` · فلتر تنقية الأسرار مُفعّل.
+- **القوالب كبيانات** (بما فيها اليومي بصياغتين utility/marketing §08) — تُقدَّم لـMeta يدويًا.
+- **الاختبارات (42):** المجال النقي · التوقيع/التحدّي · التفعيل (يربط الطلب بالرقم، ONBOARDING، idempotent، invalid/expired/conflict) · التسليم (مفتوح/مغلق+descent/opted-out) · الـworker (STOP فوري، دعم بلا PII، descent، status callback، idempotency) · endpoints.
+- **الإجمالي المتراكم: 240/240 أخضر · ruff+mypy نظيفان · محاكاة CI من الصفر (0001–0005) ناجحة.**
+
+**شرط خروج C4 (§13):** «توكن التفعيل يربط طلبًا برقم، والتسليم التكيفي يعمل بالحالتين، وSTOP يوقف فورًا» — **مُثبت بالاختبارات**. يُغلق حيًّا عند (👤 فهد): Meta Business Portfolio + تطبيق + WABA تجريبي + رقم اختبار + `WHATSAPP_*`/`TELEGRAM_ADMIN_*` + اعتماد القوالب → عندها أُوصِّل `HttpWhatsAppClient`/`HttpTelegramAdminClient` وأتحقّق حيًّا.
 
 ## قرارات معلّقة على فهد
 

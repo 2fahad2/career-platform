@@ -53,6 +53,11 @@ jobs:
       DB_PASSWORD: ci_app_pw
       REDIS_HOST: localhost
       REDIS_PORT: "6379"
+      # Test-only fake secrets so signature/endpoint tests actually run in CI
+      # (they skip when the app's configured secret != the test value).
+      SALLA_WEBHOOK_SECRET: test_secret_123
+      WHATSAPP_APP_SECRET: wa_app_secret_123
+      WHATSAPP_VERIFY_TOKEN: wa_verify_123
       # Force the cross-tenant RLS tests (and the Redis queue test) to actually
       # run — never silently skip. Whitepaper §13 C2 exit condition: cross-tenant
       # tests pass in CI.

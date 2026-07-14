@@ -46,6 +46,17 @@ class Settings(BaseSettings):
     salla_webhook_secret: str = Field(default="", alias="SALLA_WEBHOOK_SECRET")
     salla_api_key: str = Field(default="", alias="SALLA_API_KEY")
 
+    # WhatsApp Cloud API (C4). Filled when the Meta app + WABA are set up.
+    whatsapp_app_secret: str = Field(default="", alias="WHATSAPP_APP_SECRET")
+    whatsapp_verify_token: str = Field(default="", alias="WHATSAPP_VERIFY_TOKEN")
+    whatsapp_access_token: str = Field(default="", alias="WHATSAPP_ACCESS_TOKEN")
+    whatsapp_phone_number_id: str = Field(default="", alias="WHATSAPP_PHONE_NUMBER_ID")
+    whatsapp_number_e164: str = Field(default="", alias="WHATSAPP_NUMBER_E164")
+
+    # Telegram admin channel (C4). Bot token must be rotated before live use.
+    telegram_admin_bot_token: str = Field(default="", alias="TELEGRAM_ADMIN_BOT_TOKEN")
+    telegram_admin_chat_id: str = Field(default="", alias="TELEGRAM_ADMIN_CHAT_ID")
+
     def _dsn(self, user: str, password: str) -> str:
         return (
             f"postgresql+psycopg://{user}:{password}"
