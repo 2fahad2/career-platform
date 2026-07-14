@@ -16,7 +16,7 @@
 | C1 | عزل المشروع / تهيئة المستودع | ✅ مكتملة |
 | C2 | قاعدة المنصة | 🟡 النطاق المطلوب هذه الجلسة منجز ومُختبَر · شرط الخروج الكامل (§13) **جزئي** — انظر أدناه |
 | P-A | النواة النقية career_core + اختبارات القبول | ✅ مكتملة (14 يوليو) |
-| P-B | إغلاق C2 (CI، نسخ/Restore، Queue/Outbox، Audit، فلتر أسرار) | 🟡 P-B.1 CI ✅ · الباقي جارٍ |
+| P-B | إغلاق C2 (CI، نسخ/Restore، Queue/Outbox، Audit، فلتر أسرار) | 🟡 P-B.1 CI ✅ · P-B.2 فلتر أسرار ✅ · P-B.3 Queue/Outbox/Worker ✅ · P-B.4 Audit ✅ · **يتبقّى فقط: النسخ/Restore (مؤجل بقرار فهد)** |
 | C3–C9 | — | لم تبدأ |
 
 ---
@@ -56,15 +56,13 @@
 
 **بق أُصلح أثناء التنفيذ:** السياسة الأولى استخدمت `current_setting(...)::uuid` مباشرة، فكان GUC مخصّص يعود `''` (لا NULL) على اتصال من الـpool بعد انتهاء المعاملة → خطأ `''::uuid`. أمسكه اختبار fail-closed؛ أُصلح بـ`NULLIF`.
 
-**تقييم شرط خروج C2 الكامل (§13):** «اختبارات Cross-tenant تفشل في الاختراق وتنجح في CI، وRestore تجريبي ناجح من نسخة خارجية.»
-- ✅ **Cross-tenant:** محقّق فعليًا (5/5 ضد Postgres 16 حقيقي).
-- ⚠️ **CI:** الاختبارات موجودة وتمر محليًا؛ لا يوجد بعدُ workflow CI فعلي (GitHub Actions) يشغّلها آليًا — **متبقٍّ**.
-- ❌ **نسخ خارجي مشفّر + اختبار Restore:** لم يُنفّذ (خارج نطاق ما طُلب هذه الجلسة) — **متبقٍّ**.
-- ❌ **بنود C2 الأوسع في §10/§13:** Object Storage حقيقي (S3)، Queue + Outbox، Audit events — لم تُبنَ بعد (StorageAdapter مهيّأ للاستبدال لاحقًا دون تغيير الطبقات الأعلى).
+**تقييم شرط خروج C2 الكامل (§13) — مُحدَّث بعد P-B:** «اختبارات Cross-tenant تفشل في الاختراق وتنجح في CI، وRestore تجريبي ناجح من نسخة خارجية.»
+- ✅ **Cross-tenant:** محقّق فعليًا (اختبارات عزل ضد Postgres 16 حقيقي).
+- ✅ **CI:** `.github/workflows/ci.yml` يشغّل ruff+mypy+alembic upgrade+alembic check+pytest على Postgres 16 + Redis 7، مع `CI_REQUIRE_DB=1` يمنع تخطّي اختبارات العزل صمتًا. (⚠️ لم يُدفع بعد — يحتاج فهد يضيف صلاحية `workflow` للتوكن؛ انظر أدناه.)
+- ❌ **نسخ خارجي مشفّر + اختبار Restore:** **مؤجل بقرار فهد** («بسويه بعدين») — التصميم كامل في PLAN P-B.5. هذا البند الوحيد المتبقّي لإغلاق شرط خروج C2.
+- ✅ **Queue + Outbox + Audit** (كانت بنود §10 الأوسع): أُنجزت في P-B.3/P-B.4 (migrations 0002/0003) مع اختبارات عزل هجومية. StorageAdapter مهيّأ لاستبدال S3 لاحقًا دون تغيير الطبقات الأعلى.
 
-> **خلاصة صادقة (§15.12 لا نجاح صامت):** ما طلبته لهذه الجلسة من C2 **منجز ومُختبَر بالكامل**، لكن **شرط خروج C2 الكامل لم يتحقق بعد** (ينقصه: CI فعلي، نسخ/Restore خارجي، Queue/Outbox، Audit). لا تُفتح C3 قبل إغلاق هذه البنود أو قرار صريح منك بتسلسل مختلف.
-
-**الخطوة التالية المقترحة:** (أ) workflow CI يشغّل pytest على خدمة Postgres 16 · (ب) نسخ مشفّر خارجي + اختبار Restore · (ج) هيكل Queue/Outbox + Audit — ثم إغلاق C2 والانتقال لـC3 (سلة).
+> **خلاصة صادقة (§15.12 لا نجاح صامت):** بعد P-B، **كل بنود C2 منجزة ومُختبَرة عدا النسخ/Restore الخارجي المؤجل بقرارك**. شرط خروج C2 يبقى **مفتوحًا رسميًا** حتى (أ) دفع فرع CI ونجاحه على GitHub [يحتاج صلاحية `workflow`]، و(ب) تنفيذ النسخ/Restore. لا تُفتح C3 قبل إغلاق هذين، أو قرار صريح منك.
 
 ---
 
@@ -85,7 +83,17 @@
 
 **شرط الخروج (PLAN):** ✅ كل اختبارات القبول خضراء بلا شبكة، الحزمة مستقلة، الانحرافات مسجلة في DEVIATIONS.
 
-**التالي:** P-B (CI أولًا — لا يحتاج شيئًا من فهد؛ النسخ الاحتياطي مؤجل بقراره).
+## P-B — إغلاق C2 🟡 (14 يوليو 2026)
+
+- **P-B.1 CI ✅:** `.github/workflows/ci.yml` (Postgres 16 + Redis 7 services) → ruff · mypy · alembic upgrade · alembic check (drift) · pytest، على Python 3.11. `scripts/ci_create_app_role.py` ينشئ دور `career_app` غير الـsuperuser (hermetic عبر psycopg). `CI_REQUIRE_DB=1` يحوّل تخطّي اختبارات العزل إلى **فشل صريح** (تحقّقت من المسارين). بادج في README.
+- **P-B.2 فلتر أسرار ✅:** `src/career/logging_filters.py` — نقل §9.2 معمَّم لكل القنوات (bot-URL، أسرار query، KV مع Bearer/Basic، أسرار مسجّلة)، تعقيم msg/args/traceback، يُركّب على handlers، `install_secret_redaction` يثبّت httpx/httpcore على WARNING. 18 اختبارًا (منها حالتان أمسكتا بق أول نقل).
+- **P-B.3 Queue/Outbox/Worker ✅:** migration 0002 — `outbox_events` (ENABLE-only، relay بدور المالك عبر المستأجرين) + `processed_messages` (idempotency، ENABLE+FORCE). `QueueMessage` (المفاتيح الأربعة) · InMemory/Redis queue · outbox ذرّي same-txn + relay · **worker يعيد التحقق من الملكية من القاعدة عبر RLS (§15.11)**: مرجع مزوّر عبر المستأجرين غير مرئي → يُرفض؛ claim بـON CONFLICT قبل المعالجة → redelivery = no-op؛ فشل المعالج يرجّع الـclaim. 22 اختبارًا.
+- **P-B.4 Audit ✅:** migration 0003 — `audit_events` tenant-scoped (ENABLE+FORCE، **append-only**: INSERT/SELECT فقط للتطبيق). `record_audit` مركزي يمرّر details عبر مُنقّي الأسرار (defense-in-depth). 5 اختبارات: عزل، رفض tenant مزوّر (WITH CHECK)، تنقية السر، منع UPDATE/DELETE. 
+- **الإجمالي: 173/173 اختبارًا أخضر · ruff نظيف · mypy strict نظيف · محاكاة CI من الصفر (migrations 0001–0003) ناجحة.**
+
+**المتبقّي في P-B:** (1) **دفع الفرع ونجاح CI فعليًا على GitHub** — محجوب: التوكن ينقصه صلاحية `workflow` (يحتاج فهد: `gh auth refresh -h github.com -s workflow`). كل commits P-B.1–P-B.4 محفوظة محليًا بانتظار الدفع. (2) النسخ/Restore الخارجي (مؤجل بقرار فهد).
+
+**التالي:** بعد الدفع ونجاح CI + النسخ/Restore → إغلاق C2 والانتقال لـC3 (سلة).
 
 ## قرارات معلّقة على فهد
 
