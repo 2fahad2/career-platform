@@ -51,7 +51,7 @@ select = ["E", "F", "I", "UP", "B", "S"]
 python_version = "3.11"
 strict = true
 mypy_path = "src"
-packages = ["career"]
+packages = ["career", "career_core"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
