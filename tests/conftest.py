@@ -3,12 +3,15 @@
 These tests require a running Postgres 16 with migration 0001 applied and the
 non-superuser ``career_app`` role present (Compose brings both up). Connection
 details come from the environment (the same Settings the app uses). If no
-database is reachable the DB tests are skipped with a clear reason — they are
-never silently treated as passing.
+database is reachable the DB tests are skipped locally with a clear reason —
+never silently treated as passing. In CI (``CI_REQUIRE_DB=1``) an unreachable
+database is a hard FAILURE, so the isolation guarantee is actually exercised
+(whitepaper §13 C2 exit condition: cross-tenant tests must pass in CI).
 """
 
 from __future__ import annotations
 
+import os
 import uuid
 from collections.abc import Iterator
 
@@ -17,6 +20,10 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
 from career.config import get_settings
+
+
+def _require_db() -> bool:
+    return os.environ.get("CI_REQUIRE_DB", "").strip().lower() in {"1", "true", "yes"}
 
 
 @pytest.fixture(scope="session")
@@ -28,7 +35,10 @@ def owner_engine() -> Iterator[Engine]:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
     except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"Postgres not reachable for RLS tests: {exc}")
+        msg = f"Postgres not reachable for RLS tests: {exc}"
+        if _require_db():
+            pytest.fail(msg)  # CI: must not silently skip the isolation gate
+        pytest.skip(msg)
     yield engine
     engine.dispose()
 

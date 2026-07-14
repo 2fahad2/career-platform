@@ -1,5 +1,7 @@
 # Career Platform
 
+[![CI](https://github.com/2fahad2/career-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/2fahad2/career-platform/actions/workflows/ci.yml)
+
 Paid personal job-search assistant for the Saudi market (WhatsApp + Salla).
 It searches daily, filters through each customer's private gate, generates a
 tailored English CV per selected opportunity, and delivers it over WhatsApp so
