@@ -13,8 +13,6 @@ only its hash stored).
 
 from __future__ import annotations
 
-import hashlib
-import secrets
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -26,6 +24,7 @@ from sqlalchemy.orm import Session
 from career.db.models import ActivationToken, Subscription, SubscriptionEvent, Tenant, WebhookEvent
 from career.salla import subscriptions as sub_states
 from career.salla.client import SallaClient
+from career.tokens import hash_token, new_activation_token
 
 # product_id -> plan_code (from the Salla store setup; injected).
 ProductCatalog = dict[str, str]
@@ -50,10 +49,6 @@ class ProvisionResult:
     # The raw activation token is returned exactly once, only on a fresh
     # provision, to build the WhatsApp deep link. It is never stored raw.
     activation_token: str | None = None
-
-
-def _hash_token(raw: str) -> str:
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _next_tenant_code(session: Session) -> str:
@@ -142,13 +137,13 @@ def provision_order(
         )
     )
 
-    raw_token = secrets.token_urlsafe(32)
+    raw_token = new_activation_token()
     owner_session.add(
         ActivationToken(
             id=uuid.uuid4(),
             tenant_id=tenant.id,
             subscription_id=subscription.id,
-            token_hash=_hash_token(raw_token),
+            token_hash=hash_token(raw_token),
             expires_at=datetime.now(UTC) + timedelta(days=ACTIVATION_TOKEN_TTL_DAYS),
         )
     )
