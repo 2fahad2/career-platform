@@ -17,7 +17,8 @@
 | C2 | قاعدة المنصة | 🟡 النطاق المطلوب هذه الجلسة منجز ومُختبَر · شرط الخروج الكامل (§13) **جزئي** — انظر أدناه |
 | P-A | النواة النقية career_core + اختبارات القبول | ✅ مكتملة (14 يوليو) |
 | P-B | إغلاق C2 (CI، نسخ/Restore، Queue/Outbox، Audit، فلتر أسرار) | 🟡 P-B.1 CI ✅ · P-B.2 فلتر أسرار ✅ · P-B.3 Queue/Outbox/Worker ✅ · P-B.4 Audit ✅ · **يتبقّى فقط: النسخ/Restore (مؤجل بقرار فهد)** |
-| C3–C9 | — | لم تبدأ |
+| C3 | سلة: webhooks · اشتراكات · تفعيل | 🟡 الكود منجز ومُختبَر (25 اختبارًا) · شرط الخروج يحتاج شراء ريال حي + إعداد فهد اليدوي |
+| C4–C9 | — | لم تبدأ |
 
 ---
 
@@ -96,6 +97,21 @@
 **المتبقّي في P-B:** بند واحد فقط — النسخ/Restore الخارجي (مؤجل بقرار فهد). CI دُفع ونجح على GitHub ✅.
 
 **التالي:** تنفيذ النسخ/Restore (عند إذن فهد) → إغلاق C2 → C3 (سلة).
+
+## C3 — سلة 🟡 (14 يوليو 2026)
+
+**الكود منجز ومُختبَر (migration 0004 + 25 اختبارًا):**
+- **الجداول:** `plan_entitlements` (مرجعية مبذورة من §04: 149/279/449 بصلاحياتها) · `subscriptions` · `subscription_events` · `activation_tokens` (tenant-scoped، ENABLE+FORCE RLS) · `webhook_events` (intake نظامي بلا RLS، fingerprint فريد).
+- **توقيع سلة** (`signature.py`): HMAC-SHA256، مقارنة ثابتة الزمن، fail-closed.
+- **الاستقبال** (`webhook.py`): تحقّق التوقيع → fingerprint → dedupe بـON CONFLICT → 200 فورًا؛ توقيع خاطئ = 401 **بلا كتابة**؛ مكرّر = 200 duplicate.
+- **العميل** (`client.py`): `SallaClient` Protocol + `FakeSallaClient` + `HttpSallaClient` هيكل يُوصَل عند وصول المفتاح.
+- **التزويد** (`provisioning.py`): يعيد التحقق من الطلب عبر Salla API (لا يثق بالـwebhook) → **provisioning فقط عند `paid`** → tenant + اشتراك `PAID_UNCLAIMED` + activation token (الخام يُعاد مرة، يُخزَّن hash فقط). idempotent عبر `salla_order_id` فريد + pre-check. `process_pending_webhooks` = الـworker.
+- **آلة الحالات** (`subscriptions.py`): 11 حالة + انتقالات مُتحقّقة؛ refund/cancel/chargeback تُعطّل فورًا؛ النهائية idempotent.
+- **Endpoint** `POST /webhooks/salla` + `install_secret_redaction()` فُعّل قبل أول تكامل خارجي.
+- **الاختبارات (25):** توقيع·حالات·استقبال·تزويد·دورة حياة·endpoint — منها: **حدث مكرّر → اشتراك واحد**، توقيع خاطئ يُرفض، غير مدفوع لا يُزوَّد، منتج مجهول يُتجاهل، **استرداد يُعطّل فورًا**.
+- **الإجمالي المتراكم: 198/198 أخضر · ruff+mypy نظيفان · محاكاة CI من الصفر (0001–0004) ناجحة.**
+
+**شرط خروج C3 (§13):** المنطق مُثبت بالاختبارات، لكنه يُغلق فقط بشراء حي. يحتاج (👤 فهد): Partner App في portal.salla.partners + `SALLA_WEBHOOK_SECRET`/`SALLA_API_KEY` + منتج الريال المخفي + شراء تجريبي → عندها أُوصِّل `HttpSallaClient` وأتحقّق حيًّا.
 
 ## قرارات معلّقة على فهد
 

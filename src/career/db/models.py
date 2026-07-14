@@ -10,14 +10,17 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     DateTime,
     ForeignKey,
     Index,
     Integer,
+    Numeric,
     String,
     UniqueConstraint,
     func,
@@ -179,4 +182,151 @@ class AuditEvent(Base):
     details: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class PlanEntitlement(Base):
+    """Plan → feature entitlements (whitepaper §04). Reference data (no RLS).
+    Features are built from day one; only the price numbers are provisional."""
+
+    __tablename__ = "plan_entitlements"
+
+    plan_code: Mapped[str] = mapped_column(String(32), primary_key=True)
+    daily_job_limit: Mapped[int] = mapped_column(Integer, nullable=False)
+    monthly_cv_safety_cap: Mapped[int] = mapped_column(Integer, nullable=False)
+    intro_blurb: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    cover_letter: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    human_review_monthly: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    weekly_report: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    queue_priority: Mapped[str] = mapped_column(String(16), nullable=False)
+    support_sla_hours: Mapped[int] = mapped_column(Integer, nullable=False)
+    seats_cap: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    indicative_price_sar: Mapped[int] = mapped_column(Integer, nullable=False)
+
+
+class Subscription(Base):
+    """A customer's subscription (whitepaper §05). Tenant-scoped. Provisioned
+    only on payment=paid; states drive the daily loop and billing."""
+
+    __tablename__ = "subscriptions"
+    __table_args__ = (
+        UniqueConstraint("salla_order_id", name="uq_subscriptions_salla_order_id"),
+        Index("ix_subscriptions_tenant_id", "tenant_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    plan_code: Mapped[str] = mapped_column(
+        String(32), ForeignKey("plan_entitlements.plan_code"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    salla_order_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    amount_sar: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    currency: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    current_period_start: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    current_period_end: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class SubscriptionEvent(Base):
+    """Append-only trail of subscription state transitions and order events."""
+
+    __tablename__ = "subscription_events"
+    __table_args__ = (
+        Index("ix_subscription_events_subscription_id", "subscription_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    subscription_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("subscriptions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    event_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    from_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    to_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    salla_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    details: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class ActivationToken(Base):
+    """Short-lived token linking a paid order ↔ the phone that starts WhatsApp ↔
+    the customer. The raw token is never stored — only its SHA-256 hash."""
+
+    __tablename__ = "activation_tokens"
+    __table_args__ = (
+        UniqueConstraint("token_hash", name="uq_activation_tokens_token_hash"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    subscription_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("subscriptions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class WebhookEvent(Base):
+    """System-level intake of provider webhooks (no RLS — an order arrives before
+    the customer/tenant is known). event_fingerprint is unique → idempotency."""
+
+    __tablename__ = "webhook_events"
+    __table_args__ = (
+        UniqueConstraint("event_fingerprint", name="uq_webhook_events_event_fingerprint"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    provider: Mapped[str] = mapped_column(String(16), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_fingerprint: Mapped[str] = mapped_column(String(128), nullable=False)
+    signature_valid: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    salla_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    processing_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    processed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )

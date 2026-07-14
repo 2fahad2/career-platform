@@ -18,6 +18,7 @@ from collections.abc import Iterator
 import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session
 
 from career.config import get_settings
 
@@ -61,3 +62,36 @@ def two_tenants(owner_engine: Engine) -> Iterator[tuple[str, str]]:
     with owner_engine.begin() as conn:
         # CASCADE removes any documents created during the test.
         conn.execute(text("DELETE FROM tenants WHERE id IN (:a, :b)"), {"a": a, "b": b})
+
+
+@pytest.fixture()
+def owner_session(owner_engine: Engine) -> Iterator[Session]:
+    """A plain owner-role session (bypasses RLS) for provisioning-side tests."""
+    session = Session(owner_engine)
+    try:
+        yield session
+    finally:
+        session.close()
+
+
+@pytest.fixture()
+def clean_billing(owner_engine: Engine) -> Iterator[None]:
+    """Delete tenants + webhook_events created during a billing test (tenant
+    delete cascades subscriptions/tokens/events)."""
+    def ids(table: str) -> set[str]:
+        with Session(owner_engine) as s:
+            return {str(r[0]) for r in s.execute(text(f"SELECT id::text FROM {table}"))}
+
+    before_t = ids("tenants")
+    before_w = ids("webhook_events")
+    yield
+    new_t = ids("tenants") - before_t
+    new_w = ids("webhook_events") - before_w
+    with Session(owner_engine) as s:
+        if new_t:
+            s.execute(text("DELETE FROM tenants WHERE id::text = ANY(:ids)"),
+                      {"ids": list(new_t)})
+        if new_w:
+            s.execute(text("DELETE FROM webhook_events WHERE id::text = ANY(:ids)"),
+                      {"ids": list(new_w)})
+        s.commit()

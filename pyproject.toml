@@ -45,7 +45,8 @@ select = ["E", "F", "I", "UP", "B", "S"]
 # S101 (assert) is fine in tests; handled per-file below.
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["S101"]
+# Tests use assert, hardcoded fake secrets, and build SQL from fixed table names.
+"tests/*" = ["S101", "S105", "S106", "S608"]
 
 [tool.mypy]
 python_version = "3.11"

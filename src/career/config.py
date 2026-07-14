@@ -42,6 +42,10 @@ class Settings(BaseSettings):
     # Anthropic — the only LLM provider (locked). Unused until C7.
     anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
 
+    # Salla — billing/webhooks (C3). Filled when the Partner App is created.
+    salla_webhook_secret: str = Field(default="", alias="SALLA_WEBHOOK_SECRET")
+    salla_api_key: str = Field(default="", alias="SALLA_API_KEY")
+
     def _dsn(self, user: str, password: str) -> str:
         return (
             f"postgresql+psycopg://{user}:{password}"
