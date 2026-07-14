@@ -16,11 +16,10 @@ import json
 from dataclasses import dataclass
 from enum import StrEnum
 
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from career.db.models import WebhookEvent
 from career.salla.signature import verify_signature
+from career.webhooks.intake import persist_deduped_event
 
 
 class WebhookStatus(StrEnum):
@@ -76,24 +75,12 @@ def receive_webhook(
         payload = {"_unparseable": True}
 
     order_id = extract_salla_order_id(payload)
-    stmt = (
-        pg_insert(WebhookEvent)
-        .values(
-            provider=provider,
-            event_type=event_type,
-            event_fingerprint=fingerprint,
-            signature_valid=True,
-            salla_order_id=order_id,
-            payload=payload,
-            processing_status="received",
-        )
-        .on_conflict_do_nothing(constraint="uq_webhook_events_event_fingerprint")
-        .returning(WebhookEvent.id)
+    event_id = persist_deduped_event(
+        session, provider=provider, event_type=event_type,
+        fingerprint=fingerprint, payload=payload, order_id=order_id,
     )
-    row = session.execute(stmt).first()
-    session.commit()  # durable intake before returning 200
-    if row is None:
+    if event_id is None:
         return WebhookResult(WebhookStatus.DUPLICATE, event_fingerprint=fingerprint)
     return WebhookResult(
-        WebhookStatus.ACCEPTED, webhook_event_id=str(row[0]), event_fingerprint=fingerprint
+        WebhookStatus.ACCEPTED, webhook_event_id=event_id, event_fingerprint=fingerprint
     )

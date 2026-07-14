@@ -9,19 +9,21 @@ storage key + SHA + type + size + owner + status, never the PDF bytes.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    Date,
     DateTime,
     ForeignKey,
     Index,
     Integer,
     Numeric,
     String,
+    Text,
     UniqueConstraint,
     func,
     text,
@@ -330,3 +332,153 @@ class WebhookEvent(Base):
     processed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+
+
+class CustomerChannel(Base):
+    """A customer's messaging channel (whitepaper §08). phone_e164 is PII —
+    stored here, never logged, never shown in the admin channel. Unique per
+    (provider, phone): one WhatsApp number maps to exactly one customer."""
+
+    __tablename__ = "customer_channels"
+    __table_args__ = (
+        UniqueConstraint("provider", "phone_e164",
+                         name="uq_customer_channels_provider_phone_e164"),
+        Index("ix_customer_channels_tenant_id", "tenant_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    subscription_id: Mapped[uuid.UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("subscriptions.id", ondelete="SET NULL"), nullable=True
+    )
+    provider: Mapped[str] = mapped_column(String(16), nullable=False)
+    phone_e164: Mapped[str] = mapped_column(String(20), nullable=False)
+    display_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    opt_in_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    opt_out_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_inbound_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class Delivery(Base):
+    """The adaptive-delivery unit for one customer-day (whitepaper §08). The
+    bundle is a generic parts list here; C7 fills it with real CV/job refs."""
+
+    __tablename__ = "deliveries"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "run_date", name="uq_deliveries_tenant_id_run_date"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    channel_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("customer_channels.id", ondelete="CASCADE"), nullable=False
+    )
+    run_date: Mapped[date] = mapped_column(Date, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    window_state_at_start: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    template_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    bundle: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    opened_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class DeliveryMessage(Base):
+    """Outbound message log + delivery receipts (statuses[])."""
+
+    __tablename__ = "delivery_messages"
+    __table_args__ = (
+        Index("ix_delivery_messages_wa_message_id", "wa_message_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    channel_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("customer_channels.id", ondelete="CASCADE"), nullable=False
+    )
+    delivery_id: Mapped[uuid.UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("deliveries.id", ondelete="SET NULL"), nullable=True
+    )
+    wa_message_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    template_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    status_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class InboundMessage(Base):
+    """Inbound customer message (whitepaper §08). wa_message_id unique →
+    idempotency. text_body is PII."""
+
+    __tablename__ = "inbound_messages"
+    __table_args__ = (
+        UniqueConstraint("wa_message_id", name="uq_inbound_messages_wa_message_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    channel_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("customer_channels.id", ondelete="CASCADE"), nullable=False
+    )
+    wa_message_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    message_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    text_body: Mapped[str | None] = mapped_column(Text, nullable=True)
+    classification: Mapped[str] = mapped_column(String(32), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class SupportEvent(Base):
+    """A 'support' escalation to the admin channel (whitepaper §08)."""
+
+    __tablename__ = "support_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    channel_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("customer_channels.id", ondelete="CASCADE"), nullable=False
+    )
+    inbound_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("inbound_messages.id", ondelete="SET NULL"), nullable=True
+    )
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    admin_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
