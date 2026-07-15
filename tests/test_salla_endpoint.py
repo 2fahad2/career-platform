@@ -89,6 +89,20 @@ def test_app_store_authorize_bad_signature_rejected(clean_billing: None) -> None
     assert resp.status_code == 401
 
 
+def test_any_app_family_event_is_persisted(clean_billing: None) -> None:
+    """Salla app-lifecycle event names vary (app.installed, app.updated, …) —
+    the whole signed app.* family must be persisted, not silently ignored."""
+    body = json.dumps({"event": "app.installed", "merchant": 855028708}).encode("utf-8")
+    sig = compute_signature(body, SECRET)
+    with TestClient(app) as client:
+        resp = client.post(
+            "/webhooks/salla", content=body,
+            headers={"X-Salla-Event": "app.installed", "X-Salla-Signature": sig},
+        )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "accepted"
+
+
 def test_unknown_event_type_ignored(clean_billing: None) -> None:
     with TestClient(app) as client:
         resp = client.post(

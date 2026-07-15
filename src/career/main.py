@@ -73,8 +73,14 @@ async def salla_webhook(request: Request) -> JSONResponse:
     signature = request.headers.get("X-Salla-Signature")
     secret = get_settings().salla_webhook_secret
 
-    if event_type not in _SALLA_EVENTS:
-        # Unknown/absent event type — acknowledge without persisting.
+    # App lifecycle events (app.installed, app.store.authorize, …) are rare and
+    # valuable — the authorize one carries the Easy-Mode tokens — so accept the
+    # whole app.* family; exact names vary across Salla flows.
+    known = event_type in _SALLA_EVENTS or event_type.startswith("app.")
+    if not known:
+        # Unknown/absent event type — acknowledge without persisting, but leave
+        # a trace so silently-dropped event names are visible (§15.12).
+        logger.info("salla webhook ignored: event_type=%r", event_type)
         return JSONResponse(status_code=200, content={"status": "ignored"})
 
     session = SessionLocal()
