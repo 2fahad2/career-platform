@@ -20,6 +20,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import TypeVar
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -53,7 +54,10 @@ class PolicyNotFound(Exception):
     """The policy id does not exist for this tenant."""
 
 
-def _one_or_missing[T](session: Session, model: type[T], tenant_id: uuid.UUID, what: str) -> T:
+T = TypeVar("T")
+
+
+def _one_or_missing(session: Session, model: type[T], tenant_id: uuid.UUID, what: str) -> T:
     row = session.execute(
         select(model).where(model.tenant_id == tenant_id)  # type: ignore[attr-defined]
     ).scalars().first()
