@@ -30,9 +30,12 @@ logger = logging.getLogger("career")
 app = FastAPI(title="Career Platform", version=__version__)
 
 # Salla event types we accept on the webhook endpoint (whitepaper §09).
+# app.store.authorize carries the Easy-Mode access/refresh tokens on install —
+# it must be persisted (signature-verified) or the tokens are lost.
 _SALLA_EVENTS = frozenset({
-    "order.created", "order.payment.updated", "order.cancelled",
-    "order.canceled", "order.refunded", "order.chargeback",
+    "order.created", "order.payment.updated", "order.status.updated",
+    "order.cancelled", "order.canceled", "order.refunded", "order.chargeback",
+    "app.store.authorize",
 })
 
 

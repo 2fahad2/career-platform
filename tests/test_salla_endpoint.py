@@ -62,6 +62,33 @@ def test_duplicate_returns_200_duplicate(clean_billing: None) -> None:
     assert second.json()["status"] == "duplicate"
 
 
+def test_app_store_authorize_is_persisted(clean_billing: None) -> None:
+    """Easy-Mode token event must be accepted (persisted), never ignored —
+    losing it means losing the merchant access token."""
+    body = json.dumps(
+        {"event": "app.store.authorize", "merchant": 855028708,
+         "data": {"access_token": "tok", "refresh_token": "ref", "expires": 1}},
+    ).encode("utf-8")
+    sig = compute_signature(body, SECRET)
+    with TestClient(app) as client:
+        resp = client.post(
+            "/webhooks/salla", content=body,
+            headers={"X-Salla-Event": "app.store.authorize", "X-Salla-Signature": sig},
+        )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "accepted"
+
+
+def test_app_store_authorize_bad_signature_rejected(clean_billing: None) -> None:
+    body = json.dumps({"event": "app.store.authorize", "data": {"access_token": "tok"}}).encode()
+    with TestClient(app) as client:
+        resp = client.post(
+            "/webhooks/salla", content=body,
+            headers={"X-Salla-Event": "app.store.authorize", "X-Salla-Signature": "forged"},
+        )
+    assert resp.status_code == 401
+
+
 def test_unknown_event_type_ignored(clean_billing: None) -> None:
     with TestClient(app) as client:
         resp = client.post(
