@@ -7,6 +7,7 @@ returned here (§15.13).
 
 from __future__ import annotations
 
+import json
 import logging
 
 import redis
@@ -69,7 +70,17 @@ async def salla_webhook(request: Request) -> JSONResponse:
     """Fast intake: verify signature, dedupe, persist, return 200. Provisioning
     is done by a separate worker (process_pending_webhooks) — never in-request."""
     raw_body = await request.body()
-    event_type = request.headers.get("X-Salla-Event", "")
+    # Salla carries the event name in the JSON body ("event"), not in a header
+    # (verified live 2026-07-15: install events arrived with no X-Salla-Event).
+    # Keep the header as a fallback; the signature is over the raw body either
+    # way, so routing on the body field grants no forgery power.
+    try:
+        parsed = json.loads(raw_body)
+        event_type = str(parsed.get("event", "")) if isinstance(parsed, dict) else ""
+    except ValueError:
+        event_type = ""
+    if not event_type:
+        event_type = request.headers.get("X-Salla-Event", "")
     signature = request.headers.get("X-Salla-Signature")
     secret = get_settings().salla_webhook_secret
 

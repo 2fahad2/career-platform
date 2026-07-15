@@ -103,6 +103,23 @@ def test_any_app_family_event_is_persisted(clean_billing: None) -> None:
     assert resp.json()["status"] == "accepted"
 
 
+def test_event_name_read_from_body_without_header(clean_billing: None) -> None:
+    """Live Salla sends no X-Salla-Event header — the event name lives in the
+    JSON body. A signed event with body-only name must be persisted."""
+    body = json.dumps(
+        {"event": "app.store.authorize", "merchant": 855028708,
+         "data": {"access_token": "tok", "refresh_token": "ref"}},
+    ).encode("utf-8")
+    sig = compute_signature(body, SECRET)
+    with TestClient(app) as client:
+        resp = client.post(
+            "/webhooks/salla", content=body,
+            headers={"X-Salla-Signature": sig},  # deliberately no X-Salla-Event
+        )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "accepted"
+
+
 def test_unknown_event_type_ignored(clean_billing: None) -> None:
     with TestClient(app) as client:
         resp = client.post(
