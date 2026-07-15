@@ -235,7 +235,14 @@ class AnthropicExtractor:
         )
         if response.stop_reason != "end_turn":
             raise ExtractionFailed(f"stop_reason:{response.stop_reason}")
-        text = next((b.text for b in response.content if b.type == "text"), None)
+        # getattr-based extraction: works for SDK blocks and injected fakes
+        # alike, and keeps mypy honest about the SDK's wide content union.
+        text: str | None = None
+        for block in response.content:
+            candidate = getattr(block, "text", None)
+            if getattr(block, "type", "") == "text" and isinstance(candidate, str):
+                text = candidate
+                break
         if text is None:
             raise ExtractionFailed("no_text_block")
         try:
