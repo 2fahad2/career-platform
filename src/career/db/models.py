@@ -759,6 +759,146 @@ class PrivacyRequest(Base):
     fulfilled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+# ── C6 — the shared nightly pool + per-tenant decisions (whitepaper §06) ─────
+
+
+class JobPosting(Base):
+    """One posting in the SHARED nightly pool (whitepaper §06): discovered once
+    for everyone, evaluated per tenant — cost grows with role families, not
+    customers. System table (no RLS): job ads are public data with no PII; the
+    engine writes as the owner role, the app role reads only.
+
+    Identity: ``url_identity`` (joburl:v1:<sha256>) is the base and unique key;
+    the extended ids exist because the same job appears under many URLs.
+    ``repost_group_id`` groups reposts for suppression (§06/§8.1)."""
+
+    __tablename__ = "job_postings"
+    __table_args__ = (
+        UniqueConstraint("url_identity", name="uq_job_postings_url_identity"),
+        Index("ix_job_postings_cross_source_fingerprint", "cross_source_fingerprint"),
+        Index("ix_job_postings_repost_group_id", "repost_group_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    url_identity: Mapped[str] = mapped_column(String(80), nullable=False)
+    url: Mapped[str] = mapped_column(Text, nullable=False)
+    canonical_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_native_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    job_entity_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    cross_source_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    repost_group_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    title: Mapped[str] = mapped_column(String(256), nullable=False)
+    company: Mapped[str] = mapped_column(String(256), nullable=False)
+    location: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    description_snippet: Mapped[str | None] = mapped_column(Text, nullable=True)
+    salary_raw: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    # apply_options routing verdict (§5.4): original/canonical/route_type/…
+    route: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    posted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    # enrichment — once per posting regardless of tenant count (§06)
+    jd_status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="NOT_REQUESTED"
+    )
+    jd_snippet: Mapped[str | None] = mapped_column(Text, nullable=True)
+    enriched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class DiscoveryRun(Base):
+    """One nightly discovery run (whitepaper §06) — honest statuses per source
+    and stage; digest_only mirrors D9 (no send, no ledger writes)."""
+
+    __tablename__ = "discovery_runs"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    run_date: Mapped[date] = mapped_column(Date, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="running")
+    digest_only: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    counts: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class TenantJobDecision(Base):
+    """The per-tenant decision record for one posting in one run (whitepaper
+    §06): answers «ليش أرسلتوها لي؟» and feeds calibration. Near-misses are
+    captured for the zero-day report. rank/rank trace filled for PASSed jobs."""
+
+    __tablename__ = "tenant_job_decisions"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "run_id", "job_posting_id",
+            name="uq_tenant_job_decisions_tenant_run_job",
+        ),
+        Index("ix_tenant_job_decisions_tenant_id_run_id", "tenant_id", "run_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("discovery_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    job_posting_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("job_postings.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    decision: Mapped[str] = mapped_column(String(8), nullable=False)  # PASS | BLOCK
+    near_miss: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # role_score, salary_status, company_tier, seniority, location, final_score…
+    reasons: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    gate_policy_version: Mapped[str] = mapped_column(String(16), nullable=False)
+    rank: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    ranking_policy_version: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class TenantJobSuppression(Base):
+    """Delivered-jobs suppression (D3 port of §8.1): a delivered posting is
+    suppressed per tenant for a bounded TTL at the repost-group level, keyed by
+    the SAME normalized-URL identity as same-run dedupe. Reads are fail-open in
+    code (an unreadable ledger never hides a job); rows are written only after
+    confirmed delivery (C7)."""
+
+    __tablename__ = "tenant_job_suppressions"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "suppression_key",
+            name="uq_tenant_job_suppressions_tenant_key",
+        ),
+        Index("ix_tenant_job_suppressions_repost_group_id", "repost_group_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    suppression_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    repost_group_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    delivered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class CvUpload(Base):
     """One uploaded CV file and its security-pipeline verdict (whitepaper §05 +
     §11 controls: MIME sniffing, size/page limits, sandboxed parsing, metadata
