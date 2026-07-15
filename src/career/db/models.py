@@ -482,3 +482,308 @@ class SupportEvent(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+# ── C5 — onboarding, consents, profile, facts, policies, privacy (whitepaper §05) ──
+
+
+class OnboardingSession(Base):
+    """One onboarding journey per tenant (whitepaper §05): the 10-state FSM
+    PAID_UNCLAIMED → … → ACTIVE. Resumable at any time; a >24h stall makes it
+    reminder-eligible; «دعم» escalates from every state. ``completed_at`` is the
+    anchor the 30-day subscription countdown starts from (not payment time)."""
+
+    __tablename__ = "onboarding_sessions"
+    __table_args__ = (
+        # Exactly one journey per tenant — restarts resume, never duplicate.
+        UniqueConstraint("tenant_id", name="uq_onboarding_sessions_tenant_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    subscription_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("subscriptions.id", ondelete="CASCADE"), nullable=False
+    )
+    channel_id: Mapped[uuid.UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("customer_channels.id", ondelete="SET NULL"), nullable=True
+    )
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    state_entered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    last_interaction_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_reminder_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Cursor inside a multi-step state (e.g. which basic-data field is next).
+    context: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class ConsentEvent(Base):
+    """Append-only, purpose-scoped consent trail (whitepaper §12): granted and
+    withdrawn events both live here with timestamps — history is never edited.
+    App role gets INSERT/SELECT only (same posture as audit_events)."""
+
+    __tablename__ = "consent_events"
+    __table_args__ = (
+        Index("ix_consent_events_tenant_id_purpose", "tenant_id", "purpose"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    # basic_processing | external_providers | daily_messages | anonymous_stats
+    purpose: Mapped[str] = mapped_column(String(32), nullable=False)
+    action: Mapped[str] = mapped_column(String(16), nullable=False)  # granted | withdrawn
+    policy_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    source_inbound_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("inbound_messages.id", ondelete="SET NULL"), nullable=True
+    )
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class CustomerProfile(Base):
+    """The basic-data answers collected by buttons/lists (whitepaper §05) —
+    one row per tenant, filled progressively. cv_full_name is PII (it goes on
+    the CV); expected_salary is a per-tenant target, not a hard filter (D4).
+    Never contains national id or date of birth — by design, no columns."""
+
+    __tablename__ = "customer_profiles"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", name="uq_customer_profiles_tenant_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    cv_full_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    city: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    current_title: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    years_experience: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    notice_period_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    employment_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    willing_to_relocate: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    remote_preference: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # D4: a target number (7k/15k/…), optional and soft — never a hard gate.
+    expected_salary_sar: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    communication_language: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    requested_path: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ProfileFact(Base):
+    """One extracted/asserted fact about the customer (whitepaper §05):
+    extraction is NOT truth — only CUSTOMER_CONFIRMED / CUSTOMER_CORRECTED /
+    OPERATOR_VERIFIED facts constitute the achievement bank (§15.5). A
+    correction keeps the original payload for the audit trail."""
+
+    __tablename__ = "profile_facts"
+    __table_args__ = (
+        Index("ix_profile_facts_tenant_id_category", "tenant_id", "category"),
+        Index("ix_profile_facts_tenant_id_status", "tenant_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    # experience | education | certification | skill | achievement | language
+    category: Mapped[str] = mapped_column(String(32), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    # EXTRACTED | CUSTOMER_CONFIRMED | CUSTOMER_CORRECTED | CUSTOMER_REJECTED
+    # | OPERATOR_VERIFIED
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="EXTRACTED")
+    # cv_extraction | conversation | operator
+    source: Mapped[str] = mapped_column(String(24), nullable=False)
+    original_payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class ForbiddenClaim(Base):
+    """A claim the CV generator must never make for this tenant (§15.5):
+    customer-rejected facts land here, plus operator additions."""
+
+    __tablename__ = "forbidden_claims"
+    __table_args__ = (
+        Index("ix_forbidden_claims_tenant_id", "tenant_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    claim: Mapped[str] = mapped_column(Text, nullable=False)
+    source: Mapped[str] = mapped_column(String(24), nullable=False)  # customer_rejected | operator
+    source_fact_id: Mapped[uuid.UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("profile_facts.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class CareerPathAssessment(Base):
+    """Three-layer career-path evaluation (whitepaper §05): requested (what the
+    customer wants), suggested (what the system sees: score + strengths + gaps +
+    closest 3), approved (Primary/Secondary/Stretch with the customer's consent).
+    Insisting on a weak path sets customer_override with explicit acknowledgment."""
+
+    __tablename__ = "career_path_assessments"
+    __table_args__ = (
+        Index("ix_career_path_assessments_tenant_id", "tenant_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    requested_path: Mapped[str] = mapped_column(String(64), nullable=False)
+    # [{path, score, strengths: [], gaps: []}, …] — closest paths included.
+    suggested: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    # {primary, secondary, stretch} once the customer approves.
+    approved: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    fit_score: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    customer_override: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    override_acknowledged_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Optional agreed realistic/stretch split (~80/20) when overriding.
+    stretch_ratio_percent: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="draft")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class SearchPolicy(Base):
+    """Versioned per-tenant search policy (whitepaper §05/§06) — the gate reads
+    the active version; edits create a new version (audit + gate_policy_version
+    provenance in C6 decision logs). unknown_salary_policy defaults to
+    'balanced' (D4): unadvertised salaries are not blocked by default."""
+
+    __tablename__ = "search_policies"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "version", name="uq_search_policies_tenant_id_version"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="draft")
+    # {primary, secondary, stretch} — mirrors the approved assessment.
+    approved_paths: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    cities: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    min_salary_sar: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    unknown_salary_policy: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="balanced"
+    )
+    remote_policy: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    sectors_preferred: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    sectors_avoided: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    banned_companies: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    # Snapshot from plan_entitlements at confirmation time.
+    daily_job_limit: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class PrivacyRequest(Base):
+    """A standing privacy command (whitepaper §12): export / delete / pause /
+    stop_messages / withdraw_consent / status — fulfilled within a declared
+    deadline; financial, consent and limited security records survive deletion
+    (regulatory retention)."""
+
+    __tablename__ = "privacy_requests"
+    __table_args__ = (
+        Index("ix_privacy_requests_tenant_id_status", "tenant_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    kind: Mapped[str] = mapped_column(String(24), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="received")
+    source_inbound_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("inbound_messages.id", ondelete="SET NULL"), nullable=True
+    )
+    details: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    requested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    fulfilled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class CvUpload(Base):
+    """One uploaded CV file and its security-pipeline verdict (whitepaper §05 +
+    §11 controls: MIME sniffing, size/page limits, sandboxed parsing, metadata
+    removal, JS/embedded blocking, timeout). Bytes live in object storage via
+    StorageAdapter — never in the DB (§10); scan_findings is PII-free."""
+
+    __tablename__ = "cv_uploads"
+    __table_args__ = (
+        Index("ix_cv_uploads_tenant_id", "tenant_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    document_id: Mapped[uuid.UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("documents.id", ondelete="SET NULL"), nullable=True
+    )
+    original_filename: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    mime_detected: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    page_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    scan_status: Mapped[str] = mapped_column(String(24), nullable=False, default="received")
+    scan_findings: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    extracted_text_storage_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="received")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
