@@ -36,10 +36,10 @@ _POLICIES = {
 def _clean(session: Session) -> int:
     removed = 0
     for code in DEMO_CODES:
-        result = session.execute(
+        cursor = session.execute(
             text("DELETE FROM tenants WHERE code = :c"), {"c": code}
         )
-        removed += result.rowcount or 0
+        removed += getattr(cursor, "rowcount", 0) or 0
     return removed
 
 
