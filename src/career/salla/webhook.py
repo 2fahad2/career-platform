@@ -46,13 +46,17 @@ def _fingerprint(provider: str, event_type: str, raw_body: bytes) -> str:
 
 
 def extract_salla_order_id(payload: dict[str, object]) -> str | None:
-    """Salla order webhooks carry the order id at data.id."""
+    """Salla order webhooks usually carry the order id at data.id, but activity
+    events (e.g. order.status.updated, verified live 2026-07-15) wrap the order:
+    data.id is the activity id and the order lives at data.order.id — prefer it."""
     data = payload.get("data")
-    if isinstance(data, dict):
-        oid = data.get("id")
-        if oid is not None:
-            return str(oid)
-    return None
+    if not isinstance(data, dict):
+        return None
+    order = data.get("order")
+    if isinstance(order, dict) and order.get("id") is not None:
+        return str(order["id"])
+    oid = data.get("id")
+    return str(oid) if oid is not None else None
 
 
 def receive_webhook(
