@@ -19,6 +19,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    Identity,
     Index,
     Integer,
     Numeric,
@@ -537,6 +538,7 @@ class ConsentEvent(Base):
     __tablename__ = "consent_events"
     __table_args__ = (
         Index("ix_consent_events_tenant_id_purpose", "tenant_id", "purpose"),
+        Index("ix_consent_events_seq", "seq", unique=True),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -545,6 +547,9 @@ class ConsentEvent(Base):
     tenant_id: Mapped[uuid.UUID] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
     )
+    # Total insertion order — now() is transaction-fixed, so same-transaction
+    # events share occurred_at and need an unambiguous tie-break.
+    seq: Mapped[int] = mapped_column(BigInteger, Identity(always=True), nullable=False)
     # basic_processing | external_providers | daily_messages | anonymous_stats
     purpose: Mapped[str] = mapped_column(String(32), nullable=False)
     action: Mapped[str] = mapped_column(String(16), nullable=False)  # granted | withdrawn
