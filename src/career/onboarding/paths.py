@@ -51,6 +51,9 @@ class PathFamily:
     skill_tokens: tuple[str, ...]
     #: lowercase tokens matched against certification names.
     cert_tokens: tuple[str, ...] = ()
+    #: proper-case Arabic+English aliases used to BUILD discovery queries
+    #: (whitepaper §06 family structure) — the single query authority (D5).
+    query_aliases: tuple[str, ...] = ()
 
 
 DEFAULT_FAMILIES: tuple[PathFamily, ...] = (
@@ -60,6 +63,8 @@ DEFAULT_FAMILIES: tuple[PathFamily, ...] = (
         title_tokens=("business analyst", "business analysis", "محلل أعمال", "محلل الأعمال"),
         skill_tokens=("sql", "power bi", "requirements", "stakeholder", "bpmn", "تحليل"),
         cert_tokens=("cbap", "ccba", "pmi-pba"),
+        query_aliases=("Business Analyst", "Business Systems Analyst",
+                       "Requirements Analyst", "محلل أعمال", "محلل نظم أعمال"),
     ),
     PathFamily(
         key="project_manager",
@@ -67,6 +72,8 @@ DEFAULT_FAMILIES: tuple[PathFamily, ...] = (
         title_tokens=("project manager", "program manager", "pmo", "مدير مشاريع", "مدير مشروع"),
         skill_tokens=("project management", "agile", "scrum", "planning", "إدارة مشاريع"),
         cert_tokens=("pmp", "prince2", "capm", "psm"),
+        query_aliases=("Project Manager", "Program Manager", "PMO Manager",
+                       "مدير مشاريع", "مدير برامج"),
     ),
     PathFamily(
         key="it_operations",
@@ -75,6 +82,8 @@ DEFAULT_FAMILIES: tuple[PathFamily, ...] = (
                       "عمليات تقنية", "مدير تقنية"),
         skill_tokens=("itil", "itsm", "sla", "incident", "governance", "servicenow"),
         cert_tokens=("itil", "cobit"),
+        query_aliases=("IT Operations Manager", "IT Manager", "IT Governance Manager",
+                       "مدير عمليات تقنية المعلومات", "مدير تقنية المعلومات"),
     ),
     PathFamily(
         key="data_analyst",
@@ -82,6 +91,7 @@ DEFAULT_FAMILIES: tuple[PathFamily, ...] = (
         title_tokens=("data analyst", "bi analyst", "محلل بيانات"),
         skill_tokens=("sql", "python", "tableau", "power bi", "excel", "statistics"),
         cert_tokens=("dasca", "microsoft certified: data analyst"),
+        query_aliases=("Data Analyst", "BI Analyst", "محلل بيانات"),
     ),
     PathFamily(
         key="service_delivery",
@@ -89,6 +99,8 @@ DEFAULT_FAMILIES: tuple[PathFamily, ...] = (
         title_tokens=("service delivery", "delivery manager", "تقديم الخدمات"),
         skill_tokens=("sla", "itil", "vendor", "kpi", "operations"),
         cert_tokens=("itil",),
+        query_aliases=("Service Delivery Manager", "IT Service Delivery Manager",
+                       "مدير تقديم الخدمات"),
     ),
     PathFamily(
         key="software_engineering",
@@ -96,6 +108,7 @@ DEFAULT_FAMILIES: tuple[PathFamily, ...] = (
         title_tokens=("software engineer", "developer", "programmer", "مهندس برمجيات", "مطور"),
         skill_tokens=("java", "python", "javascript", "react", "docker", "git"),
         cert_tokens=("oca", "ocp", "aws certified developer"),
+        query_aliases=("Software Engineer", "Software Developer", "مهندس برمجيات", "مطور برمجيات"),
     ),
 )
 
