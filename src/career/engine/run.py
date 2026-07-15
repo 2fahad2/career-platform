@@ -39,7 +39,7 @@ from career.engine.ranking import RANKING_POLICY_VERSION, RankCandidate
 from career.engine.sources import (
     DiscoveredJob,
     JobSpyClient,
-    SerpApiClient,
+    SearchApiClient,
     fetch_google_jobs,
     fetch_jobspy,
 )
@@ -77,7 +77,7 @@ def _gate_policy_of(policy: SearchPolicy) -> TenantGatePolicy:
 
 def _discover(
     families: list[QueryFamily],
-    serpapi: SerpApiClient,
+    searchapi: SearchApiClient,
     jobspy_client: JobSpyClient,
     max_per_query: int,
 ) -> tuple[list[DiscoveredJob], dict[str, Any]]:
@@ -91,19 +91,19 @@ def _discover(
         skips_total: dict[str, int] = {}
         for family in families:
             family_jobs, skips = fetch_google_jobs(
-                serpapi, aliases=family.aliases, locations=family.locations,
+                searchapi, aliases=family.aliases, locations=family.locations,
                 family=family.family, max_per_query=max_per_query,
             )
             jobs.extend(family_jobs)
             fetched += len(family_jobs)
             for key, value in skips.items():
                 skips_total[key] = skips_total.get(key, 0) + value
-        sources["serpapi_google_jobs"] = {
+        sources["searchapi_google_jobs"] = {
             "status": "ok", "fetched": fetched, "skips": skips_total,
         }
     except Exception as exc:  # noqa: BLE001 — isolation is the contract (§5.2)
         logger.warning("google_jobs discovery failed", exc_info=True)
-        sources["serpapi_google_jobs"] = {
+        sources["searchapi_google_jobs"] = {
             "status": "error", "reason": type(exc).__name__,  # sanitized
         }
 
@@ -189,7 +189,7 @@ def _to_candidate(posting: JobPosting, verdict: GateVerdict) -> RankCandidate:
 def run_nightly(
     owner_session: Session,
     *,
-    serpapi: SerpApiClient,
+    searchapi: SearchApiClient,
     jobspy_client: JobSpyClient,
     fetcher: PageFetcher,
     now: datetime,
@@ -220,7 +220,7 @@ def run_nightly(
         return _finish("no_active_tenants", {})
 
     # 2) discovery — two isolated fetchers
-    jobs, sources = _discover(families, serpapi, jobspy_client, max_per_query)
+    jobs, sources = _discover(families, searchapi, jobspy_client, max_per_query)
     counts["sources"] = sources
     failed_sources = sum(1 for s in sources.values() if s["status"] == "error")
     if failed_sources == len(sources):

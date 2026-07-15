@@ -18,7 +18,7 @@ def _job(title: str = "Business Analyst", company: str = "Acme",
          url: str = "https://careers.acme.com/j/1", **kw: object) -> DiscoveredJob:
     defaults: dict[str, object] = {
         "title": title, "company": company, "url": url,
-        "source": "serpapi_google_jobs", "family": "business_analyst",
+        "source": "searchapi_google_jobs", "family": "business_analyst",
     }
     defaults.update(kw)
     return DiscoveredJob(**defaults)  # type: ignore[arg-type]

@@ -3,14 +3,16 @@
 Two production fetchers (whitepaper §06: the digest path calls exactly these,
 each isolated by the runner):
 
-- **SerpApi google_jobs**: row acceptance (title AND company required), URL
-  preference ``apply_link > share_link > related_link`` (never a Google page),
-  description assembled from job_highlights when empty, the LENIENT per-family
-  title filter (positive signal → accept; else negative pattern → reject;
-  neither → accept), and §5.4 apply-routing: aggregator landings are re-routed
-  to the best ``apply_options`` destination (ats > employer > unknown >
-  aggregator) and the canonical is structurally PROMOTED to the effective URL
-  — otherwise identity/dedupe/binding key on a rotating aggregator page.
+- **SearchAPI.io google_jobs** (provider per D13; same engine and §5.2 rules):
+  row acceptance (title AND company required), URL preference
+  ``apply_link > sharing_link`` (never a bare Google page), descriptions
+  tag-stripped (the provider returns full but HTML-bearing text — live-probed)
+  with job_highlights fallback, the LENIENT per-family title filter (positive
+  signal → accept; else negative pattern → reject; neither → accept), and
+  §5.4 apply-routing: aggregator landings are re-routed to the best
+  ``apply_links`` destination (ats > employer > unknown > aggregator) and the
+  canonical is structurally PROMOTED to the effective URL — otherwise
+  identity/dedupe/binding key on a rotating aggregator page.
 - **JobSpy (indeed only)**: 14-day window, one call with the family's aliases
   OR-joined, and the CONSERVATIVE two-tier post-filter (require hit → keep;
   reject hit → skip; a rule existed but neither matched → skip; no rule →
@@ -22,11 +24,14 @@ from Settings by the runner — never constants buried here.
 
 from __future__ import annotations
 
+import json
 import re
+import urllib.error
+import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 # ── §5.4 apply routing ───────────────────────────────────────────────────────
 
@@ -52,7 +57,7 @@ _AGGREGATOR_DOMAINS = frozenset(
         "expertini.com", "talent.com", "laimoon.com", "drjobpro.com",
         "wuzzuf.net", "tanqeeb.com", "akhtaboot.com", "rozee.pk",
         "jobrapido.com", "neuvoo.com", "jora.com", "adzuna.com",
-        "whatjobs.com", "snagajob.com",
+        "whatjobs.com", "snagajob.com", "bebee.com", "jooble.org",
     )
     for d in (base, f"www.{base}")
 )
@@ -207,11 +212,21 @@ def _passes_conservative_post_filter(title: str, family: str) -> bool:
     return False  # a rule existed but neither matched → conservative skip
 
 
-# ── SerpApi google_jobs (production digest fetcher) ──────────────────────────
+# ── SearchAPI.io google_jobs (production digest fetcher — D13) ────────────────
 
 
-class SerpApiClient(Protocol):
+class SearchApiClient(Protocol):
     def search(self, params: dict[str, Any]) -> dict[str, Any]: ...
+
+
+_HTML_TAG_RE = re.compile(r"<[^>]{0,300}>")
+_HTML_WS_RE = re.compile(r"\s+")
+
+
+def _strip_html(text: str) -> str:
+    """Live-probed: SearchAPI descriptions carry HTML tags — strip them so the
+    gate's text scoring never sees glued tokens."""
+    return _HTML_WS_RE.sub(" ", _HTML_TAG_RE.sub(" ", text)).strip()
 
 
 def _highlights_text(row: dict[str, Any]) -> str | None:
@@ -223,14 +238,18 @@ def _highlights_text(row: dict[str, Any]) -> str | None:
 
 
 def fetch_google_jobs(
-    client: SerpApiClient,
+    client: SearchApiClient,
     *,
     aliases: tuple[str, ...],
     locations: tuple[str, ...],
     family: str,
     max_per_query: int,
 ) -> tuple[list[DiscoveredJob], dict[str, int]]:
-    """Fan out aliases × locations; normalize, filter and route each row."""
+    """Fan out aliases × locations; normalize, filter and route each row.
+
+    Consumes the SearchAPI.io google_jobs shape as live-probed 16 Jul 2026:
+    root key ``jobs``; per-row ``apply_link``/``apply_links``/``sharing_link``;
+    full but HTML-bearing ``description``; ``detected_extensions.posted_at``."""
     jobs: list[DiscoveredJob] = []
     skips = {"missing_title": 0, "missing_company": 0, "missing_url": 0,
              "family_filter": 0}
@@ -242,7 +261,7 @@ def fetch_google_jobs(
                 "hl": "en",
             })
             accepted = 0
-            for row in payload.get("jobs_results") or []:
+            for row in payload.get("jobs") or []:
                 if accepted >= max_per_query:
                     break
                 title = row.get("title")
@@ -253,10 +272,7 @@ def fetch_google_jobs(
                 if not company:
                     skips["missing_company"] += 1
                     continue
-                url = (
-                    row.get("apply_link") or row.get("share_link")
-                    or row.get("related_link")
-                )
+                url = row.get("apply_link") or row.get("sharing_link")
                 if not url:
                     skips["missing_url"] += 1
                     continue
@@ -267,13 +283,16 @@ def fetch_google_jobs(
                 effective = promote_canonical_apply_url(
                     str(url), routing["canonical_apply_url"]
                 )
-                description = row.get("description") or _highlights_text(row)
+                raw_description = row.get("description") or _highlights_text(row)
                 jobs.append(
                     DiscoveredJob(
                         title=str(title), company=str(company), url=effective,
-                        source="serpapi_google_jobs", family=family,
+                        source="searchapi_google_jobs", family=family,
                         location=row.get("location"),
-                        description=description,
+                        description=(
+                            _strip_html(str(raw_description))
+                            if raw_description else None
+                        ),
                         salary_raw=row.get("salary"),
                         source_native_id=row.get("job_id"),
                         posted_at_raw=(row.get("detected_extensions") or {}).get(
@@ -286,18 +305,55 @@ def fetch_google_jobs(
     return jobs, skips
 
 
-class HttpSerpApiClient:  # pragma: no cover — wired when the SerpApi key arrives
-    """GET https://serpapi.com/search.json — filled and integration-tested once
-    the key exists (a Fahad step); no speculative untested payload code."""
+class SearchApiError(RuntimeError):
+    """Non-200 from SearchAPI.io — message carries the status only, never the
+    provider body (which may quote query/account details)."""
 
-    def __init__(self, api_key: str, timeout: float = 15.0) -> None:
+
+_SEARCHAPI_ENDPOINT = "https://www.searchapi.io/api/v1/search"
+
+
+def _urllib_opener(  # pragma: no cover — exercised live in C6's gate
+    url: str, headers: dict[str, str], timeout: float
+) -> tuple[int, bytes]:
+    request = urllib.request.Request(url, headers=headers)  # noqa: S310
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:  # noqa: S310
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, b""
+
+
+class HttpSearchApiClient:
+    """GET https://www.searchapi.io/api/v1/search with Bearer auth (D13).
+
+    Live-probed 16 Jul 2026: ``location`` accepts "Riyadh, Saudi Arabia" but
+    rejects "Remote" with a 400 — the pseudo-location becomes a remote-flavored
+    query instead, and every request is country-anchored with ``gl=sa``."""
+
+    def __init__(
+        self,
+        api_key: str,
+        timeout: float = 15.0,
+        opener: Callable[[str, dict[str, str], float], tuple[int, bytes]] | None = None,
+    ) -> None:
         self._api_key = api_key
         self._timeout = timeout
+        self._opener = opener or _urllib_opener
 
     def search(self, params: dict[str, Any]) -> dict[str, Any]:
-        raise NotImplementedError(
-            "HttpSerpApiClient is wired in C6's live step once SERPAPI_API_KEY exists"
-        )
+        query = dict(params)
+        query.setdefault("gl", "sa")
+        if query.get("location") == "Remote":
+            del query["location"]
+            query["q"] = f"{query.get('q', '')} remote".strip()
+        url = f"{_SEARCHAPI_ENDPOINT}?{urlencode(query)}"
+        headers = {"Authorization": f"Bearer {self._api_key}"}
+        status, body = self._opener(url, headers, self._timeout)
+        if status != 200:
+            raise SearchApiError(f"searchapi returned HTTP {status}")
+        result: dict[str, Any] = json.loads(body)
+        return result
 
 
 # ── JobSpy (indeed) ──────────────────────────────────────────────────────────

@@ -181,7 +181,7 @@ def test_decisions_persist_per_tenant_run_job(owner_engine: Engine) -> None:
             sql_text(
                 "INSERT INTO job_postings (id, url_identity, url, title, company, source) "
                 "VALUES (:id, :ident, 'https://careers.aramco.com/j/1', "
-                "'Senior Business Analyst', 'Saudi Aramco', 'serpapi_google_jobs')"
+                "'Senior Business Analyst', 'Saudi Aramco', 'searchapi_google_jobs')"
             ),
             {"id": posting_id, "ident": f"joburl:v1:{uuid.uuid4().hex}{uuid.uuid4().hex[:32]}"},
         )

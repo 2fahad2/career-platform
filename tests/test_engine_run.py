@@ -39,7 +39,7 @@ JOBS = [
 ]
 
 
-class FakeSerpApi:
+class FakeSearchApi:
     def __init__(self, fail: bool = False) -> None:
         self.fail = fail
         self.calls = 0
@@ -49,8 +49,8 @@ class FakeSerpApi:
         if self.fail:
             raise ConnectionError("secret-laden provider message — must not leak")
         if params["q"] == "Business Analyst" and params["location"] == RIYADH:
-            return {"jobs_results": JOBS}
-        return {"jobs_results": []}
+            return {"jobs": JOBS}
+        return {"jobs": []}
 
 
 class FakeJobSpy:
@@ -136,7 +136,7 @@ def test_two_tenants_one_pool_two_different_correct_lists(
         try:
             report = engine_run.run_nightly(
                 s,
-                serpapi=FakeSerpApi(),
+                searchapi=FakeSearchApi(),
                 jobspy_client=FakeJobSpy(),
                 fetcher=NoFetch(),
                 resolver=_resolver,
@@ -210,7 +210,7 @@ def test_a_failing_source_degrades_to_partial_with_sanitized_reason(
         s.commit()
         try:
             report = engine_run.run_nightly(
-                s, serpapi=FakeSerpApi(fail=True), jobspy_client=FakeJobSpy([
+                s, searchapi=FakeSearchApi(fail=True), jobspy_client=FakeJobSpy([
                     # probed: bare "Business Analyst" scores 63 (<70); Senior → 73
                     {"title": "Senior Business Analyst", "company": "Delta Solutions",
                      "job_url": "https://careers.delta.example/j/9",
@@ -221,7 +221,7 @@ def test_a_failing_source_degrades_to_partial_with_sanitized_reason(
             )
             run_id = str(report.run_id)
             assert report.status == "partial"
-            google = report.counts["sources"]["serpapi_google_jobs"]
+            google = report.counts["sources"]["searchapi_google_jobs"]
             assert google["status"] == "error"
             assert google["reason"] == "ConnectionError"          # class name only
             assert "secret-laden" not in json.dumps(report.counts)  # sanitized
@@ -235,7 +235,7 @@ def test_a_failing_source_degrades_to_partial_with_sanitized_reason(
 def test_no_active_tenants_is_an_honest_short_run(owner_engine: Engine) -> None:
     with Session(owner_engine) as s:
         report = engine_run.run_nightly(
-            s, serpapi=FakeSerpApi(), jobspy_client=FakeJobSpy(),
+            s, searchapi=FakeSearchApi(), jobspy_client=FakeJobSpy(),
             fetcher=NoFetch(), resolver=_resolver, now=NOW,
             tenant_ids=[uuid.uuid4()],  # nobody active
         )
@@ -257,7 +257,7 @@ def test_pool_upserts_by_identity_across_runs(owner_engine: Engine) -> None:
         try:
             for _ in range(2):
                 report = engine_run.run_nightly(
-                    s, serpapi=FakeSerpApi(), jobspy_client=FakeJobSpy(),
+                    s, searchapi=FakeSearchApi(), jobspy_client=FakeJobSpy(),
                     fetcher=NoFetch(), resolver=_resolver, now=NOW,
                     tenant_ids=[uuid.UUID(tids[0])],
                 )

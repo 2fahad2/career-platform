@@ -26,7 +26,7 @@ NOW = datetime(2026, 7, 15, 23, 30, tzinfo=UTC)
 def _candidate(
     key: str, *, salary_outcome: str = "PASS_CONFIRMED", cq: int = 95,
     role: int = 90, demoted: bool = False, company_tier: int = 1,
-    title: str = "Business Analyst", source: str = "serpapi_google_jobs",
+    title: str = "Business Analyst", source: str = "searchapi_google_jobs",
     posted_at: datetime | None = None, repost_group_id: str | None = None,
     dedupe_url_key: str | None = None,
 ) -> ranking.RankCandidate:

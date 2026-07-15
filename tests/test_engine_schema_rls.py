@@ -30,7 +30,7 @@ def _seed_pool(owner_engine: Engine) -> tuple[str, str]:
             text(
                 "INSERT INTO job_postings (id, url_identity, url, title, company, source) "
                 "VALUES (:id, :ident, 'https://ex.example/j/1', 'BA', 'Acme', "
-                "'serpapi_google_jobs')"
+                "'searchapi_google_jobs')"
             ),
             {"id": posting_id, "ident": f"joburl:v1:{uuid.uuid4().hex}{uuid.uuid4().hex}"[:75]},
         )

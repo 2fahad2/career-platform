@@ -121,7 +121,7 @@ def _seed_posting(owner: Session, url: str) -> str:
     owner.execute(
         sql_text(
             "INSERT INTO job_postings (id, url_identity, url, title, company, source) "
-            "VALUES (:id, :ident, :url, 'BA', 'Acme', 'serpapi_google_jobs')"
+            "VALUES (:id, :ident, :url, 'BA', 'Acme', 'searchapi_google_jobs')"
         ),
         {"id": posting_id, "ident": f"joburl:v1:{uuid.uuid4().hex}{uuid.uuid4().hex[:32]}",
          "url": url},

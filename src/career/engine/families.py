@@ -20,7 +20,7 @@ from career.db.models import SearchPolicy, Subscription
 from career.onboarding.paths import DEFAULT_FAMILIES, PathFamily
 from career.salla import subscriptions as sub_states
 
-#: Arabic policy city → SerpApi-style English location. Unknown cities fall
+#: Arabic policy city → SearchAPI-style English location. Unknown cities fall
 #: back to the country — an honest net, never an invented location.
 _CITY_LOCATIONS: dict[str, str] = {
     "الرياض": "Riyadh, Saudi Arabia",
