@@ -21,6 +21,8 @@ dependencies = [
     # and entity-expansion-safe XML for untrusted DOCX parts.
     "pypdf>=4.2",
     "defusedxml>=0.7",
+    # CV extraction via Claude (C5.6) — the only LLM provider (D1).
+    "anthropic>=0.40",
 ]
 
 [project.optional-dependencies]
