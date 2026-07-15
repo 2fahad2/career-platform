@@ -23,13 +23,15 @@ from career.db.models import (
     CustomerChannel,
     DeliveryMessage,
     InboundMessage,
+    OnboardingSession,
     SupportEvent,
     Tenant,
     WebhookEvent,
 )
+from career.onboarding import orchestrator
 from career.telegram import messages as admin_msg
 from career.telegram.admin import TelegramAdminClient
-from career.whatsapp.activation_flow import activate
+from career.whatsapp.activation_flow import ActivationStatus, activate
 from career.whatsapp.client import WhatsAppClient
 from career.whatsapp.delivery import descend_pending_delivery
 from career.whatsapp.inbound import InboundKind, classify_inbound
@@ -87,9 +89,19 @@ def _text_of(msg: dict[str, Any]) -> str | None:
     return raw if isinstance(raw, str) else None
 
 
+def _incomplete_journey(session: Session, tenant_id: uuid.UUID) -> OnboardingSession | None:
+    journey = session.execute(
+        select(OnboardingSession).where(OnboardingSession.tenant_id == tenant_id)
+    ).scalar_one_or_none()
+    if journey is None or journey.state == "ACTIVE":
+        return None
+    return journey
+
+
 def _handle_message(
     session: Session, msg: dict[str, Any], *,
     whatsapp_client: WhatsAppClient, admin_client: TelegramAdminClient, now: datetime,
+    onboarding: orchestrator.Deps | None = None,
 ) -> None:
     wamid = msg.get("id")
     from_phone = msg.get("from")
@@ -114,6 +126,20 @@ def _handle_message(
                 message_type=message_type, text_body=text_body,
                 classification="activation", payload=msg, now=now,
             )
+            # activation hands over to the onboarding journey (whitepaper §05)
+            if (
+                onboarding is not None
+                and result.subscription_id is not None
+                and result.status
+                in (ActivationStatus.ACTIVATED, ActivationStatus.ALREADY_LINKED)
+            ):
+                orchestrator.start_journey(
+                    session,
+                    tenant_id=uuid.UUID(result.tenant_id),
+                    subscription_id=uuid.UUID(result.subscription_id),
+                    channel_id=uuid.UUID(result.channel_id),
+                    deps=onboarding, now=now,
+                )
             session.commit()
         return
 
@@ -149,11 +175,29 @@ def _handle_message(
         session.commit()
         return
 
-    # OTHER — record, and if not opted out, this tap descends a pending delivery.
+    # OTHER — record; route to the onboarding journey when one is running,
+    # else this tap descends a pending delivery (the post-ACTIVE behavior).
     _record_inbound(session, tenant_id=channel.tenant_id, channel_id=channel.id,
                     wamid=wamid, message_type=message_type, text_body=text_body,
                     classification="other", payload=msg, now=now)
-    if not opted_out:
+    if opted_out:
+        session.commit()
+        return
+    journey = _incomplete_journey(session, channel.tenant_id) if onboarding else None
+    if onboarding is not None and journey is not None:
+        if message_type == "document":
+            document = msg.get("document", {}) or {}
+            orchestrator.handle_document(
+                session, channel_id=channel.id,
+                media_id=str(document.get("id", "")),
+                filename=document.get("filename"), deps=onboarding, now=now,
+            )
+        else:
+            orchestrator.handle_text(
+                session, channel_id=channel.id, text=text_body or "",
+                deps=onboarding, now=now,
+            )
+    else:
         descend_pending_delivery(session, channel, whatsapp_client=whatsapp_client, now=now)
     session.commit()
 
@@ -174,6 +218,7 @@ def process_pending_whatsapp(
     owner_session: Session, *,
     whatsapp_client: WhatsAppClient, admin_client: TelegramAdminClient,
     now: datetime, limit: int = 100,
+    onboarding: orchestrator.Deps | None = None,
 ) -> dict[str, int]:
     events = list(owner_session.execute(
         select(WebhookEvent)
@@ -191,7 +236,8 @@ def process_pending_whatsapp(
                 value = change.get("value", {}) or {}
                 for msg in value.get("messages", []) or []:
                     _handle_message(owner_session, msg, whatsapp_client=whatsapp_client,
-                                    admin_client=admin_client, now=now)
+                                    admin_client=admin_client, now=now,
+                                    onboarding=onboarding)
                     counts["messages"] += 1
                 for st in value.get("statuses", []) or []:
                     _handle_status(owner_session, st, now=now)

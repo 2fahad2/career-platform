@@ -37,6 +37,9 @@ class WhatsAppClient(Protocol):
     def send_interactive(
         self, to_phone: str, body: str, buttons: tuple[str, ...]
     ) -> str: ...
+    def download_media(self, media_id: str) -> tuple[bytes, str | None] | None:
+        """Fetch inbound media bytes (+ filename if known); None if unavailable."""
+        ...
 
 
 class FakeWhatsAppClient:
@@ -44,6 +47,8 @@ class FakeWhatsAppClient:
 
     def __init__(self) -> None:
         self.sent: list[SentMessage] = []
+        #: media_id -> (bytes, filename) — seed in tests for inbound documents.
+        self.media: dict[str, tuple[bytes, str | None]] = {}
         self._n = 0
 
     def _next_id(self) -> str:
@@ -82,6 +87,9 @@ class FakeWhatsAppClient:
         self.sent.append(SentMessage(to_phone, "interactive", mid, body=body, buttons=buttons))
         return mid
 
+    def download_media(self, media_id: str) -> tuple[bytes, str | None] | None:
+        return self.media.get(media_id)
+
 
 class HttpWhatsAppClient:  # pragma: no cover — wired when Meta creds arrive
     """Skeleton. Fill the payloads and POST to the Graph API once the access
@@ -116,3 +124,7 @@ class HttpWhatsAppClient:  # pragma: no cover — wired when Meta creds arrive
         self, to_phone: str, body: str, buttons: tuple[str, ...]
     ) -> str:
         return self._unimplemented()
+
+    def download_media(self, media_id: str) -> tuple[bytes, str | None] | None:
+        self._unimplemented()
+        return None
