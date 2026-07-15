@@ -1,0 +1,232 @@
+"""Source-adapter acceptance tests (LEGACY §5.2/5.3/5.4 verbatim) — before code.
+
+The apply-routing layer turns aggregator landings into canonical employer/ATS
+links (score ats > employer > unknown > aggregator), never returns None and
+never blocks a row; promotion to the effective URL fails closed. The
+google_jobs adapter enforces row acceptance (title+company), URL preference
+apply>share>related, highlights-fallback descriptions and the LENIENT family
+title filter; skip reasons are counted, never silent. The JobSpy adapter uses
+indeed-only, 14-day window, OR-joined alias expansion and the CONSERVATIVE
+two-tier post-filter; a missing optional dependency yields [] without
+breaking anything.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from career.engine import sources
+
+# ── §5.4 routing: classification, selection, fail-closed promotion ───────────
+
+
+def test_route_classification_priorities() -> None:
+    assert sources.classify_route("https://boards.greenhouse.io/acme/jobs/1")[0] == "ats"
+    assert sources.classify_route("https://careers.acme.com/jobs/1")[0] == "employer"
+    assert sources.classify_route("https://www.linkedin.com/jobs/view/1")[0] == "aggregator"
+    assert sources.classify_route("https://acme.example/positions/1")[0] == "unknown"
+    # confidence is high ONLY for ats/employer
+    assert sources.classify_route("https://jobs.acme.com/x")[1] == "high"
+    assert sources.classify_route("https://something.example/x")[1] != "high"
+
+
+def test_routing_picks_the_best_apply_option_and_never_none() -> None:
+    item = {
+        "apply_options": [
+            {"title": "LinkedIn", "link": "https://www.linkedin.com/jobs/view/9"},
+            {"title": "Employer", "link": "https://careers.acme.com/jobs/9"},
+            {"title": "ATS", "link": "https://acme.wd3.myworkdayjobs.com/en/job/9"},
+            {"title": "junk", "link": "javascript:void(0)"},
+        ]
+    }
+    routing = sources.route_apply_url(item, "https://www.bayt.com/en/job/9/")
+    assert routing["route_type"] == "ats"
+    assert routing["canonical_apply_url"] == "https://acme.wd3.myworkdayjobs.com/en/job/9"
+    assert routing["original_apply_url"] == "https://www.bayt.com/en/job/9/"
+    assert routing["route_confidence"] == "high"
+
+    # no options at all → still a verdict, never None, row never blocked
+    bare = sources.route_apply_url({}, "https://www.bayt.com/en/job/9/")
+    assert bare["route_type"] == "aggregator"
+    assert bare["canonical_apply_url"] == "https://www.bayt.com/en/job/9/"
+
+
+def test_promotion_fails_closed() -> None:
+    keep = "https://www.bayt.com/en/job/9/"
+    assert sources.promote_canonical_apply_url(keep, None) == keep
+    assert sources.promote_canonical_apply_url(keep, "") == keep
+    assert sources.promote_canonical_apply_url(keep, "ftp://x/y") == keep
+    assert sources.promote_canonical_apply_url(keep, "https://") == keep
+    assert sources.promote_canonical_apply_url(keep, 42) == keep  # type: ignore[arg-type]
+    promoted = sources.promote_canonical_apply_url(keep, "https://careers.acme.com/j/9")
+    assert promoted == "https://careers.acme.com/j/9"
+    # a usable URL is never replaced by an empty value — and never raises
+    assert sources.promote_canonical_apply_url("", "https://careers.acme.com/j") \
+        == "https://careers.acme.com/j"
+
+
+# ── google_jobs adapter ──────────────────────────────────────────────────────
+
+
+class FakeSerpApi:
+    def __init__(self, pages: dict[tuple[str, str], list[dict[str, Any]]]) -> None:
+        self.pages = pages
+        self.calls: list[dict[str, Any]] = []
+
+    def search(self, params: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append(params)
+        return {"jobs_results": self.pages.get((params["q"], params["location"]), [])}
+
+
+def _row(title: str, company: str | None = "Acme", **kw: Any) -> dict[str, Any]:
+    row: dict[str, Any] = {"title": title, "company_name": company}
+    row.update(kw)
+    return row
+
+
+def test_google_jobs_row_acceptance_and_url_preference() -> None:
+    fake = FakeSerpApi({
+        ("Business Analyst", "Saudi Arabia"): [
+            _row("Business Analyst", None),                       # no company → skip
+            _row("Business Analyst", "Acme",
+                 apply_link="https://careers.acme.com/j/1",
+                 share_link="https://share.example/1"),
+            _row("Requirements Analyst", "Beta",
+                 share_link="https://share.example/2"),           # falls to share
+            _row("BA", "Gamma"),                                  # no URL at all → skip
+        ],
+    })
+    jobs, skips = sources.fetch_google_jobs(
+        fake, aliases=("Business Analyst",), locations=("Saudi Arabia",),
+        family="business_analyst", max_per_query=5,
+    )
+    assert [j.url for j in jobs] == [
+        "https://careers.acme.com/j/1", "https://share.example/2",
+    ]
+    assert skips["missing_company"] == 1
+    assert skips["missing_url"] == 1
+
+
+def test_google_jobs_description_falls_back_to_highlights() -> None:
+    fake = FakeSerpApi({
+        ("Business Analyst", "Saudi Arabia"): [
+            _row("Business Analyst", "Acme",
+                 apply_link="https://careers.acme.com/j/2",
+                 job_highlights=[{"title": "Qualifications",
+                                  "items": ["SQL", "5 years BA experience"]}]),
+        ],
+    })
+    jobs, _ = sources.fetch_google_jobs(
+        fake, aliases=("Business Analyst",), locations=("Saudi Arabia",),
+        family="business_analyst", max_per_query=5,
+    )
+    assert "SQL" in (jobs[0].description or "")
+
+
+def test_google_jobs_lenient_family_filter() -> None:
+    """Positive signal → accept; else negative pattern → reject; NEITHER →
+    accept (lenient — §5.2)."""
+    fake = FakeSerpApi({
+        ("Business Analyst", "Saudi Arabia"): [
+            _row("Senior Business Analyst", "A", apply_link="https://c.a/1"),  # positive
+            _row("Sales Manager", "B", apply_link="https://c.b/2"),            # negative
+            _row("Transformation Consultant", "C", apply_link="https://c.c/3"),  # neither
+        ],
+    })
+    jobs, skips = sources.fetch_google_jobs(
+        fake, aliases=("Business Analyst",), locations=("Saudi Arabia",),
+        family="business_analyst", max_per_query=5,
+    )
+    assert [j.title for j in jobs] == [
+        "Senior Business Analyst", "Transformation Consultant",
+    ]
+    assert skips["family_filter"] == 1
+
+
+def test_google_jobs_fanout_and_cap() -> None:
+    rows = [
+        _row(f"Business Analyst {i}", "Acme", apply_link=f"https://c.a/{i}")
+        for i in range(10)
+    ]
+    fake = FakeSerpApi({
+        ("Business Analyst", "Riyadh, Saudi Arabia"): rows,
+        ("Business Analyst", "Saudi Arabia"): rows,
+        ("محلل أعمال", "Riyadh, Saudi Arabia"): [],
+        ("محلل أعمال", "Saudi Arabia"): [],
+    })
+    jobs, _ = sources.fetch_google_jobs(
+        fake, aliases=("Business Analyst", "محلل أعمال"),
+        locations=("Riyadh, Saudi Arabia", "Saudi Arabia"),
+        family="business_analyst", max_per_query=3,
+    )
+    assert len(fake.calls) == 4                     # aliases × locations
+    assert len(jobs) == 6                           # ≤ max_per_query per call
+    assert all(j.source == "serpapi_google_jobs" for j in jobs)
+
+
+def test_google_jobs_routing_promotes_the_effective_url() -> None:
+    fake = FakeSerpApi({
+        ("Business Analyst", "Saudi Arabia"): [
+            _row("Business Analyst", "Acme",
+                 apply_link="https://www.bayt.com/en/job/5/",
+                 apply_options=[{"link": "https://boards.greenhouse.io/acme/5"}]),
+        ],
+    })
+    jobs, _ = sources.fetch_google_jobs(
+        fake, aliases=("Business Analyst",), locations=("Saudi Arabia",),
+        family="business_analyst", max_per_query=5,
+    )
+    job = jobs[0]
+    assert job.url == "https://boards.greenhouse.io/acme/5"      # promoted
+    assert job.route["route_type"] == "ats"
+    assert job.route["original_apply_url"] == "https://www.bayt.com/en/job/5/"
+
+
+# ── JobSpy adapter ───────────────────────────────────────────────────────────
+
+
+class FakeJobSpy:
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows
+        self.calls: list[dict[str, Any]] = []
+
+    def scrape(self, **kwargs: Any) -> list[dict[str, Any]]:
+        self.calls.append(kwargs)
+        return self.rows
+
+
+def test_jobspy_settings_and_or_joined_expansion() -> None:
+    fake = FakeJobSpy([])
+    sources.fetch_jobspy(
+        fake, aliases=("Business Analyst", "Business Systems Analyst"),
+        family="business_analyst", max_results=5,
+    )
+    call = fake.calls[0]
+    assert call["site_name"] == ["indeed"]           # Glassdoor N/A, Zip geoblocked
+    assert call["hours_old"] == 336                  # 14 days
+    assert call["country_indeed"] == "Saudi Arabia"
+    assert call["search_term"] == "Business Analyst OR Business Systems Analyst"
+
+
+def test_jobspy_two_tier_conservative_post_filter() -> None:
+    rows = [
+        {"title": "Business Analyst", "company": "A", "job_url": "https://a/1"},
+        {"title": "Financial Analyst", "company": "B", "job_url": "https://b/2"},  # reject
+        {"title": "Operations Coordinator", "company": "C", "job_url": "https://c/3"},
+        # rule exists but neither require nor reject matched → conservative skip
+    ]
+    jobs, skips = sources.fetch_jobspy(
+        FakeJobSpy(rows), aliases=("Business Analyst",),
+        family="business_analyst", max_results=10,
+    )
+    assert [j.title for j in jobs] == ["Business Analyst"]
+    assert skips["post_filter"] == 2
+    assert jobs[0].source == "jobspy"
+
+
+def test_jobspy_missing_dependency_returns_empty() -> None:
+    """The real client degrades to [] when python-jobspy is not installed —
+    the optional dependency never breaks the app (LEGACY §5.3)."""
+    client = sources.PythonJobSpyClient(importer=lambda name: (_ for _ in ()).throw(ImportError))
+    assert client.scrape(search_term="x", site_name=["indeed"], results_wanted=5,
+                         hours_old=336, country_indeed="Saudi Arabia") == []
