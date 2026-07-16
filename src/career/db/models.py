@@ -487,6 +487,40 @@ class OutcomeEvent(Base):
     )
 
 
+class FunnelSession(Base):
+    """The CV-analysis product journey (§04, C8) — one row per funnel tenant;
+    deliberately separate from onboarding_sessions."""
+
+    __tablename__ = "funnel_sessions"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False, unique=True,
+    )
+    subscription_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("subscriptions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    channel_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("customer_channels.id", ondelete="CASCADE"), nullable=False,
+    )
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    context: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    report: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB(none_as_null=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class UsageEvent(Base):
     """One raw metered event (LLM call, enrichment fetch…) — append-only;
     the fuel for cost_allocations and the C9 pricing report (§14)."""

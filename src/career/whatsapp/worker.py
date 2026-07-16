@@ -135,20 +135,36 @@ def _handle_message(
                 message_type=message_type, text_body=text_body,
                 classification="activation", payload=msg, now=now,
             )
-            # activation hands over to the onboarding journey (whitepaper §05)
+            # activation hands over to the matching journey (whitepaper §05):
+            # cv_analysis plans get the funnel (§04, C8); the rest onboard.
             if (
                 onboarding is not None
                 and result.subscription_id is not None
                 and result.status
                 in (ActivationStatus.ACTIVATED, ActivationStatus.ALREADY_LINKED)
             ):
-                orchestrator.start_journey(
-                    session,
-                    tenant_id=uuid.UUID(result.tenant_id),
-                    subscription_id=uuid.UUID(result.subscription_id),
-                    channel_id=uuid.UUID(result.channel_id),
-                    deps=onboarding, now=now,
+                from career.db.models import Subscription
+                from career.funnel import flow as funnel_flow
+
+                sub = session.get(
+                    Subscription, uuid.UUID(result.subscription_id)
                 )
+                if sub is not None and sub.plan_code == "cv_analysis":
+                    funnel_flow.start_funnel(
+                        session,
+                        tenant_id=uuid.UUID(result.tenant_id),
+                        subscription_id=uuid.UUID(result.subscription_id),
+                        channel_id=uuid.UUID(result.channel_id),
+                        deps=onboarding, now=now,
+                    )
+                else:
+                    orchestrator.start_journey(
+                        session,
+                        tenant_id=uuid.UUID(result.tenant_id),
+                        subscription_id=uuid.UUID(result.subscription_id),
+                        channel_id=uuid.UUID(result.channel_id),
+                        deps=onboarding, now=now,
+                    )
             session.commit()
         return
 
@@ -190,6 +206,27 @@ def _handle_message(
                     wamid=wamid, message_type=message_type, text_body=text_body,
                     classification="other", payload=msg, now=now)
     if opted_out:
+        session.commit()
+        return
+    from career.funnel import flow as funnel_flow
+
+    funnel = (
+        funnel_flow.incomplete_funnel(session, channel.tenant_id)
+        if onboarding else None
+    )
+    if onboarding is not None and funnel is not None:
+        if message_type == "document":
+            document = msg.get("document", {}) or {}
+            funnel_flow.handle_funnel_document(
+                session, channel_id=channel.id,
+                media_id=str(document.get("id", "")),
+                filename=document.get("filename"), deps=onboarding, now=now,
+            )
+        else:
+            funnel_flow.handle_funnel_text(
+                session, channel_id=channel.id, text=text_body or "",
+                deps=onboarding, now=now,
+            )
         session.commit()
         return
     journey = _incomplete_journey(session, channel.tenant_id) if onboarding else None
