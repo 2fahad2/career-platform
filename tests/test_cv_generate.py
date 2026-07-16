@@ -268,5 +268,126 @@ def test_skills_ranked_by_jd_relevance_capped_12() -> None:
     assert len(ranked) == 12
 
 
+# ── the full tailoring composition (§1.8 call chain) ─────────────────────────
+
+
+def _three_stage_llm(rewrite: str) -> FakeLlm:
+    return FakeLlm([
+        json.dumps({"role_family": "Business Analysis", "seniority": "Senior",
+                    "match_score": 0.9, "key_requirements": ["SQL", "UAT"],
+                    "recommendation": "APPLY"}),
+        json.dumps({"experience_order": [0]}),
+        rewrite,
+    ])
+
+
+def test_tailor_cv_composes_the_documented_chain() -> None:
+    clean = (
+        "Senior business analyst with 9 years of experience delivering "
+        "regulated banking programs at Alpha Bank. PMP certified and fluent "
+        "in SQL and Power BI across requirements workshops and delivery."
+    )
+    cv = generate.tailor_cv(
+        _three_stage_llm(clean), bank=BANK,
+        current_title="Senior Business Analyst", years_experience=9,
+        job_title="Business Analyst", company="Target Corp",
+        jd_text="SQL, UAT, requirements gathering.",
+    )
+    assert cv.job_title == "Business Analyst" and cv.company == "Target Corp"
+    assert cv.tailored_summary == clean
+    assert len(cv.selected_skills) <= 12
+    assert cv.selected_experience[0].company == "Alpha Bank"
+    assert len(cv.selected_experience[0].achievements) <= 4     # paced
+    # §15.8: the tailored CV carries the PLACEHOLDER contact — the real
+    # identity is injected locally at publish time, never here
+    assert cv.master_cv.contact.name == generate.PLACEHOLDER_CONTACT["name"]
+
+
+def test_tailor_cv_survives_a_dead_llm_entirely() -> None:
+    cv = generate.tailor_cv(
+        FakeLlm([]), bank=BANK,
+        current_title="Senior Business Analyst", years_experience=9,
+        job_title="Business Analyst", company="Target Corp",
+        jd_text="SQL and requirements.",
+    )
+    assert cv.tailored_summary                            # deterministic base
+    assert cv.selected_experience                         # rule-ranked
+
+
+def test_tailor_cv_blocks_on_summary_quality() -> None:
+    dangling = (
+        "Senior Business Analyst with 9 years of experience across Alpha "
+        "Bank. Certified: PMP. Core strengths include SQL, Power BI and"
+    )
+    try:
+        generate.tailor_cv(
+            _three_stage_llm(dangling), bank=BANK,
+            current_title="Senior Business Analyst", years_experience=9,
+            job_title="BA", company="X", jd_text="",
+        )
+        raise AssertionError("expected TailoringBlocked")
+    except generate.TailoringBlocked as exc:
+        assert str(exc) in ("summary_incomplete_terminal",
+                            "summary_dangling_connector")
+
+
+# ── the real client shape (injected fake SDK — zero network) ─────────────────
+
+
+class _FakeBlock:
+    def __init__(self, type_: str, text: str) -> None:
+        self.type = type_
+        self.text = text
+
+
+class _FakeResponse:
+    def __init__(self, text: str, stop_reason: str = "end_turn") -> None:
+        self.stop_reason = stop_reason
+        self.content = [_FakeBlock("text", text)]
+
+
+class _FakeSdk:
+    def __init__(self, response: _FakeResponse) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.messages = self
+
+    def create(self, **kwargs: Any) -> _FakeResponse:
+        self.calls.append(kwargs)
+        return self._response
+
+    def __call__(self) -> None:  # pragma: no cover
+        raise AssertionError
+
+    @property
+    def _response(self) -> _FakeResponse:
+        return self.__dict__["response"]
+
+
+def test_anthropic_client_request_shape() -> None:
+    sdk = _FakeSdk.__new__(_FakeSdk)
+    sdk.calls = []
+    sdk.messages = sdk
+    sdk.__dict__["response"] = _FakeResponse("hello")
+    client = generate.AnthropicLlmClient(client=sdk)
+    assert client.complete("prompt text") == "hello"
+    call = sdk.calls[0]
+    assert call["model"] == "claude-opus-4-8"
+    assert call["thinking"] == {"type": "adaptive"}
+    assert call["messages"] == [{"role": "user", "content": "prompt text"}]
+
+
+def test_anthropic_client_rejects_truncation() -> None:
+    sdk = _FakeSdk.__new__(_FakeSdk)
+    sdk.calls = []
+    sdk.messages = sdk
+    sdk.__dict__["response"] = _FakeResponse("partial", stop_reason="max_tokens")
+    client = generate.AnthropicLlmClient(client=sdk)
+    try:
+        client.complete("prompt")
+        raise AssertionError("expected GenerationFailed")
+    except generate.GenerationFailed as exc:
+        assert "max_tokens" in str(exc)
+
+
 def _no_pii_probe(value: Any) -> None:  # silence vulture-style unused warnings
     assert value is not None

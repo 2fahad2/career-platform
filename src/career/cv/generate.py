@@ -21,6 +21,7 @@ from career.cv.prompts import (
     JOB_ANALYSIS_PROMPT,
     SUMMARY_HUMANIZATION_PROMPT,
 )
+from career.cv.schemas import TailoredCV
 
 logger = logging.getLogger("career.cv")
 
@@ -399,3 +400,132 @@ def rank_skills(skills: list[str], *, jd_text: str, cap: int = 12) -> list[str]:
         dict.fromkeys(skills), key=lambda s: -score(s)
     )
     return ranked[:cap]
+
+
+# ── the full tailoring composition (§1.8 call chain, D6 sources) ─────────────
+
+#: §15.8: generation never sees the customer's identity — the real contact is
+#: injected locally at publish time (C7.4), far downstream of every LLM call.
+PLACEHOLDER_CONTACT: dict[str, str] = {
+    "name": "CANDIDATE",
+    "email": "candidate@example.com",
+    "phone": "+000000000000",
+    "location": "Riyadh, Saudi Arabia",
+}
+
+
+class TailoringBlocked(Exception):
+    """The §1.6 summary gate refused the CV before any file was written."""
+
+
+class GenerationFailed(Exception):
+    """The LLM transport failed in a way the caller must see honestly."""
+
+
+def tailor_cv(
+    llm: LlmClient,
+    *,
+    bank: dict[str, list[dict[str, Any]]],
+    current_title: str | None,
+    years_experience: int | None,
+    job_title: str,
+    company: str,
+    jd_text: str,
+    budget: BudgetGuard | None = None,
+) -> TailoredCV:
+    """The §1.8 chain: analyze → rank → pace → skills → variant → humanize →
+    enforce → the §1.6 gate. Every LLM stage degrades to rules; the PDF look
+    is identical either way because template + caps are deterministic."""
+    from career.cv import enforce, normalize
+    from career_core.sentences import validate_summary_quality
+
+    vocabulary = bank_vocabulary(bank)
+    analysis = analyze_job(
+        llm, job_title=job_title, company=company, jd_text=jd_text,
+        budget=budget,
+    )
+    key_requirements = list(analysis.get("key_requirements") or [])
+    jd_keywords = tuple(
+        {*(k.lower() for k in key_requirements), *_tokens(jd_text)}
+    )
+
+    base = base_summary(
+        bank=bank, current_title=current_title,
+        years_experience=years_experience, jd_keywords=jd_keywords,
+    )
+    master = normalize.build_master_cv(
+        contact=PLACEHOLDER_CONTACT, bank=bank,
+        headline=current_title, summary=base,
+    )
+
+    entries_payload = [
+        {"title": e.title, "company": e.company,
+         "achievements": e.achievements, "technologies": e.technologies}
+        for e in master.experience
+    ]
+    order = rank_experience(
+        llm, entries=entries_payload, job_title=job_title, company=company,
+        jd_text=jd_text, key_requirements=key_requirements, budget=budget,
+    )
+    selected = [master.experience[i] for i in order]
+
+    summary = humanize_summary(
+        llm, original=base, vocabulary=vocabulary, job_title=job_title,
+        company=company, key_requirements=key_requirements, jd_text=jd_text,
+        budget=budget,
+    )
+
+    cv = TailoredCV(
+        master_cv=master,
+        job_title=job_title,
+        company=company,
+        tailored_summary=summary,
+        selected_experience=selected,
+        selected_skills=rank_skills(master.skills, jd_text=jd_text, cap=12),
+        modifications=f"tailored for {job_title} @ {company}",
+    )
+    cv = enforce.enforce_one_page(cv, jd_keywords=jd_keywords)
+
+    ok, reason = validate_summary_quality(cv.tailored_summary)
+    if not ok:
+        raise TailoringBlocked(str(reason))   # blocks BEFORE any file (§1.6)
+    return cv
+
+
+# ── the real Claude client (D1 — injectable, mirrors C5.6's proven shape) ────
+
+_MODEL = "claude-opus-4-8"
+_MAX_TOKENS = 2048
+
+
+class AnthropicLlmClient:
+    """Claude-only transport (D1). SDK client injectable — tests exercise the
+    exact request shape with zero network; retries are the SDK's built-in."""
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        client: Any | None = None,
+        model: str = _MODEL,
+    ) -> None:
+        if client is None:  # pragma: no cover — exercised live by the canary
+            import anthropic
+
+            client = anthropic.Anthropic(api_key=api_key)
+        self._client = client
+        self._model = model
+
+    def complete(self, prompt: str) -> str:
+        response = self._client.messages.create(
+            model=self._model,
+            max_tokens=_MAX_TOKENS,
+            thinking={"type": "adaptive"},
+            messages=[{"role": "user", "content": prompt}],
+        )
+        if response.stop_reason != "end_turn":
+            raise GenerationFailed(f"stop_reason:{response.stop_reason}")
+        for block in response.content:
+            candidate = getattr(block, "text", None)
+            if getattr(block, "type", "") == "text" and isinstance(candidate, str):
+                return candidate
+        raise GenerationFailed("no_text_block")
