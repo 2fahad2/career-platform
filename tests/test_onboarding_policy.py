@@ -80,7 +80,8 @@ def test_draft_policy_derives_from_profile_paths_and_plan(
         assert draft.approved_paths == {
             "primary": "business_analyst", "secondary": "it_operations", "stretch": None,
         }
-        assert draft.cities == {"cities": ["الرياض"], "willing_to_relocate": True}
+        assert draft.cities == {"cities": ["الرياض"], "region": None,
+                                "willing_to_relocate": True}
         assert draft.min_salary_sar == Decimal("12000")
         assert draft.unknown_salary_policy == "balanced"  # D4 default
         assert draft.remote_policy == "hybrid"

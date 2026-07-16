@@ -125,10 +125,11 @@ def test_full_journey_from_activation_to_active(
         assert "اختياري" in _last_sent(deps)  # anonymous_stats presented last
         m = _say(s, deps, channel_id, "لا أوافق", m)  # optional refusal is fine
 
-        # ── the eleven questions ─────────────────────────────────────────────
+        # ── the fourteen questions (CHANGELOG v1.1 §9 expansion) ─────────────
         assert "الاسم" in _last_sent(deps)
         answers = [
-            "Fahad Almulhim", "riyadh", "Senior Business Analyst", "9",
+            "Fahad Almulhim", "fahad@example.com", "linkedin.com/in/fahad-x",
+            "riyadh", "riyadh_region", "Senior Business Analyst", "9",
             "one_month", "full_time", "yes", "hybrid", "12000", "ar",
             "محلل أعمال",
         ]
@@ -212,7 +213,7 @@ def test_journey_is_resumable_mid_questions(two_tenants: tuple[str, str], tmp_pa
     deps2 = _deps(tmp_path)
     with tenant_session(a) as s:
         _say(s, deps2, channel_id, "مرحبا؟", 60)
-    assert "مدينة" in _last_sent(deps2)  # city question — exactly where we left
+    assert "بريد" in _last_sent(deps2)  # email question — exactly where we left
 
 
 def test_invalid_answer_reprompts_in_arabic_without_advancing(
@@ -233,7 +234,7 @@ def test_invalid_answer_reprompts_in_arabic_without_advancing(
         _say(s, deps, channel_id, "فهد الملحم", 5)  # Arabic name → invalid
         assert "بالإنجليزية" in _last_sent(deps)
         _say(s, deps, channel_id, "Fahad Almulhim", 6)  # now accepted
-        assert "مدينة" in _last_sent(deps)
+        assert "بريد" in _last_sent(deps)
 
 
 def test_required_consent_refusal_explains_and_does_not_advance(
@@ -309,7 +310,8 @@ def test_correction_subflow_stores_customer_text(
         for i in range(3):
             _say(s, deps, channel_id, "أوافق", i + 1)
         _say(s, deps, channel_id, "لا أوافق", 4)
-        answers = ["Fahad Almulhim", "riyadh", "Senior BA", "9", "one_month",
+        answers = ["Fahad Almulhim", "fahad@example.com", "__skip__",
+                   "riyadh", "eastern", "Senior BA", "9", "one_month",
                    "full_time", "yes", "hybrid", "12000", "ar", "محلل أعمال"]
         for i, answer in enumerate(answers):
             _say(s, deps, channel_id, answer, 5 + i)

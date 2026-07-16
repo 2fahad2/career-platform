@@ -580,6 +580,10 @@ class CustomerProfile(Base):
         PGUUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
     )
     cv_full_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # CHANGELOG v1.1 §9: CV contact line + region-aware location matching.
+    email: Mapped[str | None] = mapped_column(String(254), nullable=True)
+    linkedin_url: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    region: Mapped[str | None] = mapped_column(String(64), nullable=True)
     city: Mapped[str | None] = mapped_column(String(64), nullable=True)
     current_title: Mapped[str | None] = mapped_column(String(128), nullable=True)
     years_experience: Mapped[int | None] = mapped_column(Integer, nullable=True)

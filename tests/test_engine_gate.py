@@ -204,6 +204,18 @@ def test_country_level_location_is_doubt_not_a_block() -> None:
     assert gate.evaluate(policy, _posting(location="Jeddah, Saudi Arabia")).decision == "BLOCK"
 
 
+def test_region_equivalence_matches_province_level_postings() -> None:
+    """CHANGELOG v1.1 §9: live postings say «Eastern Province», not the city —
+    the collected region closes that gap; a wrong region still blocks."""
+    dammam = _policy(cities_ar=("الدمام",), region_ar="الشرقية")
+    assert gate.evaluate(dammam, _posting(location="Eastern Province")).decision == "PASS"
+    assert gate.evaluate(dammam, _posting(location="Dhahran")).decision == "PASS"
+    riyadh = _policy(region_ar="الرياض")                 # cities الرياض
+    assert gate.evaluate(riyadh, _posting(location="Eastern Province")).decision == "BLOCK"
+    # region absent → behavior unchanged
+    assert gate.evaluate(_policy(), _posting(location="Eastern Province")).decision == "BLOCK"
+
+
 def test_anywhere_location_is_remote(scope: None = None) -> None:
     """Live lesson: SearchAPI marks remote jobs location='Anywhere'."""
     hybrid = _policy()                               # remote_policy=hybrid

@@ -65,6 +65,20 @@ _SALARY_STATUS = {
 _SLOT_WEIGHTS = {"primary": 30, "secondary": 24, "stretch": 18}
 
 #: Arabic policy city ↔ English job-ad city (lowercase compare tokens).
+#: Region-level equivalence (CHANGELOG v1.1 §9): live postings often carry
+#: the administrative region («Eastern Province») instead of a city.
+_REGION_EQUIV: dict[str, tuple[str, ...]] = {
+    "الرياض": ("riyadh province", "riyadh region", "منطقة الرياض"),
+    "مكة المكرمة": ("makkah province", "makkah region", "منطقة مكة"),
+    "الشرقية": ("eastern province", "eastern region", "الشرقية", "المنطقة الشرقية"),
+    "المدينة المنورة": ("madinah province", "madinah region", "منطقة المدينة"),
+    "القصيم": ("qassim", "القصيم"),
+    "عسير": ("asir", "عسير"),
+    "تبوك": ("tabuk", "تبوك"),
+    "حائل": ("hail", "حائل"),
+    "جازان": ("jazan", "jizan", "جازان"),
+}
+
 _CITY_EQUIV: dict[str, tuple[str, ...]] = {
     "الرياض": ("riyadh", "الرياض"),
     "جدة": ("jeddah", "جدة"),
@@ -85,6 +99,7 @@ class TenantGatePolicy:
     min_salary_sar: float | None
     unknown_salary_policy: str  # strict | balanced | wide
     daily_job_limit: int | None
+    region_ar: str | None = None  # CHANGELOG v1.1 §9
 
 
 @dataclass(frozen=True)
@@ -151,6 +166,12 @@ def _location_verdict(policy: TenantGatePolicy, location: str | None) -> tuple[s
         for token in _CITY_EQUIV.get(city_ar, (city_ar.lower(),)):
             if token in loc_l:
                 return "PASS", f"city:{city_ar}"
+    if policy.region_ar:
+        for token in _REGION_EQUIV.get(
+            policy.region_ar, (policy.region_ar.lower(),)
+        ):
+            if token in loc_l:
+                return "PASS", f"region:{policy.region_ar}"
     if policy.willing_to_relocate:
         return "PASS", "relocation_ok"
     return "BLOCK", f"location_mismatch:{location}"

@@ -68,6 +68,7 @@ def _gate_policy_of(policy: SearchPolicy) -> TenantGatePolicy:
         approved_paths=dict(policy.approved_paths or {}),
         cities_ar=tuple(cities),
         willing_to_relocate=bool((policy.cities or {}).get("willing_to_relocate")),
+        region_ar=(policy.cities or {}).get("region"),
         remote_policy=policy.remote_policy,
         min_salary_sar=float(policy.min_salary_sar) if policy.min_salary_sar else None,
         unknown_salary_policy=policy.unknown_salary_policy,

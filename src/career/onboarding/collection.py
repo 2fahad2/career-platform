@@ -76,6 +76,23 @@ QUESTIONS: tuple[Question, ...] = (
         kind="text",
     ),
     Question(
+        key="email",
+        prompt_ar=(
+            "وش بريدك الإلكتروني؟ (يظهر في سيرتك الذاتية "
+            "ويتواصل عليه أصحاب العمل)"
+        ),
+        kind="text",
+    ),
+    Question(
+        key="linkedin_url",
+        prompt_ar=(
+            "رابط حسابك في LinkedIn؟ (يظهر على سيرتك — "
+            "أرسل الرابط أو اسم المستخدم، أو تخطَّ إن ما عندك حساب)"
+        ),
+        kind="text",
+        skippable=True,
+    ),
+    Question(
         key="city",
         prompt_ar="في أي مدينة تسكن؟",
         kind="list",
@@ -86,6 +103,26 @@ QUESTIONS: tuple[Question, ...] = (
             Option("makkah", "مكة المكرمة", "مكة المكرمة"),
             Option("madinah", "المدينة المنورة", "المدينة المنورة"),
             Option("other", "مدينة أخرى (اكتبها)", None),
+        ),
+    ),
+    Question(
+        key="region",
+        prompt_ar=(
+            "وش منطقتك الإدارية؟ (تساعدنا نطابق الإعلانات اللي تذكر "
+            "المنطقة بدل المدينة)"
+        ),
+        kind="list",
+        options=(
+            Option("riyadh_region", "منطقة الرياض", "الرياض"),
+            Option("makkah_region", "منطقة مكة المكرمة", "مكة المكرمة"),
+            Option("eastern", "المنطقة الشرقية", "الشرقية"),
+            Option("madinah_region", "منطقة المدينة المنورة", "المدينة المنورة"),
+            Option("qassim", "منطقة القصيم", "القصيم"),
+            Option("asir", "منطقة عسير", "عسير"),
+            Option("tabuk", "منطقة تبوك", "تبوك"),
+            Option("hail", "منطقة حائل", "حائل"),
+            Option("jazan", "منطقة جازان", "جازان"),
+            Option("other", "منطقة أخرى (اكتبها)", None),
         ),
     ),
     Question(
@@ -226,6 +263,40 @@ def parse_answer(key: str, raw: str) -> Any:
             raise AnswerInvalid("اكتب اسمك الكامل بالأحرف الإنجليزية من فضلك.")
         return text
 
+    if key == "email":
+        candidate = text.lower()
+        if _ARABIC_SCRIPT.search(candidate) or not re.fullmatch(
+            r"[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}", candidate
+        ):
+            raise AnswerInvalid(
+                "اكتب بريدًا إلكترونيًا صحيحًا بالأحرف الإنجليزية "
+                "(مثال: fahad@example.com)."
+            )
+        return candidate
+
+    if key == "linkedin_url":
+        candidate = text.strip().rstrip("/")
+        if _ARABIC_SCRIPT.search(candidate) or len(candidate) > 200:
+            raise AnswerInvalid(
+                "أرسل رابط حسابك في LinkedIn (مثال: linkedin.com/in/fahad) "
+                "أو اضغط «تخطّي»."
+            )
+        match = re.search(
+            r"(?:^|/)in/([A-Za-z0-9\-_.%]{2,100})$", candidate
+        ) or (
+            re.fullmatch(r"[A-Za-z0-9\-_.%]{2,100}", candidate)
+            if "/" not in candidate and "." not in candidate
+            else None
+        )
+        if not match:
+            raise AnswerInvalid(
+                "الرابط غير واضح — أرسل رابط ملفك الشخصي "
+                "(مثال: linkedin.com/in/fahad) أو اسم المستخدم فقط، "
+                "أو اضغط «تخطّي»."
+            )
+        handle = match.group(1) if match.groups() else match.group(0)
+        return f"linkedin.com/in/{handle}"
+
     if key == "city":
         chosen = _option_value(q, text)
         if chosen is not _MISSING and chosen is not None:
@@ -233,6 +304,14 @@ def parse_answer(key: str, raw: str) -> Any:
         if 2 <= len(text) <= 64 and text != "other":
             return text  # free-text city ("أخرى")
         raise AnswerInvalid("اختر مدينتك من القائمة أو اكتب اسمها.")
+
+    if key == "region":
+        chosen = _option_value(q, text)
+        if chosen is not _MISSING and chosen is not None:
+            return chosen
+        if 2 <= len(text) <= 64 and text != "other":
+            return text  # free-text region ("أخرى")
+        raise AnswerInvalid("اختر منطقتك من القائمة أو اكتب اسمها.")
 
     if key == "current_title":
         if not (2 <= len(text) <= 128):

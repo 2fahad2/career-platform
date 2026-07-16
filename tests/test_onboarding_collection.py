@@ -22,7 +22,10 @@ from career.onboarding import collection
 
 EXPECTED_KEYS = [
     "cv_full_name",
+    "email",
+    "linkedin_url",
     "city",
+    "region",
     "current_title",
     "years_experience",
     "notice_period_days",
@@ -35,7 +38,8 @@ EXPECTED_KEYS = [
 ]
 
 
-def test_questions_cover_the_ten_documented_fields_in_order() -> None:
+def test_questions_cover_the_documented_fields_in_order() -> None:
+    """The §05 list as expanded by CHANGELOG v1.1 §9 (email/LinkedIn/region)."""
     assert [q.key for q in collection.QUESTIONS] == EXPECTED_KEYS
 
 
@@ -56,9 +60,43 @@ def test_interactive_questions_have_options_and_text_ones_do_not() -> None:
             assert q.kind == "text"
 
 
-def test_only_the_salary_question_is_skippable() -> None:
+def test_only_linkedin_and_salary_are_skippable() -> None:
     skippable = [q.key for q in collection.QUESTIONS if q.skippable]
-    assert skippable == ["expected_salary_sar"]
+    assert skippable == ["linkedin_url", "expected_salary_sar"]
+
+
+def test_email_validation() -> None:
+    assert collection.parse_answer("email", " Fahad@Example.COM ") == "fahad@example.com"
+    for bad in ("not-an-email", "a@b", "فهد@مثال.سعودية", "a b@c.com", ""):
+        with pytest.raises(collection.AnswerInvalid):
+            collection.parse_answer("email", bad)
+
+
+def test_linkedin_normalizes_every_common_shape() -> None:
+    expected = "linkedin.com/in/fahad-x"
+    for raw in (
+        "https://www.linkedin.com/in/fahad-x",
+        "http://linkedin.com/in/fahad-x/",
+        "www.linkedin.com/in/fahad-x",
+        "linkedin.com/in/fahad-x",
+        "sa.linkedin.com/in/fahad-x",
+        "fahad-x",                              # bare handle
+        "in/fahad-x",
+    ):
+        assert collection.parse_answer("linkedin_url", raw) == expected, raw
+    assert collection.parse_answer("linkedin_url", collection.SKIP) is None
+    for bad in ("https://twitter.com/x", "linkedin.com/company/acme",
+                "حسابي بالعربي", "a" * 300):
+        with pytest.raises(collection.AnswerInvalid):
+            collection.parse_answer("linkedin_url", bad)
+
+
+def test_region_accepts_option_and_free_text() -> None:
+    assert collection.parse_answer("region", "eastern") == "الشرقية"
+    assert collection.parse_answer("region", "riyadh_region") == "الرياض"
+    assert collection.parse_answer("region", "الجوف") == "الجوف"  # free text
+    with pytest.raises(collection.AnswerInvalid):
+        collection.parse_answer("region", "x")
 
 
 def test_every_question_has_arabic_prompt() -> None:

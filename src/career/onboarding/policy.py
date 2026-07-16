@@ -97,6 +97,7 @@ def build_draft_policy(session: Session, *, tenant_id: uuid.UUID) -> SearchPolic
         approved_paths=dict(assessment.approved),
         cities={
             "cities": [profile.city] if profile.city else [],
+            "region": profile.region,  # CHANGELOG v1.1 §9 — gate matching
             "willing_to_relocate": bool(profile.willing_to_relocate),
         },
         min_salary_sar=profile.expected_salary_sar,  # D4: soft target, not a gate
