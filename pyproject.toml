@@ -23,9 +23,20 @@ dependencies = [
     "defusedxml>=0.7",
     # CV extraction via Claude (C5.6) — the only LLM provider (D1).
     "anthropic>=0.40",
+    # CV rendering (C7.1): v5 template via Jinja (autoescape) + WeasyPrint;
+    # EmailStr needs the email extra. System deps: libpango + Liberation/DejaVu
+    # fonts (pinned in the Docker image / host for deterministic layout).
+    "jinja2>=3.1",
+    "weasyprint>=62",
+    "email-validator>=2.0",
 ]
 
 [project.optional-dependencies]
+# Discovery engine extra (C6): jobspy is optional by design — the adapter
+# degrades to [] without it (§5.3). Installed on the nightly-runner host.
+engine = [
+    "python-jobspy>=1.1.80",
+]
 dev = [
     "pytest>=8.2",
     "pytest-asyncio>=0.23",
@@ -54,12 +65,21 @@ select = ["E", "F", "I", "UP", "B", "S"]
 [tool.ruff.lint.per-file-ignores]
 # Tests use assert, hardcoded fake secrets, and build SQL from fixed table names.
 "tests/*" = ["S101", "S105", "S106", "S608"]
+# Machine-extracted byte-verbatim templates (LEGACY §1.2/§1.7) — the strings
+# are one line each by construction and must not be reflowed.
+"src/career/cv/template.py" = ["E501"]
 
 [tool.mypy]
 python_version = "3.11"
 strict = true
 mypy_path = "src"
 packages = ["career", "career_core"]
+
+[[tool.mypy.overrides]]
+# WeasyPrint ships no type stubs; its two call sites are wrapped in our own
+# typed functions (render_cv_pdf / render_cover_letter_pdf).
+module = "weasyprint.*"
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
