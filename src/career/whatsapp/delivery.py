@@ -8,6 +8,7 @@ logged in delivery_messages for the delivery receipts.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import date, datetime
 from typing import Any
@@ -21,10 +22,13 @@ from career.whatsapp.client import WhatsAppClient
 from career.whatsapp.templates import TemplateSpec
 from career.whatsapp.window import window_state
 
+logger = logging.getLogger("career.whatsapp")
+
 DELIVERY_PENDING = "PENDING_WINDOW"
 DELIVERY_OPENED = "OPENED"
 DELIVERY_COMPLETED = "COMPLETED"
 DELIVERY_NO_SEND = "NO_SEND"
+DELIVERY_PARTIAL = "PARTIAL"      # some job groups failed — honest, never hidden
 
 
 def record_out(
@@ -66,6 +70,80 @@ def _send_bundle_parts(
                        kind="document", wa_message_id=mid, delivery_id=delivery.id, now=now)
 
 
+def _send_grouped_bundle(
+    session: Session, channel: CustomerChannel, delivery: Delivery,
+    *, whatsapp_client: WhatsAppClient, now: datetime,
+) -> tuple[list[str], list[str]]:
+    """C7 job bundles (§08): header, then per job its card followed by ITS
+    document. A failing card skips its OWN document only; a sent card whose
+    document fails marks the JOB failed (a missing CV is never success);
+    one job's failure never aborts its siblings. Returns
+    (delivered_groups, failed_groups)."""
+    delivered: list[str] = []
+    failed: list[str] = []
+
+    header = delivery.bundle.get("header")
+    if header:
+        try:
+            mid = whatsapp_client.send_text(channel.phone_e164, header)
+            record_out(session, tenant_id=channel.tenant_id, channel_id=channel.id,
+                       kind="text", wa_message_id=mid, delivery_id=delivery.id,
+                       now=now)
+        except Exception:  # noqa: BLE001 — header failure ≠ job failures
+            logger.warning("bundle header send failed", exc_info=True)
+
+    for entry in delivery.bundle.get("jobs", []):
+        group = str(entry.get("group", ""))
+        card = entry.get("card") or {}
+        document = entry.get("document") or {}
+        try:
+            mid = whatsapp_client.send_text(channel.phone_e164, card["body"])
+            record_out(session, tenant_id=channel.tenant_id, channel_id=channel.id,
+                       kind="text", wa_message_id=mid, delivery_id=delivery.id,
+                       now=now)
+        except Exception:  # noqa: BLE001 — card failed → document not attempted
+            logger.warning("job card send failed", exc_info=True)
+            failed.append(group)
+            continue
+        try:
+            mid = whatsapp_client.send_document(
+                channel.phone_e164, document["ref"],
+                filename=document.get("filename", "cv.pdf"),
+                caption=document.get("caption", ""),
+            )
+            record_out(session, tenant_id=channel.tenant_id, channel_id=channel.id,
+                       kind="document", wa_message_id=mid, delivery_id=delivery.id,
+                       now=now)
+        except Exception:  # noqa: BLE001 — card without its CV = job FAILED
+            logger.warning("job document send failed", exc_info=True)
+            failed.append(group)
+            continue
+        delivered.append(group)
+    return delivered, failed
+
+
+def _dispatch_bundle(
+    session: Session, channel: CustomerChannel, delivery: Delivery,
+    *, whatsapp_client: WhatsAppClient, now: datetime,
+) -> None:
+    """Send the held bundle and set the HONEST final status."""
+    if delivery.bundle.get("grouped"):
+        delivered, failed = _send_grouped_bundle(
+            session, channel, delivery, whatsapp_client=whatsapp_client, now=now
+        )
+        delivery.bundle = {
+            **delivery.bundle,
+            "results": {"delivered": delivered, "failed": failed},
+        }
+        delivery.status = DELIVERY_COMPLETED if not failed else DELIVERY_PARTIAL
+    else:
+        _send_bundle_parts(
+            session, channel, delivery, whatsapp_client=whatsapp_client, now=now
+        )
+        delivery.status = DELIVERY_COMPLETED
+    delivery.completed_at = now
+
+
 def deliver_adaptive(
     session: Session, channel: CustomerChannel, bundle: dict[str, Any],
     *, run_date: date, whatsapp_client: WhatsAppClient, daily_template: TemplateSpec,
@@ -86,9 +164,8 @@ def deliver_adaptive(
     if action is DeliveryAction.SKIP_OPTED_OUT:
         delivery.status = DELIVERY_NO_SEND
     elif action is DeliveryAction.SEND_DIRECT:
-        _send_bundle_parts(session, channel, delivery, whatsapp_client=whatsapp_client, now=now)
-        delivery.status = DELIVERY_COMPLETED
-        delivery.completed_at = now
+        _dispatch_bundle(session, channel, delivery,
+                         whatsapp_client=whatsapp_client, now=now)
     else:  # SEND_TEMPLATE_THEN_WAIT
         mid = whatsapp_client.send_template(
             channel.phone_e164, daily_template.name, daily_template.language,
@@ -115,7 +192,6 @@ def descend_pending_delivery(
     if delivery is None:
         return None
     delivery.opened_at = now
-    _send_bundle_parts(session, channel, delivery, whatsapp_client=whatsapp_client, now=now)
-    delivery.status = DELIVERY_COMPLETED
-    delivery.completed_at = now
+    _dispatch_bundle(session, channel, delivery,
+                     whatsapp_client=whatsapp_client, now=now)
     return delivery

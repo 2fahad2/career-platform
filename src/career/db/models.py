@@ -459,6 +459,34 @@ class InboundMessage(Base):
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class OutcomeEvent(Base):
+    """The customer's «قدّمت/تجاهل» feedback on a delivered job (whitepaper
+    §08/§14) — append-only measurement fuel; never rewritten."""
+
+    __tablename__ = "outcome_events"
+    __table_args__ = (
+        Index("ix_outcome_events_tenant_id_occurred_at", "tenant_id", "occurred_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    delivery_id: Mapped[uuid.UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("deliveries.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    job_ref: Mapped[str] = mapped_column(Text, nullable=False)
+    outcome: Mapped[str] = mapped_column(String(16), nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class SupportEvent(Base):
     """A 'support' escalation to the admin channel (whitepaper §08)."""
 
