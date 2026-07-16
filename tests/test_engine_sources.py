@@ -262,6 +262,88 @@ def test_http_client_fails_loudly_and_body_free_on_non_200() -> None:
         assert "quota" not in str(exc)                 # provider body never quoted
 
 
+def test_http_client_retries_transient_transport_errors() -> None:
+    """Live lesson (16 Jul): the provider has latency windows past any sane
+    timeout — one retry with a pause rides them out."""
+    calls: list[str] = []
+
+    def flaky(url: str, headers: dict[str, str], timeout: float) -> tuple[int, bytes]:
+        calls.append(url)
+        if len(calls) == 1:
+            raise TimeoutError("read timed out")
+        return 200, b'{"jobs": []}'
+
+    naps: list[float] = []
+    client = sources.HttpSearchApiClient(
+        "k", opener=flaky, sleeper=naps.append
+    )
+    assert client.search({"engine": "google_jobs", "q": "BA"}) == {"jobs": []}
+    assert len(calls) == 2
+    assert naps                                     # backed off between tries
+
+
+def test_http_client_gives_up_after_retries_with_the_real_error() -> None:
+    def dead(url: str, headers: dict[str, str], timeout: float) -> tuple[int, bytes]:
+        raise TimeoutError("read timed out")
+
+    client = sources.HttpSearchApiClient(
+        "k", opener=dead, retries=2, sleeper=lambda s: None
+    )
+    try:
+        client.search({"engine": "google_jobs", "q": "BA"})
+        raise AssertionError("expected TimeoutError")
+    except TimeoutError:
+        pass
+
+
+def test_http_client_does_not_retry_permanent_statuses() -> None:
+    opener = FakeOpener(status=401, body=b"{}")
+    client = sources.HttpSearchApiClient("k", opener=opener, sleeper=lambda s: None)
+    try:
+        client.search({"engine": "google_jobs", "q": "BA"})
+        raise AssertionError("expected SearchApiError")
+    except sources.SearchApiError:
+        pass
+    assert len(opener.requests) == 1                # 4xx is not transient
+
+
+def test_google_jobs_isolates_failing_queries_but_raises_when_all_fail() -> None:
+    """One flaky alias×location must not kill the healthy nine (§15.12 —
+    counted, never silent); a source with ZERO successful queries is DOWN and
+    must raise so the runner records an honest error status."""
+
+    class HalfDead:
+        def search(self, params: dict[str, Any]) -> dict[str, Any]:
+            if params["location"] == "Saudi Arabia":
+                raise TimeoutError("slow window")
+            return {"jobs": [
+                {"title": "Business Analyst", "company_name": "Acme",
+                 "apply_link": "https://careers.acme.com/j/1"},
+            ]}
+
+    jobs, skips = sources.fetch_google_jobs(
+        HalfDead(), aliases=("Business Analyst",),
+        locations=("Riyadh, Saudi Arabia", "Saudi Arabia"),
+        family="business_analyst", max_per_query=5,
+    )
+    assert len(jobs) == 1                           # the healthy query survived
+    assert skips["query_errors"] == 1               # the sick one is counted
+
+    class AllDead:
+        def search(self, params: dict[str, Any]) -> dict[str, Any]:
+            raise TimeoutError("provider down")
+
+    try:
+        sources.fetch_google_jobs(
+            AllDead(), aliases=("Business Analyst",),
+            locations=("Riyadh, Saudi Arabia",),
+            family="business_analyst", max_per_query=5,
+        )
+        raise AssertionError("expected TimeoutError")
+    except TimeoutError:
+        pass
+
+
 def test_http_client_propagates_malformed_json() -> None:
     import json
 

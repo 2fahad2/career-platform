@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
@@ -254,12 +255,25 @@ def fetch_google_jobs(
     skips = {"missing_title": 0, "missing_company": 0, "missing_url": 0,
              "family_filter": 0}
 
+    skips["query_errors"] = 0
+    succeeded = 0
+    last_exc: Exception | None = None
+
     for alias in aliases:
         for location in locations:
-            payload = client.search({
-                "engine": "google_jobs", "q": alias, "location": location,
-                "hl": "en",
-            })
+            try:
+                payload = client.search({
+                    "engine": "google_jobs", "q": alias, "location": location,
+                    "hl": "en",
+                })
+            except Exception as exc:  # noqa: BLE001 — per-query isolation:
+                # one slow alias×location must not kill the healthy rest
+                # (live lesson 16 Jul: provider latency windows); counted,
+                # never silent (§15.12).
+                skips["query_errors"] += 1
+                last_exc = exc
+                continue
+            succeeded += 1
             accepted = 0
             for row in payload.get("jobs") or []:
                 if accepted >= max_per_query:
@@ -302,6 +316,9 @@ def fetch_google_jobs(
                     )
                 )
                 accepted += 1
+
+    if succeeded == 0 and last_exc is not None:
+        raise last_exc  # zero successful queries = the source is DOWN — honest
     return jobs, skips
 
 
@@ -329,17 +346,24 @@ class HttpSearchApiClient:
 
     Live-probed 16 Jul 2026: ``location`` accepts "Riyadh, Saudi Arabia" but
     rejects "Remote" with a 400 — the pseudo-location becomes a remote-flavored
-    query instead, and every request is country-anchored with ``gl=sa``."""
+    query instead, and every request is country-anchored with ``gl=sa``.
+    Live lesson (same night): the provider has transient latency windows past
+    15s — the timeout is generous and transport errors retry with a pause;
+    non-200 statuses are permanent and never retried."""
 
     def __init__(
         self,
         api_key: str,
-        timeout: float = 15.0,
+        timeout: float = 45.0,
         opener: Callable[[str, dict[str, str], float], tuple[int, bytes]] | None = None,
+        retries: int = 1,
+        sleeper: Callable[[float], None] | None = None,
     ) -> None:
         self._api_key = api_key
         self._timeout = timeout
         self._opener = opener or _urllib_opener
+        self._retries = max(0, retries)
+        self._sleeper = sleeper or time.sleep
 
     def search(self, params: dict[str, Any]) -> dict[str, Any]:
         query = dict(params)
@@ -349,11 +373,20 @@ class HttpSearchApiClient:
             query["q"] = f"{query.get('q', '')} remote".strip()
         url = f"{_SEARCHAPI_ENDPOINT}?{urlencode(query)}"
         headers = {"Authorization": f"Bearer {self._api_key}"}
-        status, body = self._opener(url, headers, self._timeout)
-        if status != 200:
-            raise SearchApiError(f"searchapi returned HTTP {status}")
-        result: dict[str, Any] = json.loads(body)
-        return result
+
+        for attempt in range(self._retries + 1):
+            try:
+                status, body = self._opener(url, headers, self._timeout)
+            except (TimeoutError, urllib.error.URLError, OSError):
+                if attempt >= self._retries:
+                    raise
+                self._sleeper(2.0 * (attempt + 1))
+                continue
+            if status != 200:
+                raise SearchApiError(f"searchapi returned HTTP {status}")
+            result: dict[str, Any] = json.loads(body)
+            return result
+        raise SearchApiError("unreachable")  # pragma: no cover — loop exits above
 
 
 # ── JobSpy (indeed) ──────────────────────────────────────────────────────────
