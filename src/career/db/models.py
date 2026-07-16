@@ -864,7 +864,10 @@ class TenantJobDecision(Base):
     # role_score, salary_status, company_tier, seniority, location, final_score…
     reasons: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     gate_policy_version: Mapped[str] = mapped_column(String(16), nullable=False)
-    rank: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    # none_as_null: a BLOCK row has NO rank — SQL NULL, never JSON null
+    rank: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB(none_as_null=True), nullable=True
+    )
     ranking_policy_version: Mapped[str | None] = mapped_column(String(16), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

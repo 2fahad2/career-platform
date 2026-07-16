@@ -4,8 +4,8 @@ The live exit condition needs two ACTIVE tenants with different policies on
 one pool. Until real onboarded customers exist (C5 live gate), these two
 clearly-labeled demo tenants stand in:
 
-- TEN-9901 «demo-low»:  min 8,000 SAR, balanced unknown-salary, limit 3
-- TEN-9902 «demo-high»: min 20,000 SAR, strict unknown-salary, limit 3
+- TEN-9901 «demo-riyadh»: الرياض, min 8,000 SAR, balanced, limit 3
+- TEN-9902 «demo-jeddah»: جدة, min 12,000 SAR, strict, limit 2
 
 ``seed`` is idempotent (re-running replaces the pair); ``clean`` deletes the
 pair (FK cascade removes their subscriptions/policies/decisions/suppressions)
@@ -28,8 +28,10 @@ from career.config import get_settings
 DEMO_CODES = ("TEN-9901", "TEN-9902")
 
 _POLICIES = {
-    "TEN-9901": {"minsal": 8000.0, "unknown": "balanced"},
-    "TEN-9902": {"minsal": 20000.0, "unknown": "strict"},
+    "TEN-9901": {"minsal": 8000.0, "unknown": "balanced", "city": "الرياض",
+                 "limit": 3},
+    "TEN-9902": {"minsal": 12000.0, "unknown": "strict", "city": "جدة",
+                 "limit": 2},
 }
 
 
@@ -69,16 +71,18 @@ def _seed(session: Session) -> None:
                 "banned_companies, daily_job_limit) VALUES "
                 "(:id, :tid, 1, 'active', CAST(:paths AS jsonb), "
                 "CAST(:cities AS jsonb), :minsal, :unknown, 'hybrid', "
-                "'{}', '{}', '{}', 3)"
+                "'{}', '{}', '{}', :lim)"
             ),
             {"id": str(uuid.uuid4()), "tid": tenant_id,
              "paths": json.dumps({"primary": "business_analyst",
                                   "secondary": None, "stretch": None}),
-             "cities": json.dumps({"cities": ["الرياض"],
+             "cities": json.dumps({"cities": [policy["city"]],
                                    "willing_to_relocate": False}),
-             "minsal": policy["minsal"], "unknown": policy["unknown"]},
+             "minsal": policy["minsal"], "unknown": policy["unknown"],
+             "lim": policy["limit"]},
         )
-        print(f"seeded {code} (min {policy['minsal']:.0f}, {policy['unknown']})")
+        print(f"seeded {code} ({policy['city']}, min {policy['minsal']:.0f}, "
+              f"{policy['unknown']}, limit {policy['limit']})")
 
 
 def main() -> int:

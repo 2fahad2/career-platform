@@ -178,6 +178,8 @@ def test_two_tenants_one_pool_two_different_correct_lists(
                 and r.rank["position"] >= 1
                 for r in passes
             )
+            # and a BLOCK carries none — SQL NULL, never JSON null
+            assert all(r.rank is None for r in decisions if r.decision == "BLOCK")
             # the high-target tenant blocked J1 for the salary, recorded honestly
             blocked = [
                 r for r in decisions
