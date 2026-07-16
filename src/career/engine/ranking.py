@@ -114,7 +114,29 @@ def record_suppression(
     """Record a CONFIRMED delivery (C7 calls this after the ledger write).
     Upserts — a re-delivery refreshes the window — and prunes expired rows
     (§8.1 write semantics)."""
-    if not candidate.dedupe_url_key:
+    record_suppression_by_url(
+        owner_session, tenant_id=tenant_id,
+        url=candidate.dedupe_url_key or "",
+        repost_group_id=candidate.repost_group_id,
+        now=now, ttl_days=ttl_days,
+    )
+
+
+def record_suppression_by_url(
+    owner_session: Session,
+    *,
+    tenant_id: uuid.UUID,
+    url: str,
+    repost_group_id: str | None = None,
+    now: datetime,
+    ttl_days: int = SUPPRESSION_TTL_DAYS,
+) -> None:
+    """Same §8.1 semantics keyed directly by the delivered URL — what the C7
+    daily close holds after a confirmed delivery."""
+    from career.engine.identity import _dedupe_url_key
+
+    candidate_key = _dedupe_url_key(url) if url else None
+    if not candidate_key:
         return  # no usable key → never suppress (fail-open)
     owner_session.execute(
         delete(TenantJobSuppression).where(
@@ -125,20 +147,20 @@ def record_suppression(
     existing = owner_session.execute(
         select(TenantJobSuppression).where(
             TenantJobSuppression.tenant_id == tenant_id,
-            TenantJobSuppression.suppression_key == candidate.dedupe_url_key,
+            TenantJobSuppression.suppression_key == candidate_key,
         )
     ).scalar_one_or_none()
     if existing is not None:
         existing.delivered_at = now
         existing.expires_at = now + timedelta(days=ttl_days)
-        existing.repost_group_id = candidate.repost_group_id
+        existing.repost_group_id = repost_group_id
     else:
         owner_session.add(
             TenantJobSuppression(
                 id=uuid.uuid4(),
                 tenant_id=tenant_id,
-                suppression_key=candidate.dedupe_url_key,
-                repost_group_id=candidate.repost_group_id,
+                suppression_key=candidate_key,
+                repost_group_id=repost_group_id,
                 delivered_at=now,
                 expires_at=now + timedelta(days=ttl_days),
             )
