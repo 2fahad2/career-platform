@@ -161,6 +161,29 @@ def test_location_gate() -> None:
     assert gate.evaluate(policy, _posting(location=None)).reasons["location"] == "UNKNOWN"
 
 
+def test_country_level_location_is_doubt_not_a_block() -> None:
+    """Live lesson (first real run, 16 Jul): 13/41 postings carried a bare
+    country location («Saudi Arabia»/«السعودية») — one was titled
+    'Business Analyst - Riyadh, KSA' and got blocked. Country-level location
+    is AMBIGUOUS: doubt like a missing location, never mismatch evidence."""
+    policy = _policy()  # الرياض, no relocation
+    for loc in ("Saudi Arabia", "السعودية", "KSA",
+                "Kingdom of Saudi Arabia", "saudi arabia"):
+        verdict = gate.evaluate(_policy(), _posting(location=loc))
+        assert verdict.decision == "PASS", loc
+        assert verdict.reasons["location"] == "UNKNOWN"
+    # real city mismatches still block
+    assert gate.evaluate(policy, _posting(location="Jeddah, Saudi Arabia")).decision == "BLOCK"
+
+
+def test_anywhere_location_is_remote(scope: None = None) -> None:
+    """Live lesson: SearchAPI marks remote jobs location='Anywhere'."""
+    hybrid = _policy()                               # remote_policy=hybrid
+    assert gate.evaluate(hybrid, _posting(location="Anywhere")).decision == "PASS"
+    onsite = _policy(remote_policy=None)
+    assert gate.evaluate(onsite, _posting(location="Anywhere")).decision == "BLOCK"
+
+
 def test_junior_title_blocks_hard() -> None:
     verdict = gate.evaluate(_policy(), _posting(title="Junior Business Analyst"))
     assert verdict.decision == "BLOCK"

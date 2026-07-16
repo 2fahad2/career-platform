@@ -239,14 +239,15 @@ def test_http_client_builds_an_authorized_country_anchored_request() -> None:
 
 
 def test_http_client_translates_the_remote_pseudo_location() -> None:
-    """Live-probed: the provider 400s on location="Remote" — it becomes a
-    remote-flavored query, still country-anchored."""
+    """Live-probed twice: the provider 400s on location="Remote", and an
+    unanchored remote query returns US on-site jobs that waste the retrieval
+    cap — so it becomes a remote-flavored query anchored to Saudi Arabia."""
     opener = FakeOpener()
     sources.HttpSearchApiClient("k", opener=opener).search({
         "engine": "google_jobs", "q": "Business Analyst", "location": "Remote",
     })
     url, _, _ = opener.requests[0]
-    assert "location=" not in url
+    assert "location=Saudi+Arabia" in url
     assert "q=Business+Analyst+remote" in url
     assert "gl=sa" in url
 
@@ -396,6 +397,30 @@ def test_jobspy_two_tier_conservative_post_filter() -> None:
     assert [j.title for j in jobs] == ["Business Analyst"]
     assert skips["post_filter"] == 2
     assert jobs[0].source == "jobspy"
+
+
+def test_jobspy_nan_fields_never_reach_the_pool() -> None:
+    """Live lesson (16 Jul): jobspy rows come from a pandas frame — missing
+    values are float NaN, which is TRUTHY, so 'nan' companies would pass the
+    required-fields check and pollute the pool."""
+    nan = float("nan")
+    fake = FakeJobSpy([
+        {"title": "Business Analyst", "company": nan,
+         "job_url": "https://sa.indeed.com/j/1"},                # NaN company
+        {"title": nan, "company": "Acme", "job_url": "https://sa.indeed.com/j/2"},
+        {"title": "Senior Business Analyst", "company": "Acme",
+         "job_url": "https://sa.indeed.com/j/3",
+         "location": nan, "description": nan, "salary": nan},    # NaN optionals
+    ])
+    jobs, skips = sources.fetch_jobspy(
+        fake, aliases=("Business Analyst",), family="business_analyst",
+        max_results=10,
+    )
+    assert skips["missing_fields"] == 2
+    assert len(jobs) == 1
+    job = jobs[0]
+    assert job.location is None and job.description is None    # never "nan"
+    assert job.salary_raw is None
 
 
 def test_jobspy_missing_dependency_returns_empty() -> None:

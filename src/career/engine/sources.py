@@ -369,7 +369,9 @@ class HttpSearchApiClient:
         query = dict(params)
         query.setdefault("gl", "sa")
         if query.get("location") == "Remote":
-            del query["location"]
+            # live-probed twice: the provider 400s on "Remote", and an
+            # unanchored remote query drifts to US on-site jobs
+            query["location"] = "Saudi Arabia"
             query["q"] = f"{query.get('q', '')} remote".strip()
         url = f"{_SEARCHAPI_ENDPOINT}?{urlencode(query)}"
         headers = {"Authorization": f"Bearer {self._api_key}"}
@@ -396,6 +398,17 @@ class JobSpyClient(Protocol):
     def scrape(self, **kwargs: Any) -> list[dict[str, Any]]: ...
 
 
+def _jobspy_field(row: dict[str, Any], key: str) -> str | None:
+    """NaN-safe field read: jobspy rows come from a pandas frame, so missing
+    values arrive as float NaN — which is TRUTHY and str()s to 'nan' (live
+    lesson 16 Jul: a 'nan' company nearly reached the pool)."""
+    value = row.get(key)
+    if value is None or isinstance(value, float):
+        return None
+    text = str(value).strip()
+    return text if text and text.lower() != "nan" else None
+
+
 def fetch_jobspy(
     client: JobSpyClient,
     *,
@@ -415,21 +428,25 @@ def fetch_jobspy(
     jobs: list[DiscoveredJob] = []
     skips = {"missing_fields": 0, "post_filter": 0}
     for row in rows:
-        title, company, url = row.get("title"), row.get("company"), row.get("job_url")
+        title = _jobspy_field(row, "title")
+        company = _jobspy_field(row, "company")
+        url = _jobspy_field(row, "job_url")
         if not title or not company or not url:
             skips["missing_fields"] += 1
             continue
-        if not _passes_conservative_post_filter(str(title), family):
+        if not _passes_conservative_post_filter(title, family):
             skips["post_filter"] += 1
             continue
         jobs.append(
             DiscoveredJob(
-                title=str(title), company=str(company), url=str(url),
+                title=title, company=company, url=url,
                 source="jobspy", family=family,
-                location=row.get("location"),
-                description=row.get("description"),
-                salary_raw=row.get("salary") or row.get("compensation"),
-                posted_at_raw=str(row.get("date_posted") or "") or None,
+                location=_jobspy_field(row, "location"),
+                description=_jobspy_field(row, "description"),
+                salary_raw=(
+                    _jobspy_field(row, "salary") or _jobspy_field(row, "compensation")
+                ),
+                posted_at_raw=_jobspy_field(row, "date_posted"),
             )
         )
     return jobs, skips

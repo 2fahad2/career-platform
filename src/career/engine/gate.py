@@ -127,13 +127,26 @@ def build_role_map(
 # ── location ─────────────────────────────────────────────────────────────────
 
 
+#: Country-level locations are AMBIGUOUS, not mismatch evidence — live lesson
+#: (16 Jul, first real run): 13/41 postings carried a bare country location,
+#: one titled "… - Riyadh, KSA", and were wrongly blocked.
+_COUNTRY_LEVEL_LOCATIONS = frozenset({
+    "saudi arabia", "السعودية", "ksa", "kingdom of saudi arabia",
+    "المملكة العربية السعودية",
+})
+
+
 def _location_verdict(policy: TenantGatePolicy, location: str | None) -> tuple[str, str]:
-    """(PASS|BLOCK|UNKNOWN, detail). A missing location is doubt, not a block."""
+    """(PASS|BLOCK|UNKNOWN, detail). A missing OR country-level location is
+    doubt, not a block; 'Anywhere' is how the live source spells remote."""
     if not location:
         return "UNKNOWN", "location_missing"
     loc_l = location.lower()
-    if "remote" in loc_l and (policy.remote_policy or "") in ("remote", "hybrid", "any"):
+    is_remote = "remote" in loc_l or loc_l.strip() == "anywhere"
+    if is_remote and (policy.remote_policy or "") in ("remote", "hybrid", "any"):
         return "PASS", "remote_ok"
+    if loc_l.strip() in _COUNTRY_LEVEL_LOCATIONS:
+        return "UNKNOWN", "location_country_level"
     for city_ar in policy.cities_ar:
         for token in _CITY_EQUIV.get(city_ar, (city_ar.lower(),)):
             if token in loc_l:
