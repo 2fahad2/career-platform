@@ -75,6 +75,15 @@ def _record_inbound(
     return inbound
 
 
+def _button_id_of(msg: dict[str, Any]) -> str | None:
+    """The machine id of a tapped button (outcome buttons carry it) —
+    distinct from the human label _text_of returns."""
+    inter = msg.get("interactive", {}) or {}
+    reply = inter.get("button_reply") or inter.get("list_reply") or {}
+    raw = reply.get("id")
+    return raw if isinstance(raw, str) else None
+
+
 def _text_of(msg: dict[str, Any]) -> str | None:
     mtype = msg.get("type", "")
     raw: Any = None
@@ -198,7 +207,29 @@ def _handle_message(
                 deps=onboarding, now=now,
             )
     else:
-        descend_pending_delivery(session, channel, whatsapp_client=whatsapp_client, now=now)
+        from career.cv import deliver as cv_deliver
+        from career.cv.daily_run import close_from_delivery
+
+        outcome = cv_deliver.parse_outcome_button(
+            _button_id_of(msg) or text_body
+        )
+        if outcome is not None:
+            outcome_kind, job_ref = outcome
+            cv_deliver.record_outcome(
+                session, tenant_id=channel.tenant_id, job_ref=job_ref,
+                outcome=outcome_kind, reason=None, now=now,
+            )
+            whatsapp_client.send_text(
+                channel.phone_e164,
+                "شكرًا! سجلنا ملاحظتك — تساعدنا نحسّن اختياراتنا لك. 🙏",
+            )
+        else:
+            landed = descend_pending_delivery(
+                session, channel, whatsapp_client=whatsapp_client, now=now
+            )
+            if landed is not None:
+                # the held day closes when its bundle actually lands
+                close_from_delivery(session, delivery=landed, now=now)
     session.commit()
 
 
