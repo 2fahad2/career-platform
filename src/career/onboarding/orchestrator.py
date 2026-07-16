@@ -261,6 +261,15 @@ def _answers_so_far(session: Session, tenant_id: uuid.UUID) -> dict[str, Any]:
     return answers
 
 
+def _has_extraction_facts(session: Session, tenant_id: uuid.UUID) -> bool:
+    return session.execute(
+        select(ProfileFact.id).where(
+            ProfileFact.tenant_id == tenant_id,
+            ProfileFact.source == "cv_extraction",
+        ).limit(1)
+    ).scalar_one_or_none() is not None
+
+
 def _prompt_current_step(
     session: Session, journey: OnboardingSession, channel: CustomerChannel,
     deps: Deps, *, now: datetime,
@@ -292,6 +301,18 @@ def _prompt_current_step(
             _send(session, deps, channel, question.prompt_ar, buttons=buttons, now=now)
             return
         _advance(journey, "CV_UPLOAD_PENDING", now)
+        if _has_extraction_facts(session, tenant_id):
+            # §04 inheritance: the funnel already read their CV — pass through
+            # the upload leg step-by-step (no FSM jump) into confirmation.
+            _advance(journey, "CV_PROCESSING", now)
+            _advance(journey, "PROFILE_CONFIRMATION", now)
+            _send(
+                session, deps, channel,
+                "قرأنا سيرتك سابقًا في تحليل الـCV — نراجع الحقائق معك الآن ✅",
+                now=now,
+            )
+            _prompt_current_step(session, journey, channel, deps, now=now)
+            return
         _send(session, deps, channel, _UPLOAD_PROMPT, now=now)
         return
 

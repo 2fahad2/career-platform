@@ -153,6 +153,94 @@ def test_purchase_to_report_in_one_conversation(
         owner_session.commit()
 
 
+def test_upgrade_relinks_and_opens_half_ready_onboarding(
+    owner_session: Session, clean_billing: None, tmp_path
+) -> None:
+    """The §13-C8 exit condition's second half: the funnel customer buys a
+    subscription with the SAME phone → the new purchase re-links to their
+    existing tenant (the facts live there), consents carry over, and the
+    onboarding skips the upload leg straight into fact confirmation."""
+    token = _provision_funnel(owner_session)
+    phone = f"+96650{uuid.uuid4().int % 10_000_000:07d}"
+    deps = _deps(tmp_path)
+    admin = FakeTelegramAdminClient()
+
+    def handle(msg: dict, minutes: int) -> None:
+        _handle_message(
+            owner_session, msg, whatsapp_client=deps.whatsapp_client,
+            admin_client=admin, now=NOW + timedelta(minutes=minutes),
+            onboarding=deps,
+        )
+
+    # ── the full funnel journey first ────────────────────────────────────
+    handle(_msg_text(phone, f"تفعيل {token}"), 0)
+    tenant_id = owner_session.execute(
+        sql_text("SELECT tenant_id FROM customer_channels WHERE phone_e164 = :p"),
+        {"p": phone},
+    ).scalar_one()
+    try:
+        for i in range(3):
+            handle(_msg_text(phone, "أوافق"), 1 + i)
+        handle(_msg_doc(phone, "media-9"), 5)
+        handle(_msg_text(phone, "محلل أعمال"), 6)
+        assert owner_session.execute(
+            sql_text("SELECT state FROM funnel_sessions WHERE tenant_id = :t"),
+            {"t": str(tenant_id)},
+        ).scalar_one() == "DONE"
+
+        # ── the upgrade: a basic order, activated from the SAME phone ────
+        order_id = f"ORD-{uuid.uuid4()}"
+        client = FakeSallaClient({
+            order_id: SallaOrder(order_id, "paid", "prod_basic",
+                                 Decimal("149"), "SAR")
+        })
+        upgrade = provision_order(
+            owner_session, order_id, salla_client=client,
+            product_catalog={"prod_basic": "basic"},
+        )
+        assert upgrade.activation_token is not None
+        handle(_msg_text(phone, f"تفعيل {upgrade.activation_token}"), 10)
+
+        # the subscription re-linked to the FUNNEL tenant, not the shell
+        plans = owner_session.execute(
+            sql_text("SELECT plan_code FROM subscriptions WHERE tenant_id = :t "
+                     "ORDER BY plan_code"), {"t": str(tenant_id)},
+        ).scalars().all()
+        assert plans == ["basic", "cv_analysis"]
+        assert any("ترقية" in m for m in admin.messages)     # admin informed
+
+        # the three REQUIRED consents carried over — only the never-asked
+        # OPTIONAL one (anonymous stats) is presented now
+        assert any("اختياري" in (m.body or "")
+                   for m in deps.whatsapp_client.sent[-3:])
+        handle(_msg_text(phone, "لا أوافق"), 10)      # optional refusal is fine
+        assert any("الاسم" in (m.body or "")
+                   for m in deps.whatsapp_client.sent[-3:])
+
+        # answer the fourteen questions — then NO upload prompt: straight
+        # into fact confirmation (half-ready, §04)
+        answers = ["Fahad Almulhim", "fahad@example.com", "__skip__",
+                   "riyadh", "riyadh_region", "Senior BA", "9", "one_month",
+                   "full_time", "yes", "hybrid", "12000", "ar", "محلل أعمال"]
+        for i, answer in enumerate(answers):
+            handle(_msg_text(phone, answer), 11 + i)
+
+        journey_state = owner_session.execute(
+            sql_text("SELECT state FROM onboarding_sessions WHERE tenant_id = :t"),
+            {"t": str(tenant_id)},
+        ).scalar_one()
+        assert journey_state == "PROFILE_CONFIRMATION"
+        recent = [m.body or "" for m in deps.whatsapp_client.sent[-3:]]
+        assert any("قرأنا سيرتك سابقًا" in b for b in recent)
+        assert not any("أرسل سيرتك" in b for b in recent)     # no upload leg
+    finally:
+        owner_session.rollback()
+        owner_session.execute(
+            sql_text("DELETE FROM tenants WHERE id = :t"), {"t": str(tenant_id)}
+        )
+        owner_session.commit()
+
+
 def test_consent_refusal_explains_and_holds(
     owner_session: Session, clean_billing: None, tmp_path
 ) -> None:

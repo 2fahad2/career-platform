@@ -58,6 +58,15 @@ def _channel_for_phone(session: Session, phone: str) -> CustomerChannel | None:
     ).scalar_one_or_none()
 
 
+def _is_funnel_only_tenant(owner_session: Session, tenant_id: uuid.UUID) -> bool:
+    """True when the tenant's every subscription is the cv_analysis product —
+    the §04 upgrade-inheritance precondition."""
+    plans = owner_session.execute(
+        select(Subscription.plan_code).where(Subscription.tenant_id == tenant_id)
+    ).scalars().all()
+    return bool(plans) and all(p == "cv_analysis" for p in plans)
+
+
 def activate(
     owner_session: Session,
     *,
@@ -79,11 +88,30 @@ def activate(
     ten_code = owner_session.get(Tenant, tok.tenant_id).code  # type: ignore[union-attr]
     existing = _channel_for_phone(owner_session, from_phone)
 
-    # Phone already belongs to a different customer → conflict.
+    # Phone already belongs to a different customer. ONE documented exception
+    # (§04 inheritance): a funnel-only customer upgrading — their extracted
+    # facts live on the EXISTING tenant, so the new purchase re-links to it.
+    # The freshly provisioned shell tenant stays empty and harmless: nothing
+    # is deleted, ever.
     if existing is not None and existing.tenant_id != tok.tenant_id:
-        whatsapp_client.send_text(from_phone, _CONFLICT)
-        admin_client.send_admin(admin_msg.activation_failed(ten_code, "phone_conflict"))
-        return ActivationResult(ActivationStatus.CONFLICT)
+        if _is_funnel_only_tenant(owner_session, existing.tenant_id):
+            shell_code = ten_code
+            moved = owner_session.get(Subscription, tok.subscription_id)
+            if moved is not None:
+                moved.tenant_id = existing.tenant_id
+            tok.tenant_id = existing.tenant_id
+            ten_code = owner_session.get(  # type: ignore[union-attr]
+                Tenant, existing.tenant_id
+            ).code
+            admin_client.send_admin(
+                f"↻ ترقية من قمع التحليل: {shell_code} → {ten_code}"
+            )
+        else:
+            whatsapp_client.send_text(from_phone, _CONFLICT)
+            admin_client.send_admin(
+                admin_msg.activation_failed(ten_code, "phone_conflict")
+            )
+            return ActivationResult(ActivationStatus.CONFLICT)
 
     if tok.expires_at < now:
         whatsapp_client.send_text(from_phone, _EXPIRED)
