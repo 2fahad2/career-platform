@@ -144,6 +144,34 @@ def test_unknown_salary_policies() -> None:
     assert wide.reasons["demoted"] is True
 
 
+def test_possible_high_passes_balanced_at_the_match_floor() -> None:
+    """D4 letter (conformance audit, 16 Jul live run): INFERRED_MEDIUM is an
+    UNADVERTISED salary with positive evidence — «لا تُحجب افتراضيًا». It
+    passes balanced/wide at the match floor and the ranking's salary-certainty
+    key orders it below LIKELY/CONFIRMED; strict keeps only its UNKNOWN ban,
+    and the tenant's own threshold still bites (INFERRED_LOW blocks)."""
+    # live-shaped case: solid BA at a tier-3 company, salary inferred medium
+    posting = _posting(
+        title="Senior Business Analyst", company="Delta Solutions",
+        url="https://portal.example/j/9", jd_text=_RICH_JD,
+    )
+    for policy_name in ("balanced", "wide", "strict"):
+        verdict = gate.evaluate(
+            _policy(unknown_salary_policy=policy_name, min_salary_sar=8000.0),
+            posting,
+        )
+        assert verdict.decision == "PASS", policy_name
+        assert verdict.reasons["salary_status"] == "INFERRED_MEDIUM"
+        assert not verdict.reasons.get("demoted")   # certainty ranking suffices
+    # below the match floor the role axis still blocks
+    weak_role = gate.evaluate(
+        _policy(min_salary_sar=8000.0),
+        _posting(title="Business Analysis Officer", company="Delta Solutions",
+                 url="https://portal.example/j/9", jd_text=None),
+    )
+    assert weak_role.decision == "BLOCK"
+
+
 # ── location honors cities, remote and relocation ────────────────────────────
 
 

@@ -220,7 +220,23 @@ def evaluate(policy: TenantGatePolicy, posting: PostingFacts) -> GateVerdict:
     )
     reasons["gate_reason"] = decision.reason
 
-    # 4) D4 wide policy: an UNKNOWN-salary block becomes a demoted pass
+    # 4) D4 letter (conformance audit 16 Jul): INFERRED_MEDIUM is an
+    # UNADVERTISED salary with positive evidence — «لا تُحجب افتراضيًا».
+    # It passes at the match floor under every policy (strict bans only
+    # UNKNOWN); the ranking's salary-certainty key orders it below
+    # LIKELY/CONFIRMED, so no demotion flag is needed. The inherited
+    # match>=90+cq>=85 rule stays verbatim for pure UNKNOWN.
+    if (
+        decision.decision == "BLOCK"
+        and salary.outcome == SALARY_GATE_PASS_POSSIBLE_HIGH
+        and decision.reason.startswith("possible_high")
+        and role_score >= _MATCH_FLOOR
+    ):
+        reasons["gate_reason"] = "possible_high_passes_at_floor"
+        reasons["near_reasons"] = near_reasons
+        return GateVerdict("PASS", False, reasons)
+
+    # 5) D4 wide policy: an UNKNOWN-salary block becomes a demoted pass
     if (
         policy.unknown_salary_policy == "wide"
         and decision.decision == "BLOCK"
@@ -237,7 +253,7 @@ def evaluate(policy: TenantGatePolicy, posting: PostingFacts) -> GateVerdict:
         reasons["near_reasons"] = near_reasons
         return GateVerdict("PASS", False, reasons)
 
-    # 5) near-miss capture for boundary blocks (§06)
+    # 6) near-miss capture for boundary blocks (§06)
     if (
         decision.reason.startswith("role_match_too_low")
         and role_score >= _MATCH_FLOOR - _NEAR_MATCH_WINDOW
