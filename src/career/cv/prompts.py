@@ -1,0 +1,16 @@
+"""The generation prompts — LEGACY §10.1/§10.2/§10.3 BYTE-VERBATIM.
+
+Machine-extracted from docs/LEGACY_KNOWLEDGE.md and guarded by tests that
+re-extract and compare (same discipline as the CV template). The braces are
+format placeholders filled at call time; the instruction text itself never
+drifts from the documented source. The prompts are NOT trusted alone — the
+§10.2 invented-content guard and the §1.6 summary gate run on every output.
+"""
+
+from __future__ import annotations
+
+JOB_ANALYSIS_PROMPT = 'You are a precise job analysis engine.\n\nAnalyze the following job opening and return ONLY valid JSON.\nDo not add markdown fences, explanations, or extra text.\n\nJob title: {job_title}\nCompany: {company}\n\nJob description:\n{job_description}\n\nReturn JSON with exactly these keys:\n{\n  "role_family": "string",\n  "seniority": "string",\n  "match_score": 0.0,\n  "key_requirements": ["string"],\n  "recommendation": "APPLY" or "MAYBE" or "SKIP"\n}\n\nRules:\n- match_score must be between 0 and 1\n- key_requirements should be concise and important\n- recommendation should reflect the overall fit implied by the role\n- role_family should be something like Business Analysis, IT Operations, Project Management, Infrastructure, Security, Support, etc.\n- seniority should be one of: Entry-level, Mid-level, Senior, Manager, Unknown'
+
+SUMMARY_HUMANIZATION_PROMPT = 'You are rewriting a CV summary for a job application.\n\nReturn ONLY the rewritten summary text. No markdown. No bullet points.\n\nRules:\n- Keep it truthful. Do NOT invent employers, years, tools, certifications, or achievements.\n- Do NOT insert frameworks, methodologies, tools, or certifications from the job description unless they already appear verbatim in the original summary. For example, if the job mentions ITIL, Agile, PRINCE2, Six Sigma, or any other framework but the original summary does not contain it, you MUST NOT add it.\n- Use ONLY information already present in the original summary.\n- Make it sound natural, professional, and tailored to the role.\n- Write in active voice with strong, clear language.\n- Keep it concise: 2 to 4 sentences maximum.\n- Maximum length: 420 characters.\n- You may emphasize existing skills from the original summary that are relevant to the role, but never introduce new skills, tools, or frameworks.\n- Avoid generic phrases like "results-driven", "team player", "go-getter".\n- Focus on specific expertise and measurable impact already stated in the original summary.\n\nTarget job title: {job_title}\nTarget company: {company}\nKey requirements: {key_requirements}\n\nJob description:\n{job_description}\n\nOriginal CV summary:\n{summary}'
+
+EXPERIENCE_RANKING_PROMPT = 'You are ranking CV experience entries for a specific job.\n\nReturn ONLY valid JSON with this exact shape:\n{\n  "experience_order": [0, 1, 2]\n}\n\nRules:\n- Use ONLY the provided experience indexes.\n- Include all indexes exactly once.\n- Rank the most relevant experience first for the target role.\n- Do not invent or rewrite anything.\n- Focus on role fit, requirements match, and relevance.\n\nTarget job title: {job_title}\nTarget company: {company}\nKey requirements: {key_requirements}\n\nJob description:\n{job_description}\n\nExperience entries:\n{json.dumps(payload)}'
