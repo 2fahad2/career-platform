@@ -63,3 +63,13 @@ class FilesystemStorageAdapter(StorageAdapter):
 
     def delete(self, key: str) -> None:
         self._path(key).unlink(missing_ok=True)
+
+    def list_keys(self, prefix: str) -> list[str]:
+        base = self._path(prefix)
+        if not base.is_dir():
+            return []
+        return sorted(
+            str(p.relative_to(self._root))
+            for p in base.rglob("*")
+            if p.is_file() and not p.name.startswith(".")
+        )

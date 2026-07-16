@@ -37,3 +37,8 @@ class StorageAdapter(ABC):
     @abstractmethod
     def delete(self, key: str) -> None:
         """Delete the object at ``key``. No error if it does not exist."""
+
+    @abstractmethod
+    def list_keys(self, prefix: str) -> list[str]:
+        """All keys under ``prefix``, SORTED (a stable order is part of the
+        contract — §7.6 candidate discovery depends on it)."""
