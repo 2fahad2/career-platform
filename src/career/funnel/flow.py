@@ -21,7 +21,8 @@ from sqlalchemy.orm import Session
 from career.db.models import CustomerChannel, FunnelSession, ProfileFact
 from career.funnel.evaluation import evaluate
 from career.funnel.report import render_report_pdf, whatsapp_summary
-from career.onboarding.consents import PURPOSES, record_consent
+from career.onboarding.consents import PURPOSES, missing_required, record_consent
+from career.onboarding.consents import _load_records as _consent_records
 from career.onboarding.extraction import run_extraction, strip_pii
 from career.onboarding.orchestrator import Deps
 from career.onboarding.upload import process_cv_upload
@@ -107,6 +108,30 @@ def start_funnel(
     if channel is None:  # activation just created it — absence is a bug
         raise LookupError(f"channel not found: {channel_id}")
     if existing is not None:
+        if existing.state != STATE_DONE:
+            return existing               # resume the running journey
+        # AUDIT FIX B: a paying SECOND analysis restarts the journey — the
+        # required consents carry over presence-driven, so it reopens at
+        # the first still-missing step (usually the upload).
+        existing.subscription_id = subscription_id
+        still_missing = missing_required(
+            _consent_records(session, tenant_id)
+        )
+        if still_missing:
+            existing.state = STATE_CONSENT
+            existing.context = {"consent_cursor": 0}
+            session.flush()
+            deps.whatsapp_client.send_text(channel.phone_e164, _WELCOME)
+            _prompt_consent(deps, channel, 0)
+        else:
+            existing.state = STATE_UPLOAD
+            existing.context = {}
+            session.flush()
+            deps.whatsapp_client.send_text(
+                channel.phone_e164,
+                "أهلًا بعودتك! 📊 تحليل جديد لسيرتك — " + _UPLOAD_PROMPT,
+            )
+        existing.updated_at = now
         return existing
     row = FunnelSession(
         id=uuid.uuid4(), tenant_id=tenant_id, subscription_id=subscription_id,

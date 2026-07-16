@@ -308,6 +308,25 @@ def test_resolver_generation_paths(tmp_path: Any) -> None:
 # ── the budget loop (§7.5 digest side) ───────────────────────────────────────
 
 
+def test_budget_not_consumed_by_existing_cv_resolutions() -> None:
+    """AUDIT FIX C: LEGACY §7.5 — a job resolved by REUSE performed no
+    generation and must not consume the budget."""
+    def resolve(job: dict[str, Any]) -> publish.ResolveResult:
+        if job["url"] == "u1":
+            return publish.ResolveResult("existing_valid_cv", cv_key="k1")
+        return publish.ResolveResult("generated_valid_cv", cv_key=f"k:{job['url']}")
+
+    jobs = [
+        {"url": u, "cv_attachment_status": "no_tailored_cv"}
+        for u in ("u1", "u2", "u3")
+    ]
+    out = publish.generate_missing_cvs(jobs, resolve=resolve, budget=2)
+    # u1 reused (free) → u2 and u3 BOTH fit in the 2-generation budget
+    assert [j.get("cv_generation_status") for j in out] == [
+        "existing_valid_cv", "generated_valid_cv", "generated_valid_cv",
+    ]
+
+
 def test_generation_budget_loop_semantics() -> None:
     calls: list[str] = []
 

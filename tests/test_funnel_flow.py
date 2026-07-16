@@ -241,6 +241,131 @@ def test_upgrade_relinks_and_opens_half_ready_onboarding(
         owner_session.commit()
 
 
+def test_expired_upgrade_token_never_relinks(
+    owner_session: Session, clean_billing: None, tmp_path
+) -> None:
+    """AUDIT FIX A: an invalid/expired token from a funnel phone must reject
+    WITHOUT side effects — the subscription must never move before the token
+    passes every validity check (the worker commits after activate)."""
+    token = _provision_funnel(owner_session)
+    phone = f"+96650{uuid.uuid4().int % 10_000_000:07d}"
+    deps = _deps(tmp_path)
+    admin = FakeTelegramAdminClient()
+    _handle_message(
+        owner_session, _msg_text(phone, f"تفعيل {token}"),
+        whatsapp_client=deps.whatsapp_client, admin_client=admin,
+        now=NOW, onboarding=deps,
+    )
+    tenant_id = owner_session.execute(
+        sql_text("SELECT tenant_id FROM customer_channels WHERE phone_e164 = :p"),
+        {"p": phone},
+    ).scalar_one()
+    try:
+        order_id = f"ORD-{uuid.uuid4()}"
+        client = FakeSallaClient({
+            order_id: SallaOrder(order_id, "paid", "prod_basic",
+                                 Decimal("149"), "SAR")
+        })
+        upgrade = provision_order(
+            owner_session, order_id, salla_client=client,
+            product_catalog={"prod_basic": "basic"},
+        )
+        assert upgrade.activation_token is not None
+        # expire the upgrade token BEFORE the customer taps it
+        owner_session.execute(
+            sql_text("UPDATE activation_tokens SET expires_at = :past "
+                     "WHERE tenant_id = :shell"),
+            {"past": NOW - timedelta(days=1), "shell": upgrade.tenant_id},
+        )
+        owner_session.commit()
+
+        _handle_message(
+            owner_session, _msg_text(phone, f"تفعيل {upgrade.activation_token}"),
+            whatsapp_client=deps.whatsapp_client, admin_client=admin,
+            now=NOW + timedelta(minutes=10), onboarding=deps,
+        )
+        # the basic subscription must still belong to the SHELL, untouched
+        plans_funnel = owner_session.execute(
+            sql_text("SELECT plan_code FROM subscriptions WHERE tenant_id = :t"),
+            {"t": str(tenant_id)},
+        ).scalars().all()
+        assert plans_funnel == ["cv_analysis"]           # nothing moved
+        shell_plans = owner_session.execute(
+            sql_text("SELECT plan_code FROM subscriptions WHERE tenant_id = :t"),
+            {"t": str(upgrade.tenant_id)},
+        ).scalars().all()
+        assert shell_plans == ["basic"]
+    finally:
+        owner_session.rollback()
+        owner_session.execute(
+            sql_text("DELETE FROM tenants WHERE id = :t"), {"t": str(tenant_id)}
+        )
+        owner_session.commit()
+
+
+def test_second_analysis_purchase_restarts_the_funnel(
+    owner_session: Session, clean_billing: None, tmp_path
+) -> None:
+    """AUDIT FIX B: a paying second cv_analysis purchase must produce a second
+    report — the DONE session resets (consents carry over presence-driven,
+    so it reopens at the upload step)."""
+    token = _provision_funnel(owner_session)
+    phone = f"+96650{uuid.uuid4().int % 10_000_000:07d}"
+    deps = _deps(tmp_path)
+    admin = FakeTelegramAdminClient()
+
+    def handle(msg: dict, minutes: int) -> None:
+        _handle_message(
+            owner_session, msg, whatsapp_client=deps.whatsapp_client,
+            admin_client=admin, now=NOW + timedelta(minutes=minutes),
+            onboarding=deps,
+        )
+
+    handle(_msg_text(phone, f"تفعيل {token}"), 0)
+    tenant_id = owner_session.execute(
+        sql_text("SELECT tenant_id FROM customer_channels WHERE phone_e164 = :p"),
+        {"p": phone},
+    ).scalar_one()
+    try:
+        for i in range(3):
+            handle(_msg_text(phone, "أوافق"), 1 + i)
+        handle(_msg_doc(phone, "media-9"), 5)
+        handle(_msg_text(phone, "محلل أعمال"), 6)
+
+        # the SECOND analysis purchase, same phone
+        order_id = f"ORD-{uuid.uuid4()}"
+        client = FakeSallaClient({
+            order_id: SallaOrder(order_id, "paid", "prod_cv",
+                                 Decimal("29"), "SAR")
+        })
+        second = provision_order(
+            owner_session, order_id, salla_client=client,
+            product_catalog={"prod_cv": "cv_analysis"},
+        )
+        assert second.activation_token is not None
+        handle(_msg_text(phone, f"تفعيل {second.activation_token}"), 10)
+
+        state = owner_session.execute(
+            sql_text("SELECT state FROM funnel_sessions WHERE tenant_id = :t"),
+            {"t": str(tenant_id)},
+        ).scalar_one()
+        assert state == "UPLOAD_PENDING"                 # reopened, not DONE
+        assert any("أرسل سيرتك" in (m.body or "")
+                   for m in deps.whatsapp_client.sent[-2:])
+
+        # and the second journey completes to a fresh report
+        handle(_msg_doc(phone, "media-9"), 11)
+        handle(_msg_text(phone, "محلل أعمال"), 12)
+        docs = [m for m in deps.whatsapp_client.sent if m.kind == "document"]
+        assert len(docs) == 2                            # two reports delivered
+    finally:
+        owner_session.rollback()
+        owner_session.execute(
+            sql_text("DELETE FROM tenants WHERE id = :t"), {"t": str(tenant_id)}
+        )
+        owner_session.commit()
+
+
 def test_consent_refusal_explains_and_holds(
     owner_session: Session, clean_billing: None, tmp_path
 ) -> None:

@@ -91,21 +91,14 @@ def activate(
     # Phone already belongs to a different customer. ONE documented exception
     # (§04 inheritance): a funnel-only customer upgrading — their extracted
     # facts live on the EXISTING tenant, so the new purchase re-links to it.
-    # The freshly provisioned shell tenant stays empty and harmless: nothing
-    # is deleted, ever.
+    # DETECTED here, but MUTATED only after every token validity check passes
+    # (audit fix A: the worker commits after activate — an early-return path
+    # must leave zero side effects). The shell tenant stays empty and
+    # harmless: nothing is deleted, ever.
+    inherit = False
     if existing is not None and existing.tenant_id != tok.tenant_id:
         if _is_funnel_only_tenant(owner_session, existing.tenant_id):
-            shell_code = ten_code
-            moved = owner_session.get(Subscription, tok.subscription_id)
-            if moved is not None:
-                moved.tenant_id = existing.tenant_id
-            tok.tenant_id = existing.tenant_id
-            ten_code = owner_session.get(  # type: ignore[union-attr]
-                Tenant, existing.tenant_id
-            ).code
-            admin_client.send_admin(
-                f"↻ ترقية من قمع التحليل: {shell_code} → {ten_code}"
-            )
+            inherit = True
         else:
             whatsapp_client.send_text(from_phone, _CONFLICT)
             admin_client.send_admin(
@@ -132,7 +125,20 @@ def activate(
         admin_client.send_admin(admin_msg.activation_failed(ten_code, "token_reused"))
         return ActivationResult(ActivationStatus.ALREADY_USED)
 
-    # Happy path — create or refresh the channel, consume the token, advance sub.
+    # Happy path — every validity check passed; NOW mutations may begin.
+    if inherit and existing is not None:
+        shell_code = ten_code
+        moved = owner_session.get(Subscription, tok.subscription_id)
+        if moved is not None:
+            moved.tenant_id = existing.tenant_id
+        tok.tenant_id = existing.tenant_id
+        ten_code = owner_session.get(  # type: ignore[union-attr]
+            Tenant, existing.tenant_id
+        ).code
+        admin_client.send_admin(
+            f"↻ ترقية من قمع التحليل: {shell_code} → {ten_code}"
+        )
+
     if existing is None:
         channel = CustomerChannel(
             id=uuid.uuid4(), tenant_id=tok.tenant_id, subscription_id=tok.subscription_id,

@@ -20,6 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -54,8 +55,11 @@ from career.whatsapp.templates import DAILY_UTILITY, TemplateSpec
 
 logger = logging.getLogger("career.cv")
 
-#: Saudi weekend — Friday (4) and Saturday (5) in Python weekday numbering.
+#: Saudi weekend — Friday (4) and Saturday (5) in Python weekday numbering,
+#: computed in Asia/Riyadh explicitly (audit fix E: a UTC clock reads the
+#: previous day between 00:00 and 03:00 Riyadh).
 _WEEKEND = (4, 5)
+_RIYADH = ZoneInfo("Asia/Riyadh")
 
 
 @dataclass
@@ -139,7 +143,7 @@ def _run_tenant(
     renderer: Callable[..., Any],
     suppressor: close_mod.Suppressor,
 ) -> TenantDayState | None:
-    run_date = now.date()
+    run_date = now.astimezone(_RIYADH).date()
     discovery_ok = report.status != "discovery_failed"
     final = list(payload.get("final") or [])
     gate_passes = int((payload.get("counts") or {}).get("passed", len(final)))
@@ -205,18 +209,19 @@ def _run_tenant(
                 job_title=str(job["title"]), company=str(job["company"]),
                 jd_text=str(job["jd_text"]),
             )
-            keys = publish.publish_cv_pair(
+            # audit fix D: the LLM spend happened HERE — record it before
+            # publish/render can fail, or the §14 cost fuel undercounts.
+            close_mod.record_usage(
+                session, tenant_id=tenant_id, kind="llm_generation",
+                run_id=report.run_id, now=now,
+            )
+            return publish.publish_cv_pair(
                 deps.storage, tenant_id=str(tenant_id),
                 cv=_inject_contact(tailored, contact),
                 job_url=str(job["url"]), location=job.get("location"),
                 portal=job.get("portal"), job_analysis={}, now=now,
                 renderer=renderer,
             )
-            close_mod.record_usage(
-                session, tenant_id=tenant_id, kind="llm_generation",
-                run_id=report.run_id, now=now,
-            )
-            return keys
 
         return publish.resolve_tailored_cv(
             deps.storage, tenant_id=str(tenant_id), job_url=str(job["url"]),
@@ -263,7 +268,8 @@ def run_daily_delivery(
 ) -> dict[uuid.UUID, TenantDayState]:
     """One delivery day. Tenants are isolated — one tenant's crash never
     touches the others; the admin summary reports every closed tenant."""
-    if now.weekday() in _WEEKEND:
+    riyadh_now = now.astimezone(_RIYADH)
+    if riyadh_now.weekday() in _WEEKEND:
         logger.info("weekend — no delivery day (§08)")
         return {}
 

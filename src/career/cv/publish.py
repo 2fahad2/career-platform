@@ -379,8 +379,11 @@ def generate_missing_cvs(
             job["cv_generation_status"] = "generation_budget_exhausted"
             out.append(job)
             continue
-        spent += 1
         result = resolve(job)
+        # LEGACY §7.5: only actual GENERATION work consumes the budget —
+        # a reuse resolved for free (audit fix C).
+        if result.status != "existing_valid_cv":
+            spent += 1
         job["cv_generation_status"] = result.status
         if result.status in ("generated_valid_cv", "existing_valid_cv"):
             job["cv_key"] = result.cv_key
