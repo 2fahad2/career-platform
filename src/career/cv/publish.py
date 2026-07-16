@@ -107,7 +107,7 @@ def publish_cv_pair(
         rendered = renderer(cv, Path(tmp) / f"joburl-{hexpart}.pdf")
         pdf_bytes = Path(rendered).read_bytes()
 
-    sidecar = {
+    sidecar: dict[str, Any] = {
         "job_title": cv.job_title,
         "company": cv.company,
         "job_id": None,                       # provenance only, never identity
