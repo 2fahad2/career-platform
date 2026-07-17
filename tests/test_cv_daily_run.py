@@ -251,6 +251,26 @@ def test_royal_journey_engine_to_delivered(
 # ═════════════ the failure matrix (§15.12) ═══════════════════════════════════
 
 
+def test_all_suppressed_day_is_no_matches_not_cv_failure(
+    owner_session: Session, clean_billing: None, tmp_path: Any
+) -> None:
+    """Audit fix: every gate pass already delivered (suppressed within TTL)
+    is an honest NO_MATCHES — nothing failed, the jobs are repeats."""
+    tid, _ = _seed_active_tenant(owner_session)
+    try:
+        report = _engine_report(owner_session, tid)
+        report = engine_run.RunReport(
+            report.run_id, report.status, report.counts,
+            {tid: {"final": [], "counts": {"passed": 1, "suppressed": 1}}},
+        )
+        states = daily_run.run_daily_delivery(
+            owner_session, report=report, deps=_deps(tmp_path), now=NOW,
+        )
+        assert states[tid].state == "NO_MATCHES"
+    finally:
+        _cleanup(owner_session, tid)
+
+
 def test_no_matches_day(owner_session: Session, clean_billing: None,
                         tmp_path: Any) -> None:
     tid, _ = _seed_active_tenant(owner_session)
@@ -446,6 +466,52 @@ def test_held_window_day_closes_on_descend(
         assert state == "DELIVERED"
         kinds = [m.kind for m in wa2.sent]
         assert "document" in kinds                          # the bundle landed
+    finally:
+        _cleanup(owner_session, tid)
+
+
+def test_stale_held_delivery_expires_into_honest_close(
+    owner_session: Session, clean_billing: None, tmp_path: Any
+) -> None:
+    """Audit fix: a held bundle whose window never opened must close its own
+    day (WHATSAPP_FAILED) at the next run instead of vanishing silently."""
+    from datetime import timedelta
+
+    tid, channel = _seed_active_tenant(owner_session)
+    try:
+        owner_session.execute(sql_text(
+            "UPDATE customer_channels SET last_inbound_at = NULL WHERE id = :id"),
+            {"id": str(channel.id)},
+        )
+        owner_session.commit()
+        report = _engine_report(owner_session, tid)
+        yesterday = NOW - timedelta(days=3)     # Thursday — a delivery day
+        held = daily_run.run_daily_delivery(
+            owner_session, report=report, deps=_deps(tmp_path), now=yesterday,
+        )
+        owner_session.commit()
+        assert tid not in held                               # held, not closed
+
+        # next dawn: the sweep closes yesterday honestly
+        states = daily_run.run_daily_delivery(
+            owner_session, report=engine_run.RunReport(
+                report.run_id, report.status, report.counts, {}),
+            deps=_deps(tmp_path), now=NOW,
+        )
+        owner_session.commit()
+        assert states == {}                                  # no tenants today
+        row = owner_session.execute(
+            sql_text("SELECT state FROM tenant_day_states WHERE tenant_id = :t"
+                     " AND run_date = :d"),
+            {"t": str(tid), "d": yesterday.astimezone(
+                daily_run._RIYADH).date().isoformat()},
+        ).scalar_one()
+        assert row == "WHATSAPP_FAILED"
+        status = owner_session.execute(
+            sql_text("SELECT status FROM deliveries WHERE tenant_id = :t"),
+            {"t": str(tid)},
+        ).scalar_one()
+        assert status == daily_run.DELIVERY_EXPIRED          # descend won't fire
     finally:
         _cleanup(owner_session, tid)
 

@@ -19,6 +19,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -33,6 +34,7 @@ from career.db.models import (
     CustomerChannel,
     CustomerProfile,
     Delivery,
+    ForbiddenClaim,
     JobPosting,
     ProfileFact,
     Tenant,
@@ -49,11 +51,29 @@ from career.whatsapp.client import WhatsAppClient
 from career.whatsapp.delivery import (
     DELIVERY_COMPLETED,
     DELIVERY_PARTIAL,
+    DELIVERY_PENDING,
     deliver_adaptive,
 )
 from career.whatsapp.templates import DAILY_UTILITY, TemplateSpec
 
 logger = logging.getLogger("career.cv")
+
+#: A held bundle whose window never opened before the NEXT run day — the day
+#: must still close honestly instead of silently never existing (§15.12).
+DELIVERY_EXPIRED = "EXPIRED_WINDOW"
+
+#: claude-opus-4-8 list prices (USD per token) — the §14 cost fuel.
+_LLM_USD_PER_INPUT_TOKEN = Decimal("0.000005")
+_LLM_USD_PER_OUTPUT_TOKEN = Decimal("0.000025")
+
+
+def _llm_cost_usd(input_tokens: int, output_tokens: int) -> Decimal | None:
+    if input_tokens <= 0 and output_tokens <= 0:
+        return None
+    return (
+        _LLM_USD_PER_INPUT_TOKEN * input_tokens
+        + _LLM_USD_PER_OUTPUT_TOKEN * output_tokens
+    )
 
 #: Saudi weekend — Friday (4) and Saturday (5) in Python weekday numbering,
 #: computed in Asia/Riyadh explicitly (audit fix E: a UTC clock reads the
@@ -146,7 +166,13 @@ def _run_tenant(
     run_date = now.astimezone(_RIYADH).date()
     discovery_ok = report.status != "discovery_failed"
     final = list(payload.get("final") or [])
-    gate_passes = int((payload.get("counts") or {}).get("passed", len(final)))
+    counts_in = payload.get("counts") or {}
+    raw_passed = int(counts_in.get("passed", len(final)))
+    suppressed = int(counts_in.get("suppressed", 0))
+    # audit fix: gate_passes = FRESH passes only. A day where every pass was
+    # already delivered (suppressed) is honestly NO_MATCHES — nothing failed,
+    # the jobs are simply repeats within the TTL (§15.12).
+    gate_passes = max(raw_passed - suppressed, len(final))
 
     def _close(
         *, cv_resolved: int = 0, cv_failed: int = 0,
@@ -176,6 +202,13 @@ def _run_tenant(
 
     bank = _load_bank(session, tenant_id)
     contact = _contact_for(profile, channel)
+    forbidden = [
+        claim for (claim,) in session.execute(
+            select(ForbiddenClaim.claim).where(
+                ForbiddenClaim.tenant_id == tenant_id
+            )
+        ).all()
+    ]
 
     jobs: list[dict[str, Any]] = []
     for item in final:
@@ -202,18 +235,26 @@ def _run_tenant(
 
     def _resolve(job: dict[str, Any]) -> publish.ResolveResult:
         def _generator() -> dict[str, str]:
+            in_before = int(getattr(deps.llm, "total_input_tokens", 0) or 0)
+            out_before = int(getattr(deps.llm, "total_output_tokens", 0) or 0)
             tailored = generate.tailor_cv(
                 deps.llm, bank=bank,
                 current_title=profile.current_title,
                 years_experience=profile.years_experience,
                 job_title=str(job["title"]), company=str(job["company"]),
                 jd_text=str(job["jd_text"]),
+                forbidden_claims=forbidden,
             )
             # audit fix D: the LLM spend happened HERE — record it before
             # publish/render can fail, or the §14 cost fuel undercounts.
+            in_used = int(getattr(deps.llm, "total_input_tokens", 0) or 0) - in_before
+            out_used = int(getattr(deps.llm, "total_output_tokens", 0) or 0) - out_before
             close_mod.record_usage(
                 session, tenant_id=tenant_id, kind="llm_generation",
                 run_id=report.run_id, now=now,
+                input_tokens=in_used or None,
+                output_tokens=out_used or None,
+                cost_usd=_llm_cost_usd(in_used, out_used),
             )
             return publish.publish_cv_pair(
                 deps.storage, tenant_id=str(tenant_id),
@@ -266,6 +307,46 @@ def _run_tenant(
     return state  # None ⇒ held for the window; the descend path closes it
 
 
+def expire_stale_held_deliveries(
+    session: Session,
+    *,
+    now: datetime,
+    suppressor: close_mod.Suppressor = record_suppression_by_url,
+) -> int:
+    """Audit fix (§15.12 gap): a PENDING_WINDOW bundle from a PREVIOUS run
+    day whose customer never opened the window would otherwise leave that day
+    with no state at all. Expire it and close the day honestly — nothing was
+    delivered, so the state authority yields WHATSAPP_FAILED. The descend
+    path no longer matches the row (status left PENDING only for today)."""
+    today = now.astimezone(_RIYADH).date()
+    stale = session.execute(
+        select(Delivery).where(
+            Delivery.status == DELIVERY_PENDING,
+            Delivery.run_date < today,
+        )
+    ).scalars().all()
+    for delivery in stale:
+        delivery.status = DELIVERY_EXPIRED
+        snapshot = delivery.bundle.get("close") or {}
+        groups = [
+            str(e.get("group")) for e in delivery.bundle.get("jobs", [])
+        ]
+        close_mod.close_tenant_day(
+            session,
+            tenant_id=delivery.tenant_id,
+            run_date=delivery.run_date,
+            now=now,
+            discovery_ok=True,
+            gate_passes=int(snapshot.get("gate_passes", len(groups))),
+            cv_resolved=int(snapshot.get("cv_resolved", len(groups))),
+            cv_failed=int(snapshot.get("cv_failed", 0)),
+            delivered_groups=[],
+            failed_groups=groups,
+            suppressor=suppressor,
+        )
+    return len(stale)
+
+
 def run_daily_delivery(
     session: Session,
     *,
@@ -281,6 +362,16 @@ def run_daily_delivery(
     touches the others; the admin summary reports every closed tenant.
     ``include_weekend`` exists for manual canary runs only — the timer
     never sets it (§08: Sunday–Thursday)."""
+    expired = expire_stale_held_deliveries(session, suppressor=suppressor, now=now)
+    if expired:
+        try:
+            deps.admin_client.send_admin(
+                f"⌛ أُغلقت {expired} تسليمة معلقة من يوم سابق — "
+                "النافذة لم تُفتح (WHATSAPP_FAILED)"
+            )
+        except Exception:  # noqa: BLE001 — reporting never breaks the day
+            logger.warning("expiry admin note failed", exc_info=True)
+
     if not include_weekend and now.astimezone(_RIYADH).weekday() in _WEEKEND:
         logger.info("weekend — no delivery day (§08)")
         return {}
@@ -298,6 +389,13 @@ def run_daily_delivery(
             continue
         if state is not None:
             states[tenant_id] = state
+            try:
+                # §14: fold the day's raw usage events into the cost rollup
+                close_mod.rollup_costs(
+                    session, tenant_id=tenant_id, day=state.run_date
+                )
+            except Exception:  # noqa: BLE001 — accounting never breaks the day
+                logger.warning("cost rollup failed", exc_info=True)
 
     rows: list[tuple[str, str, dict[str, int]]] = []
     for tenant_id, state in states.items():

@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Sequence
 from typing import Any, Protocol
 
 from career.cv.prompts import (
@@ -422,6 +423,21 @@ class GenerationFailed(Exception):
     """The LLM transport failed in a way the caller must see honestly."""
 
 
+def _forbidden_claim_hit(cv: TailoredCV, claims: Sequence[str]) -> bool:
+    """§15.5: the customer's forbidden list is honored literally — any
+    forbidden phrase appearing in generated text blocks the CV."""
+    normalized = [c.strip().casefold() for c in claims if c and c.strip()]
+    if not normalized:
+        return False
+    parts: list[str] = [cv.tailored_summary, cv.master_cv.headline or ""]
+    parts.extend(cv.selected_skills)
+    for exp in cv.selected_experience:
+        parts.extend(exp.achievements)
+        parts.extend(exp.technologies)
+    haystack = "\n".join(parts).casefold()
+    return any(claim in haystack for claim in normalized)
+
+
 def tailor_cv(
     llm: LlmClient,
     *,
@@ -432,11 +448,14 @@ def tailor_cv(
     company: str,
     jd_text: str,
     budget: BudgetGuard | None = None,
+    forbidden_claims: Sequence[str] = (),
 ) -> TailoredCV:
     """The §1.8 chain: analyze → rank → pace → skills → variant → humanize →
-    enforce → the §1.6 gate. Every LLM stage degrades to rules; the PDF look
-    is identical either way because template + caps are deterministic."""
+    enforce → the §1.6 gate → forbidden-claims + pre-render guards. Every LLM
+    stage degrades to rules; the PDF look is identical either way because
+    template + caps are deterministic."""
     from career.cv import enforce, normalize
+    from career.cv.validate import validate_pre_render
     from career_core.sentences import validate_summary_quality
 
     vocabulary = bank_vocabulary(bank)
@@ -489,6 +508,17 @@ def tailor_cv(
     ok, reason = validate_summary_quality(cv.tailored_summary)
     if not ok:
         raise TailoringBlocked(str(reason))   # blocks BEFORE any file (§1.6)
+
+    # §15.5: the forbidden list is honored literally — reason code only,
+    # never the claim text (it may quote customer content).
+    if _forbidden_claim_hit(cv, forbidden_claims):
+        raise TailoringBlocked("forbidden_claim")
+
+    # §1.10 pre-render guard (audit fix: existed but was never wired) —
+    # Arabic-leak/structure issues block; warnings are advisory only.
+    valid, issues, _warnings = validate_pre_render(cv)
+    if not valid:
+        raise TailoringBlocked(",".join(issues))
     return cv
 
 
@@ -500,7 +530,9 @@ _MAX_TOKENS = 2048
 
 class AnthropicLlmClient:
     """Claude-only transport (D1). SDK client injectable — tests exercise the
-    exact request shape with zero network; retries are the SDK's built-in."""
+    exact request shape with zero network; retries are the SDK's built-in.
+    Token totals accumulate on the instance so the caller can meter the §14
+    cost fuel per tailoring (audit fix: usage was recorded without numbers)."""
 
     def __init__(
         self,
@@ -514,6 +546,8 @@ class AnthropicLlmClient:
             client = anthropic.Anthropic(api_key=api_key)
         self._client = client
         self._model = model
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
 
     def complete(self, prompt: str) -> str:
         response = self._client.messages.create(
@@ -522,6 +556,10 @@ class AnthropicLlmClient:
             thinking={"type": "adaptive"},
             messages=[{"role": "user", "content": prompt}],
         )
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            self.total_input_tokens += int(getattr(usage, "input_tokens", 0) or 0)
+            self.total_output_tokens += int(getattr(usage, "output_tokens", 0) or 0)
         if response.stop_reason != "end_turn":
             raise GenerationFailed(f"stop_reason:{response.stop_reason}")
         for block in response.content:

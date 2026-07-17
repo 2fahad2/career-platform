@@ -55,7 +55,8 @@ BANK = {
          "institution": "King Saud University", "graduation_year": 2017},
     ],
     "certification": [{"name": "PMP", "issuer": "PMI", "issue_date": "2020-01"}],
-    "skill": [{"name": "SQL"}, {"name": "Power BI"}],
+    "skill": [{"name": "SQL"}, {"name": "Power BI"}, {"name": "Excel"},
+              {"name": "Jira"}, {"name": "UAT"}],
     "language": [{"language": "English", "proficiency": "Fluent"}],
 }
 
@@ -329,6 +330,50 @@ def test_tailor_cv_blocks_on_summary_quality() -> None:
     except generate.TailoringBlocked as exc:
         assert str(exc) in ("summary_incomplete_terminal",
                             "summary_dangling_connector")
+
+
+def test_tailor_cv_blocks_on_forbidden_claim() -> None:
+    """§15.5 audit fix: the customer's forbidden list is enforced literally
+    in the generation path — reason code only, never the claim text."""
+    try:
+        generate.tailor_cv(
+            FakeLlm([]), bank=BANK,
+            current_title="Senior Business Analyst", years_experience=9,
+            job_title="Business Analyst", company="Target Corp",
+            jd_text="SQL and requirements.",
+            forbidden_claims=["SAMA-regulated"],   # appears in bank text
+        )
+        raise AssertionError("expected TailoringBlocked")
+    except generate.TailoringBlocked as exc:
+        assert str(exc) == "forbidden_claim"
+        assert "SAMA" not in str(exc)              # never quotes the claim
+
+
+def test_tailor_cv_unmatched_forbidden_claims_pass() -> None:
+    cv = generate.tailor_cv(
+        FakeLlm([]), bank=BANK,
+        current_title="Senior Business Analyst", years_experience=9,
+        job_title="Business Analyst", company="Target Corp",
+        jd_text="SQL and requirements.",
+        forbidden_claims=["Kubernetes expert", ""],
+    )
+    assert cv.tailored_summary
+
+
+def test_tailor_cv_blocks_on_arabic_leak() -> None:
+    """§1.10 audit fix: validate_pre_render is now WIRED — Arabic sneaking
+    into the confirmed bank must block before any file."""
+    bank = {**BANK, "skill": [{"name": "SQL"}, {"name": "إدارة مشاريع"}]}
+    try:
+        generate.tailor_cv(
+            FakeLlm([]), bank=bank,
+            current_title="Senior Business Analyst", years_experience=9,
+            job_title="Business Analyst", company="Target Corp",
+            jd_text="SQL and requirements.",
+        )
+        raise AssertionError("expected TailoringBlocked")
+    except generate.TailoringBlocked as exc:
+        assert "arabic_characters_detected" in str(exc)
 
 
 # ── the real client shape (injected fake SDK — zero network) ─────────────────
