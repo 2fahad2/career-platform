@@ -265,11 +265,13 @@ def run_daily_delivery(
     generation_budget: int = publish.MAX_GENERATIONS_PER_RUN,
     renderer: Callable[..., Any] = render_cv_pdf,
     suppressor: close_mod.Suppressor = record_suppression_by_url,
+    include_weekend: bool = False,
 ) -> dict[uuid.UUID, TenantDayState]:
     """One delivery day. Tenants are isolated — one tenant's crash never
-    touches the others; the admin summary reports every closed tenant."""
-    riyadh_now = now.astimezone(_RIYADH)
-    if riyadh_now.weekday() in _WEEKEND:
+    touches the others; the admin summary reports every closed tenant.
+    ``include_weekend`` exists for manual canary runs only — the timer
+    never sets it (§08: Sunday–Thursday)."""
+    if not include_weekend and now.astimezone(_RIYADH).weekday() in _WEEKEND:
         logger.info("weekend — no delivery day (§08)")
         return {}
 

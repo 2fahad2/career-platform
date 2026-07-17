@@ -61,6 +61,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--tenant", type=uuid.UUID, action="append", default=None,
         help="scope the run to specific tenant id(s); repeatable",
     )
+    parser.add_argument(
+        "--include-weekend",
+        action="store_true",
+        help="manual canary runs only — deliver on a Riyadh weekend too",
+    )
+    parser.add_argument(
+        "--deliver",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="run the delivery phase after discovery (Sun-Thu, skipped "
+             "automatically without WhatsApp credentials); --no-deliver is "
+             "the explicit off form (D9).",
+    )
     return parser
 
 
@@ -120,7 +133,47 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
     finally:
         engine.dispose()
 
-    print(json.dumps(summarize(report, codes), ensure_ascii=False, default=str))
+    summary = summarize(report, codes)
+
+    # ── the delivery phase (C7): engine result → CV → WhatsApp → close ──
+    if args.deliver and settings.whatsapp_access_token and report.per_tenant:
+        from career.cv.daily_run import DailyDeps, run_daily_delivery
+        from career.cv.generate import AnthropicLlmClient
+        from career.storage import FilesystemStorageAdapter
+        from career.whatsapp.client import HttpWhatsAppClient
+
+        class _JournalAdmin:
+            def send_admin(self, text: str) -> str:
+                logger.info("ADMIN: %s", text)
+                return "journal"
+
+        storage = FilesystemStorageAdapter(settings.storage_root)
+        deps = DailyDeps(
+            storage=storage,
+            whatsapp_client=HttpWhatsAppClient(
+                settings.whatsapp_access_token,
+                settings.whatsapp_phone_number_id,
+                storage=storage,
+            ),
+            admin_client=_JournalAdmin(),
+            llm=AnthropicLlmClient(api_key=settings.anthropic_api_key),
+        )
+        engine2 = create_engine(settings.owner_database_url, future=True)
+        try:
+            with Session(engine2) as session:
+                states = run_daily_delivery(
+                    session, report=report, deps=deps,
+                    now=datetime.now(UTC),
+                    include_weekend=args.include_weekend,
+                )
+                session.commit()
+            summary["delivery"] = {
+                str(tid): state.state for tid, state in states.items()
+            }
+        finally:
+            engine2.dispose()
+
+    print(json.dumps(summary, ensure_ascii=False, default=str))
     return exit_code_for(report.status)
 
 
