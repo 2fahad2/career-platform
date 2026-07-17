@@ -49,12 +49,21 @@ docker exec "$PG_CONTAINER" pg_dump -U "$PG_OWNER" -Fc "$PG_DB" > "$DUMP"
 echo "backup: dump size $(du -h "$DUMP" | cut -f1)"
 restic backup --stdin --stdin-filename "${PG_DB}.dump" --tag staging --tag db < "$DUMP"
 
-# 2. Back up the per-tenant object-storage volume if present (may be empty pre-C7).
+# 2. Back up the REAL per-tenant object storage. The host services (worker,
+#    nightly, admin bot) write to STORAGE_ROOT on the host filesystem — the
+#    docker volume only serves the compose api container. Audit fix: the
+#    volume alone was backed up while every real CV/upload lived on the host
+#    path, so tenant files had never actually been protected.
+STORAGE_ROOT="${STORAGE_ROOT:-/root/career/data}"
+if [[ -d "$STORAGE_ROOT" ]]; then
+  echo "backup: backing up host storage root $STORAGE_ROOT"
+  restic backup --tag staging --tag storage "$STORAGE_ROOT"
+fi
 if docker volume inspect "$STORAGE_VOLUME" >/dev/null 2>&1; then
   STORAGE_PATH="$(docker volume inspect -f '{{.Mountpoint}}' "$STORAGE_VOLUME")"
   if [[ -d "$STORAGE_PATH" ]]; then
     echo "backup: backing up storage volume"
-    restic backup --tag staging --tag storage "$STORAGE_PATH"
+    restic backup --tag staging --tag storage-volume "$STORAGE_PATH"
   fi
 fi
 

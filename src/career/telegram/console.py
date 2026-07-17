@@ -278,15 +278,19 @@ def _business_data(
     usage_row = session.execute(usage_query).one()
 
     # funnel upgrade = a tenant holding BOTH a cv_analysis purchase and a
-    # search subscription (the §04 inheritance path)
+    # search subscription (the §04 inheritance path); the RANGE applies to
+    # when the upgrade subscription was created (audit fix: was all-time)
     analysis_tenants = select(Subscription.tenant_id).where(
         Subscription.plan_code == "cv_analysis"
     )
-    upgrades = int(session.execute(
+    upgrades_query = (
         select(func.count(func.distinct(Subscription.tenant_id)))
         .where(Subscription.tenant_id.in_(analysis_tenants),
                Subscription.plan_code != "cv_analysis")
-    ).scalar_one())
+    )
+    if cutoff is not None:
+        upgrades_query = upgrades_query.where(Subscription.created_at >= cutoff)
+    upgrades = int(session.execute(upgrades_query).scalar_one())
 
     return {
         "subs_by_plan": subs_by_plan,

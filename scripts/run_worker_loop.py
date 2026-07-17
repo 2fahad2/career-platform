@@ -38,13 +38,11 @@ REMINDER_SWEEP_SECONDS = 3600.0  # §05 stall nudges — hourly is plenty for 24
 _RIYADH = ZoneInfo("Asia/Riyadh")
 
 
-def _salla_catalog() -> dict[str, str]:
+def _salla_catalog(raw: str) -> dict[str, str]:
     import json
-    import os
 
-    raw = os.environ.get("SALLA_PRODUCT_CATALOG", "{}")
     try:
-        parsed = json.loads(raw)
+        parsed = json.loads(raw or "{}")
         return {str(k): str(v) for k, v in parsed.items()}
     except ValueError:
         return {}
@@ -101,7 +99,7 @@ def main() -> None:  # pragma: no cover — the C7.8 live runner
     logger.info("worker loop up — polling every %.0fs", POLL_SECONDS)
 
     salla = HttpSallaClient(settings.salla_api_key)
-    catalog = _salla_catalog()
+    catalog = _salla_catalog(settings.salla_product_catalog)
     last_reminder_sweep = 0.0
     last_window_nudge: date | None = None
 

@@ -271,8 +271,11 @@ def _finish_report(
             output_path=Path(tmp) / "report.pdf",
         )
         pdf_bytes = pdf_path.read_bytes()
+    # audit fix: a second same-day analysis must never overwrite the first
+    # stored artifact — the key carries the full timestamp.
+    stamp = now.astimezone(UTC).strftime("%Y-%m-%d-%H%M%S")
     report_key = tenant_key(
-        str(row.tenant_id), "funnel_reports", f"{report_date}.pdf"
+        str(row.tenant_id), "funnel_reports", f"{stamp}.pdf"
     )
     deps.storage.put(report_key, pdf_bytes, content_type="application/pdf")
 

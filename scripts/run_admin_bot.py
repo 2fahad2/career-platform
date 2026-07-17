@@ -31,8 +31,16 @@ logger = logging.getLogger("career.admin_bot")
 
 POLL_TIMEOUT = 50
 ERROR_PAUSE = 5.0
-#: Captured Salla access token expiry (manual until auto-refresh lands).
-SALLA_TOKEN_EXPIRES = datetime(2026, 7, 29, tzinfo=UTC)
+#: Fallback Salla access-token expiry — overridden by SALLA_TOKEN_EXPIRES_AT.
+_SALLA_EXPIRES_DEFAULT = datetime(2026, 7, 29, tzinfo=UTC)
+
+
+def _salla_expiry(settings: Any) -> datetime:
+    raw = getattr(settings, "salla_token_expires_at", "") or ""
+    try:
+        return datetime.fromisoformat(raw).replace(tzinfo=UTC)
+    except ValueError:
+        return _SALLA_EXPIRES_DEFAULT
 
 
 class LiveProbes:  # pragma: no cover — live boundary, facts only
@@ -72,6 +80,8 @@ class LiveProbes:  # pragma: no cover — live boundary, facts only
             return None
 
     def _meta_token_ok(self) -> bool | None:
+        from urllib.error import HTTPError
+
         try:
             with urlopen(
                 "https://graph.facebook.com/v21.0/"
@@ -80,8 +90,10 @@ class LiveProbes:  # pragma: no cover — live boundary, facts only
                 timeout=10,
             ) as resp:
                 return bool(json.load(resp).get("id"))
+        except HTTPError:
+            return False        # Graph answered and refused — a real red
         except Exception:  # noqa: BLE001
-            return False
+            return None         # transient network trouble ≠ token failure
 
     def _searchapi(self) -> tuple[int, int] | None:
         try:
@@ -153,7 +165,7 @@ class LiveProbes:  # pragma: no cover — live boundary, facts only
             return []
 
     def collect(self) -> dict[str, Any]:
-        days_left = (SALLA_TOKEN_EXPIRES - datetime.now(UTC)).days
+        days_left = (_salla_expiry(self._settings) - datetime.now(UTC)).days
         return {
             "worker_active": self._systemd_active("career-worker.service"),
             "timer_next": self._timer_next(),

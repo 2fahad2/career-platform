@@ -48,6 +48,11 @@ class Settings(BaseSettings):
     # Salla — billing/webhooks (C3). Filled when the Partner App is created.
     salla_webhook_secret: str = Field(default="", alias="SALLA_WEBHOOK_SECRET")
     salla_api_key: str = Field(default="", alias="SALLA_API_KEY")
+    # product id → plan code JSON map — decides funnel vs subscription
+    # (audit fix: lived only as a raw env read in the worker script).
+    salla_product_catalog: str = Field(default="{}", alias="SALLA_PRODUCT_CATALOG")
+    # captured access-token expiry (ISO date) — manual until auto-refresh lands
+    salla_token_expires_at: str = Field(default="", alias="SALLA_TOKEN_EXPIRES_AT")
 
     # WhatsApp Cloud API (C4). Filled when the Meta app + WABA are set up.
     whatsapp_app_secret: str = Field(default="", alias="WHATSAPP_APP_SECRET")
@@ -83,4 +88,18 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    settings = Settings()
+    # audit fix: the exact-literal log scrubber existed but was never armed —
+    # register every real secret so even pattern-missed echoes get redacted.
+    from career.logging_filters import register_secret
+
+    for value in (
+        settings.db_password, settings.db_owner_password,
+        settings.redis_password, settings.salla_webhook_secret,
+        settings.salla_api_key, settings.anthropic_api_key,
+        settings.searchapi_api_key, settings.whatsapp_access_token,
+        settings.whatsapp_app_secret, settings.whatsapp_verify_token,
+        settings.telegram_admin_bot_token,
+    ):
+        register_secret(value)
+    return settings
