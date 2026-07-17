@@ -135,17 +135,37 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
 
     summary = summarize(report, codes)
 
+    class _JournalAdmin:
+        def send_admin(self, text: str) -> str:
+            logger.info("ADMIN: %s", text)
+            return "journal"
+
+    def _admin_client() -> Any:
+        if settings.telegram_admin_bot_token and settings.telegram_admin_chat_id:
+            from career.telegram.admin import HttpTelegramAdminClient
+
+            return HttpTelegramAdminClient(
+                settings.telegram_admin_bot_token,
+                settings.telegram_admin_chat_id,
+            )
+        return _JournalAdmin()
+
+    admin = _admin_client()
+    if report.status in ("discovery_failed", "partial"):
+        try:
+            admin.send_admin(
+                f"⚠️ التشغيلة الليلية: {report.status} — "
+                f"counts={report.counts}"
+            )
+        except Exception:  # noqa: BLE001 — alerting never breaks the run
+            logger.warning("admin alert failed", exc_info=True)
+
     # ── the delivery phase (C7): engine result → CV → WhatsApp → close ──
     if args.deliver and settings.whatsapp_access_token and report.per_tenant:
         from career.cv.daily_run import DailyDeps, run_daily_delivery
         from career.cv.generate import AnthropicLlmClient
         from career.storage import FilesystemStorageAdapter
         from career.whatsapp.client import HttpWhatsAppClient
-
-        class _JournalAdmin:
-            def send_admin(self, text: str) -> str:
-                logger.info("ADMIN: %s", text)
-                return "journal"
 
         storage = FilesystemStorageAdapter(settings.storage_root)
         deps = DailyDeps(
@@ -155,7 +175,7 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
                 settings.whatsapp_phone_number_id,
                 storage=storage,
             ),
-            admin_client=_JournalAdmin(),
+            admin_client=admin,
             llm=AnthropicLlmClient(api_key=settings.anthropic_api_key),
         )
         engine2 = create_engine(settings.owner_database_url, future=True)

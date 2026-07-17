@@ -450,6 +450,43 @@ def test_held_window_day_closes_on_descend(
         _cleanup(owner_session, tid)
 
 
+def test_template_send_crash_closes_whatsapp_failed(
+    owner_session: Session, clean_billing: None, tmp_path: Any
+) -> None:
+    """Closed window + morning template rejected (e.g. still PENDING at
+    Meta) → the day must close WHATSAPP_FAILED, never crash-skip."""
+    class NoTemplateWhatsApp(FakeWhatsAppClient):
+        def send_template(self, to_phone: str, template_name: str,
+                          language: str, variables: dict | None = None,
+                          buttons: tuple = ()) -> str:
+            raise RuntimeError("template not approved (132001)")
+
+    tid, channel = _seed_active_tenant(owner_session)
+    try:
+        owner_session.execute(sql_text(
+            "UPDATE customer_channels SET last_inbound_at = NULL WHERE id = :id"),
+            {"id": str(channel.id)},
+        )
+        owner_session.commit()
+        report = _engine_report(owner_session, tid)
+        states = daily_run.run_daily_delivery(
+            owner_session, report=report,
+            deps=_deps(tmp_path, whatsapp_client=NoTemplateWhatsApp()), now=NOW,
+        )
+        assert states[tid].state == "WHATSAPP_FAILED"
+        counts = dict(states[tid].counts)
+        assert counts["cv_resolved"] >= 1                    # CV work was done
+        assert counts["delivered"] == 0
+        assert counts["failed_sends"] >= 1
+        suppressed = owner_session.execute(
+            sql_text("SELECT count(*) FROM tenant_job_suppressions "
+                     "WHERE tenant_id = :t"), {"t": str(tid)},
+        ).scalar_one()
+        assert suppressed == 0                               # failed ≠ delivered
+    finally:
+        _cleanup(owner_session, tid)
+
+
 # ═════════════ the weekday guard: Sunday–Thursday only ═══════════════════════
 
 

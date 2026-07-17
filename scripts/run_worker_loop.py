@@ -20,16 +20,18 @@ from sqlalchemy.orm import Session
 from career.config import get_settings
 from career.logging_filters import install_secret_redaction
 from career.onboarding.extraction import AnthropicExtractor
-from career.onboarding.orchestrator import Deps
+from career.onboarding.orchestrator import Deps, send_due_reminders
 from career.salla.client import HttpSallaClient
 from career.salla.provisioning import process_pending_webhooks
 from career.storage import FilesystemStorageAdapter
+from career.telegram.admin import HttpTelegramAdminClient
 from career.whatsapp.client import HttpWhatsAppClient
 from career.whatsapp.worker import process_pending_whatsapp
 
 logger = logging.getLogger("career.worker_loop")
 
 POLL_SECONDS = 3.0
+REMINDER_SWEEP_SECONDS = 3600.0  # §05 stall nudges — hourly is plenty for 24h
 
 
 def _salla_catalog() -> dict[str, str]:
@@ -81,11 +83,22 @@ def main() -> None:  # pragma: no cover — the C7.8 live runner
         storage=storage,
         extractor=AnthropicExtractor(api_key=settings.anthropic_api_key),
     )
-    admin = JournalAdminClient()
+    if settings.telegram_admin_bot_token and settings.telegram_admin_chat_id:
+        admin = HttpTelegramAdminClient(
+            settings.telegram_admin_bot_token, settings.telegram_admin_chat_id
+        )
+        try:
+            admin.send_admin("🟢 عامل المحادثة انطلق")
+        except Exception:  # noqa: BLE001 — heartbeat only
+            logger.warning("admin heartbeat failed", exc_info=True)
+            admin = JournalAdminClient()
+    else:
+        admin = JournalAdminClient()
     logger.info("worker loop up — polling every %.0fs", POLL_SECONDS)
 
     salla = HttpSallaClient(settings.salla_api_key)
     catalog = _salla_catalog()
+    last_reminder_sweep = 0.0
 
     while True:
         try:
@@ -101,6 +114,15 @@ def main() -> None:  # pragma: no cover — the C7.8 live runner
                 logger.info("processed: %s", counts)
             if salla_counts:
                 logger.info("salla processed: %d orders", len(salla_counts))
+            if time.monotonic() - last_reminder_sweep >= REMINDER_SWEEP_SECONDS:
+                last_reminder_sweep = time.monotonic()
+                with Session(engine) as session:
+                    nudged = send_due_reminders(
+                        session, deps=deps, now=datetime.now(UTC)
+                    )
+                    session.commit()
+                if nudged:
+                    logger.info("stall reminders sent: %d", nudged)
         except Exception:  # noqa: BLE001 — the loop must survive anything
             logger.error("worker cycle failed", exc_info=True)
         time.sleep(POLL_SECONDS)
