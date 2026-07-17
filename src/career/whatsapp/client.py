@@ -10,7 +10,7 @@ untested payload code is shipped before it can be verified live.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Any, Protocol
 
 
 @dataclass
@@ -91,40 +91,148 @@ class FakeWhatsAppClient:
         return self.media.get(media_id)
 
 
-class HttpWhatsAppClient:  # pragma: no cover — wired when Meta creds arrive
-    """Skeleton. Fill the payloads and POST to the Graph API once the access
-    token + phone number id exist and can be tested against a live WABA."""
+class WhatsAppSendError(RuntimeError):
+    """Non-200 from the Graph API — message carries the HTTP status and the
+    Graph error CODE only, never the body (it can quote message content)."""
 
-    def __init__(self, access_token: str, phone_number_id: str,
-                 base_url: str = "https://graph.facebook.com/v20.0") -> None:
+
+class _RequestsTransport:  # pragma: no cover — exercised live in C4's gate
+    def post(
+        self, url: str, *, headers: dict[str, str],
+        json: dict[str, Any] | None = None,
+        data: dict[str, Any] | None = None,
+        files: dict[str, Any] | None = None,
+    ) -> tuple[int, dict[str, Any]]:
+        import requests
+
+        resp = requests.post(url, headers=headers, json=json, data=data,
+                             files=files, timeout=60)
+        try:
+            payload = resp.json()
+        except ValueError:
+            payload = {}
+        return resp.status_code, payload
+
+    def get(self, url: str, *, headers: dict[str, str]) -> tuple[int, Any]:
+        import requests
+
+        resp = requests.get(url, headers=headers, timeout=60)
+        content_type = resp.headers.get("Content-Type", "")
+        if "application/json" in content_type:
+            return resp.status_code, resp.json()
+        return resp.status_code, resp.content
+
+
+class HttpWhatsAppClient:
+    """The real Graph Cloud API client. ``document_ref`` values are STORAGE
+    KEYS (the C7 bundles carry them) — sending uploads the bytes to the
+    /media endpoint first, then messages by media id. The transport is
+    injectable so every payload shape is unit-asserted with zero network."""
+
+    def __init__(
+        self,
+        access_token: str,
+        phone_number_id: str,
+        base_url: str = "https://graph.facebook.com/v21.0",
+        storage: Any = None,
+        transport: Any = None,
+    ) -> None:
         self._token = access_token
         self._phone_number_id = phone_number_id
         self._base_url = base_url.rstrip("/")
+        self._storage = storage
+        self._transport = transport or _RequestsTransport()
 
-    def _unimplemented(self) -> str:
-        raise NotImplementedError(
-            "HttpWhatsAppClient is wired in C4 once the Meta access token exists"
+    # ── plumbing ─────────────────────────────────────────────────────────
+
+    def _headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self._token}"}
+
+    def _post_message(self, payload: dict[str, Any]) -> str:
+        status, body = self._transport.post(
+            f"{self._base_url}/{self._phone_number_id}/messages",
+            headers=self._headers(),
+            json={"messaging_product": "whatsapp", **payload},
         )
+        if status != 200:
+            code = (body.get("error") or {}).get("code", "?")
+            raise WhatsAppSendError(f"graph HTTP {status} (code {code})")
+        return str(body["messages"][0]["id"])
+
+    # ── the protocol ─────────────────────────────────────────────────────
 
     def send_text(self, to_phone: str, body: str) -> str:
-        return self._unimplemented()
+        return self._post_message(
+            {"to": to_phone, "type": "text", "text": {"body": body}}
+        )
 
-    def send_document(
-        self, to_phone: str, document_ref: str, *, filename: str, caption: str = ""
+    def send_interactive(
+        self, to_phone: str, body: str, buttons: tuple[str, ...]
     ) -> str:
-        return self._unimplemented()
+        return self._post_message({
+            "to": to_phone, "type": "interactive",
+            "interactive": {
+                "type": "button",
+                "body": {"text": body},
+                "action": {"buttons": [
+                    # WhatsApp caps reply titles/ids at 20 chars
+                    {"type": "reply",
+                     "reply": {"id": label[:20], "title": label[:20]}}
+                    for label in buttons[:3]
+                ]},
+            },
+        })
 
     def send_template(
         self, to_phone: str, template_name: str, language: str,
         variables: dict[str, str] | None = None, buttons: tuple[str, ...] = (),
     ) -> str:
-        return self._unimplemented()
+        template: dict[str, Any] = {
+            "name": template_name, "language": {"code": language},
+        }
+        if variables:
+            template["components"] = [{
+                "type": "body",
+                "parameters": [
+                    {"type": "text", "text": variables[key]}
+                    for key in sorted(variables)
+                ],
+            }]
+        return self._post_message(
+            {"to": to_phone, "type": "template", "template": template}
+        )
 
-    def send_interactive(
-        self, to_phone: str, body: str, buttons: tuple[str, ...]
+    def send_document(
+        self, to_phone: str, document_ref: str, *, filename: str, caption: str = ""
     ) -> str:
-        return self._unimplemented()
+        if self._storage is None:
+            raise WhatsAppSendError("no storage wired for document refs")
+        data = self._storage.get(document_ref)
+        status, body = self._transport.post(
+            f"{self._base_url}/{self._phone_number_id}/media",
+            headers=self._headers(),
+            data={"messaging_product": "whatsapp"},
+            files={"file": (filename, data, "application/pdf")},
+        )
+        if status != 200:
+            code = (body.get("error") or {}).get("code", "?")
+            raise WhatsAppSendError(f"graph media HTTP {status} (code {code})")
+        media_id = str(body["id"])
+        return self._post_message({
+            "to": to_phone, "type": "document",
+            "document": {"id": media_id, "filename": filename,
+                         "caption": caption},
+        })
 
     def download_media(self, media_id: str) -> tuple[bytes, str | None] | None:
-        self._unimplemented()
-        return None
+        status, meta = self._transport.get(
+            f"{self._base_url}/{media_id}", headers=self._headers()
+        )
+        if status != 200 or not isinstance(meta, dict) or "url" not in meta:
+            return None
+        status, blob = self._transport.get(
+            str(meta["url"]), headers=self._headers()
+        )
+        if status != 200 or not isinstance(blob, bytes):
+            return None
+        return blob, None
