@@ -160,6 +160,25 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
         except Exception:  # noqa: BLE001 — alerting never breaks the run
             logger.warning("admin alert failed", exc_info=True)
 
+    # SearchAPI credit watch (trial reads all-zero → quota_alert stays quiet)
+    try:
+        import json as _json
+        from urllib.request import urlopen
+
+        from career.engine.quota import quota_alert
+
+        with urlopen(
+            "https://www.searchapi.io/api/v1/me?api_key="
+            + settings.searchapi_api_key,
+            timeout=20,
+        ) as resp:
+            account = _json.load(resp).get("account") or {}
+        alert = quota_alert(account)
+        if alert:
+            admin.send_admin(alert)
+    except Exception:  # noqa: BLE001 — credit watch never breaks the run
+        logger.warning("searchapi credit check failed", exc_info=True)
+
     # ── the delivery phase (C7): engine result → CV → WhatsApp → close ──
     if args.deliver and settings.whatsapp_access_token and report.per_tenant:
         from career.cv.daily_run import DailyDeps, run_daily_delivery

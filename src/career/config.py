@@ -60,6 +60,9 @@ class Settings(BaseSettings):
     telegram_admin_bot_token: str = Field(default="", alias="TELEGRAM_ADMIN_BOT_TOKEN")
     telegram_admin_chat_id: str = Field(default="", alias="TELEGRAM_ADMIN_CHAT_ID")
 
+    # Canary phase: the operator's own WhatsApp number (evening window nudge).
+    canary_test_phone: str = Field(default="", alias="CANARY_TEST_PHONE")
+
     def _dsn(self, user: str, password: str) -> str:
         return (
             f"postgresql+psycopg://{user}:{password}"
