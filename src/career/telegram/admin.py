@@ -38,10 +38,18 @@ class TelegramSendError(RuntimeError):
 
 
 class _RequestsTransport:  # pragma: no cover — exercised live
-    def post(self, url: str, json: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    """Keep-alive session; per-call timeout so a 50s long-poll is never
+    killed by a 30s transport default (that mismatch stalled every button)."""
+
+    def __init__(self) -> None:
         import requests
 
-        resp = requests.post(url, json=json, timeout=30)
+        self._session = requests.Session()
+
+    def post(
+        self, url: str, json: dict[str, Any], timeout: float = 30.0
+    ) -> tuple[int, dict[str, Any]]:
+        resp = self._session.post(url, json=json, timeout=timeout)
         try:
             payload = resp.json()
         except ValueError:
@@ -65,9 +73,12 @@ class HttpTelegramAdminClient:
         self._base_url = base_url.rstrip("/")
         self._transport = transport or _RequestsTransport()
 
-    def _call(self, method: str, payload: dict[str, Any]) -> Any:
+    def _call(
+        self, method: str, payload: dict[str, Any], timeout: float = 30.0
+    ) -> Any:
         status, body = self._transport.post(
-            f"{self._base_url}/bot{self._bot_token}/{method}", json=payload
+            f"{self._base_url}/bot{self._bot_token}/{method}", json=payload,
+            timeout=timeout,
         )
         if status != 200 or not body.get("ok"):
             raise TelegramSendError(f"bot API HTTP {status}")
@@ -96,7 +107,7 @@ class HttpTelegramAdminClient:
         result = self._call("getUpdates", {
             "offset": offset, "timeout": timeout,
             "allowed_updates": ["message", "callback_query"],
-        })
+        }, timeout=timeout + 10)   # transport must outlive the long poll
         return list(result or [])
 
     def send_screen(self, text: str, keyboard: Keyboard | None = None) -> str:

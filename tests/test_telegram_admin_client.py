@@ -15,8 +15,10 @@ class FakeTransport:
         self.posts: list[dict[str, Any]] = []
         self.post_replies: list[tuple[int, dict[str, Any]]] = []
 
-    def post(self, url: str, json: dict[str, Any]) -> tuple[int, dict[str, Any]]:
-        self.posts.append({"url": url, "json": json})
+    def post(
+        self, url: str, json: dict[str, Any], timeout: float = 30.0
+    ) -> tuple[int, dict[str, Any]]:
+        self.posts.append({"url": url, "json": json, "timeout": timeout})
         return self.post_replies.pop(0)
 
 

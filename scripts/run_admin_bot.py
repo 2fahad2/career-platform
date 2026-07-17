@@ -16,6 +16,7 @@ import time
 from datetime import UTC, datetime
 from typing import Any
 from urllib.request import urlopen
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import create_engine
 from sqlalchemy import text as sql_text
@@ -56,7 +57,17 @@ class LiveProbes:  # pragma: no cover — live boundary, facts only
                 capture_output=True, text=True, timeout=5,
             )
             value = out.stdout.strip()
-            return value or None
+            if not value:
+                return None
+            # "Sat 2026-07-18 03:30:00 CEST" (server-local) → Arabic Riyadh
+            local = datetime.strptime(
+                " ".join(value.split()[1:3]), "%Y-%m-%d %H:%M:%S"
+            ).astimezone()
+            riyadh = local.astimezone(ZoneInfo("Asia/Riyadh"))
+            days_ar = ["الاثنين", "الثلاثاء", "الأربعاء", "الخميس",
+                       "الجمعة", "السبت", "الأحد"]
+            return (f"{days_ar[riyadh.weekday()]}"
+                    f" {riyadh.strftime('%H:%M')} بتوقيت الرياض")
         except Exception:  # noqa: BLE001
             return None
 
