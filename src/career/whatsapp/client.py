@@ -9,8 +9,21 @@ untested payload code is shipped before it can be verified live.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
+
+#: A reply button: either a bare label (id == title, both capped at 20 —
+#: onboarding answers resolve by label) or an ``(id, title)`` pair where the
+#: id is a machine token (Graph caps ids at 256, titles at 20).
+ButtonSpec = str | Sequence[str]
+
+
+def button_pair(spec: ButtonSpec) -> tuple[str, str]:
+    if isinstance(spec, str):
+        return spec[:20], spec[:20]
+    ident, title = spec
+    return str(ident)[:256], str(title)[:20]
 
 
 @dataclass
@@ -35,7 +48,7 @@ class WhatsAppClient(Protocol):
         variables: dict[str, str] | None = None, buttons: tuple[str, ...] = (),
     ) -> str: ...
     def send_interactive(
-        self, to_phone: str, body: str, buttons: tuple[str, ...]
+        self, to_phone: str, body: str, buttons: Sequence[ButtonSpec]
     ) -> str: ...
     def download_media(self, media_id: str) -> tuple[bytes, str | None] | None:
         """Fetch inbound media bytes (+ filename if known); None if unavailable."""
@@ -81,10 +94,13 @@ class FakeWhatsAppClient:
         return mid
 
     def send_interactive(
-        self, to_phone: str, body: str, buttons: tuple[str, ...]
+        self, to_phone: str, body: str, buttons: Sequence[ButtonSpec]
     ) -> str:
         mid = self._next_id()
-        self.sent.append(SentMessage(to_phone, "interactive", mid, body=body, buttons=buttons))
+        self.sent.append(SentMessage(
+            to_phone, "interactive", mid, body=body,
+            buttons=tuple(button_pair(b)[0] for b in buttons),
+        ))
         return mid
 
     def download_media(self, media_id: str) -> tuple[bytes, str | None] | None:
@@ -167,18 +183,17 @@ class HttpWhatsAppClient:
         )
 
     def send_interactive(
-        self, to_phone: str, body: str, buttons: tuple[str, ...]
+        self, to_phone: str, body: str, buttons: Sequence[ButtonSpec]
     ) -> str:
+        pairs = [button_pair(spec) for spec in buttons[:3]]
         return self._post_message({
             "to": to_phone, "type": "interactive",
             "interactive": {
                 "type": "button",
                 "body": {"text": body},
                 "action": {"buttons": [
-                    # WhatsApp caps reply titles/ids at 20 chars
-                    {"type": "reply",
-                     "reply": {"id": label[:20], "title": label[:20]}}
-                    for label in buttons[:3]
+                    {"type": "reply", "reply": {"id": ident, "title": title}}
+                    for ident, title in pairs
                 ]},
             },
         })

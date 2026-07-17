@@ -118,6 +118,20 @@ def _send_grouped_bundle(
             logger.warning("job document send failed", exc_info=True)
             failed.append(group)
             continue
+        outcome = entry.get("outcome") or {}
+        if outcome.get("buttons"):
+            # §14 measurement fuel only — the delivery contract (§08) is
+            # card+document, so a failed buttons message never fails the job.
+            try:
+                mid = whatsapp_client.send_interactive(
+                    channel.phone_e164, outcome.get("body", ""),
+                    [tuple(b) for b in outcome["buttons"]],
+                )
+                record_out(session, tenant_id=channel.tenant_id,
+                           channel_id=channel.id, kind="interactive",
+                           wa_message_id=mid, delivery_id=delivery.id, now=now)
+            except Exception:  # noqa: BLE001
+                logger.warning("outcome buttons send failed", exc_info=True)
         delivered.append(group)
     return delivered, failed
 

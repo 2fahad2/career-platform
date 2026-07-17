@@ -22,6 +22,12 @@ from career_core.urltools import strip_tracking_params
 #: The standing safety statement (§9.1) — every daily header carries it.
 SAFETY_LINE_AR = "⚠️ التقديم يدوي من طرفك — لا تقديم تلقائي أبدًا"
 
+#: Outcome buttons (§14): titles ≤ 20 chars (WhatsApp cap); the machine id
+#: carries the job url so a tap lands in outcome_events without lookup.
+OUTCOME_PROMPT_AR = "بعد ما تطلع على الفرصة والـCV — علّمني وش قررت 👇"
+OUTCOME_APPLIED_AR = "قدمت ✅"
+OUTCOME_IGNORED_AR = "ما ناسبتني"
+
 _SALARY_LABELS_AR = {
     "EXPLICIT_CONFIRMED": "✅ الراتب: معلن ومناسب",
     "INFERRED_HIGH": "✅ الراتب: مرجّح مرتفع",
@@ -119,6 +125,14 @@ def build_daily_bundle(
             "document": {
                 "kind": "document", "ref": cv_key, "filename": filename,
                 "caption": f"#{index} CV — {str(job.get('title', ''))[:80]}",
+            },
+            "outcome": {
+                "kind": "buttons",
+                "body": f"#{index} — {OUTCOME_PROMPT_AR}",
+                "buttons": [
+                    [f"applied:{group}", OUTCOME_APPLIED_AR],
+                    [f"ignored:{group}", OUTCOME_IGNORED_AR],
+                ],
             },
         })
 

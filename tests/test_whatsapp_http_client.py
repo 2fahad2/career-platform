@@ -68,6 +68,21 @@ def test_send_interactive_buttons_ids_capped_at_20() -> None:
     assert buttons[1]["reply"]["id"] == long_label[:20]
 
 
+def test_send_interactive_pair_buttons_keep_long_machine_ids() -> None:
+    t = FakeTransport()
+    t.post_replies = [(200, {"messages": [{"id": "wamid.X9"}]})]
+    url = "https://careers.example.com/very/long/posting/path/53839716"
+    _client(t).send_interactive(
+        "+9665", "وش قررت؟",
+        [(f"applied:{url}", "قدمت ✅"), (f"ignored:{url}", "ما ناسبتني")],
+    )
+    buttons = t.posts[0]["json"]["interactive"]["action"]["buttons"]
+    # ids exceed 20 chars (Graph caps ids at 256, only titles at 20)
+    assert buttons[0]["reply"]["id"] == f"applied:{url}"
+    assert buttons[0]["reply"]["title"] == "قدمت ✅"
+    assert buttons[1]["reply"]["id"] == f"ignored:{url}"
+
+
 def test_send_template_with_variables() -> None:
     t = FakeTransport()
     t.post_replies = [(200, {"messages": [{"id": "wamid.X3"}]})]

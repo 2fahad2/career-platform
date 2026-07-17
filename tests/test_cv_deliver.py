@@ -124,6 +124,14 @@ def test_bundle_binds_each_card_to_its_document() -> None:
         assert job["document"]["kind"] == "document"
         assert job["document"]["filename"].startswith("Fahad Almulhim - ")
         assert f"Role {i}" in job["card"]["body"]
+        # outcome buttons: machine id carries the url; Arabic titles ≤ 20
+        buttons = job["outcome"]["buttons"]
+        assert buttons[0][0] == f"applied:{job['group']}"
+        assert buttons[1][0] == f"ignored:{job['group']}"
+        for _ident, title in buttons:
+            assert len(title) <= 20
+        applied = deliver.parse_outcome_button(buttons[0][0])
+        assert applied == ("applied", job["group"])
 
 
 def test_bundle_excludes_cv_unresolved_jobs_as_failures() -> None:
@@ -208,9 +216,38 @@ def test_grouped_send_full_success_is_completed(
     owner_session.commit()
     assert delivery.status == DELIVERY_COMPLETED
     kinds = [m.kind for m in wa.sent]
-    # header, then card→document, card→document (visual binding order)
-    assert kinds == ["text", "text", "document", "text", "document"]
+    # header, then card→document→outcome buttons per job (visual binding order)
+    assert kinds == ["text", "text", "document", "interactive",
+                     "text", "document", "interactive"]
     assert delivery.bundle["results"]["failed"] == []
+    # the tap ids reach the wire intact (parseable outcome refs)
+    interactives = [m for m in wa.sent if m.kind == "interactive"]
+    assert interactives[0].buttons == (
+        f"applied:{_jobs(2)[0]['url']}", f"ignored:{_jobs(2)[0]['url']}"
+    )
+
+
+class NoButtonsWhatsApp(FakeWhatsAppClient):
+    """Interactive sends always fail — buttons must stay measurement-only."""
+
+    def send_interactive(self, to_phone: str, body: str, buttons) -> str:  # type: ignore[override]
+        raise RuntimeError("interactive down")
+
+
+def test_outcome_buttons_failure_never_fails_the_job(
+    owner_session: Session, owner_engine: Engine, clean_billing: None
+) -> None:
+    ch = _channel(owner_session)
+    bundle, _ = deliver.build_daily_bundle(_jobs(2), customer_name="F A")
+    wa = NoButtonsWhatsApp()
+    delivery = deliver_adaptive(
+        owner_session, ch, bundle, run_date=NOW.date(),
+        whatsapp_client=wa, daily_template=DAILY_UTILITY, now=NOW,
+    )
+    owner_session.commit()
+    assert delivery.status == DELIVERY_COMPLETED       # §08 contract untouched
+    assert delivery.bundle["results"]["failed"] == []
+    assert len(delivery.bundle["results"]["delivered"]) == 2
 
 
 # ── outcome events (D8 buttons → the measurement fuel) ───────────────────────

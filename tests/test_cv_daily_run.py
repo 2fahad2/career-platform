@@ -212,12 +212,14 @@ def test_royal_journey_engine_to_delivered(
         owner_session.commit()
 
         assert states[tid].state == "DELIVERED"
-        # the WhatsApp stream: header → card → ITS document with a D8 name
+        # the WhatsApp stream: header → card → ITS document → outcome buttons
         wa = deps.whatsapp_client
         kinds = [m.kind for m in wa.sent]
-        assert kinds == ["text", "text", "document"]
-        doc = wa.sent[-1]
+        assert kinds == ["text", "text", "document", "interactive"]
+        doc = [m for m in wa.sent if m.kind == "document"][-1]
         assert doc.body.startswith("#1 CV")
+        taps = wa.sent[-1]
+        assert taps.buttons and taps.buttons[0].startswith("applied:")
         sent_doc = [m for m in wa.sent if m.kind == "document"][0]
         assert "Fahad Almulhim - " in str(sent_doc.document_ref) or True
         # the published pair is validator-ready and referenced by key
