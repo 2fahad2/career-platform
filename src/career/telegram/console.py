@@ -19,12 +19,25 @@ from datetime import datetime
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from career.db.models import DiscoveryRun, Tenant, TenantDayState
+from career.db.models import (
+    CustomerChannel,
+    Delivery,
+    DiscoveryRun,
+    FunnelSession,
+    OnboardingSession,
+    OutcomeEvent,
+    Subscription,
+    Tenant,
+    TenantDayState,
+    TenantJobSuppression,
+    UsageEvent,
+)
 from career.telegram import views
 from career.telegram.admin import Keyboard
+from career.whatsapp.window import window_state
 
 logger = logging.getLogger("career.telegram.console")
 
@@ -38,6 +51,11 @@ class HealthProbes(Protocol):
     (= unknown, rendered honestly as ⚪)."""
 
     def collect(self) -> dict[str, Any]: ...
+
+    def error_lines(self) -> list[str]:
+        """Recent error lines — collector contract: logger + static message
+        only (our loggers are PII-free by §15.13; payloads never logged)."""
+        ...
 
 
 @dataclass
@@ -58,6 +76,21 @@ def _screen(
         return views.render_today(*_today_data(session, now=now))
     if name == "health":
         return views.render_health(probes.collect())
+    if name == "customers":
+        try:
+            page = max(0, int(arg or "0"))
+        except ValueError:
+            return None
+        return views.render_customers(*_customers_data(session, page=page, now=now))
+    if name == "tenant":
+        card = _tenant_card(session, code=arg, now=now)
+        return views.render_tenant_card(card) if card else None
+    if name == "business":
+        if arg not in ("7", "30", "all"):
+            return None
+        return views.render_business(arg, _business_data(session, arg, now=now))
+    if name == "errors":
+        return views.render_errors(probes.error_lines())
     if name == "soon":
         return views.render_soon(arg)
     return None
@@ -82,6 +115,188 @@ def _today_data(
     ).all()
     states = [(str(c), str(s), dict(k or {})) for c, s, k in rows]
     return run_date, run, states
+
+
+def _window_of(
+    last_inbound_at: datetime | None, opt_out_at: datetime | None, now: datetime
+) -> str:
+    return window_state(
+        last_inbound_at=last_inbound_at, opt_out_at=opt_out_at, now=now
+    ).value
+
+
+def _latest_subs(session: Session) -> dict[Any, Subscription]:
+    """tenant_id → newest subscription (tiny scale; reduced in Python)."""
+    latest: dict[Any, Subscription] = {}
+    for sub in session.execute(
+        select(Subscription).order_by(Subscription.created_at)
+    ).scalars():
+        latest[sub.tenant_id] = sub
+    return latest
+
+
+def _customers_data(
+    session: Session, *, page: int, now: datetime
+) -> tuple[list[dict[str, Any]], int, int]:
+    """(page_rows, page, total). TEN codes + plan + states only — the queries
+    NEVER select names/phones (§15.13)."""
+    tenants = session.execute(
+        select(Tenant.id, Tenant.code).order_by(Tenant.code)
+    ).all()
+    total = len(tenants)
+    start = page * views.PAGE_SIZE
+    page_tenants = tenants[start:start + views.PAGE_SIZE]
+    subs = _latest_subs(session)
+    journeys = {
+        tid: state for tid, state in session.execute(
+            select(OnboardingSession.tenant_id, OnboardingSession.state)
+        ).all()
+    }
+    funnels = {
+        tid: state for tid, state in session.execute(
+            select(FunnelSession.tenant_id, FunnelSession.state)
+        ).all()
+    }
+    channels = {
+        tid: (last, opt) for tid, last, opt in session.execute(
+            select(CustomerChannel.tenant_id, CustomerChannel.last_inbound_at,
+                   CustomerChannel.opt_out_at)
+        ).all()
+    }
+    rows = []
+    for tid, code in page_tenants:
+        sub = subs.get(tid)
+        channel = channels.get(tid)
+        rows.append({
+            "code": str(code),
+            "plan_code": sub.plan_code if sub else None,
+            "journey_state": journeys.get(tid) or funnels.get(tid),
+            "window": _window_of(channel[0], channel[1], now) if channel else None,
+        })
+    return rows, page, total
+
+
+def _tenant_card(
+    session: Session, *, code: str, now: datetime
+) -> dict[str, Any] | None:
+    tenant = session.execute(
+        select(Tenant).where(Tenant.code == code)
+    ).scalars().first()
+    if tenant is None:
+        return None
+    sub = session.execute(
+        select(Subscription).where(Subscription.tenant_id == tenant.id)
+        .order_by(Subscription.created_at.desc())
+    ).scalars().first()
+    journey = session.execute(
+        select(OnboardingSession.state)
+        .where(OnboardingSession.tenant_id == tenant.id)
+    ).scalar_one_or_none() or session.execute(
+        select(FunnelSession.state)
+        .where(FunnelSession.tenant_id == tenant.id)
+    ).scalar_one_or_none()
+    channel = session.execute(
+        select(CustomerChannel.last_inbound_at, CustomerChannel.opt_out_at)
+        .where(CustomerChannel.tenant_id == tenant.id)
+    ).first()
+    delivery = session.execute(
+        select(Delivery.run_date, Delivery.status)
+        .where(Delivery.tenant_id == tenant.id)
+        .order_by(Delivery.created_at.desc()).limit(1)
+    ).first()
+    outcomes = {
+        outcome: count for outcome, count in session.execute(
+            select(OutcomeEvent.outcome, func.count())
+            .where(OutcomeEvent.tenant_id == tenant.id)
+            .group_by(OutcomeEvent.outcome)
+        ).all()
+    }
+    suppressions = session.execute(
+        select(func.count()).select_from(TenantJobSuppression)
+        .where(TenantJobSuppression.tenant_id == tenant.id)
+    ).scalar_one()
+    return {
+        "code": code,
+        "plan_code": sub.plan_code if sub else None,
+        "sub_status": sub.status if sub else None,
+        "sub_age_days": (now - sub.created_at).days if sub else None,
+        "journey_state": journey,
+        "window": _window_of(channel[0], channel[1], now) if channel else None,
+        "last_delivery": (
+            {"run_date": delivery[0].isoformat(), "status": delivery[1]}
+            if delivery else None
+        ),
+        "outcomes": outcomes,
+        "suppressions": int(suppressions),
+    }
+
+
+def _business_data(
+    session: Session, range_key: str, *, now: datetime
+) -> dict[str, Any]:
+    cutoff = None
+    if range_key in ("7", "30"):
+        from datetime import timedelta
+
+        cutoff = now - timedelta(days=int(range_key))
+
+    subs_query = select(Subscription.plan_code, func.count(),
+                        func.coalesce(func.sum(Subscription.amount_sar), 0))
+    if cutoff is not None:
+        subs_query = subs_query.where(Subscription.created_at >= cutoff)
+    subs_by_plan: dict[str, int] = {}
+    revenue = 0
+    for plan_code, count, amount in session.execute(
+        subs_query.group_by(Subscription.plan_code)
+    ).all():
+        subs_by_plan[str(plan_code)] = int(count)
+        revenue += int(amount or 0)
+
+    outcomes_query = select(OutcomeEvent.outcome, func.count())
+    if cutoff is not None:
+        outcomes_query = outcomes_query.where(OutcomeEvent.occurred_at >= cutoff)
+    outcomes = {
+        str(outcome): int(count) for outcome, count in session.execute(
+            outcomes_query.group_by(OutcomeEvent.outcome)
+        ).all()
+    }
+
+    delivered_query = select(func.count()).select_from(TenantDayState).where(
+        TenantDayState.state == "DELIVERED"
+    )
+    if cutoff is not None:
+        delivered_query = delivered_query.where(
+            TenantDayState.recorded_at >= cutoff
+        )
+    delivered_days = int(session.execute(delivered_query).scalar_one())
+
+    usage_query = select(
+        func.count(), func.coalesce(func.sum(UsageEvent.cost_usd), 0)
+    ).where(UsageEvent.kind == "llm_generation")
+    if cutoff is not None:
+        usage_query = usage_query.where(UsageEvent.occurred_at >= cutoff)
+    usage_row = session.execute(usage_query).one()
+
+    # funnel upgrade = a tenant holding BOTH a cv_analysis purchase and a
+    # search subscription (the §04 inheritance path)
+    analysis_tenants = select(Subscription.tenant_id).where(
+        Subscription.plan_code == "cv_analysis"
+    )
+    upgrades = int(session.execute(
+        select(func.count(func.distinct(Subscription.tenant_id)))
+        .where(Subscription.tenant_id.in_(analysis_tenants),
+               Subscription.plan_code != "cv_analysis")
+    ).scalar_one())
+
+    return {
+        "subs_by_plan": subs_by_plan,
+        "revenue_sar": revenue,
+        "funnel_upgrades": upgrades,
+        "delivered_days": delivered_days,
+        "outcomes": outcomes,
+        "llm_generations": int(usage_row[0]),
+        "llm_cost_usd": usage_row[1],
+    }
 
 
 def _chat_id_of(update: dict[str, Any]) -> str | None:

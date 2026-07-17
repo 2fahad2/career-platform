@@ -18,11 +18,16 @@ ADMIN = "666"
 
 
 class FakeProbes:
-    def __init__(self, facts: dict[str, Any] | None = None) -> None:
+    def __init__(self, facts: dict[str, Any] | None = None,
+                 errors: list[str] | None = None) -> None:
         self.facts = facts if facts is not None else {}
+        self.errors = errors if errors is not None else []
 
     def collect(self) -> dict[str, Any]:
         return self.facts
+
+    def error_lines(self) -> list[str]:
+        return self.errors
 
 
 def _msg(chat_id: str, text: str = "/start") -> dict[str, Any]:
@@ -124,6 +129,81 @@ def test_today_screen_shows_ten_codes_and_states(
         owner_session.execute(sql_text(
             "DELETE FROM tenant_day_states WHERE tenant_id = :t"), {"t": t1})
         owner_session.commit()
+
+
+# ── customers / business / errors (phase 2+3) ────────────────────────────────
+
+
+def test_customers_list_and_card_are_pii_free(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    outcomes = handle_update(
+        owner_session, _cbq(ADMIN, "v1|customers|0"), admin_chat_id=ADMIN,
+        probes=FakeProbes(), now=NOW,
+    )
+    text = outcomes[1].text
+    assert "👥 العملاء" in text
+    keyboard = outcomes[1].keyboard or []
+    tenant_buttons = [
+        b for row in keyboard for b in row if b[1].startswith("v1|tenant|")
+    ]
+    assert len(tenant_buttons) >= 2                      # seeded tenants listed
+    # drill into the first card
+    code = tenant_buttons[0][1].split("|")[2]
+    card = handle_update(
+        owner_session, _cbq(ADMIN, f"v1|tenant|{code}"), admin_chat_id=ADMIN,
+        probes=FakeProbes(), now=NOW,
+    )
+    assert code in card[1].text
+    assert "قراراته" in card[1].text
+    assert "+966" not in card[1].text                    # no phone can appear
+
+
+def test_customers_pagination_bounds(owner_session: Session) -> None:
+    outcomes = handle_update(
+        owner_session, _cbq(ADMIN, "v1|customers|99"), admin_chat_id=ADMIN,
+        probes=FakeProbes(), now=NOW,
+    )
+    assert outcomes[1].kind == "edit"                    # far page renders empty
+    assert handle_update(
+        owner_session, _cbq(ADMIN, "v1|customers|x"), admin_chat_id=ADMIN,
+        probes=FakeProbes(), now=NOW,
+    )[0].text == EXPIRED_BUTTON_AR                       # garbage page → expired
+
+
+def test_unknown_tenant_card_answers_expired(owner_session: Session) -> None:
+    outcomes = handle_update(
+        owner_session, _cbq(ADMIN, "v1|tenant|TEN-9999"), admin_chat_id=ADMIN,
+        probes=FakeProbes(), now=NOW,
+    )
+    assert [o.kind for o in outcomes] == ["ack"]
+
+
+def test_business_screen_ranges(owner_session: Session) -> None:
+    for key in ("7", "30", "all"):
+        outcomes = handle_update(
+            owner_session, _cbq(ADMIN, f"v1|business|{key}"),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+        )
+        assert "💰 الأعمال" in outcomes[1].text
+    assert handle_update(
+        owner_session, _cbq(ADMIN, "v1|business|9000"), admin_chat_id=ADMIN,
+        probes=FakeProbes(), now=NOW,
+    )[0].text == EXPIRED_BUTTON_AR
+
+
+def test_errors_screen_renders_collector_lines(owner_session: Session) -> None:
+    outcomes = handle_update(
+        owner_session, _cbq(ADMIN, "v1|errors"), admin_chat_id=ADMIN,
+        probes=FakeProbes(errors=["career.worker_loop · worker cycle failed"]),
+        now=NOW,
+    )
+    assert "worker cycle failed" in outcomes[1].text
+    clean = handle_update(
+        owner_session, _cbq(ADMIN, "v1|errors"), admin_chat_id=ADMIN,
+        probes=FakeProbes(errors=[]), now=NOW,
+    )
+    assert "نظيف" in clean[1].text
 
 
 # ── renderers: golden + PII discipline ───────────────────────────────────────

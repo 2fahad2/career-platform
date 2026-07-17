@@ -120,6 +120,27 @@ class LiveProbes:  # pragma: no cover — live boundary, facts only
         except Exception:  # noqa: BLE001
             return None
 
+    def error_lines(self) -> list[str]:
+        """Recent ERROR lines from our two services — logger + static message
+        only (our log discipline is PII-free; no payloads are ever logged)."""
+        try:
+            out = subprocess.run(
+                ["journalctl", "-u", "career-worker.service",
+                 "-u", "career-engine-nightly.service",
+                 "-u", "career-admin-bot.service",
+                 "--since", "-24h", "--no-pager", "-o", "cat"],
+                capture_output=True, text=True, timeout=10,
+            )
+            lines = []
+            for raw in out.stdout.splitlines():
+                if raw.startswith("ERROR:"):
+                    parts = raw.split(":", 2)
+                    if len(parts) == 3:
+                        lines.append(f"{parts[1]} · {parts[2].strip()}")
+            return lines[-10:]
+        except Exception:  # noqa: BLE001
+            return []
+
     def collect(self) -> dict[str, Any]:
         days_left = (SALLA_TOKEN_EXPIRES - datetime.now(UTC)).days
         return {
