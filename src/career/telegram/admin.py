@@ -13,6 +13,9 @@ from typing import Any, Protocol
 
 from career.logging_filters import sanitize_secret_text
 
+#: Inline keyboard shape: rows of (label, callback_data).
+Keyboard = list[list[tuple[str, str]]]
+
 
 class TelegramAdminClient(Protocol):
     def send_admin(self, text: str) -> str: ...
@@ -62,15 +65,66 @@ class HttpTelegramAdminClient:
         self._base_url = base_url.rstrip("/")
         self._transport = transport or _RequestsTransport()
 
-    def send_admin(self, text: str) -> str:
+    def _call(self, method: str, payload: dict[str, Any]) -> Any:
         status, body = self._transport.post(
-            f"{self._base_url}/bot{self._bot_token}/sendMessage",
-            json={
-                "chat_id": self._chat_id,
-                "text": sanitize_secret_text(text),
-                "disable_web_page_preview": True,
-            },
+            f"{self._base_url}/bot{self._bot_token}/{method}", json=payload
         )
         if status != 200 or not body.get("ok"):
             raise TelegramSendError(f"bot API HTTP {status}")
-        return str(body["result"]["message_id"])
+        return body.get("result")
+
+    @staticmethod
+    def _markup(keyboard: Keyboard | None) -> dict[str, Any] | None:
+        if not keyboard:
+            return None
+        return {"inline_keyboard": [
+            [{"text": label, "callback_data": data} for label, data in row]
+            for row in keyboard
+        ]}
+
+    def send_admin(self, text: str) -> str:
+        result = self._call("sendMessage", {
+            "chat_id": self._chat_id,
+            "text": sanitize_secret_text(text),
+            "disable_web_page_preview": True,
+        })
+        return str(result["message_id"])
+
+    # ── the watchtower console surface (design doc §2) ───────────────────
+
+    def get_updates(self, offset: int, timeout: int = 50) -> list[dict[str, Any]]:
+        result = self._call("getUpdates", {
+            "offset": offset, "timeout": timeout,
+            "allowed_updates": ["message", "callback_query"],
+        })
+        return list(result or [])
+
+    def send_screen(self, text: str, keyboard: Keyboard | None = None) -> str:
+        payload: dict[str, Any] = {
+            "chat_id": self._chat_id,
+            "text": sanitize_secret_text(text),
+            "disable_web_page_preview": True,
+        }
+        markup = self._markup(keyboard)
+        if markup:
+            payload["reply_markup"] = markup
+        return str(self._call("sendMessage", payload)["message_id"])
+
+    def edit_screen(
+        self, message_id: int, text: str, keyboard: Keyboard | None = None
+    ) -> None:
+        payload: dict[str, Any] = {
+            "chat_id": self._chat_id, "message_id": message_id,
+            "text": sanitize_secret_text(text),
+            "disable_web_page_preview": True,
+        }
+        markup = self._markup(keyboard)
+        if markup:
+            payload["reply_markup"] = markup
+        self._call("editMessageText", payload)
+
+    def answer_callback(self, callback_query_id: str, text: str = "") -> None:
+        self._call("answerCallbackQuery", {
+            "callback_query_id": callback_query_id,
+            "text": sanitize_secret_text(text) if text else "",
+        })

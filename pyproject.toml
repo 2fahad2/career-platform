@@ -71,6 +71,9 @@ select = ["E", "F", "I", "UP", "B", "S"]
 # §10.1–10.3 prompts) — one line each by construction; must not be reflowed.
 "src/career/cv/template.py" = ["E501"]
 "src/career/cv/prompts.py" = ["E501"]
+# Live probes: fixed systemctl arg-lists and fixed https URLs only — the
+# operator console reads liveness facts, no untrusted input reaches either.
+"scripts/run_admin_bot.py" = ["S310", "S603", "S607"]
 
 [tool.mypy]
 python_version = "3.11"

@@ -55,6 +55,7 @@ class Settings(BaseSettings):
     whatsapp_access_token: str = Field(default="", alias="WHATSAPP_ACCESS_TOKEN")
     whatsapp_phone_number_id: str = Field(default="", alias="WHATSAPP_PHONE_NUMBER_ID")
     whatsapp_number_e164: str = Field(default="", alias="WHATSAPP_NUMBER_E164")
+    whatsapp_waba_id: str = Field(default="", alias="WHATSAPP_WABA_ID")
 
     # Telegram admin channel (C4). Bot token must be rotated before live use.
     telegram_admin_bot_token: str = Field(default="", alias="TELEGRAM_ADMIN_BOT_TOKEN")

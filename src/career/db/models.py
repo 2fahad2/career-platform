@@ -23,6 +23,7 @@ from sqlalchemy import (
     Index,
     Integer,
     Numeric,
+    SmallInteger,
     String,
     Text,
     UniqueConstraint,
@@ -1080,3 +1081,18 @@ class CvUpload(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class AdminBotState(Base):
+    """The watchtower console's getUpdates cursor — one system row (id=1),
+    owner-written, no tenant data (no RLS, like webhook_events)."""
+
+    __tablename__ = "admin_bot_state"
+
+    id: Mapped[int] = mapped_column(SmallInteger, primary_key=True, default=1)
+    update_offset: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
