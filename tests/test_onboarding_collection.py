@@ -94,7 +94,9 @@ def test_linkedin_normalizes_every_common_shape() -> None:
 def test_region_accepts_option_and_free_text() -> None:
     assert collection.parse_answer("region", "eastern") == "الشرقية"
     assert collection.parse_answer("region", "riyadh_region") == "الرياض"
-    assert collection.parse_answer("region", "الجوف") == "الجوف"  # free text
+    # CHANGELOG §10: Jeddah carries the Makkah province value for the gate
+    assert collection.parse_answer("region", "jeddah_region") == "مكة المكرمة"
+    assert collection.parse_answer("region", "الجوف") == "الجوف"  # typed text
     with pytest.raises(collection.AnswerInvalid):
         collection.parse_answer("region", "x")
 
@@ -156,6 +158,11 @@ def test_years_experience_parses_arabic_digits_and_bounds() -> None:
     for bad in ("خبرة طويلة", "-3", "70"):
         with pytest.raises(collection.AnswerInvalid):
             collection.parse_answer("years_experience", bad)
+
+
+def test_notice_period_has_exactly_three_options() -> None:
+    q = collection.question("notice_period_days")
+    assert [o.id for o in q.options] == ["immediate", "one_month", "two_months"]
 
 
 def test_notice_period_buttons_map_to_days() -> None:

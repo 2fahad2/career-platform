@@ -128,7 +128,7 @@ def test_texts_route_to_the_journey_not_the_descend(
             ),
             {"tid": tenant_id},
         ).scalar_one()
-    assert consents == 1  # the orchestrator consumed the tap
+    assert consents == 3  # one tap grants all three purposes (CHANGELOG §10)
 
 
 def test_document_routes_to_the_upload_pipeline(

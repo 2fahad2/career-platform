@@ -118,12 +118,10 @@ def test_full_journey_from_activation_to_active(
         assert "التشغيل الأساسي" in _last_sent(deps)  # first consent prompt
         assert "سحب" in _last_sent(deps)  # rights text shown (§12)
 
-        # ── consents: three required + one optional ──────────────────────────
+        # ── consents: ONE merged message, one tap (CHANGELOG §10) ────────────
+        assert "موافقة واحدة" in _last_sent(deps)
         m = 1
-        for _i in range(3):
-            m = _say(s, deps, channel_id, "أوافق", m)
-        assert "اختياري" in _last_sent(deps)  # anonymous_stats presented last
-        m = _say(s, deps, channel_id, "لا أوافق", m)  # optional refusal is fine
+        m = _say(s, deps, channel_id, "أوافق", m)
 
         # ── the fourteen questions (CHANGELOG v1.1 §9 expansion) ─────────────
         assert "الاسم" in _last_sent(deps)
@@ -146,14 +144,15 @@ def test_full_journey_from_activation_to_active(
         )
         m += 1
 
-        # extraction ran inline → confirmation began
+        # extraction ran inline → the BATCH summary (CHANGELOG §10)
         journey = orchestrator.get_journey(s, tenant_id=tid)
         assert journey.state == "PROFILE_CONFIRMATION"
-        assert "Senior Business Analyst" in _last_sent(deps)  # first fact prompt
+        summary = _last_sent(deps)
+        assert "Senior Business Analyst" in summary          # numbered summary
+        assert "تأكيد الكل" in summary
 
-        # ── confirm both facts ───────────────────────────────────────────────
-        m = _say(s, deps, channel_id, "confirm", m)
-        m = _say(s, deps, channel_id, "confirm", m)
+        # ── one tap confirms everything ──────────────────────────────────────
+        m = _say(s, deps, channel_id, "تأكيد الكل", m)
 
         # no gaps (experience+skill exist) → straight to path review
         journey = orchestrator.get_journey(s, tenant_id=tid)
@@ -204,10 +203,8 @@ def test_journey_is_resumable_mid_questions(two_tenants: tuple[str, str], tmp_pa
             s, tenant_id=tid, subscription_id=sub_id, channel_id=channel_id,
             deps=deps, now=NOW,
         )
-        for i in range(3):
-            _say(s, deps, channel_id, "أوافق", i + 1)
-        _say(s, deps, channel_id, "لا أوافق", 4)
-        _say(s, deps, channel_id, "Fahad Almulhim", 5)  # answered Q1 only
+        _say(s, deps, channel_id, "أوافق", 1)
+        _say(s, deps, channel_id, "Fahad Almulhim", 2)  # answered Q1 only
 
     # a fresh session (process restart) — the next nudge re-asks Q2, not Q1
     deps2 = _deps(tmp_path)
@@ -228,12 +225,10 @@ def test_invalid_answer_reprompts_in_arabic_without_advancing(
             s, tenant_id=tid, subscription_id=sub_id, channel_id=channel_id,
             deps=deps, now=NOW,
         )
-        for i in range(3):
-            _say(s, deps, channel_id, "أوافق", i + 1)
-        _say(s, deps, channel_id, "لا أوافق", 4)
-        _say(s, deps, channel_id, "فهد الملحم", 5)  # Arabic name → invalid
+        _say(s, deps, channel_id, "أوافق", 1)
+        _say(s, deps, channel_id, "فهد الملحم", 2)  # Arabic name → invalid
         assert "بالإنجليزية" in _last_sent(deps)
-        _say(s, deps, channel_id, "Fahad Almulhim", 6)  # now accepted
+        _say(s, deps, channel_id, "Fahad Almulhim", 3)  # now accepted
         assert "بريد" in _last_sent(deps)
 
 
@@ -307,21 +302,19 @@ def test_correction_subflow_stores_customer_text(
             s, tenant_id=tid, subscription_id=sub_id, channel_id=channel_id,
             deps=deps, now=NOW,
         )
-        for i in range(3):
-            _say(s, deps, channel_id, "أوافق", i + 1)
-        _say(s, deps, channel_id, "لا أوافق", 4)
+        _say(s, deps, channel_id, "أوافق", 1)
         answers = ["Fahad Almulhim", "fahad@example.com", "__skip__",
                    "riyadh", "eastern", "Senior BA", "9", "one_month",
                    "full_time", "yes", "hybrid", "12000", "ar", "محلل أعمال"]
         for i, answer in enumerate(answers):
-            _say(s, deps, channel_id, answer, 5 + i)
+            _say(s, deps, channel_id, answer, 2 + i)
         orchestrator.handle_document(
             s, channel_id=channel_id, media_id="media-1", filename="cv.pdf",
             deps=deps, now=NOW + timedelta(minutes=30),
         )
-        _say(s, deps, channel_id, "correct", 31)
-        assert "التصحيح" in _last_sent(deps)  # asked to type the correction
-        _say(s, deps, channel_id, "Lead Business Analyst — Acme", 32)
+        _say(s, deps, channel_id, "تعديل بند", 31)
+        assert "رقم البند" in _last_sent(deps)   # asked for number + fix
+        _say(s, deps, channel_id, "1 Lead Business Analyst — Acme", 32)
     with tenant_session(a) as s:
         row = s.execute(
             sql_text(

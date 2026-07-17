@@ -256,3 +256,38 @@ def pending_gaps(session: Session, *, tenant_id: uuid.UUID) -> list[str]:
         ).scalars()
     }
     return [c for c in _ESSENTIAL_CATEGORIES if c not in present]
+
+
+# ── batch confirmation (CHANGELOG §10 — the royal-canary decision) ───────────
+
+
+def facts_awaiting(session: Session, *, tenant_id: uuid.UUID) -> list[ProfileFact]:
+    """Every EXTRACTED fact, in the same stable order the one-by-one flow
+    used — the batch summary numbers follow this order."""
+    return list(session.execute(
+        select(ProfileFact)
+        .where(ProfileFact.tenant_id == tenant_id,
+               ProfileFact.status == "EXTRACTED")
+        .order_by(ProfileFact.category, ProfileFact.created_at, ProfileFact.id)
+    ).scalars().all())
+
+
+def render_batch_summary(facts: list[ProfileFact]) -> str:
+    """One numbered Arabic message for the whole extraction (§15.5 intact:
+    confirm-all grants CUSTOMER_CONFIRMED per item; corrections keep the
+    original as the audit trail)."""
+    lines = ["هذا ما قرأناه من سيرتك — راجعه سريعًا:"]
+    for index, fact in enumerate(facts, start=1):
+        lines.append(f"{index}. {_fact_summary(fact)}")
+    lines.append("")
+    lines.append("لو فيه بند غلط اختر «تعديل بند» — وإلا اضغط «تأكيد الكل».")
+    return "\n".join(lines)
+
+
+def confirm_all(session: Session, *, tenant_id: uuid.UUID) -> int:
+    """CUSTOMER_CONFIRMED for every still-EXTRACTED fact. Returns the count."""
+    facts = facts_awaiting(session, tenant_id=tenant_id)
+    for fact in facts:
+        fact.status = "CUSTOMER_CONFIRMED"
+    session.flush()
+    return len(facts)

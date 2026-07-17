@@ -107,9 +107,8 @@ def test_purchase_to_report_in_one_conversation(
         {"p": phone},
     ).scalar_one()
     try:
-        # the three required consents
-        for i in range(3):
-            say("أوافق", 1 + i)
+        # ONE merged consent (CHANGELOG §10)
+        say("أوافق", 1)
         assert any("أرسل سيرتك" in (m.body or "")
                    for m in deps.whatsapp_client.sent)
 
@@ -179,8 +178,7 @@ def test_upgrade_relinks_and_opens_half_ready_onboarding(
         {"p": phone},
     ).scalar_one()
     try:
-        for i in range(3):
-            handle(_msg_text(phone, "أوافق"), 1 + i)
+        handle(_msg_text(phone, "أوافق"), 1)
         handle(_msg_doc(phone, "media-9"), 5)
         handle(_msg_text(phone, "محلل أعمال"), 6)
         assert owner_session.execute(
@@ -209,11 +207,8 @@ def test_upgrade_relinks_and_opens_half_ready_onboarding(
         assert plans == ["basic", "cv_analysis"]
         assert any("ترقية" in m for m in admin.messages)     # admin informed
 
-        # the three REQUIRED consents carried over — only the never-asked
-        # OPTIONAL one (anonymous stats) is presented now
-        assert any("اختياري" in (m.body or "")
-                   for m in deps.whatsapp_client.sent[-3:])
-        handle(_msg_text(phone, "لا أوافق"), 10)      # optional refusal is fine
+        # every required consent carried over — the journey goes STRAIGHT to
+        # the questions (the optional purpose never enters onboarding, §10)
         assert any("الاسم" in (m.body or "")
                    for m in deps.whatsapp_client.sent[-3:])
 
@@ -327,8 +322,7 @@ def test_second_analysis_purchase_restarts_the_funnel(
         {"p": phone},
     ).scalar_one()
     try:
-        for i in range(3):
-            handle(_msg_text(phone, "أوافق"), 1 + i)
+        handle(_msg_text(phone, "أوافق"), 1)
         handle(_msg_doc(phone, "media-9"), 5)
         handle(_msg_text(phone, "محلل أعمال"), 6)
 
@@ -421,12 +415,11 @@ def test_rejected_file_returns_honestly(
         {"p": phone},
     ).scalar_one()
     try:
-        for i in range(3):
-            _handle_message(
-                owner_session, _msg_text(phone, "أوافق"),
-                whatsapp_client=deps.whatsapp_client, admin_client=admin,
-                now=NOW + timedelta(minutes=1 + i), onboarding=deps,
-            )
+        _handle_message(
+            owner_session, _msg_text(phone, "أوافق"),
+            whatsapp_client=deps.whatsapp_client, admin_client=admin,
+            now=NOW + timedelta(minutes=1), onboarding=deps,
+        )
         _handle_message(
             owner_session, _msg_doc(phone, "media-bad"),
             whatsapp_client=deps.whatsapp_client, admin_client=admin,

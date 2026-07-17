@@ -111,18 +111,13 @@ QUESTIONS: tuple[Question, ...] = (
             "وش منطقتك الإدارية؟ (تساعدنا نطابق الإعلانات اللي تذكر "
             "المنطقة بدل المدينة)"
         ),
-        kind="list",
+        kind="buttons",
         options=(
-            Option("riyadh_region", "منطقة الرياض", "الرياض"),
-            Option("makkah_region", "منطقة مكة المكرمة", "مكة المكرمة"),
-            Option("eastern", "المنطقة الشرقية", "الشرقية"),
-            Option("madinah_region", "منطقة المدينة المنورة", "المدينة المنورة"),
-            Option("qassim", "منطقة القصيم", "القصيم"),
-            Option("asir", "منطقة عسير", "عسير"),
-            Option("tabuk", "منطقة تبوك", "تبوك"),
-            Option("hail", "منطقة حائل", "حائل"),
-            Option("jazan", "منطقة جازان", "جازان"),
-            Option("other", "منطقة أخرى (اكتبها)", None),
+            # CHANGELOG §10: three regions only (Jeddah carries the Makkah
+            # province value so the gate's region matching works).
+            Option("riyadh_region", "الرياض", "الرياض"),
+            Option("jeddah_region", "جدة", "مكة المكرمة"),
+            Option("eastern", "الشرقية", "الشرقية"),
         ),
     ),
     Question(
@@ -140,11 +135,10 @@ QUESTIONS: tuple[Question, ...] = (
         prompt_ar="كم فترة الإشعار المطلوبة في عملك الحالي؟",
         kind="buttons",
         options=(
+            # CHANGELOG §10: three notice periods only.
             Option("immediate", "أقدر أبدأ فورًا", 0),
-            Option("two_weeks", "أسبوعان", 14),
             Option("one_month", "شهر", 30),
             Option("two_months", "شهران", 60),
-            Option("three_months", "ثلاثة أشهر", 90),
         ),
     ),
     Question(
@@ -309,9 +303,9 @@ def parse_answer(key: str, raw: str) -> Any:
         chosen = _option_value(q, text)
         if chosen is not _MISSING and chosen is not None:
             return chosen
-        if 2 <= len(text) <= 64 and text != "other":
-            return text  # free-text region ("أخرى")
-        raise AnswerInvalid("اختر منطقتك من القائمة أو اكتب اسمها.")
+        if 2 <= len(text) <= 64:
+            return text  # typed free text still lands honestly
+        raise AnswerInvalid("اختر منطقتك: الرياض / جدة / الشرقية.")
 
     if key == "current_title":
         if not (2 <= len(text) <= 128):

@@ -81,14 +81,15 @@ def incomplete_funnel(session: Session, tenant_id: uuid.UUID) -> FunnelSession |
     return row
 
 
-def _prompt_consent(
-    deps: Deps, channel: CustomerChannel, cursor: int
-) -> None:
-    purpose = _required_purposes()[cursor]
+def _prompt_consent(deps: Deps, channel: CustomerChannel) -> None:
+    """CHANGELOG §10: one merged message for the three required purposes."""
+    bullets = "\n".join(
+        f"• {p.title_ar}: {p.description_ar}" for p in _required_purposes()
+    )
     deps.whatsapp_client.send_text(
         channel.phone_e164,
-        f"{purpose.title_ar}\n{purpose.description_ar}\n\n"
-        f"رد بـ«{_AGREE}» أو «{_DECLINE}».",
+        "قبل ما نبدأ — موافقة واحدة تغطي تشغيل الخدمة:\n"
+        f"{bullets}\n\nرد بـ«{_AGREE}» أو «{_DECLINE}».",
     )
 
 
@@ -119,10 +120,10 @@ def start_funnel(
         )
         if still_missing:
             existing.state = STATE_CONSENT
-            existing.context = {"consent_cursor": 0}
+            existing.context = {}
             session.flush()
             deps.whatsapp_client.send_text(channel.phone_e164, _WELCOME)
-            _prompt_consent(deps, channel, 0)
+            _prompt_consent(deps, channel)
         else:
             existing.state = STATE_UPLOAD
             existing.context = {}
@@ -136,12 +137,12 @@ def start_funnel(
     row = FunnelSession(
         id=uuid.uuid4(), tenant_id=tenant_id, subscription_id=subscription_id,
         channel_id=channel_id, state=STATE_CONSENT,
-        context={"consent_cursor": 0}, updated_at=now,
+        context={}, updated_at=now,
     )
     session.add(row)
     session.flush()
     deps.whatsapp_client.send_text(channel.phone_e164, _WELCOME)
-    _prompt_consent(deps, channel, 0)
+    _prompt_consent(deps, channel)
     return row
 
 
@@ -156,29 +157,24 @@ def handle_funnel_text(
     body = text.strip()
 
     if row.state == STATE_CONSENT:
-        cursor = int(row.context.get("consent_cursor", 0))
-        purposes = _required_purposes()
         if body == _AGREE:
-            record_consent(
-                session, tenant_id=row.tenant_id,
-                purpose=purposes[cursor].key, action="granted",
-            )
-            cursor += 1
-            if cursor < len(purposes):
-                row.context = {**row.context, "consent_cursor": cursor}
-                _prompt_consent(deps, channel, cursor)
-            else:
-                row.state = STATE_UPLOAD
-                deps.whatsapp_client.send_text(channel.phone_e164, _UPLOAD_PROMPT)
+            # one tap → the three required purposes, each its own event
+            for purpose in _required_purposes():
+                record_consent(
+                    session, tenant_id=row.tenant_id,
+                    purpose=purpose.key, action="granted",
+                )
+            row.state = STATE_UPLOAD
+            deps.whatsapp_client.send_text(channel.phone_e164, _UPLOAD_PROMPT)
         elif body == _DECLINE:
             deps.whatsapp_client.send_text(
                 channel.phone_e164,
                 "هذه الموافقة ضرورية للتشغيل الأساسي — بدونها لا نستطيع قراءة "
                 "سيرتك. حقوقك محفوظة: تسحبها وتحذف بياناتك متى شئت.",
             )
-            _prompt_consent(deps, channel, cursor)
+            _prompt_consent(deps, channel)
         else:
-            _prompt_consent(deps, channel, cursor)
+            _prompt_consent(deps, channel)
 
     elif row.state == STATE_UPLOAD:
         deps.whatsapp_client.send_text(channel.phone_e164, _UPLOAD_PROMPT)

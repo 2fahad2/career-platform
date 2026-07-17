@@ -31,6 +31,7 @@ Documented design decisions:
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -79,6 +80,12 @@ class JourneyNotFound(Exception):
 # ── Arabic copy ──────────────────────────────────────────────────────────────
 
 _CONSENT_YES = "أوافق"
+_BATCH_CONFIRM_ALL = "تأكيد الكل"
+_BATCH_FIX_ITEM = "تعديل بند"
+_BATCH_FIX_PROMPT = (
+    "أرسل رقم البند والتصحيح في رسالة واحدة\n"
+    "(مثال: 2 المسمى الصحيح هو Lead Business Analyst)"
+)
 _CONSENT_NO = "لا أوافق"
 _CONSENT_REQUIRED_EXPLAIN = (
     "هذي الموافقة ضرورية لتشغيل الخدمة — بدونها ما نقدر نكمل. "
@@ -238,12 +245,22 @@ def _consent_state(session: Session, tenant_id: uuid.UUID) -> dict[str, bool]:
     return consents.consent_state(session, tenant_id=tenant_id)
 
 
-def _next_consent(session: Session, tenant_id: uuid.UUID) -> consents.ConsentPurpose | None:
+def _missing_required(
+    session: Session, tenant_id: uuid.UUID
+) -> list[consents.ConsentPurpose]:
+    """CHANGELOG §10: the three required purposes are presented as ONE merged
+    message; the optional stats purpose is never part of onboarding."""
     state = _consent_state(session, tenant_id)
-    context_free = [p for p in consents.PURPOSES if not state[p.key]]
-    # required first, then the optional one; answered (granted) are skipped —
-    # a withdrawn/never-granted optional is re-presented once then recorded.
-    return context_free[0] if context_free else None
+    return [p for p in consents.PURPOSES if p.required and not state[p.key]]
+
+
+def _merged_consent_text(missing: list[consents.ConsentPurpose]) -> str:
+    rights = consents.RIGHTS_TEXT_AR.format(policy_url="(الرابط في صفحة المنتج)")
+    bullets = "\n".join(f"• {p.title_ar}: {p.description_ar}" for p in missing)
+    return (
+        "قبل ما نبدأ — موافقة واحدة تغطي تشغيل الخدمة:\n"
+        f"{bullets}\n\n{rights}"
+    )
 
 
 def _answers_so_far(session: Session, tenant_id: uuid.UUID) -> dict[str, Any]:
@@ -278,16 +295,10 @@ def _prompt_current_step(
     tenant_id = journey.tenant_id
 
     if state == "CONSENT_PENDING":
-        purpose = _next_consent(session, tenant_id)
-        optional_done = (journey.context or {}).get("optional_done")
-        if purpose is not None and optional_done and not purpose.required:
-            purpose = None
-        if purpose is not None:
-            rights = consents.RIGHTS_TEXT_AR.format(policy_url="(الرابط في صفحة المنتج)")
-            label = "اختياري" if not purpose.required else "مطلوبة للتشغيل"
+        missing = _missing_required(session, tenant_id)
+        if missing:
             _send(
-                session, deps, channel,
-                f"{purpose.title_ar} ({label}):\n{purpose.description_ar}\n\n{rights}",
+                session, deps, channel, _merged_consent_text(missing),
                 buttons=(_CONSENT_YES, _CONSENT_NO), now=now,
             )
             return
@@ -321,13 +332,18 @@ def _prompt_current_step(
         return
 
     if state == "PROFILE_CONFIRMATION":
-        fact = confirmation.next_fact_to_confirm(session, tenant_id=tenant_id)
-        if fact is not None:
-            prompt = confirmation.render_fact_prompt(fact)
-            journey.context = {**(journey.context or {}), "current_fact_id": str(fact.id)}
+        facts = confirmation.facts_awaiting(session, tenant_id=tenant_id)
+        if facts:
+            # CHANGELOG §10: ONE numbered summary + confirm-all — the live
+            # canary measured the fact-by-fact flow at ~9 minutes.
+            journey.context = {
+                **(journey.context or {}),
+                "batch_ids": [str(f.id) for f in facts],
+            }
             _send(
-                session, deps, channel, prompt.prompt_ar,
-                buttons=tuple(o.label_ar for o in prompt.options), now=now,
+                session, deps, channel,
+                confirmation.render_batch_summary(facts),
+                buttons=(_BATCH_CONFIRM_ALL, _BATCH_FIX_ITEM), now=now,
             )
             return
         _after_confirmation(session, journey, channel, deps, now=now)
@@ -384,21 +400,21 @@ def _handle_consent_or_question(
     deps: Deps, body: str, *, now: datetime,
 ) -> None:
     tenant_id = journey.tenant_id
-    purpose = _next_consent(session, tenant_id)
-    optional_done = (journey.context or {}).get("optional_done", False)
+    missing = _missing_required(session, tenant_id)
 
-    if purpose is not None and not (optional_done and not purpose.required):
+    if missing:
         if body == _CONSENT_YES:
-            consents.record_consent(
-                session, tenant_id=tenant_id, purpose=purpose.key, action="granted"
-            )
+            # one tap → every required purpose granted, each its own event
+            # (purpose separation lives in the ledger — CHANGELOG §10)
+            for purpose in missing:
+                consents.record_consent(
+                    session, tenant_id=tenant_id, purpose=purpose.key,
+                    action="granted",
+                )
         elif body == _CONSENT_NO:
-            if purpose.required:
-                _send(session, deps, channel, _CONSENT_REQUIRED_EXPLAIN, now=now)
-                _prompt_current_step(session, journey, channel, deps, now=now)
-                return
-            # optional refusal: remember and move on — never re-nag (§12).
-            journey.context = {**(journey.context or {}), "optional_done": True}
+            _send(session, deps, channel, _CONSENT_REQUIRED_EXPLAIN, now=now)
+            _prompt_current_step(session, journey, channel, deps, now=now)
+            return
         else:
             _prompt_current_step(session, journey, channel, deps, now=now)
             return
@@ -534,32 +550,38 @@ def _handle_verdict(
         _after_confirmation(session, journey, channel, deps, now=now)
         return
 
-    if context.get("awaiting_correction_for"):
-        fact_id = uuid.UUID(context["awaiting_correction_for"])
-        pending = session.get(ProfileFact, fact_id)
-        if pending is not None:
-            confirmation.correct_fact(
-                session, tenant_id=tenant_id, fact_id=fact_id,
-                corrected_payload={**(pending.payload or {}), "customer_correction": body},
-            )
-        journey.context = {k: v for k, v in context.items() if k != "awaiting_correction_for"}
-        _prompt_current_step(session, journey, channel, deps, now=now)
+    if context.get("awaiting_item_fix"):
+        # expected shape: «<رقم البند> <التصحيح>» in one message
+        match = re.match(r"\s*(\d+)[\s.\-:]+(.+)", body, re.DOTALL)
+        batch_ids = context.get("batch_ids") or []
+        if match and 1 <= int(match.group(1)) <= len(batch_ids):
+            index = int(match.group(1))
+            fact_id = uuid.UUID(batch_ids[index - 1])
+            pending = session.get(ProfileFact, fact_id)
+            if pending is not None and pending.status == "EXTRACTED":
+                confirmation.correct_fact(
+                    session, tenant_id=tenant_id, fact_id=fact_id,
+                    corrected_payload={
+                        **(pending.payload or {}),
+                        "customer_correction": match.group(2).strip(),
+                    },
+                )
+            journey.context = {
+                k: v for k, v in context.items() if k != "awaiting_item_fix"
+            }
+            _send(session, deps, channel, "تم التعديل ✅", now=now)
+            _prompt_current_step(session, journey, channel, deps, now=now)
+            return
+        _send(session, deps, channel, _BATCH_FIX_PROMPT, now=now)
         return
 
-    verdict = _VERDICT_IDS.get(body)
-    fact_id_raw = context.get("current_fact_id")
-    if verdict is None or fact_id_raw is None:
-        _prompt_current_step(session, journey, channel, deps, now=now)
+    if body == _BATCH_CONFIRM_ALL:
+        confirmation.confirm_all(session, tenant_id=tenant_id)
+        _after_confirmation(session, journey, channel, deps, now=now)
         return
-    fact_id = uuid.UUID(fact_id_raw)
-
-    if verdict == "confirm":
-        confirmation.confirm_fact(session, tenant_id=tenant_id, fact_id=fact_id)
-    elif verdict == "reject":
-        confirmation.reject_fact(session, tenant_id=tenant_id, fact_id=fact_id)
-    else:  # correct → sub-flow: wait for the typed correction
-        journey.context = {**context, "awaiting_correction_for": str(fact_id)}
-        _send(session, deps, channel, _CORRECTION_PROMPT, now=now)
+    if body == _BATCH_FIX_ITEM:
+        journey.context = {**context, "awaiting_item_fix": True}
+        _send(session, deps, channel, _BATCH_FIX_PROMPT, now=now)
         return
     _prompt_current_step(session, journey, channel, deps, now=now)
 
