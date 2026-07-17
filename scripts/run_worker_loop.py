@@ -21,10 +21,10 @@ from career.config import get_settings
 from career.logging_filters import install_secret_redaction
 from career.onboarding.extraction import AnthropicExtractor
 from career.onboarding.orchestrator import Deps
-from career.storage import FilesystemStorageAdapter
-from career.whatsapp.client import HttpWhatsAppClient
 from career.salla.client import HttpSallaClient
 from career.salla.provisioning import process_pending_webhooks
+from career.storage import FilesystemStorageAdapter
+from career.whatsapp.client import HttpWhatsAppClient
 from career.whatsapp.worker import process_pending_whatsapp
 
 logger = logging.getLogger("career.worker_loop")
