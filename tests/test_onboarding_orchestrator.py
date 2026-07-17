@@ -290,34 +290,26 @@ def test_rejected_file_regresses_to_upload_with_reasons(
         assert "ما قدرنا" in _last_sent(deps) or "أعد" in _last_sent(deps)
 
 
-def test_truncated_button_labels_resolve_to_values(
-    two_tenants: tuple[str, str], tmp_path
-) -> None:
-    """AUDIT (live TEN-0002 data): WhatsApp caps reply ids/titles at 20 chars,
-    so «الدمام / الخبر / الظهران» arrives truncated — it must still resolve
-    to the option VALUE, never be stored as garbage free text."""
-    a, _ = two_tenants
-    tid = uuid.UUID(a)
-    deps = _deps(tmp_path)
-    with tenant_session(a) as s:
-        sub_id, channel_id = _seed_activated_tenant(s, tid)
-        orchestrator.start_journey(
-            s, tenant_id=tid, subscription_id=sub_id, channel_id=channel_id,
-            deps=deps, now=NOW,
-        )
-        _say(s, deps, channel_id, "أوافق", 1)
-        for i, answer in enumerate(["Fahad Almulhim", "fahad@example.com",
-                                    "__skip__"]):
-            _say(s, deps, channel_id, answer, 2 + i)
-        # the tap arrives as the label truncated to WhatsApp's 20 chars
-        truncated = "الدمام / الخبر / الظهران"[:20]
-        _say(s, deps, channel_id, truncated, 6)
-    with tenant_session(a) as s:
-        city = s.execute(
-            sql_text("SELECT city FROM customer_profiles WHERE tenant_id = :t"),
-            {"t": a},
-        ).scalar_one()
-    assert city == "الدمام"                       # the VALUE, not the label
+def test_truncated_button_labels_resolve_to_values() -> None:
+    """AUDIT (live TEN-0002 data): WhatsApp caps reply ids/titles at 20
+    chars — a tap arriving as label_ar[:20] must resolve to the option id,
+    never fall through to free text. All shipped labels are now ≤20 by
+    design; this unit test guards the defense-in-depth for any future
+    long label."""
+    from career.onboarding.collection import Option, Question
+
+    q = Question(
+        key="city", prompt_ar="؟", kind="list",
+        options=(Option("dammam", "الدمام / الخبر / الظهران", "الدمام"),),
+    )
+    truncated = "الدمام / الخبر / الظهران"[:20]
+    assert orchestrator._resolve_question_input(q, truncated) == "dammam"
+    assert orchestrator._resolve_question_input(q, "dammam") == "dammam"
+    # every SHIPPED label fits the cap by design (the class is dead)
+    from career.onboarding import collection as c
+    for question in c.QUESTIONS:
+        for option in question.options:
+            assert len(option.label_ar) <= 20, option.label_ar
 
 
 def test_correction_subflow_stores_customer_text(

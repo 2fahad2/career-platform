@@ -70,24 +70,21 @@ QUESTIONS: tuple[Question, ...] = (
     Question(
         key="cv_full_name",
         prompt_ar=(
-            "وش الاسم اللي تبيه يظهر على سيرتك الذاتية؟ "
+            "نبدأ باسمك ✨ وش الاسم اللي يظهر على سيرتك الذاتية؟ "
             "(بالأحرف الإنجليزية — السيرة تُكتب بالإنجليزية)"
         ),
         kind="text",
     ),
     Question(
         key="email",
-        prompt_ar=(
-            "وش بريدك الإلكتروني؟ (يظهر في سيرتك الذاتية "
-            "ويتواصل عليه أصحاب العمل)"
-        ),
+        prompt_ar="بريدك الإلكتروني؟ (يظهر بالسيرة ويراسلك عليه أصحاب العمل)",
         kind="text",
     ),
     Question(
         key="linkedin_url",
         prompt_ar=(
-            "رابط حسابك في LinkedIn؟ (يظهر على سيرتك — "
-            "أرسل الرابط أو اسم المستخدم، أو تخطَّ إن ما عندك حساب)"
+            "رابط حسابك في LinkedIn؟ أرسل الرابط أو اسم المستخدم — "
+            "أو اكتب: تخطي"
         ),
         kind="text",
         skippable=True,
@@ -99,7 +96,7 @@ QUESTIONS: tuple[Question, ...] = (
         options=(
             Option("riyadh", "الرياض", "الرياض"),
             Option("jeddah", "جدة", "جدة"),
-            Option("dammam", "الدمام / الخبر / الظهران", "الدمام"),
+            Option("dammam", "الدمام / الخبر", "الدمام"),
             Option("makkah", "مكة المكرمة", "مكة المكرمة"),
             Option("madinah", "المدينة المنورة", "المدينة المنورة"),
             Option("other", "مدينة أخرى (اكتبها)", None),
@@ -107,10 +104,7 @@ QUESTIONS: tuple[Question, ...] = (
     ),
     Question(
         key="region",
-        prompt_ar=(
-            "وش منطقتك الإدارية؟ (تساعدنا نطابق الإعلانات اللي تذكر "
-            "المنطقة بدل المدينة)"
-        ),
+        prompt_ar="ومنطقتك الإدارية؟ (بعض الإعلانات تذكر المنطقة بدل المدينة)",
         kind="buttons",
         options=(
             # CHANGELOG §10: three regions only (Jeddah carries the Makkah
@@ -122,28 +116,28 @@ QUESTIONS: tuple[Question, ...] = (
     ),
     Question(
         key="current_title",
-        prompt_ar="وش مسماك الوظيفي الحالي (أو آخر مسمى)؟",
+        prompt_ar="وش مسماك الوظيفي الحالي أو الأخير؟",
         kind="text",
     ),
     Question(
         key="years_experience",
-        prompt_ar="كم سنة خبرة عندك؟ (رقم فقط)",
+        prompt_ar="كم سنة خبرتك؟ (رقم فقط)",
         kind="text",
     ),
     Question(
         key="notice_period_days",
-        prompt_ar="كم فترة الإشعار المطلوبة في عملك الحالي؟",
+        prompt_ar="لو جاتك فرصة مناسبة — متى تقدر تبدأ؟",
         kind="buttons",
         options=(
             # CHANGELOG §10: three notice periods only.
-            Option("immediate", "أقدر أبدأ فورًا", 0),
-            Option("one_month", "شهر", 30),
-            Option("two_months", "شهران", 60),
+            Option("immediate", "فورًا", 0),
+            Option("one_month", "بعد شهر", 30),
+            Option("two_months", "بعد شهرين", 60),
         ),
     ),
     Question(
         key="employment_type",
-        prompt_ar="وش نوع الدوام اللي تبحث عنه؟",
+        prompt_ar="وش نوع الدوام اللي يناسبك؟",
         kind="buttons",
         options=(
             Option("full_time", "دوام كامل", "full_time"),
@@ -153,7 +147,7 @@ QUESTIONS: tuple[Question, ...] = (
     ),
     Question(
         key="willing_to_relocate",
-        prompt_ar="هل أنت مستعد للانتقال لمدينة ثانية لو كانت الفرصة مناسبة؟",
+        prompt_ar="مستعد تنتقل لمدينة ثانية لو كانت الفرصة تستاهل؟",
         kind="buttons",
         options=(
             Option("yes", "نعم", True),
@@ -162,7 +156,7 @@ QUESTIONS: tuple[Question, ...] = (
     ),
     Question(
         key="remote_preference",
-        prompt_ar="وش تفضيلك لمكان العمل؟",
+        prompt_ar="تفضيلك لمكان العمل؟",
         kind="buttons",
         options=(
             Option("onsite", "حضوري", "onsite"),
@@ -174,15 +168,15 @@ QUESTIONS: tuple[Question, ...] = (
     Question(
         key="expected_salary_sar",
         prompt_ar=(
-            "وش الراتب الشهري اللي تستهدفه بالريال؟ (رقم تقريبي — يساعدنا نرتب "
-            "الفرص، وما نحجب عنك وظيفة ما أعلنت راتبها). تقدر تتخطى السؤال."
+            "راتبك الشهري المستهدف بالريال؟ (تقريبي — يساعدنا نرتب الفرص، "
+            "وما نحجب وظيفة ما أعلنت راتبها) — أو اكتب: تخطي"
         ),
         kind="text",
         skippable=True,
     ),
     Question(
         key="communication_language",
-        prompt_ar="وش لغة التواصل اللي تفضلها للرسائل؟",
+        prompt_ar="لغة الرسائل اللي تفضلها؟",
         kind="buttons",
         options=(
             Option("ar", "العربية", "ar"),
@@ -191,7 +185,7 @@ QUESTIONS: tuple[Question, ...] = (
     ),
     Question(
         key="requested_path",
-        prompt_ar="وش المسار الوظيفي اللي تبينا نبحث لك فيه؟ (مثال: محلل أعمال)",
+        prompt_ar="وأخيرًا 🎯 وش المسار الوظيفي اللي نبحث لك فيه؟ (مثال: محلل أعمال)",
         kind="text",
     ),
 )

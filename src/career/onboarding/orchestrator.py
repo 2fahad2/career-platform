@@ -87,6 +87,15 @@ _BATCH_FIX_PROMPT = (
     "(مثال: 2 المسمى الصحيح هو Lead Business Analyst)"
 )
 _CONSENT_NO = "لا أوافق"
+_ROADMAP = (
+    "تمت الموافقة ✅\n"
+    "رحلتك من هنا قصيرة:\n"
+    "1️⃣ أسئلة سريعة (~3 دقائق، أغلبها أزرار)\n"
+    "2️⃣ ترسل سيرتك الذاتية\n"
+    "3️⃣ تأكيد سريع بضغطة\n"
+    "4️⃣ ننطلق نبحث لك يوميًا 🚀"
+)
+_READING_CV = "استلمناها 📄 نقرأ سيرتك الآن — ثوانٍ وأرجع لك…"
 _CONSENT_REQUIRED_EXPLAIN = (
     "هذي الموافقة ضرورية لتشغيل الخدمة — بدونها ما نقدر نكمل. "
     "لو عندك سؤال أرسل: دعم"
@@ -108,8 +117,12 @@ _CORRECTION_PROMPT = "اكتب التصحيح كما تريده أن يظهر:"
 _GAP_EXPERIENCE = "قبل نكمل: وش أبرز خبرة عملية عندك؟ (المسمى وجهة العمل)"
 _GAP_SKILL = "وش أهم مهارة مهنية عندك؟"
 _DONE = (
-    "تم التفعيل ✅ انطلقنا!\n"
-    "من الليلة نبدأ نبحث لك، وأول ما نجهّز فرصك بنرسلها هنا. "
+    "انطلقنا! 🚀\n"
+    "من الليلة نبحث لك كل يوم، ومن الأحد إلى الخميس صباحًا توصلك "
+    "فرصك المختارة — كل فرصة معها سيرة ذاتية جاهزة باسمك، مفصّلة لها "
+    "بالذات.\n"
+    "لما تقدّم على وظيفة اضغط «قدمت» تحتها — يساعدنا نطوّر اختياراتنا "
+    "لك.\n"
     "أوامر تفيدك بأي وقت: حالة اشتراكي · وقف مؤقت · دعم"
 )
 _DELETE_WARNING = (
@@ -309,7 +322,13 @@ def _prompt_current_step(
         question = collection.next_question(answers)
         if question is not None:
             buttons = tuple(o.label_ar for o in question.options)[:3]
-            prompt = question.prompt_ar
+            total = len(collection.QUESTIONS)
+            position = total - sum(
+                1 for q in collection.QUESTIONS[
+                    [q.key for q in collection.QUESTIONS].index(question.key):
+                ] if q.key not in answers
+            ) + 1
+            prompt = f"📍 {position} من {total}\n{question.prompt_ar}"
             hidden = [o.label_ar for o in question.options[3:]
                       if o.value is not None]
             if hidden:
@@ -418,6 +437,7 @@ def _handle_consent_or_question(
                     session, tenant_id=tenant_id, purpose=purpose.key,
                     action="granted",
                 )
+            _send(session, deps, channel, _ROADMAP, now=now)
         elif body == _CONSENT_NO:
             _send(session, deps, channel, _CONSENT_REQUIRED_EXPLAIN, now=now)
             _prompt_current_step(session, journey, channel, deps, now=now)
@@ -486,6 +506,7 @@ def handle_document(
         session.flush()
         return
 
+    _send(session, deps, channel, _READING_CV, now=now)
     media = deps.whatsapp_client.download_media(media_id)
     if media is None:
         _send(session, deps, channel, _UPLOAD_REJECTED, now=now)
