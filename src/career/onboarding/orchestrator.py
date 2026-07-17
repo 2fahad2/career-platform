@@ -309,7 +309,14 @@ def _prompt_current_step(
         question = collection.next_question(answers)
         if question is not None:
             buttons = tuple(o.label_ar for o in question.options)[:3]
-            _send(session, deps, channel, question.prompt_ar, buttons=buttons, now=now)
+            prompt = question.prompt_ar
+            hidden = [o.label_ar for o in question.options[3:]
+                      if o.value is not None]
+            if hidden:
+                # WhatsApp caps reply buttons at 3 — the rest stay REACHABLE
+                # as typed answers (live lesson: they were silently unreachable)
+                prompt += "\n(أو اكتب: " + "، ".join(hidden) + ")"
+            _send(session, deps, channel, prompt, buttons=buttons, now=now)
             return
         _advance(journey, "CV_UPLOAD_PENDING", now)
         if _has_extraction_facts(session, tenant_id):
@@ -450,9 +457,13 @@ def _handle_consent_or_question(
 
 
 def _resolve_question_input(question: collection.Question, body: str) -> str:
-    """Accept the option id (tests/payload ids) or the Arabic label (real taps)."""
+    """Accept the option id (payload ids), the Arabic label (real taps), or
+    the label truncated to WhatsApp's 20-char reply cap — live lesson from
+    TEN-0002: «الدمام / الخبر / الظهران» arrived as its first 20 chars and
+    was stored as garbage free text."""
+    stripped = body.strip()
     for option in question.options:
-        if body == option.id or body == option.label_ar:
+        if stripped in (option.id, option.label_ar, option.label_ar[:20]):
             return option.id
     if question.skippable and body in ("تخطي", "تخطّي", collection.SKIP):
         return collection.SKIP

@@ -23,11 +23,25 @@ from career.onboarding.extraction import AnthropicExtractor
 from career.onboarding.orchestrator import Deps
 from career.storage import FilesystemStorageAdapter
 from career.whatsapp.client import HttpWhatsAppClient
+from career.salla.client import HttpSallaClient
+from career.salla.provisioning import process_pending_webhooks
 from career.whatsapp.worker import process_pending_whatsapp
 
 logger = logging.getLogger("career.worker_loop")
 
 POLL_SECONDS = 3.0
+
+
+def _salla_catalog() -> dict[str, str]:
+    import json
+    import os
+
+    raw = os.environ.get("SALLA_PRODUCT_CATALOG", "{}")
+    try:
+        parsed = json.loads(raw)
+        return {str(k): str(v) for k, v in parsed.items()}
+    except ValueError:
+        return {}
 
 
 class JournalAdminClient:
@@ -70,6 +84,9 @@ def main() -> None:  # pragma: no cover — the C7.8 live runner
     admin = JournalAdminClient()
     logger.info("worker loop up — polling every %.0fs", POLL_SECONDS)
 
+    salla = HttpSallaClient(settings.salla_api_key)
+    catalog = _salla_catalog()
+
     while True:
         try:
             with Session(engine) as session:
@@ -77,8 +94,13 @@ def main() -> None:  # pragma: no cover — the C7.8 live runner
                     session, whatsapp_client=whatsapp, admin_client=admin,
                     now=datetime.now(UTC), onboarding=deps,
                 )
+                salla_counts = process_pending_webhooks(
+                    session, salla_client=salla, product_catalog=catalog,
+                )
             if counts.get("messages") or counts.get("statuses"):
                 logger.info("processed: %s", counts)
+            if salla_counts:
+                logger.info("salla processed: %d orders", len(salla_counts))
         except Exception:  # noqa: BLE001 — the loop must survive anything
             logger.error("worker cycle failed", exc_info=True)
         time.sleep(POLL_SECONDS)

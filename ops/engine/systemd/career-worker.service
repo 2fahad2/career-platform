@@ -1,0 +1,18 @@
+# The live conversation worker (C4/C5/C7/C8) — processes WhatsApp inbound and
+# Salla orders every few seconds. Survives reboots (the nohup canary didn't).
+[Unit]
+Description=Career platform conversation worker loop
+Wants=network-online.target
+After=network-online.target docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/root/career
+EnvironmentFile=/root/career/.env.staging
+# EnvironmentFile beats Environment= — overrides ride inside ExecStart.
+ExecStart=/usr/bin/env DB_HOST=127.0.0.1 DB_PORT=5433 REDIS_HOST=127.0.0.1 REDIS_PORT=6380 STORAGE_ROOT=/root/career/data /root/career/.venv/bin/python /root/career/scripts/run_worker_loop.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
