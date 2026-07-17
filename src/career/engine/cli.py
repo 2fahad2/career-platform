@@ -166,10 +166,11 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
                     now=datetime.now(UTC),
                     include_weekend=args.include_weekend,
                 )
+                # read INSIDE the session — the rows expire on close
+                summary["delivery"] = {
+                    str(tid): state.state for tid, state in states.items()
+                }
                 session.commit()
-            summary["delivery"] = {
-                str(tid): state.state for tid, state in states.items()
-            }
         finally:
             engine2.dispose()
 
