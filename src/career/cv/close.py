@@ -82,8 +82,12 @@ def close_tenant_day(
     A suppression failure becomes LEDGER_FAILED — recorded, never raised."""
     ledger_ok = True
     try:
-        for group in delivered_groups:
-            suppressor(session, tenant_id=tenant_id, url=group, now=now)
+        # audit fix: the whole day's ledger write is ONE savepoint — a
+        # mid-loop failure must not leave earlier groups half-committed
+        # next to a LEDGER_FAILED state (§15.3 atomicity).
+        with session.begin_nested():
+            for group in delivered_groups:
+                suppressor(session, tenant_id=tenant_id, url=group, now=now)
     except Exception:  # noqa: BLE001 — the failure IS the state (§15.12)
         logger.error("suppression ledger write failed", exc_info=True)
         ledger_ok = False

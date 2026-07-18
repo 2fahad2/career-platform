@@ -298,6 +298,11 @@ def pause_subscription(session: Session, *, tenant_id: uuid.UUID) -> Subscriptio
 
 def resume_subscription(session: Session, *, tenant_id: uuid.UUID) -> Subscription:
     subscription = _subscription(session, tenant_id)
+    # audit fix: resume is only meaningful FROM paused. During onboarding the
+    # unconditional transition jumped ONBOARDING→ACTIVE, corrupting the
+    # subscription and permanently blocking activation.
+    if subscription.status != sub_states.PAUSED:
+        return subscription
     return transition(
         session, subscription, sub_states.ACTIVE, event_type="customer_resume"
     )

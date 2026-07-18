@@ -178,6 +178,32 @@ def get_journey(session: Session, *, tenant_id: uuid.UUID) -> OnboardingSession:
     return journey
 
 
+def handle_standing_command(
+    session: Session, *, channel_id: uuid.UUID, text: str,
+    deps: Deps, now: datetime,
+) -> bool:
+    """§05/§12: the standing privacy commands work FOR LIFE — audit fix:
+    they were only reachable while a journey was incomplete, so an ACTIVE
+    customer (the permanent condition) could never pause/export/delete.
+    Returns True when the text was a privacy command and was handled."""
+    command = _PRIVACY_COMMANDS.get(text.strip())
+    if command is None:
+        return False
+    channel = session.get(CustomerChannel, channel_id)
+    if channel is None:
+        return False
+    journey = session.execute(
+        select(OnboardingSession).where(
+            OnboardingSession.tenant_id == channel.tenant_id
+        )
+    ).scalar_one_or_none()
+    if journey is None:
+        return False
+    _handle_privacy_command(session, journey, channel, deps, command, now=now)
+    session.flush()
+    return True
+
+
 def _channel(session: Session, channel_id: uuid.UUID) -> CustomerChannel:
     channel = session.get(CustomerChannel, channel_id)
     if channel is None:

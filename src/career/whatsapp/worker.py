@@ -12,6 +12,7 @@ redelivered message is a no-op.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime
 from typing import Any
@@ -35,6 +36,8 @@ from career.whatsapp.activation_flow import ActivationStatus, activate
 from career.whatsapp.client import WhatsAppClient
 from career.whatsapp.delivery import descend_pending_delivery
 from career.whatsapp.inbound import InboundKind, classify_inbound
+
+logger = logging.getLogger("career.whatsapp")
 
 _UNRECOGNIZED = "أرسل رمز التفعيل من صفحة الشكر بعد الدفع للبدء."
 _STOP_CONFIRM = "تم إيقاف الرسائل. لن نرسل لك بعد الآن. لإعادة التفعيل أرسل: دعم"
@@ -244,6 +247,14 @@ def _handle_message(
                 deps=onboarding, now=now,
             )
     else:
+        # audit fix: standing privacy commands must survive ACTIVE (§05/§12)
+        if onboarding is not None and text_body and \
+                orchestrator.handle_standing_command(
+                    session, channel_id=channel.id, text=text_body,
+                    deps=onboarding, now=now):
+            session.commit()
+            return
+
         from career.cv import deliver as cv_deliver
         from career.cv.daily_run import close_from_delivery
 
@@ -296,21 +307,36 @@ def process_pending_whatsapp(
         .limit(limit)
     ).scalars().all())
 
-    counts = {"messages": 0, "statuses": 0}
+    counts = {"messages": 0, "statuses": 0, "failed": 0}
     for ev in events:
-        payload: dict[str, Any] = ev.payload or {}
-        for entry in payload.get("entry", []) or []:
-            for change in entry.get("changes", []) or []:
-                value = change.get("value", {}) or {}
-                for msg in value.get("messages", []) or []:
-                    _handle_message(owner_session, msg, whatsapp_client=whatsapp_client,
-                                    admin_client=admin_client, now=now,
-                                    onboarding=onboarding)
-                    counts["messages"] += 1
-                for st in value.get("statuses", []) or []:
-                    _handle_status(owner_session, st, now=now)
-                    counts["statuses"] += 1
-        ev.processing_status = "processed"
+        # audit fix: one poisoned event must never wedge the whole queue —
+        # without this isolation a single raise left the event 'received'
+        # and every later customer frozen behind an infinite retry.
+        try:
+            payload: dict[str, Any] = ev.payload or {}
+            for entry in payload.get("entry", []) or []:
+                for change in entry.get("changes", []) or []:
+                    value = change.get("value", {}) or {}
+                    for msg in value.get("messages", []) or []:
+                        _handle_message(owner_session, msg,
+                                        whatsapp_client=whatsapp_client,
+                                        admin_client=admin_client, now=now,
+                                        onboarding=onboarding)
+                        counts["messages"] += 1
+                    for st in value.get("statuses", []) or []:
+                        _handle_status(owner_session, st, now=now)
+                        counts["statuses"] += 1
+            ev.processing_status = "processed"
+        except Exception:  # noqa: BLE001 — isolate, record, move on
+            logger.error("whatsapp event processing failed", exc_info=True)
+            owner_session.rollback()
+            ev.processing_status = "failed"       # honest, no silent retry loop
+            counts["failed"] += 1
+            try:
+                admin_client.send_admin("⚠️ رسالة واتساب واردة فشلت معالجتها "
+                                        "وعُزلت — راجع السجل")
+            except Exception:  # noqa: BLE001
+                logger.warning("admin note failed", exc_info=True)
         ev.processed_at = func.now()
         ev.attempt_count = ev.attempt_count + 1
         owner_session.commit()
