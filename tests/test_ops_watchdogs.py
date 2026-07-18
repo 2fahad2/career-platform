@@ -26,7 +26,8 @@ def test_healthy_paid_plan_stays_quiet() -> None:
 
 
 def test_low_credits_warns_with_numbers() -> None:
-    alert = quota_alert({"monthly_allowance": 10_000, "remaining_credits": 900})
+    alert = quota_alert({"monthly_allowance": 10_000, "remaining_credits": 900,
+                         "current_month_usage": 9_100})
     assert alert is not None
     assert "900" in alert and "10000" in alert
 
@@ -34,12 +35,14 @@ def test_low_credits_warns_with_numbers() -> None:
 def test_small_plan_uses_the_floor() -> None:
     # 10% of 500 is 50 < floor(100) — 80 remaining must still warn
     assert quota_alert(
-        {"monthly_allowance": 500, "remaining_credits": 80}
+        {"monthly_allowance": 500, "remaining_credits": 80,
+         "current_month_usage": 420}
     ) is not None
 
 
 def test_exhausted_credits_alert_red() -> None:
-    alert = quota_alert({"monthly_allowance": 5_000, "remaining_credits": 0})
+    alert = quota_alert({"monthly_allowance": 5_000, "remaining_credits": 0,
+                         "current_month_usage": 5_000})
     assert alert is not None
     assert "🔴" in alert
 
@@ -103,3 +106,20 @@ def test_utc_clock_is_converted_to_riyadh() -> None:
     assert window_reminder_due(
         last_inbound_at=None, opt_out_at=None, now=utc_evening
     )
+
+
+def test_paid_plan_quirk_zero_credits_field_stays_quiet() -> None:
+    # live-probed: paid plan reports remaining_credits=0 while the monthly
+    # allowance is untouched — must NOT fire the red alert
+    assert quota_alert({
+        "monthly_allowance": 10_000, "remaining_credits": 0,
+        "current_month_usage": 0,
+    }) is None
+
+
+def test_paid_plan_quirk_still_warns_when_usage_nears_allowance() -> None:
+    alert = quota_alert({
+        "monthly_allowance": 10_000, "remaining_credits": 0,
+        "current_month_usage": 9_950,
+    })
+    assert alert is not None and "50" in alert

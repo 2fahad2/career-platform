@@ -21,10 +21,15 @@ def quota_alert(account: dict[str, Any]) -> str | None:
     try:
         allowance = int(account.get("monthly_allowance") or 0)
         remaining = int(account.get("remaining_credits") or 0)
+        used = int(account.get("current_month_usage") or 0)
     except (TypeError, ValueError):
         return None
     if allowance <= 0:
         return None
+    # live-probed provider quirk: on the paid plan remaining_credits reads 0
+    # (it tracks one-time credits, not the monthly allowance) — derive the
+    # real headroom from the allowance minus this month's usage instead.
+    remaining = max(remaining, allowance - used)
     threshold = max(MIN_REMAINING_FLOOR, allowance // 10)
     if remaining <= 0:
         return (
