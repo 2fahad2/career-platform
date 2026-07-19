@@ -17,6 +17,7 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from enum import StrEnum
 from typing import Any
 
@@ -32,6 +33,8 @@ from career.tokens import hash_token, new_activation_token
 logger = logging.getLogger("career.salla")
 
 ProductCatalog = dict[str, str]
+#: product id → (expected amount, expected currency) — the §09 triple match.
+ExpectedPricing = dict[str, tuple[Decimal, str]]
 
 ACTIVATION_TOKEN_TTL_DAYS = 7
 
@@ -43,6 +46,7 @@ class ProvisionStatus(StrEnum):
     UNKNOWN_PRODUCT = "unknown_product"
     ORDER_NOT_FOUND = "order_not_found"
     NO_ORDER_ID = "no_order_id"
+    AMOUNT_MISMATCH = "amount_mismatch"
 
 
 @dataclass(frozen=True)
@@ -75,6 +79,7 @@ def provision_order(
     salla_client: SallaClient,
     product_catalog: ProductCatalog,
     webhook_event: WebhookEvent | None = None,
+    expected_pricing: ExpectedPricing | None = None,
 ) -> ProvisionResult:
     if not order_id:
         _mark_webhook(owner_session, webhook_event, "ignored")
@@ -110,6 +115,19 @@ def provision_order(
         _mark_webhook(owner_session, webhook_event, "ignored")
         owner_session.commit()
         return ProvisionResult(ProvisionStatus.UNKNOWN_PRODUCT)
+
+    # §09 binding pattern: match (product, amount, currency) — a paid order
+    # whose amount/currency deviates from the configured price never
+    # provisions (fail closed; expected_pricing empty = check disabled).
+    expected = (expected_pricing or {}).get(order.product_id)
+    if expected is not None:
+        exp_amount, exp_currency = expected
+        if (order.amount != exp_amount
+                or (order.currency or "").upper() != exp_currency.upper()):
+            logger.warning("order amount/currency mismatch — not provisioning")
+            _mark_webhook(owner_session, webhook_event, "failed")
+            owner_session.commit()
+            return ProvisionResult(ProvisionStatus.AMOUNT_MISMATCH)
 
     # Provision: tenant → subscription(PAID_UNCLAIMED) → activation token.
     tenant = Tenant(id=uuid.uuid4(), code=_next_tenant_code(owner_session))
@@ -178,6 +196,7 @@ def process_pending_webhooks(
     admin_client: Any = None,
     whatsapp_number_e164: str = "",
     whatsapp_client: Any = None,
+    expected_pricing: ExpectedPricing | None = None,
 ) -> list[ProvisionResult]:
     """The Salla worker the webhook 200 defers to. Provisions paid orders and
     applies refund/cancel/chargeback to existing subscriptions. Runs as owner
@@ -199,8 +218,16 @@ def process_pending_webhooks(
             result = provision_order(
                 owner_session, ev.salla_order_id,
                 salla_client=salla_client, product_catalog=product_catalog,
-                webhook_event=ev,
+                webhook_event=ev, expected_pricing=expected_pricing,
             )
+            if (result.status == ProvisionStatus.AMOUNT_MISMATCH
+                    and admin_client is not None):
+                try:
+                    admin_client.send_admin(
+                        "🔴 طلب مدفوع بمبلغ/عملة مخالفة — لم يُزوَّد، راجع الطلب"
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning("mismatch alert failed", exc_info=True)
             results.append(result)
             if result.status == ProvisionStatus.PROVISIONED:
                 _announce_provision(

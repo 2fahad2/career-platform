@@ -51,6 +51,8 @@ class Settings(BaseSettings):
     # product id → plan code JSON map — decides funnel vs subscription
     # (audit fix: lived only as a raw env read in the worker script).
     salla_product_catalog: str = Field(default="{}", alias="SALLA_PRODUCT_CATALOG")
+    # product id → [amount, currency] JSON — the §09 triple-match prices
+    salla_product_pricing: str = Field(default="{}", alias="SALLA_PRODUCT_PRICING")
     # captured access-token expiry (ISO date) — manual until auto-refresh lands
     salla_token_expires_at: str = Field(default="", alias="SALLA_TOKEN_EXPIRES_AT")
 

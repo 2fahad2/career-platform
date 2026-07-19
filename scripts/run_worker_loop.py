@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import time
 from datetime import UTC, date, datetime
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import create_engine, select
@@ -45,6 +46,19 @@ def _salla_catalog(raw: str) -> dict[str, str]:
         parsed = json.loads(raw or "{}")
         return {str(k): str(v) for k, v in parsed.items()}
     except ValueError:
+        return {}
+
+
+def _salla_pricing(raw: str) -> dict[str, tuple[Decimal, str]]:
+    import json
+
+    try:
+        parsed = json.loads(raw or "{}")
+        return {
+            str(k): (Decimal(str(v[0])), str(v[1]))
+            for k, v in parsed.items()
+        }
+    except (ValueError, LookupError, ArithmeticError):
         return {}
 
 
@@ -100,6 +114,7 @@ def main() -> None:  # pragma: no cover — the C7.8 live runner
 
     salla = HttpSallaClient(settings.salla_api_key)
     catalog = _salla_catalog(settings.salla_product_catalog)
+    pricing = _salla_pricing(settings.salla_product_pricing)
     last_reminder_sweep = 0.0
     last_window_nudge: date | None = None
 
@@ -114,6 +129,8 @@ def main() -> None:  # pragma: no cover — the C7.8 live runner
                     session, salla_client=salla, product_catalog=catalog,
                     admin_client=admin,
                     whatsapp_number_e164=settings.whatsapp_number_e164,
+                    whatsapp_client=whatsapp,
+                    expected_pricing=pricing,
                 )
             if counts.get("messages") or counts.get("statuses"):
                 logger.info("processed: %s", counts)

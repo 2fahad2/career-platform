@@ -108,6 +108,27 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
         return 2
 
     engine = create_engine(settings.owner_database_url, future=True)
+
+    # §05 lifecycle sweep BEFORE the engine: a just-expired subscription
+    # must not seed tonight's query families.
+    try:
+        from career.salla.lifecycle import sweep_subscription_lifecycle
+        from career.whatsapp.client import HttpWhatsAppClient as _WaClient
+
+        lifecycle_wa = (
+            _WaClient(settings.whatsapp_access_token,
+                      settings.whatsapp_phone_number_id)
+            if settings.whatsapp_access_token else None
+        )
+        with Session(engine) as session:
+            sweep_subscription_lifecycle(
+                session, now=datetime.now(UTC),
+                whatsapp_client=lifecycle_wa,
+            )
+            session.commit()
+    except Exception:  # noqa: BLE001 — the sweep never blocks the run
+        logger.error("subscription lifecycle sweep failed", exc_info=True)
+
     try:
         with Session(engine) as session:
             report = run_nightly(
