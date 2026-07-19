@@ -218,7 +218,16 @@ def render_tenant_card(card: dict[str, Any]) -> tuple[str, Keyboard]:
         f" · تجاهل {outcomes.get('ignored', 0)}"
     )
     lines.append(f"وظائف محجوبة (مكررة): {card.get('suppressions', 0)}")
+    support_min = card.get("support_minutes")
+    review_count = card.get("review_count")
+    if support_min is not None or review_count is not None:
+        lines.append(
+            f"⏱ دقائق دعم: {support_min or 0}"
+            f" · 👁 مراجعات بشرية: {review_count or 0}"
+        )
     keyboard: Keyboard = [
+        [("⏱ +5 دقائق دعم", f"v1|log|{code}|support5"),
+         ("👁 +مراجعة بشرية", f"v1|log|{code}|review")],
         [("👥 القائمة", "v1|customers|0"), _HOME],
     ]
     return "\n".join(lines), keyboard

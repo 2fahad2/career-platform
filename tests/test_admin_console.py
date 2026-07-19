@@ -245,3 +245,27 @@ def test_views_render_only_ten_codes_never_identity_fields() -> None:
     assert "فلان" not in text
     assert "+9665" not in text
     assert "TEN-0009" in text
+
+
+def test_manual_usage_buttons_log_and_rerender(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """§14 manual counters: +5 support minutes / +1 human review."""
+    t1, _ = two_tenants
+    code = owner_session.execute(
+        sql_text("SELECT code FROM tenants WHERE id = :t"), {"t": t1}
+    ).scalar_one()
+    out = handle_update(
+        owner_session, _cbq(ADMIN, f"v1|log|{code}|support5"),
+        admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+    )
+    assert out[1].kind == "edit"
+    assert "دقائق دعم: 5" in out[1].text
+    out2 = handle_update(
+        owner_session, _cbq(ADMIN, f"v1|log|{code}|review"),
+        admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+    )
+    assert "مراجعات بشرية: 1" in out2[1].text
+    owner_session.execute(sql_text(
+        "DELETE FROM usage_events WHERE tenant_id = :t"), {"t": t1})
+    owner_session.commit()

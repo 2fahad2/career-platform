@@ -606,3 +606,39 @@ def test_zero_day_note_reaches_open_window_only(
         assert deps2.whatsapp_client.sent == []
     finally:
         _cleanup(owner_session, tid)
+
+
+def test_canary_runs_first_with_delay_before_the_rest(
+    owner_session: Session, clean_billing: None, tmp_path: Any,
+    two_tenants: tuple[str, str],
+) -> None:
+    """§14: the operator's tenant delivers FIRST; the hour-class delay fires
+    exactly once, only when other tenants follow."""
+    a, b = two_tenants
+    canary = uuid.UUID(a)
+    other = uuid.UUID(b)
+    report = engine_run.RunReport(
+        uuid.uuid4(), "completed", {},
+        {other: {"final": [], "counts": {"passed": 0}},
+         canary: {"final": [], "counts": {"passed": 0}}},
+    )
+    slept: list[float] = []
+    daily_run.run_daily_delivery(
+        owner_session, report=report, deps=_deps(tmp_path), now=NOW,
+        canary_tenant_id=canary, canary_delay_seconds=3600.0,
+        sleeper=slept.append,
+    )
+    assert slept == [3600.0]
+
+    # canary alone → no delay at all
+    solo = engine_run.RunReport(
+        uuid.uuid4(), "completed", {},
+        {canary: {"final": [], "counts": {"passed": 0}}},
+    )
+    slept2: list[float] = []
+    daily_run.run_daily_delivery(
+        owner_session, report=solo, deps=_deps(tmp_path), now=NOW,
+        canary_tenant_id=canary, canary_delay_seconds=3600.0,
+        sleeper=slept2.append,
+    )
+    assert slept2 == []

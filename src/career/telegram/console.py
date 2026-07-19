@@ -91,6 +91,16 @@ def _screen(
         return views.render_business(arg, _business_data(session, arg, now=now))
     if name == "errors":
         return views.render_errors(probes.error_lines())
+    if name == "log":
+        # §14 manual counters: v1|log|<TEN>|<support5|review>
+        parts2 = arg.split("|")
+        if len(parts2) != 2:
+            return None
+        code, kind = parts2
+        if not _log_manual_usage(session, code=code, kind=kind, now=now):
+            return None
+        card = _tenant_card(session, code=code, now=now)
+        return views.render_tenant_card(card) if card else None
     if name == "soon":
         return views.render_soon(arg)
     return None
@@ -215,7 +225,21 @@ def _tenant_card(
         select(func.count()).select_from(TenantJobSuppression)
         .where(TenantJobSuppression.tenant_id == tenant.id)
     ).scalar_one()
+    support_minutes = session.execute(
+        select(func.coalesce(func.sum(UsageEvent.input_tokens), 0)).where(
+            UsageEvent.tenant_id == tenant.id,
+            UsageEvent.kind == "support_minutes",
+        )
+    ).scalar_one()
+    review_count = session.execute(
+        select(func.count()).select_from(UsageEvent).where(
+            UsageEvent.tenant_id == tenant.id,
+            UsageEvent.kind == "human_review",
+        )
+    ).scalar_one()
     return {
+        "support_minutes": int(support_minutes or 0),
+        "review_count": int(review_count),
         "code": code,
         "plan_code": sub.plan_code if sub else None,
         "sub_status": sub.status if sub else None,
@@ -318,6 +342,29 @@ def _business_data(
     }
 
 
+def _log_manual_usage(
+    session: Session, *, code: str, kind: str, now: datetime
+) -> bool:
+    """§14 manual counters the platform can't capture automatically.
+    support5 = +5 support minutes (stored in input_tokens as minutes —
+    documented unit for kind=support_minutes); review = +1 human review."""
+    tenant = session.execute(
+        select(Tenant).where(Tenant.code == code)
+    ).scalars().first()
+    if tenant is None or kind not in ("support5", "review"):
+        return False
+    from career.cv.close import record_usage
+
+    if kind == "support5":
+        record_usage(session, tenant_id=tenant.id, kind="support_minutes",
+                     now=now, input_tokens=5)
+    else:
+        record_usage(session, tenant_id=tenant.id, kind="human_review",
+                     now=now, input_tokens=1)
+    session.commit()
+    return True
+
+
 def _chat_id_of(update: dict[str, Any]) -> str | None:
     message = update.get("message")
     if message:
@@ -360,7 +407,7 @@ def handle_update(
         screen = None
         if len(parts) >= 2 and parts[0] == "v1":
             name = parts[1]
-            arg = parts[2] if len(parts) > 2 else ""
+            arg = "|".join(parts[2:]) if len(parts) > 2 else ""
             screen = _screen(session, name, arg, probes=probes, now=now)
         if screen is None or message_id is None:
             return [Outcome(kind="ack", callback_query_id=cbq_id,

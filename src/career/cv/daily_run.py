@@ -396,6 +396,9 @@ def run_daily_delivery(
     renderer: Callable[..., Any] = render_cv_pdf,
     suppressor: close_mod.Suppressor = record_suppression_by_url,
     include_weekend: bool = False,
+    canary_tenant_id: uuid.UUID | None = None,
+    canary_delay_seconds: float = 0.0,
+    sleeper: Callable[[float], None] | None = None,
 ) -> dict[uuid.UUID, TenantDayState]:
     """One delivery day. Tenants are isolated — one tenant's crash never
     touches the others; the admin summary reports every closed tenant.
@@ -415,8 +418,19 @@ def run_daily_delivery(
         logger.info("weekend — no delivery day (§08)")
         return {}
 
+    # §14 canary ordering: the operator's tenant runs FIRST; when real
+    # customers follow, an hour-class delay separates them so a bad morning
+    # is caught on the canary before it reaches anyone else.
+    ordered = sorted(
+        report.per_tenant.items(),
+        key=lambda kv: (kv[0] != canary_tenant_id,),
+    )
+    canary_present = canary_tenant_id in report.per_tenant
+
     states: dict[uuid.UUID, TenantDayState] = {}
-    for tenant_id, payload in report.per_tenant.items():
+    for index, (tenant_id, payload) in enumerate(ordered):
+        if (index == 1 and canary_present and canary_delay_seconds > 0):
+            (sleeper or __import__("time").sleep)(canary_delay_seconds)
         try:
             state = _run_tenant(
                 session, tenant_id=tenant_id, payload=payload, report=report,

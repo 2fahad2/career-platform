@@ -221,10 +221,22 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
         engine2 = create_engine(settings.owner_database_url, future=True)
         try:
             with Session(engine2) as session:
+                canary_tid = None
+                if settings.canary_test_phone:
+                    from career.db.models import CustomerChannel
+
+                    canary_tid = session.execute(
+                        select(CustomerChannel.tenant_id).where(
+                            CustomerChannel.phone_e164
+                            == settings.canary_test_phone
+                        )
+                    ).scalar_one_or_none()
                 states = run_daily_delivery(
                     session, report=report, deps=deps,
                     now=datetime.now(UTC),
                     include_weekend=args.include_weekend,
+                    canary_tenant_id=canary_tid,
+                    canary_delay_seconds=3600.0,
                 )
                 # read INSIDE the session — the rows expire on close
                 summary["delivery"] = {
