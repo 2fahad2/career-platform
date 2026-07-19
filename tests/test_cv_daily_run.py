@@ -622,23 +622,33 @@ def test_canary_runs_first_with_delay_before_the_rest(
         {other: {"final": [], "counts": {"passed": 0}},
          canary: {"final": [], "counts": {"passed": 0}}},
     )
-    slept: list[float] = []
-    daily_run.run_daily_delivery(
-        owner_session, report=report, deps=_deps(tmp_path), now=NOW,
-        canary_tenant_id=canary, canary_delay_seconds=3600.0,
-        sleeper=slept.append,
-    )
-    assert slept == [3600.0]
+    try:
+        slept: list[float] = []
+        daily_run.run_daily_delivery(
+            owner_session, report=report, deps=_deps(tmp_path), now=NOW,
+            canary_tenant_id=canary, canary_delay_seconds=3600.0,
+            sleeper=slept.append,
+        )
+        owner_session.commit()
+        assert slept == [3600.0]
 
-    # canary alone → no delay at all
-    solo = engine_run.RunReport(
-        uuid.uuid4(), "completed", {},
-        {canary: {"final": [], "counts": {"passed": 0}}},
-    )
-    slept2: list[float] = []
-    daily_run.run_daily_delivery(
-        owner_session, report=solo, deps=_deps(tmp_path), now=NOW,
-        canary_tenant_id=canary, canary_delay_seconds=3600.0,
-        sleeper=slept2.append,
-    )
-    assert slept2 == []
+        # canary alone → no delay at all
+        solo = engine_run.RunReport(
+            uuid.uuid4(), "completed", {},
+            {canary: {"final": [], "counts": {"passed": 0}}},
+        )
+        slept2: list[float] = []
+        daily_run.run_daily_delivery(
+            owner_session, report=solo, deps=_deps(tmp_path), now=NOW,
+            canary_tenant_id=canary, canary_delay_seconds=3600.0,
+            sleeper=slept2.append,
+        )
+        owner_session.commit()
+        assert slept2 == []
+    finally:
+        # open transactions wedge the fixture teardown (repo lesson)
+        owner_session.rollback()
+        owner_session.execute(sql_text(
+            "DELETE FROM tenant_day_states WHERE tenant_id IN (:a, :b)"),
+            {"a": a, "b": b})
+        owner_session.commit()
