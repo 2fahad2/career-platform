@@ -13,4 +13,4 @@ EnvironmentFile=/root/career/.env.staging
 # Host-side overrides MUST ride inside ExecStart: systemd applies
 # EnvironmentFile AFTER Environment= lines, so plain overrides lose.
 # .env.staging is written for the compose network (postgres/redis hostnames).
-ExecStart=/usr/bin/env DB_HOST=127.0.0.1 DB_PORT=5433 REDIS_HOST=127.0.0.1 REDIS_PORT=6380 /root/career/.venv/bin/python /root/career/scripts/run_nightly.py
+ExecStart=/usr/bin/env DB_HOST=127.0.0.1 DB_PORT=5433 REDIS_HOST=127.0.0.1 REDIS_PORT=6380 STORAGE_ROOT=/root/career/data /root/career/.venv/bin/python /root/career/scripts/run_nightly.py
