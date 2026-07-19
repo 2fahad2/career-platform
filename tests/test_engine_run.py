@@ -300,3 +300,40 @@ def test_interleave_by_source_shares_the_cap_fairly() -> None:
     assert sum(1 for j in cap4 if j.source == "jobspy") == 2   # both survive
     google_kept = [j for j in mixed if j.source == "searchapi_google_jobs"]
     assert [j.title for j in google_kept] == [f"T{i}" for i in range(6)]
+
+
+def test_cross_source_repost_joins_the_same_group(
+    owner_session, two_tenants
+) -> None:
+    """Audit fix: the same job on two URLs (google + jobspy) within the §06
+    window must share ONE repost group — so suppressing one suppresses both."""
+    import uuid as _uuid
+    from datetime import UTC, datetime
+
+    from sqlalchemy import text as sql_text
+
+    from career.engine.run import _upsert_pool
+    from career.engine.sources import DiscoveredJob
+
+    now = datetime(2026, 7, 15, 0, 30, tzinfo=UTC)
+    mark = _uuid.uuid4().hex[:8]
+    j1 = DiscoveredJob(
+        title=f"Data Analyst {mark}", company="Masdr", url=f"https://a.example/{mark}/1",
+        source="searchapi_google_jobs", family="data_analyst", location="Riyadh",
+    )
+    j2 = DiscoveredJob(
+        title=f"Data Analyst {mark}", company="Masdr", url=f"https://b.example/{mark}/2",
+        source="jobspy", family="data_analyst", location="Riyadh",
+    )
+    try:
+        p1, _ = _upsert_pool(owner_session, [j1], now)
+        p2, counts = _upsert_pool(owner_session, [j2], now)
+        owner_session.commit()
+        assert counts["merged_groups"] == 1
+        assert p2[0].repost_group_id == p1[0].repost_group_id
+        assert p2[0].url_identity != p1[0].url_identity   # different URLs
+    finally:
+        owner_session.rollback()
+        owner_session.execute(sql_text(
+            "DELETE FROM job_postings WHERE url LIKE :u"), {"u": f"%{mark}%"})
+        owner_session.commit()

@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import select
@@ -148,11 +148,51 @@ def _discover(
     return jobs, sources
 
 
+#: §06 posting window for the repost quadruple — beyond it, a same-looking
+#: posting is treated as a fresh opening, not a repost.
+REPOST_WINDOW_DAYS = 14
+
+
+def _repost_group_for(
+    owner_session: Session,
+    job: DiscoveredJob,
+    ids: engine_identity.ExtendedIds,
+    now: datetime,
+) -> tuple[str | None, bool]:
+    """(group_id, merged) — audit fix: should_merge was never called in the
+    pipeline, so cross-source reposts always formed separate groups. A new
+    posting whose fingerprint matches a pool row seen within the §06 window
+    AND passes the conservative quadruple adopts that row's group."""
+    if not ids.cross_source_fingerprint:
+        return ids.repost_group_id, False
+    candidate = owner_session.execute(
+        select(JobPosting).where(
+            JobPosting.cross_source_fingerprint == ids.cross_source_fingerprint,
+            JobPosting.last_seen_at >= now - timedelta(days=REPOST_WINDOW_DAYS),
+        ).order_by(JobPosting.last_seen_at.desc())
+    ).scalars().first()
+    if candidate is None:
+        return ids.repost_group_id, False
+    cand_job = DiscoveredJob(
+        title=candidate.title, company=candidate.company, url=candidate.url,
+        source=candidate.source, family=job.family, location=candidate.location,
+    )
+    cand_ids = engine_identity.ExtendedIds(
+        url_identity=candidate.url_identity,
+        cross_source_fingerprint=candidate.cross_source_fingerprint or "",
+        repost_group_id=candidate.repost_group_id,
+        dedupe_url_key=None,
+    )
+    if engine_identity.should_merge(ids, job, cand_ids, cand_job):
+        return candidate.repost_group_id, True
+    return ids.repost_group_id, False
+
+
 def _upsert_pool(
     owner_session: Session, jobs: list[DiscoveredJob], now: datetime,
 ) -> tuple[list[JobPosting], dict[str, int]]:
     postings: list[JobPosting] = []
-    counts = {"new": 0, "seen_again": 0, "unusable_url": 0}
+    counts = {"new": 0, "seen_again": 0, "unusable_url": 0, "merged_groups": 0}
     for job in jobs:
         ids = engine_identity.derive_ids(job)
         if ids.url_identity is None:
@@ -166,6 +206,9 @@ def _upsert_pool(
             postings.append(existing)
             counts["seen_again"] += 1
             continue
+        group_id, merged = _repost_group_for(owner_session, job, ids, now)
+        if merged:
+            counts["merged_groups"] += 1
         posting = JobPosting(
             id=uuid.uuid4(),
             url_identity=ids.url_identity,
@@ -173,7 +216,7 @@ def _upsert_pool(
             canonical_url=(job.route or {}).get("canonical_apply_url"),
             source_native_id=job.source_native_id,
             cross_source_fingerprint=ids.cross_source_fingerprint,
-            repost_group_id=ids.repost_group_id,
+            repost_group_id=group_id,
             title=job.title,
             company=job.company,
             location=job.location,

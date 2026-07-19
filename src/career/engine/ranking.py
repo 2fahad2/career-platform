@@ -138,6 +138,15 @@ def record_suppression_by_url(
     candidate_key = _dedupe_url_key(url) if url else None
     if not candidate_key:
         return  # no usable key → never suppress (fail-open)
+    if repost_group_id is None:
+        # audit fix: the C7 close only knows the delivered URL — resolve the
+        # posting's repost group here so group-level suppression actually
+        # bites (rows used to land with a NULL group = URL-only suppression).
+        from career.db.models import JobPosting
+
+        repost_group_id = owner_session.execute(
+            select(JobPosting.repost_group_id).where(JobPosting.url == url)
+        ).scalar_one_or_none()
     owner_session.execute(
         delete(TenantJobSuppression).where(
             TenantJobSuppression.tenant_id == tenant_id,
