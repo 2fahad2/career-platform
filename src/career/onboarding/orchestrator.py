@@ -133,7 +133,7 @@ _DELETE_WARNING = (
 _DELETE_DONE = "تم حذف بياناتك الشخصية. سجلاتك المالية محفوظة وفق المتطلبات النظامية."
 _PAUSED = "تم الإيقاف المؤقت. الفترة الحالية لا تتمدد (§ الشروط). للعودة أرسل: استئناف"
 _RESUMED = "تم الاستئناف ✅"
-_EXPORT_ACK = "استلمنا طلب تصدير بياناتك وسنرسلها خلال المهلة المعلنة (7 أيام)."
+_EXPORT_ACK = "📁 هذي نسخة كاملة من بياناتك المحفوظة عندنا (ملف JSON)."
 _NUDGE_REMINDER = "وقفنا عند خطوة بسيطة — نكمل إعداد خدمتك؟ 👇"
 
 _APPROVE_BUTTONS = ("اعتماد المقترح", "أبي مساري كما هو")
@@ -806,17 +806,30 @@ def _handle_privacy_command(
         _send(session, deps, channel, _RESUMED, now=now)
     elif command == "export":
         request = privacy.open_request(session, tenant_id=tenant_id, kind="export", now=now)
-        privacy.fulfill_export(
+        key = privacy.fulfill_export(
             session, tenant_id=tenant_id, request_id=request.id,
             storage=deps.storage, now=now,
         )
-        _send(session, deps, channel, _EXPORT_ACK, now=now)
+        # audit fix: the bundle was written to storage and marked fulfilled
+        # but never reached the customer — deliver it as a WhatsApp document
+        # (falls back to the ack text if the send fails; still recorded).
+        try:
+            mid = deps.whatsapp_client.send_document(
+                channel.phone_e164, key,
+                filename="بياناتي.json", caption=_EXPORT_ACK,
+            )
+            record_out(session, tenant_id=tenant_id, channel_id=channel.id,
+                       kind="document", wa_message_id=mid, now=now)
+        except Exception:  # noqa: BLE001 — never lose the request on a send blip
+            logger.warning("export document send failed", exc_info=True)
+            _send(session, deps, channel, _EXPORT_ACK, now=now)
     elif command == "delete_warn":
         _send(session, deps, channel, _DELETE_WARNING, now=now)
     elif command == "delete_execute":
         request = privacy.open_request(session, tenant_id=tenant_id, kind="delete", now=now)
         report = privacy.execute_deletion(
-            session, tenant_id=tenant_id, request_id=request.id, now=now
+            session, tenant_id=tenant_id, request_id=request.id, now=now,
+            storage=deps.storage,
         )
         for key in report.storage_keys_to_purge:
             try:

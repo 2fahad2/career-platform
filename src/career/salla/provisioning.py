@@ -13,10 +13,12 @@ only its hash stored).
 
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -27,6 +29,8 @@ from career.salla.client import SallaClient
 from career.tokens import hash_token, new_activation_token
 
 # product_id -> plan_code (from the Salla store setup; injected).
+logger = logging.getLogger("career.salla")
+
 ProductCatalog = dict[str, str]
 
 ACTIVATION_TOKEN_TTL_DAYS = 7
@@ -168,10 +172,15 @@ def process_pending_webhooks(
     salla_client: SallaClient,
     product_catalog: ProductCatalog,
     limit: int = 100,
+    admin_client: Any = None,
+    whatsapp_number_e164: str = "",
 ) -> list[ProvisionResult]:
     """The Salla worker the webhook 200 defers to. Provisions paid orders and
     applies refund/cancel/chargeback to existing subscriptions. Runs as owner
-    (bypasses RLS) since it spans tenants and creates new ones."""
+    (bypasses RLS) since it spans tenants and creates new ones. On a fresh
+    provision it emits the §09 activation deep link to the admin channel so
+    the operator can hand it to the buyer (until Salla's thank-you page is
+    wired to build it directly)."""
     events = list(
         owner_session.execute(
             select(WebhookEvent)
@@ -183,13 +192,30 @@ def process_pending_webhooks(
     results: list[ProvisionResult] = []
     for ev in events:
         if ev.event_type in _PROVISION_EVENTS:
-            results.append(
-                provision_order(
-                    owner_session, ev.salla_order_id,
-                    salla_client=salla_client, product_catalog=product_catalog,
-                    webhook_event=ev,
-                )
+            result = provision_order(
+                owner_session, ev.salla_order_id,
+                salla_client=salla_client, product_catalog=product_catalog,
+                webhook_event=ev,
             )
+            results.append(result)
+            if (result.status == ProvisionStatus.PROVISIONED
+                    and result.activation_token and admin_client is not None
+                    and whatsapp_number_e164):
+                from career.salla.activation_link import build_activation_link
+                try:
+                    tenant = owner_session.get(
+                        Tenant, uuid.UUID(str(result.tenant_id))
+                    ) if result.tenant_id else None
+                    code = tenant.code if tenant else "?"
+                    link = build_activation_link(
+                        whatsapp_number_e164=whatsapp_number_e164,
+                        token=result.activation_token,
+                    )
+                    admin_client.send_admin(
+                        f"🟢 اشتراك جديد {code} — رابط التفعيل للمشتري:\n{link}"
+                    )
+                except Exception:  # noqa: BLE001 — link surfacing never blocks
+                    logger.warning("activation link surface failed", exc_info=True)
         elif ev.event_type in _LIFECYCLE_EVENTS:
             _apply_lifecycle(owner_session, ev)
         else:

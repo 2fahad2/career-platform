@@ -64,6 +64,24 @@ def _seed_personal_data(session, tenant_id: uuid.UUID) -> None:
         {"id": str(uuid.uuid4()), "tid": str(tenant_id), "cid": str(channel_id),
          "wamid": f"wamid-{uuid.uuid4()}"},
     )
+    # migration-0009 contact fields + a funnel analysis with a stored report
+    session.execute(
+        sql_text("UPDATE customer_profiles SET email = :e, linkedin_url = :l,"
+                 " region = :r WHERE tenant_id = :tid"),
+        {"e": "fahad@example.com", "l": "linkedin.com/in/fahad",
+         "r": "الرياض", "tid": str(tenant_id)},
+    )
+    sub_id = session.execute(sql_text(
+        "SELECT id FROM subscriptions WHERE tenant_id = :tid"),
+        {"tid": str(tenant_id)}).scalar_one()
+    session.execute(
+        sql_text("INSERT INTO funnel_sessions "
+                 "(id, tenant_id, subscription_id, channel_id, state, context,"
+                 " report) VALUES (:id, :tid, :sid, :cid, 'DONE', '{}'::jsonb,"
+                 " '{\"scores\": {\"overall\": 72}}'::jsonb)"),
+        {"id": str(uuid.uuid4()), "tid": str(tenant_id), "sid": str(sub_id),
+         "cid": str(channel_id)},
+    )
 
 
 # ── the request trail with declared deadlines ────────────────────────────────
@@ -102,6 +120,10 @@ def test_export_bundle_covers_the_personal_data(
     assert bundle["profile"]["cv_full_name"] == "Fahad A"
     assert bundle["facts"][0]["payload"] == {"name": "SQL"}
     assert {c["purpose"] for c in bundle["consents"]} >= set(consents.REQUIRED_KEYS)
+    # audit fix: 0009 contact fields + funnel report must be in the export
+    assert bundle["profile"]["email"] == "fahad@example.com"
+    assert bundle["profile"]["region"] == "الرياض"
+    assert bundle["funnel_analyses"][0]["report"]["scores"]["overall"] == 72
     with tenant_session(a) as s:
         row = s.execute(
             sql_text("SELECT status, fulfilled_at, details FROM privacy_requests")
@@ -193,6 +215,30 @@ def test_deletion_reports_storage_keys_to_purge(
         report = privacy.execute_deletion(s, tenant_id=tid, request_id=req.id, now=NOW)
     assert f"tenants/{tid}/uploads/cv.pdf" in report.storage_keys_to_purge
     assert f"tenants/{tid}/uploads/cv.txt" in report.storage_keys_to_purge
+
+
+def test_deletion_purges_funnel_reports_via_storage_prefix(
+    two_tenants: tuple[str, str], tmp_path
+) -> None:
+    """Audit fix: funnel report PDFs have no DB row — deletion collects the
+    whole tenant storage prefix when a storage adapter is injected, and the
+    funnel session row itself is deleted."""
+    a, _ = two_tenants
+    tid = uuid.UUID(a)
+    storage = FilesystemStorageAdapter(tmp_path)
+    storage.put(f"tenants/{tid}/funnel_reports/2026-07-19-120000.pdf",
+                b"%PDF- report", content_type="application/pdf")
+    storage.put(f"tenants/{tid}/tailored_cvs/joburl-x.pdf", b"%PDF- cv",
+                content_type="application/pdf")
+    with tenant_session(a) as s:
+        _seed_personal_data(s, tid)
+        req = privacy.open_request(s, tenant_id=tid, kind="delete", now=NOW)
+        report = privacy.execute_deletion(
+            s, tenant_id=tid, request_id=req.id, now=NOW, storage=storage
+        )
+    assert report.deleted["funnel_sessions"] == 1
+    assert any("funnel_reports" in k for k in report.storage_keys_to_purge)
+    assert any("tailored_cvs" in k for k in report.storage_keys_to_purge)
 
 
 # ── pause: suspends without extending (§05: لا يمدد) ─────────────────────────

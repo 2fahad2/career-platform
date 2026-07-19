@@ -112,6 +112,8 @@ def main() -> None:  # pragma: no cover — the C7.8 live runner
                 )
                 salla_counts = process_pending_webhooks(
                     session, salla_client=salla, product_catalog=catalog,
+                    admin_client=admin,
+                    whatsapp_number_e164=settings.whatsapp_number_e164,
                 )
             if counts.get("messages") or counts.get("statuses"):
                 logger.info("processed: %s", counts)

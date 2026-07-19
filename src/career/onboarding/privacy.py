@@ -35,6 +35,7 @@ from career.db.models import (
     DeliveryMessage,
     Document,
     ForbiddenClaim,
+    FunnelSession,
     InboundMessage,
     OnboardingSession,
     PrivacyRequest,
@@ -132,6 +133,10 @@ def export_bundle(session: Session, *, tenant_id: uuid.UUID) -> dict[str, object
     subscription = session.execute(
         select(Subscription).where(Subscription.tenant_id == tenant_id)
     ).scalars().first()
+    funnels = session.execute(
+        select(FunnelSession).where(FunnelSession.tenant_id == tenant_id)
+        .order_by(FunnelSession.created_at)
+    ).scalars().all()
 
     return {
         "profile": {
@@ -146,7 +151,15 @@ def export_bundle(session: Session, *, tenant_id: uuid.UUID) -> dict[str, object
             ),
             "remote_preference": profile.remote_preference if profile else None,
             "requested_path": profile.requested_path if profile else None,
+            # audit fix: migration-0009 contact fields were omitted (§12
+            # 'everything personal we hold')
+            "email": profile.email if profile else None,
+            "linkedin_url": profile.linkedin_url if profile else None,
+            "region": profile.region if profile else None,
         },
+        "funnel_analyses": [
+            {"state": fn.state, "report": fn.report} for fn in funnels
+        ],
         "facts": [
             {"category": f.category, "status": f.status, "payload": f.payload}
             for f in facts
@@ -215,6 +228,7 @@ _PERSONAL_DELETION_ORDER: tuple[type, ...] = (
     SearchPolicy,
     CvUpload,
     Document,
+    FunnelSession,          # the analysis report JSON + funnel context (§12)
     OnboardingSession,
     DeliveryMessage,
     Delivery,
@@ -235,28 +249,33 @@ def execute_deletion(
     tenant_id: uuid.UUID,
     request_id: uuid.UUID,
     now: datetime,
+    storage: StorageAdapter | None = None,
 ) -> DeletionReport:
     """Delete the personal tables for this tenant, honoring the regulatory
     exceptions, and report the object-storage keys the caller must purge."""
     request = _get_open_request(session, tenant_id, request_id, "delete")
 
-    # Collect storage keys BEFORE the rows disappear.
-    keys: list[str] = [
-        k
-        for k in session.execute(
-            select(Document.storage_key).where(Document.tenant_id == tenant_id)
-        ).scalars()
-    ]
-    keys += [
-        k
-        for k in session.execute(
-            select(CvUpload.extracted_text_storage_key).where(
-                CvUpload.tenant_id == tenant_id,
-                CvUpload.extracted_text_storage_key.is_not(None),
-            )
-        ).scalars()
-        if k
-    ]
+    # Every object under the tenant prefix is deleted — uploads, tailored
+    # CVs, AND funnel report PDFs (audit fix: the DB-tracked keys missed the
+    # funnel reports, which are stored under a timestamped key with no row).
+    keys: list[str] = []
+    if storage is not None:
+        keys = list(storage.list_keys(tenant_key(str(tenant_id))))
+    else:  # fallback: the two DB-tracked kinds when no storage is injected
+        keys = [
+            k for k in session.execute(
+                select(Document.storage_key).where(
+                    Document.tenant_id == tenant_id)
+            ).scalars()
+        ]
+        keys += [
+            k for k in session.execute(
+                select(CvUpload.extracted_text_storage_key).where(
+                    CvUpload.tenant_id == tenant_id,
+                    CvUpload.extracted_text_storage_key.is_not(None),
+                )
+            ).scalars() if k
+        ]
 
     deleted: dict[str, int] = {}
     for model in _PERSONAL_DELETION_ORDER:
