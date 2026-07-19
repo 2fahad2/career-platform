@@ -233,6 +233,10 @@ class Subscription(Base):
     salla_order_id: Mapped[str] = mapped_column(String(64), nullable=False)
     amount_sar: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
     currency: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    # buyer's normalized order phone — zero-touch activation (CHANGELOG §11)
+    order_phone_e164: Mapped[str | None] = mapped_column(
+        String(20), nullable=True, index=True
+    )
     current_period_start: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

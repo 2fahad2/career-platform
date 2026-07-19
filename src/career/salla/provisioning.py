@@ -116,6 +116,8 @@ def provision_order(
     owner_session.add(tenant)
     owner_session.flush()
 
+    from career.salla.activation_link import normalize_order_phone
+
     subscription = Subscription(
         id=uuid.uuid4(),
         tenant_id=tenant.id,
@@ -124,6 +126,7 @@ def provision_order(
         salla_order_id=order_id,
         amount_sar=order.amount,
         currency=order.currency,
+        order_phone_e164=normalize_order_phone(order.customer_phone),
     )
     owner_session.add(subscription)
     owner_session.flush()
@@ -174,6 +177,7 @@ def process_pending_webhooks(
     limit: int = 100,
     admin_client: Any = None,
     whatsapp_number_e164: str = "",
+    whatsapp_client: Any = None,
 ) -> list[ProvisionResult]:
     """The Salla worker the webhook 200 defers to. Provisions paid orders and
     applies refund/cancel/chargeback to existing subscriptions. Runs as owner
@@ -198,30 +202,63 @@ def process_pending_webhooks(
                 webhook_event=ev,
             )
             results.append(result)
-            if (result.status == ProvisionStatus.PROVISIONED
-                    and result.activation_token and admin_client is not None
-                    and whatsapp_number_e164):
-                from career.salla.activation_link import build_activation_link
-                try:
-                    tenant = owner_session.get(
-                        Tenant, uuid.UUID(str(result.tenant_id))
-                    ) if result.tenant_id else None
-                    code = tenant.code if tenant else "?"
-                    link = build_activation_link(
-                        whatsapp_number_e164=whatsapp_number_e164,
-                        token=result.activation_token,
-                    )
-                    admin_client.send_admin(
-                        f"🟢 اشتراك جديد {code} — رابط التفعيل للمشتري:\n{link}"
-                    )
-                except Exception:  # noqa: BLE001 — link surfacing never blocks
-                    logger.warning("activation link surface failed", exc_info=True)
+            if result.status == ProvisionStatus.PROVISIONED:
+                _announce_provision(
+                    owner_session, result,
+                    admin_client=admin_client,
+                    whatsapp_number_e164=whatsapp_number_e164,
+                    whatsapp_client=whatsapp_client,
+                )
         elif ev.event_type in _LIFECYCLE_EVENTS:
             _apply_lifecycle(owner_session, ev)
         else:
             _mark_webhook(owner_session, ev, "ignored")
             owner_session.commit()
     return results
+
+
+def _announce_provision(
+    owner_session: Session,
+    result: ProvisionResult,
+    *,
+    admin_client: Any,
+    whatsapp_number_e164: str,
+    whatsapp_client: Any,
+) -> None:
+    """CHANGELOG §11 — zero-touch activation: send the APPROVED welcome
+    template to the buyer's order phone (their reply from that number claims
+    the subscription), and surface the wa.me deep link to the admin channel
+    as the support fallback. Best-effort: announcing never blocks billing."""
+    sub = owner_session.get(
+        Subscription, uuid.UUID(str(result.subscription_id))
+    ) if result.subscription_id else None
+    tenant = owner_session.get(
+        Tenant, uuid.UUID(str(result.tenant_id))
+    ) if result.tenant_id else None
+    code = tenant.code if tenant else "?"
+
+    if whatsapp_client is not None and sub is not None and sub.order_phone_e164:
+        from career.whatsapp.templates import WELCOME_ACTIVATION
+        try:
+            whatsapp_client.send_template(
+                sub.order_phone_e164,
+                WELCOME_ACTIVATION.name, WELCOME_ACTIVATION.language,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("welcome template send failed", exc_info=True)
+
+    if admin_client is not None and whatsapp_number_e164 and result.activation_token:
+        from career.salla.activation_link import build_activation_link
+        try:
+            link = build_activation_link(
+                whatsapp_number_e164=whatsapp_number_e164,
+                token=result.activation_token,
+            )
+            admin_client.send_admin(
+                f"🟢 اشتراك جديد {code} — رابط التفعيل الاحتياطي:\n{link}"
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("activation link surface failed", exc_info=True)
 
 
 def _apply_lifecycle(owner_session: Session, ev: WebhookEvent) -> None:

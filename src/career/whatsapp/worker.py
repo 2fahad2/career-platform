@@ -32,7 +32,11 @@ from career.db.models import (
 from career.onboarding import orchestrator
 from career.telegram import messages as admin_msg
 from career.telegram.admin import TelegramAdminClient
-from career.whatsapp.activation_flow import ActivationStatus, activate
+from career.whatsapp.activation_flow import (
+    ActivationStatus,
+    activate,
+    activate_by_order_phone,
+)
 from career.whatsapp.client import WhatsAppClient
 from career.whatsapp.delivery import descend_pending_delivery
 from career.whatsapp.inbound import InboundKind, classify_inbound
@@ -126,54 +130,65 @@ def _handle_message(
     text_body = _text_of(msg)
     kind, token = classify_inbound(text_body)
 
+    def _finish_activation(result: Any) -> None:
+        """Shared post-activation handover (whitepaper §05): record the
+        inbound, then start the funnel (cv_analysis) or the onboarding."""
+        if not (result.tenant_id and result.channel_id):
+            return
+        _record_inbound(
+            session, tenant_id=uuid.UUID(result.tenant_id),
+            channel_id=uuid.UUID(result.channel_id), wamid=wamid,
+            message_type=message_type, text_body=text_body,
+            classification="activation", payload=msg, now=now,
+        )
+        if (
+            onboarding is not None
+            and result.subscription_id is not None
+            and result.status
+            in (ActivationStatus.ACTIVATED, ActivationStatus.ALREADY_LINKED)
+        ):
+            from career.db.models import Subscription
+            from career.funnel import flow as funnel_flow
+
+            sub = session.get(Subscription, uuid.UUID(result.subscription_id))
+            if sub is not None and sub.plan_code == "cv_analysis":
+                funnel_flow.start_funnel(
+                    session,
+                    tenant_id=uuid.UUID(result.tenant_id),
+                    subscription_id=uuid.UUID(result.subscription_id),
+                    channel_id=uuid.UUID(result.channel_id),
+                    deps=onboarding, now=now,
+                )
+            else:
+                orchestrator.start_journey(
+                    session,
+                    tenant_id=uuid.UUID(result.tenant_id),
+                    subscription_id=uuid.UUID(result.subscription_id),
+                    channel_id=uuid.UUID(result.channel_id),
+                    deps=onboarding, now=now,
+                )
+        session.commit()
+
     if kind is InboundKind.ACTIVATION and token is not None:
         result = activate(
             session, token=token, from_phone=from_phone, display_name=None, now=now,
             whatsapp_client=whatsapp_client, admin_client=admin_client,
         )
-        if result.tenant_id and result.channel_id:
-            _record_inbound(
-                session, tenant_id=uuid.UUID(result.tenant_id),
-                channel_id=uuid.UUID(result.channel_id), wamid=wamid,
-                message_type=message_type, text_body=text_body,
-                classification="activation", payload=msg, now=now,
-            )
-            # activation hands over to the matching journey (whitepaper §05):
-            # cv_analysis plans get the funnel (§04, C8); the rest onboard.
-            if (
-                onboarding is not None
-                and result.subscription_id is not None
-                and result.status
-                in (ActivationStatus.ACTIVATED, ActivationStatus.ALREADY_LINKED)
-            ):
-                from career.db.models import Subscription
-                from career.funnel import flow as funnel_flow
-
-                sub = session.get(
-                    Subscription, uuid.UUID(result.subscription_id)
-                )
-                if sub is not None and sub.plan_code == "cv_analysis":
-                    funnel_flow.start_funnel(
-                        session,
-                        tenant_id=uuid.UUID(result.tenant_id),
-                        subscription_id=uuid.UUID(result.subscription_id),
-                        channel_id=uuid.UUID(result.channel_id),
-                        deps=onboarding, now=now,
-                    )
-                else:
-                    orchestrator.start_journey(
-                        session,
-                        tenant_id=uuid.UUID(result.tenant_id),
-                        subscription_id=uuid.UUID(result.subscription_id),
-                        channel_id=uuid.UUID(result.channel_id),
-                        deps=onboarding, now=now,
-                    )
-            session.commit()
+        _finish_activation(result)
         return
 
     channel = _channel_for_phone(session, from_phone)
     if channel is None:
-        # Unknown number, no valid activation token → generic help (in-window).
+        # CHANGELOG §11 zero-touch claim: ANY reply from the exact phone on a
+        # paid unclaimed order activates it — the reply is the proof.
+        claimed = activate_by_order_phone(
+            session, from_phone=from_phone, display_name=None, now=now,
+            whatsapp_client=whatsapp_client, admin_client=admin_client,
+        )
+        if claimed is not None:
+            _finish_activation(claimed)
+            return
+        # Unknown number, no claimable order → generic help (in-window).
         whatsapp_client.send_text(from_phone, _UNRECOGNIZED)
         return
 

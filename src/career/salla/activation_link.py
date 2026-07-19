@@ -24,3 +24,20 @@ def build_activation_link(*, whatsapp_number_e164: str, token: str) -> str:
     digits-only per wa.me (a leading '+' or spaces break the link)."""
     digits = "".join(ch for ch in whatsapp_number_e164 if ch.isdigit())
     return f"https://wa.me/{digits}?text={quote(activation_message(token))}"
+
+
+def normalize_order_phone(raw: str | None) -> str | None:
+    """Salla order phones arrive as ``+9665…``, ``9665…``, ``05…`` or
+    ``00966…`` — normalize to ``+E164`` or None when unusable. Conservative:
+    anything that doesn't look like a full international or Saudi local
+    number is dropped (the token path still covers those buyers)."""
+    if not raw:
+        return None
+    digits = "".join(ch for ch in str(raw) if ch.isdigit())
+    if digits.startswith("00"):
+        digits = digits[2:]
+    if digits.startswith("05") and len(digits) == 10:   # Saudi local mobile
+        digits = "966" + digits[1:]
+    if len(digits) < 11 or len(digits) > 15:
+        return None
+    return f"+{digits}"

@@ -67,6 +67,43 @@ def _is_funnel_only_tenant(owner_session: Session, tenant_id: uuid.UUID) -> bool
     return bool(plans) and all(p == "cv_analysis" for p in plans)
 
 
+def activate_by_order_phone(
+    owner_session: Session,
+    *,
+    from_phone: str,
+    display_name: str | None,
+    now: datetime,
+    whatsapp_client: WhatsAppClient,
+    admin_client: TelegramAdminClient,
+) -> ActivationResult | None:
+    """CHANGELOG §11 zero-touch claim: an inbound from the exact phone on a
+    PAID_UNCLAIMED order proves ownership — activate without a typed token.
+    Returns None when no claimable subscription matches (caller falls back
+    to the generic help); token expiry is deliberately NOT checked here (the
+    proof is the reply, not the token's freshness)."""
+    sub = owner_session.execute(
+        select(Subscription).where(
+            Subscription.order_phone_e164 == from_phone,
+            Subscription.status == sub_states.PAID_UNCLAIMED,
+        ).order_by(Subscription.created_at)
+    ).scalars().first()
+    if sub is None:
+        return None
+    tok = owner_session.execute(
+        select(ActivationToken).where(
+            ActivationToken.subscription_id == sub.id,
+            ActivationToken.used_at.is_(None),
+        )
+    ).scalar_one_or_none()
+    if tok is None:
+        return None
+    return _activate_with_token(
+        owner_session, tok=tok, from_phone=from_phone,
+        display_name=display_name, now=now, check_expiry=False,
+        whatsapp_client=whatsapp_client, admin_client=admin_client,
+    )
+
+
 def activate(
     owner_session: Session,
     *,
@@ -84,6 +121,24 @@ def activate(
         whatsapp_client.send_text(from_phone, _INVALID)
         admin_client.send_admin(admin_msg.activation_failed("(unknown)", "invalid_token"))
         return ActivationResult(ActivationStatus.INVALID_TOKEN)
+    return _activate_with_token(
+        owner_session, tok=tok, from_phone=from_phone,
+        display_name=display_name, now=now, check_expiry=True,
+        whatsapp_client=whatsapp_client, admin_client=admin_client,
+    )
+
+
+def _activate_with_token(
+    owner_session: Session,
+    *,
+    tok: ActivationToken,
+    from_phone: str,
+    display_name: str | None,
+    now: datetime,
+    check_expiry: bool,
+    whatsapp_client: WhatsAppClient,
+    admin_client: TelegramAdminClient,
+) -> ActivationResult:
 
     ten_code = owner_session.get(Tenant, tok.tenant_id).code  # type: ignore[union-attr]
     existing = _channel_for_phone(owner_session, from_phone)
@@ -106,7 +161,7 @@ def activate(
             )
             return ActivationResult(ActivationStatus.CONFLICT)
 
-    if tok.expires_at < now:
+    if check_expiry and tok.expires_at < now:
         whatsapp_client.send_text(from_phone, _EXPIRED)
         admin_client.send_admin(admin_msg.activation_failed(ten_code, "expired"))
         return ActivationResult(ActivationStatus.EXPIRED)
