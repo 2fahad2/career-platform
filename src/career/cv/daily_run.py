@@ -53,8 +53,10 @@ from career.whatsapp.delivery import (
     DELIVERY_PARTIAL,
     DELIVERY_PENDING,
     deliver_adaptive,
+    record_out,
 )
 from career.whatsapp.templates import DAILY_UTILITY, TemplateSpec
+from career.whatsapp.window import WindowState, window_state
 
 logger = logging.getLogger("career.cv")
 
@@ -122,6 +124,37 @@ def _inject_contact(cv: TailoredCV, contact: ContactInfo) -> TailoredCV:
     })
 
 
+_ZERO_DAY_AR = (
+    "🔍 بحثنا اليوم ولم نجد فرصًا تطابق معاييرك — هذا طبيعي في بعض الأيام.\n"
+    "بحث الغد يبدأ تلقائيًا، ومعاييرك كما هي."
+)
+
+
+def _send_zero_day(
+    session: Session, *, tenant_id: uuid.UUID, deps: DailyDeps, now: datetime
+) -> None:
+    """Best-effort §08 zero-day note — never affects the day's state."""
+    try:
+        channel = session.execute(
+            select(CustomerChannel).where(
+                CustomerChannel.tenant_id == tenant_id
+            )
+        ).scalars().first()
+        if channel is None:
+            return
+        state = window_state(
+            last_inbound_at=channel.last_inbound_at,
+            opt_out_at=channel.opt_out_at, now=now,
+        )
+        if state is not WindowState.OPEN:
+            return
+        mid = deps.whatsapp_client.send_text(channel.phone_e164, _ZERO_DAY_AR)
+        record_out(session, tenant_id=tenant_id, channel_id=channel.id,
+                   kind="text", wa_message_id=mid, now=now)
+    except Exception:  # noqa: BLE001
+        logger.warning("zero-day note failed", exc_info=True)
+
+
 def close_from_delivery(
     session: Session,
     *,
@@ -187,7 +220,13 @@ def _run_tenant(
         )
 
     if not discovery_ok or not final:
-        return _close()
+        state = _close()
+        # §08 zero-day report: an honest «لا فرص اليوم» reaches the customer
+        # when the window is open (free-form); a closed window stays silent —
+        # the state row still records the day either way.
+        if state.state == "NO_MATCHES":
+            _send_zero_day(session, tenant_id=tenant_id, deps=deps, now=now)
+        return state
 
     channel = session.execute(
         select(CustomerChannel).where(CustomerChannel.tenant_id == tenant_id)
@@ -301,10 +340,10 @@ def _run_tenant(
             cv_resolved=len(resolved), cv_failed=cv_failed + len(bundle_failures),
             failed=[str(e.get("group")) for e in bundle.get("jobs", [])],
         )
-    state = close_from_delivery(
+    day_state = close_from_delivery(
         session, delivery=delivery, now=now, suppressor=suppressor
     )
-    return state  # None ⇒ held for the window; the descend path closes it
+    return day_state  # None ⇒ held; the descend path closes it later
 
 
 def expire_stale_held_deliveries(

@@ -570,3 +570,39 @@ def test_no_delivery_on_the_saudi_weekend(
         assert deps.whatsapp_client.sent == []
     finally:
         _cleanup(owner_session, tid)
+
+
+def test_zero_day_note_reaches_open_window_only(
+    owner_session: Session, clean_billing: None, tmp_path: Any
+) -> None:
+    """§08: a NO_MATCHES day tells the customer honestly — open window only."""
+    tid, channel = _seed_active_tenant(owner_session)
+    try:
+        report = _engine_report(owner_session, tid)
+        empty = engine_run.RunReport(
+            report.run_id, report.status, report.counts,
+            {tid: {"final": [], "counts": {"passed": 0}}},
+        )
+        deps = _deps(tmp_path)
+        states = daily_run.run_daily_delivery(
+            owner_session, report=empty, deps=deps, now=NOW,
+        )
+        assert states[tid].state == "NO_MATCHES"
+        texts = [m.body or "" for m in deps.whatsapp_client.sent]
+        assert any("لم نجد فرصًا" in t for t in texts)
+
+        # closed window → silent (state recorded, no free-form send)
+        owner_session.execute(sql_text(
+            "UPDATE customer_channels SET last_inbound_at = NULL WHERE id = :id"),
+            {"id": str(channel.id)})
+        owner_session.execute(sql_text(
+            "DELETE FROM tenant_day_states WHERE tenant_id = :t"), {"t": str(tid)})
+        owner_session.commit()
+        deps2 = _deps(tmp_path)
+        states2 = daily_run.run_daily_delivery(
+            owner_session, report=empty, deps=deps2, now=NOW,
+        )
+        assert states2[tid].state == "NO_MATCHES"
+        assert deps2.whatsapp_client.sent == []
+    finally:
+        _cleanup(owner_session, tid)

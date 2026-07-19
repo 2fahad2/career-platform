@@ -58,6 +58,7 @@ from career.onboarding.upload import Limits, MalwareScanner, process_cv_upload
 from career.storage import StorageAdapter
 from career.whatsapp.client import WhatsAppClient
 from career.whatsapp.delivery import record_out
+from career.whatsapp.templates import ONBOARDING_REMINDER
 
 logger = logging.getLogger("career.onboarding")
 
@@ -860,10 +861,16 @@ def send_due_reminders(owner_session: Session, *, deps: Deps, now: datetime) -> 
         channel = owner_session.get(CustomerChannel, journey.channel_id)
         if channel is None or channel.opt_out_at is not None:
             continue
-        mid = deps.whatsapp_client.send_text(channel.phone_e164, _NUDGE_REMINDER)
+        # audit fix: a >24h stall means the 24h window is CLOSED by
+        # definition — only the APPROVED template can reach the customer.
+        mid = deps.whatsapp_client.send_template(
+            channel.phone_e164,
+            ONBOARDING_REMINDER.name, ONBOARDING_REMINDER.language,
+        )
         record_out(
             owner_session, tenant_id=journey.tenant_id, channel_id=channel.id,
-            kind="text", wa_message_id=mid, now=now,
+            kind="template", wa_message_id=mid,
+            template_name=ONBOARDING_REMINDER.name, now=now,
         )
         journey.last_reminder_at = now
         sent += 1

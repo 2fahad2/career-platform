@@ -429,4 +429,6 @@ def test_reminder_runner_nudges_stalled_journeys_once(
     assert second == 0                                    # once per stall
     sent = deps.whatsapp_client.sent  # type: ignore[attr-defined]
     assert len(sent) == sent_count_before + 1
-    assert "نكمل" in sent[-1].body or "وقفنا" in sent[-1].body
+    # a >24h stall = closed window → the APPROVED template, never free text
+    assert sent[-1].kind == "template"
+    assert sent[-1].template_name == "onboarding_reminder"
