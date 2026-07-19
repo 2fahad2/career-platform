@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     # SearchAPI.io — Google Jobs discovery source (C6, deviation D13).
     searchapi_api_key: str = Field(default="", alias="SEARCHAPI_API_KEY")
 
+    # Engine caps (§06: «قابلة للضبط في الإعدادات لا في الكود»).
+    engine_max_per_query: int = Field(default=5, alias="ENGINE_MAX_PER_QUERY")
+    engine_retrieval_cap: int = Field(default=50, alias="ENGINE_RETRIEVAL_CAP")
+    engine_enrich_cap: int = Field(default=30, alias="ENGINE_ENRICH_CAP")
+
     # Salla — billing/webhooks (C3). Filled when the Partner App is created.
     salla_webhook_secret: str = Field(default="", alias="SALLA_WEBHOOK_SECRET")
     salla_api_key: str = Field(default="", alias="SALLA_API_KEY")

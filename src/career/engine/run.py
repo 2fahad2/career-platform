@@ -76,6 +76,26 @@ def _gate_policy_of(policy: SearchPolicy) -> TenantGatePolicy:
     )
 
 
+def interleave_by_source(jobs: list[DiscoveredJob]) -> list[DiscoveredJob]:
+    """Round-robin across sources so the retrieval cap is shared fairly —
+    discovery order used to let a full google batch starve jobspy entirely
+    (audit fix). Order within each source is preserved."""
+    lanes: dict[str, list[DiscoveredJob]] = {}
+    for job in jobs:
+        lanes.setdefault(job.source, []).append(job)
+    out: list[DiscoveredJob] = []
+    i = 0
+    while True:
+        added = False
+        for lane in lanes.values():
+            if i < len(lane):
+                out.append(lane[i])
+                added = True
+        if not added:
+            return out
+        i += 1
+
+
 def _discover(
     families: list[QueryFamily],
     searchapi: SearchApiClient,
@@ -227,11 +247,19 @@ def run_nightly(
     if failed_sources == len(sources):
         return _finish("discovery_failed", {})
 
-    # 3) same-run dedupe (§8.1) + the cheap-retrieval cap
+    # 3) same-run dedupe (§8.1) + the cheap-retrieval cap.
+    # Fairness (audit fix): interleave sources round-robin BEFORE the cap —
+    # discovery order used to let a full google batch starve jobspy rows out
+    # of the pool entirely.
     deduped, removed = engine_identity.dedupe_same_run(jobs)
     counts["dedupe_removed"] = removed
-    retrieval = deduped[:retrieval_cap]
+    retrieval = interleave_by_source(deduped)[:retrieval_cap]
     counts["retrieval"] = len(retrieval)
+    counts["retrieval_by_source"] = {}
+    for job in retrieval:
+        counts["retrieval_by_source"][job.source] = (
+            counts["retrieval_by_source"].get(job.source, 0) + 1
+        )
 
     # 4) pool upsert by identity
     postings, pool_counts = _upsert_pool(owner_session, retrieval, now)

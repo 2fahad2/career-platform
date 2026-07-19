@@ -279,3 +279,24 @@ def test_pool_upserts_by_identity_across_runs(owner_engine: Engine) -> None:
                     )
                 cleanup.commit()
             _cleanup(owner_engine, tids, None)
+
+
+def test_interleave_by_source_shares_the_cap_fairly() -> None:
+    """Audit fix: a full google batch must not starve jobspy out of the
+    retrieval slice — round-robin, order preserved within each source."""
+    from career.engine.run import interleave_by_source
+    from career.engine.sources import DiscoveredJob
+
+    def job(source: str, n: int) -> DiscoveredJob:
+        return DiscoveredJob(
+            title=f"T{n}", company=f"C{n}", url=f"https://x.example/{source}/{n}",
+            source=source, family="business_analyst",
+        )
+
+    google = [job("searchapi_google_jobs", i) for i in range(6)]
+    spy = [job("jobspy", i) for i in range(2)]
+    mixed = interleave_by_source(google + spy)
+    cap4 = mixed[:4]
+    assert sum(1 for j in cap4 if j.source == "jobspy") == 2   # both survive
+    google_kept = [j for j in mixed if j.source == "searchapi_google_jobs"]
+    assert [j.title for j in google_kept] == [f"T{i}" for i in range(6)]

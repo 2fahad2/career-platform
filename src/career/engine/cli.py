@@ -29,13 +29,7 @@ from sqlalchemy.orm import Session
 from career.config import get_settings
 from career.db.models import Tenant
 from career.engine.enrichment import UrllibPageFetcher
-from career.engine.run import (
-    DEFAULT_ENRICH_CAP,
-    DEFAULT_MAX_PER_QUERY,
-    DEFAULT_RETRIEVAL_CAP,
-    RunReport,
-    run_nightly,
-)
+from career.engine.run import RunReport, run_nightly
 from career.engine.sources import HttpSearchApiClient, PythonJobSpyClient
 from career.logging_filters import install_secret_redaction
 
@@ -54,9 +48,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="record the run as digest-only (D9). DEFAULT until C7 delivery "
              "exists; --no-digest-only is the explicit off form.",
     )
-    parser.add_argument("--max-per-query", type=int, default=DEFAULT_MAX_PER_QUERY)
-    parser.add_argument("--retrieval-cap", type=int, default=DEFAULT_RETRIEVAL_CAP)
-    parser.add_argument("--enrich-cap", type=int, default=DEFAULT_ENRICH_CAP)
+    # None ⇒ fall back to Settings (§06: caps live in configuration)
+    parser.add_argument("--max-per-query", type=int, default=None)
+    parser.add_argument("--retrieval-cap", type=int, default=None)
+    parser.add_argument("--enrich-cap", type=int, default=None)
     parser.add_argument(
         "--tenant", type=uuid.UUID, action="append", default=None,
         help="scope the run to specific tenant id(s); repeatable",
@@ -139,9 +134,9 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
                 now=datetime.now(UTC),
                 tenant_ids=args.tenant,
                 digest_only=args.digest_only,
-                max_per_query=args.max_per_query,
-                retrieval_cap=args.retrieval_cap,
-                enrich_cap=args.enrich_cap,
+                max_per_query=args.max_per_query or settings.engine_max_per_query,
+                retrieval_cap=args.retrieval_cap or settings.engine_retrieval_cap,
+                enrich_cap=args.enrich_cap or settings.engine_enrich_cap,
             )
             codes = {
                 row.id: row.code
