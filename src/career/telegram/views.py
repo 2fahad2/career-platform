@@ -256,7 +256,19 @@ def render_business(range_key: str, data: dict[str, Any]) -> tuple[str, Keyboard
     cost = data.get("llm_cost_usd")
     if llm is not None:
         cost_part = f" · ${cost}" if cost is not None else ""
-        lines.append(f"توليدات Claude: {llm}{cost_part}")
+        lines.append(f"نداءات Claude: {llm}{cost_part}")
+    statuses = data.get("message_statuses") or {}
+    if statuses:
+        read = int(statuses.get("read", 0))
+        landed = read + int(statuses.get("delivered", 0))
+        sent_only = int(statuses.get("sent", 0))
+        failed = int(statuses.get("failed", 0))
+        part = f"رسائلنا: قُرئ {read} · وصل {landed}"
+        if sent_only:
+            part += f" · أُرسل {sent_only}"
+        if failed:
+            part += f" · فشل {failed}"
+        lines.append(part)
     keyboard: Keyboard = [
         [("٧ أيام", "v1|business|7"), ("٣٠ يومًا", "v1|business|30"),
          ("الكل", "v1|business|all")],

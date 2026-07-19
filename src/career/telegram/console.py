@@ -272,10 +272,24 @@ def _business_data(
 
     usage_query = select(
         func.count(), func.coalesce(func.sum(UsageEvent.cost_usd), 0)
-    ).where(UsageEvent.kind == "llm_generation")
+    ).where(UsageEvent.kind.in_(("llm_generation", "llm_extraction")))
     if cutoff is not None:
         usage_query = usage_query.where(UsageEvent.occurred_at >= cutoff)
     usage_row = session.execute(usage_query).one()
+
+    # §14 reach metrics: outbound message statuses (read receipts flow into
+    # delivery_messages.status via the Meta status callbacks)
+    from career.db.models import DeliveryMessage
+    statuses_query = select(DeliveryMessage.status, func.count())
+    if cutoff is not None:
+        statuses_query = statuses_query.where(
+            DeliveryMessage.status_updated_at >= cutoff
+        )
+    message_statuses = {
+        str(status): int(n) for status, n in session.execute(
+            statuses_query.group_by(DeliveryMessage.status)
+        ).all()
+    }
 
     # funnel upgrade = a tenant holding BOTH a cv_analysis purchase and a
     # search subscription (the §04 inheritance path); the RANGE applies to
@@ -300,6 +314,7 @@ def _business_data(
         "outcomes": outcomes,
         "llm_generations": int(usage_row[0]),
         "llm_cost_usd": usage_row[1],
+        "message_statuses": message_statuses,
     }
 
 
