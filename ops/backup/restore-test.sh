@@ -44,15 +44,39 @@ echo "restore-test: restoring into $SCRATCH_DB"
 docker exec -i "$PG_CONTAINER" pg_restore -U "$PG_OWNER" -d "$SCRATCH_DB" --no-owner \
   < "$WORK/restore.dump"
 
-# Integrity checks.
+# Integrity checks — thresholds track the real schema (audit fix: 10/5 would
+# have passed a truncated restore; migration 0016 has 30+ tables, 25+ RLS).
 TABLES="$(docker exec "$PG_CONTAINER" psql -U "$PG_OWNER" -d "$SCRATCH_DB" -tAc \
   "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'")"
 RLS_TABLES="$(docker exec "$PG_CONTAINER" psql -U "$PG_OWNER" -d "$SCRATCH_DB" -tAc \
   "SELECT count(*) FROM pg_class WHERE relrowsecurity = true")"
 echo "restore-test: restored tables=$TABLES · RLS-enabled tables=$RLS_TABLES"
 
-if [[ "$TABLES" -lt 10 || "$RLS_TABLES" -lt 5 ]]; then
+if [[ "$TABLES" -lt 30 || "$RLS_TABLES" -lt 20 ]]; then
   echo "restore-test: FAILED — restored schema looks incomplete" >&2
   exit 1
 fi
+
+# Storage snapshot restore (audit fix: tenant CV/report files were never
+# restore-tested — only the DB dump was). Restore the latest storage snapshot
+# into a scratch dir and byte-compare one real file against the live root.
+STORAGE_ROOT="${STORAGE_ROOT:-/root/career/data}"
+if [[ -d "$STORAGE_ROOT" ]] && find "$STORAGE_ROOT" -type f | head -1 | grep -q .; then
+  echo "restore-test: restoring latest storage snapshot"
+  restic restore --tag storage latest --target "$WORK/storage" >/dev/null
+  SAMPLE="$(find "$STORAGE_ROOT" -type f | head -1)"
+  RESTORED="$WORK/storage$SAMPLE"
+  if [[ ! -f "$RESTORED" ]]; then
+    echo "restore-test: FAILED — sample file missing from storage snapshot: $SAMPLE" >&2
+    exit 1
+  fi
+  if ! cmp -s "$SAMPLE" "$RESTORED"; then
+    echo "restore-test: FAILED — restored file differs from live: $SAMPLE" >&2
+    exit 1
+  fi
+  echo "restore-test: storage snapshot verified (sample byte-identical)"
+else
+  echo "restore-test: no live storage files yet — storage check skipped" >&2
+fi
+
 echo "restore-test: PASSED — backup is recoverable"

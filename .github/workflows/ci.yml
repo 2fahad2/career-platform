@@ -84,6 +84,14 @@ jobs:
       - name: Type-check (mypy)
         run: mypy
 
+      - name: Type-check live runners (mypy scripts)
+        run: mypy scripts/ --explicit-package-bases
+
+      - name: Shellcheck ops scripts
+        run: |
+          sudo apt-get install -y shellcheck >/dev/null 2>&1 || true
+          shellcheck ops/backup/*.sh
+
       - name: Apply migrations (alembic)
         run: alembic upgrade head
 

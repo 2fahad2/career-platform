@@ -128,13 +128,23 @@ def test_send_document_uploads_storage_ref_then_sends_media_id(tmp_path: Any) ->
 def test_download_media_two_step() -> None:
     t = FakeTransport()
     t.get_replies = [
-        (200, {"url": "https://lookaside.example/blob", "id": "M1"}),
+        (200, {"url": "https://lookaside.fbcdn.net/blob", "id": "M1"}),
         (200, b"raw-bytes"),
     ]
     result = _client(t).download_media("M1")
     assert result == (b"raw-bytes", None)
     assert t.gets[0].endswith("/M1")
-    assert t.gets[1] == "https://lookaside.example/blob"
+    assert t.gets[1] == "https://lookaside.fbcdn.net/blob"
+
+
+def test_download_media_refuses_foreign_hosts() -> None:
+    """The Bearer token rides the CDN request — a poisoned url outside
+    Meta's hosts (or plain http) must never be fetched."""
+    for bad in ("https://evil.example/blob", "http://lookaside.fbcdn.net/x"):
+        t = FakeTransport()
+        t.get_replies = [(200, {"url": bad, "id": "M1"})]
+        assert _client(t).download_media("M1") is None
+        assert len(t.gets) == 1                    # metadata only — no fetch
 
 
 def test_download_media_failure_returns_none() -> None:

@@ -14,6 +14,7 @@ import logging
 import time
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from typing import IO
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import create_engine, select
@@ -27,7 +28,7 @@ from career.onboarding.orchestrator import Deps, send_due_reminders
 from career.salla.client import HttpSallaClient
 from career.salla.provisioning import process_pending_webhooks
 from career.storage import FilesystemStorageAdapter
-from career.telegram.admin import HttpTelegramAdminClient
+from career.telegram.admin import HttpTelegramAdminClient, TelegramAdminClient
 from career.whatsapp.client import HttpWhatsAppClient
 from career.whatsapp.window import window_reminder_due
 from career.whatsapp.worker import process_pending_whatsapp
@@ -79,7 +80,26 @@ class CanaryScanner:
         return None
 
 
+
+
+def _acquire_single_instance_lock(name: str) -> IO[str]:
+    """One instance per service — a second copy exits loudly instead of
+    double-processing the queue (audit fix: no lock existed)."""
+    import fcntl
+
+    path = f"/run/lock/career-{name}.lock"
+    handle = open(path, "w")  # noqa: SIM115 — held for process lifetime
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        raise SystemExit(
+            f"another {name} instance holds {path} — refusing to start"
+        ) from None
+    return handle
+
+
 def main() -> None:  # pragma: no cover — the C7.8 live runner
+    _lock = _acquire_single_instance_lock("worker")  # noqa: F841
     install_secret_redaction()
     logging.basicConfig(level=logging.INFO)
     settings = get_settings()
@@ -99,6 +119,7 @@ def main() -> None:  # pragma: no cover — the C7.8 live runner
         storage=storage,
         extractor=AnthropicExtractor(api_key=settings.anthropic_api_key),
     )
+    admin: TelegramAdminClient
     if settings.telegram_admin_bot_token and settings.telegram_admin_chat_id:
         admin = HttpTelegramAdminClient(
             settings.telegram_admin_bot_token, settings.telegram_admin_chat_id

@@ -58,6 +58,10 @@ STORAGE_ROOT="${STORAGE_ROOT:-/root/career/data}"
 if [[ -d "$STORAGE_ROOT" ]]; then
   echo "backup: backing up host storage root $STORAGE_ROOT"
   restic backup --tag staging --tag storage "$STORAGE_ROOT"
+else
+  # §15.12: a missing tenant-storage root is a FAILURE, not a silent skip
+  echo "backup: FAILED — storage root missing: $STORAGE_ROOT" >&2
+  exit 1
 fi
 if docker volume inspect "$STORAGE_VOLUME" >/dev/null 2>&1; then
   STORAGE_PATH="$(docker volume inspect -f '{{.Mountpoint}}' "$STORAGE_VOLUME")"

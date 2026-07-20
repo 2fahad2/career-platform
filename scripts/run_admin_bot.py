@@ -14,7 +14,7 @@ import logging
 import subprocess
 import time
 from datetime import UTC, datetime
-from typing import Any
+from typing import IO, Any
 from urllib.request import urlopen
 from zoneinfo import ZoneInfo
 
@@ -191,7 +191,26 @@ def _store_offset(session: Session, offset: int) -> None:
     )
 
 
+
+
+def _acquire_single_instance_lock(name: str) -> IO[str]:
+    """One instance per service — a second copy exits loudly instead of
+    double-processing the queue (audit fix: no lock existed)."""
+    import fcntl
+
+    path = f"/run/lock/career-{name}.lock"
+    handle = open(path, "w")  # noqa: SIM115 — held for process lifetime
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        raise SystemExit(
+            f"another {name} instance holds {path} — refusing to start"
+        ) from None
+    return handle
+
+
 def main() -> None:  # pragma: no cover — live runner over tested parts
+    _lock = _acquire_single_instance_lock("admin-bot")  # noqa: F841
     install_secret_redaction()
     logging.basicConfig(level=logging.INFO)
     settings = get_settings()

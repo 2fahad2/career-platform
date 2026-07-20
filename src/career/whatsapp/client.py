@@ -245,6 +245,17 @@ class HttpWhatsAppClient:
         )
         if status != 200 or not isinstance(meta, dict) or "url" not in meta:
             return None
+        # audit fix: the Bearer token rides this request — pin the scheme and
+        # host to Meta's CDN so a poisoned url can never exfiltrate it.
+        from urllib.parse import urlparse
+
+        parsed = urlparse(str(meta["url"]))
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme != "https" or not (
+            host.endswith(".fbcdn.net") or host.endswith(".facebook.com")
+            or host.endswith(".whatsapp.net")
+        ):
+            return None
         status, blob = self._transport.get(
             str(meta["url"]), headers=self._headers()
         )
