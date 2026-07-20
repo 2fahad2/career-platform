@@ -138,6 +138,7 @@ def main() -> None:  # pragma: no cover — the C7.8 live runner
     pricing = _salla_pricing(settings.salla_product_pricing)
     last_reminder_sweep = 0.0
     last_window_nudge: date | None = None
+    last_weekly_report: date | None = None
 
     while True:
         try:
@@ -188,6 +189,22 @@ def main() -> None:  # pragma: no cover — the C7.8 live runner
                             "بكرة الفجر — أرسل أي رسالة لرقم الخدمة الآن "
                             "عشان توصلك الفرص مباشرة"
                         )
+                # weekly report — Sunday morning (Riyadh), once per week
+                riyadh_now = now.astimezone(_RIYADH)
+                if (riyadh_now.weekday() == 6 and 6 <= riyadh_now.hour < 12
+                        and last_weekly_report != today):
+                    last_weekly_report = today
+                    from career.telegram.console import (
+                        business_data,
+                        week_day_states,
+                    )
+                    from career.telegram.weekly_report import format_weekly_report
+                    with Session(engine) as session:
+                        biz = business_data(session, "7", now=now)
+                        states_week = week_day_states(session, now=now)
+                    admin.send_admin(format_weekly_report(
+                        riyadh_now.date(), biz, states_week
+                    ))
         except Exception:  # noqa: BLE001 — the loop must survive anything
             logger.error("worker cycle failed", exc_info=True)
         time.sleep(POLL_SECONDS)

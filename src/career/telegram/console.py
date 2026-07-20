@@ -293,6 +293,26 @@ def _tenant_card(
     }
 
 
+def business_data(
+    session: Session, range_key: str, *, now: datetime
+) -> dict[str, Any]:
+    """Public wrapper — the weekly-report runner reuses the same numbers."""
+    return _business_data(session, range_key, now=now)
+
+
+def week_day_states(session: Session, *, now: datetime) -> dict[str, int]:
+    """The last 7 days' honest day-state tally (§15.12)."""
+    from datetime import timedelta as _td
+
+    cutoff = now - _td(days=7)
+    rows = session.execute(
+        select(TenantDayState.state, func.count())
+        .where(TenantDayState.recorded_at >= cutoff)
+        .group_by(TenantDayState.state)
+    ).all()
+    return {str(s): int(n) for s, n in rows}
+
+
 def _business_data(
     session: Session, range_key: str, *, now: datetime
 ) -> dict[str, Any]:

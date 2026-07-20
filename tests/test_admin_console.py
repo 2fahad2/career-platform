@@ -355,3 +355,45 @@ def test_action_nonce_expires_after_five_minutes(
         owner_session.execute(sql_text(
             "DELETE FROM subscriptions WHERE tenant_id = :t"), {"t": t1})
         owner_session.commit()
+
+
+def test_weekly_report_format_is_arabic_and_complete() -> None:
+    from datetime import date
+
+    from career.telegram.weekly_report import format_weekly_report
+
+    report = format_weekly_report(
+        date(2026, 7, 26),
+        {"subs_by_plan": {"professional": 2}, "revenue_sar": 558,
+         "funnel_upgrades": 1, "outcomes": {"applied": 3, "ignored": 1},
+         "message_statuses": {"read": 12, "delivered": 15},
+         "llm_generations": 8, "llm_cost_usd": "0.40"},
+        {"DELIVERED": 9, "SKIPPED_OPTED_OUT": 1, "NO_MATCHES": 2},
+    )
+    assert "التقرير الأسبوعي" in report
+    assert "احترافي: 2" in report
+    assert "558 ريال" in report
+    assert "قدّم 3/4 (75٪)" in report
+    assert "موقف الرسائل: 1" in report
+    assert "$0.40" in report
+
+
+def test_week_day_states_tally(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    from career.telegram.console import week_day_states
+
+    t1, _ = two_tenants
+    owner_session.execute(sql_text(
+        "INSERT INTO tenant_day_states (id, tenant_id, run_date, state, counts,"
+        " recorded_at) VALUES (:i, :t, :d, 'DELIVERED', '{}'::jsonb, :r)"),
+        {"i": str(uuid.uuid4()), "t": t1, "d": NOW.date().isoformat(),
+         "r": NOW})
+    owner_session.commit()
+    try:
+        tally = week_day_states(owner_session, now=NOW)
+        assert tally.get("DELIVERED", 0) >= 1
+    finally:
+        owner_session.execute(sql_text(
+            "DELETE FROM tenant_day_states WHERE tenant_id = :t"), {"t": t1})
+        owner_session.commit()
