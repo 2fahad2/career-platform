@@ -174,6 +174,16 @@ def main() -> None:  # pragma: no cover — the C7.8 live runner
                     session.commit()
                 if nudged:
                     logger.info("stall reminders sent: %d", nudged)
+                # F-ENRICH housekeeping: 3-day sweep + 72h auto-close
+                from career.onboarding.enrichment import run_hourly_sweep
+                with Session(engine) as session:
+                    enr_counts = run_hourly_sweep(
+                        session, whatsapp_client=whatsapp,
+                        examples_writer=deps.examples_writer, now=now,
+                    )
+                    session.commit()
+                if any(enr_counts.values()):
+                    logger.info("enrichment sweep: %s", enr_counts)
                 # canary evening nudge: keep the operator's own 24h window
                 # open for tomorrow's dawn delivery (template-independence)
                 today = now.astimezone(_RIYADH).date()

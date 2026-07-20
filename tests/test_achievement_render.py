@@ -485,3 +485,118 @@ def test_picked_example_becomes_the_answer(
         assert deps.whatsapp_client.sent[-1].kind == "interactive"
     finally:
         _cleanup_conversation(owner_session, a)
+
+
+# ── the hourly sweep: 72h auto-close + 3-day fallback nudge ──────────────────
+
+from datetime import timedelta as _td  # noqa: E402
+
+
+def test_stale_open_session_auto_closes_silently(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    from career.onboarding import enrichment as enr
+
+    a, _ = two_tenants
+    deps, _channel, role_id = _seed_enrichment_conversation(owner_session, a)
+    try:
+        # age the open session past the TTL
+        stale = (_NOW - enr.ENRICH_SESSION_TTL - _td(hours=1)).isoformat()
+        owner_session.execute(_sql(
+            "UPDATE onboarding_sessions SET context = jsonb_set(context,"
+            " '{enrichment,opened_at}', to_jsonb(CAST(:s AS text))) WHERE"
+            " tenant_id = :t"), {"s": stale, "t": a})
+        owner_session.commit()
+        wa = FakeWhatsAppClient()
+        counts = enr.run_hourly_sweep(
+            owner_session, whatsapp_client=wa, examples_writer=None, now=_NOW)
+        owner_session.commit()
+        assert counts["auto_closed"] == 1
+        assert wa.sent == []                      # silent — no message
+        ctx = owner_session.execute(_sql(
+            "SELECT context FROM onboarding_sessions WHERE tenant_id = :t"),
+            {"t": a}).scalar_one()
+        assert (ctx.get("enrichment") or {}).get("open") is False
+        status = owner_session.execute(_sql(
+            "SELECT status FROM role_enrichments WHERE fact_id = :f"),
+            {"f": str(role_id)}).scalar_one()
+        assert status == "SKIPPED"
+    finally:
+        _cleanup_conversation(owner_session, a)
+
+
+def _seed_sweep_candidate(
+    session: Session, tenant_id: str, *, active_days: int,
+    window_open: bool,
+) -> _uuid.UUID:
+    """ACTIVE journey (no enrichment context) + thin role + channel."""
+    tid = _uuid.UUID(tenant_id)
+    role_id = _seed_role(session, tid, [])
+    sub_id, channel_id = _uuid.uuid4(), _uuid.uuid4()
+    session.execute(_sql(
+        "INSERT INTO subscriptions (id, tenant_id, plan_code, status,"
+        " salla_order_id, amount_sar, currency) VALUES (:i, :t, 'basic',"
+        " 'ACTIVE', :o, 149, 'SAR')"),
+        {"i": str(sub_id), "t": tenant_id, "o": f"O-{_uuid.uuid4()}"})
+    session.execute(_sql(
+        "INSERT INTO customer_channels (id, tenant_id, subscription_id,"
+        " provider, phone_e164, verified_at, opt_in_at, last_inbound_at)"
+        " VALUES (:i, :t, :s, 'whatsapp', :p, :n, :n, :li)"),
+        {"i": str(channel_id), "t": tenant_id, "s": str(sub_id),
+         "p": f"+9665{_uuid.uuid4().int % 10**8:08d}", "n": _NOW,
+         "li": _NOW - _td(hours=1) if window_open else None})
+    session.execute(_sql(
+        "INSERT INTO onboarding_sessions (id, tenant_id, subscription_id,"
+        " channel_id, state, completed_at) VALUES (:i, :t, :s, :c, 'ACTIVE',"
+        " :done)"),
+        {"i": str(_uuid.uuid4()), "t": tenant_id, "s": str(sub_id),
+         "c": str(channel_id), "done": _NOW - _td(days=active_days)})
+    session.commit()
+    return role_id
+
+
+def test_sweep_nudges_old_active_thin_role_when_window_open(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    from career.onboarding import enrichment as enr
+
+    a, _ = two_tenants
+    role_id = _seed_sweep_candidate(owner_session, a, active_days=4,
+                                    window_open=True)
+    try:
+        wa = FakeWhatsAppClient()
+        counts = enr.run_hourly_sweep(
+            owner_session, whatsapp_client=wa, examples_writer=None, now=_NOW)
+        owner_session.commit()
+        assert counts["swept"] == 1
+        assert wa.sent[-1].kind == "interactive"     # opening + skip buttons
+        row = owner_session.execute(_sql(
+            "SELECT status, trigger FROM role_enrichments WHERE fact_id = :f"),
+            {"f": str(role_id)}).one()
+        assert row.status == "ASKED"
+        assert row.trigger == "post_activation_sweep"
+        # second run is a no-op — once-ever holds
+        wa2 = FakeWhatsAppClient()
+        counts2 = enr.run_hourly_sweep(
+            owner_session, whatsapp_client=wa2, examples_writer=None, now=_NOW)
+        assert counts2["swept"] == 0 and wa2.sent == []
+    finally:
+        _cleanup_conversation(owner_session, a)
+
+
+def test_sweep_respects_age_gate_and_closed_window(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    from career.onboarding import enrichment as enr
+
+    a, b = two_tenants
+    _seed_sweep_candidate(owner_session, a, active_days=1, window_open=True)
+    _seed_sweep_candidate(owner_session, b, active_days=4, window_open=False)
+    try:
+        wa = FakeWhatsAppClient()
+        counts = enr.run_hourly_sweep(
+            owner_session, whatsapp_client=wa, examples_writer=None, now=_NOW)
+        assert counts["swept"] == 0 and wa.sent == []   # too young / closed
+    finally:
+        _cleanup_conversation(owner_session, a)
+        _cleanup_conversation(owner_session, b)

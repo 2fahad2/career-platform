@@ -352,3 +352,112 @@ def pick_example(state: dict[str, Any], body: str) -> str | None:
     if idx is None or idx < 0 or idx >= len(examples):
         return None
     return str(examples[idx])
+
+
+# ── the hourly sweep: 3-day fallback nudge + 72h auto-close ──────────────────
+
+
+def run_hourly_sweep(
+    session: Session,
+    *,
+    whatsapp_client: Any,
+    examples_writer: Any,
+    now: datetime,
+) -> dict[str, int]:
+    """Two housekeeping duties, called from the worker's hourly block:
+
+    AUTO-CLOSE — an enrichment session open longer than ENRICH_SESSION_TTL
+    is closed silently (role → SKIPPED if still ASKED); no dangling «what
+    were we talking about» ever greets a customer days later.
+
+    SWEEP — a customer ACTIVE ≥ SWEEP_AFTER_DAYS whose most-recent role is
+    thin and never surfaced via the lazy trigger gets ONE gentle nudge —
+    only when their 24h window is OPEN. once-ever still holds (enqueue
+    refuses a role with any ledger row). Never raises into the loop."""
+    from career.db.models import CustomerChannel, OnboardingSession
+    from career.whatsapp.delivery import record_out
+    from career.whatsapp.window import WindowState, window_state
+
+    counts = {"auto_closed": 0, "swept": 0}
+    journeys = session.execute(
+        select(OnboardingSession).where(OnboardingSession.state == "ACTIVE")
+    ).scalars().all()
+    for journey in journeys:
+        context = dict(journey.context or {})
+        state = context.get("enrichment") or {}
+
+        if state.get("open"):
+            opened_raw = str(state.get("opened_at") or "")
+            try:
+                opened_at = datetime.fromisoformat(opened_raw)
+            except ValueError:
+                opened_at = None
+            if opened_at is not None and opened_at <= now - ENRICH_SESSION_TTL:
+                current = state.get("current")
+                if current:
+                    row = session.execute(
+                        select(RoleEnrichment).where(
+                            RoleEnrichment.tenant_id == journey.tenant_id,
+                            RoleEnrichment.fact_id == uuid.UUID(str(current)),
+                        )
+                    ).scalars().first()
+                    if row is not None and row.status == "ASKED":
+                        row.status = "SKIPPED"
+                        row.answered_at = now
+                close_session(context)
+                journey.context = context
+                counts["auto_closed"] += 1
+            continue
+
+        # sweep candidates: old enough, thin, un-asked, window open
+        completed = journey.completed_at
+        if completed is None or completed > now - timedelta(days=SWEEP_AFTER_DAYS):
+            continue
+        thin = thin_roles(session, tenant_id=journey.tenant_id)
+        if not thin:
+            continue
+        role = thin[0]
+        if _already_handled(session, tenant_id=journey.tenant_id, fact_id=role.id):
+            continue
+        channel = (
+            session.get(CustomerChannel, journey.channel_id)
+            if journey.channel_id else None
+        )
+        if channel is None or window_state(
+            last_inbound_at=channel.last_inbound_at,
+            opt_out_at=channel.opt_out_at, now=now,
+        ) is not WindowState.OPEN:
+            continue
+        if not enqueue_enrichment(
+            session, tenant_id=journey.tenant_id, role_fact_id=role.id,
+            journey_context=context, trigger="post_activation_sweep", now=now,
+        ):
+            continue
+        examples = prepare_examples(
+            session, role_fact_id=role.id, writer=examples_writer
+        )
+        if examples:
+            context["enrichment"]["examples"] = examples
+        journey.context = context
+        mid = whatsapp_client.send_interactive(
+            channel.phone_e164,
+            opening_message(session, role_fact_id=role.id),
+            OPENING_BUTTONS,
+        )
+        record_out(session, tenant_id=journey.tenant_id,
+                   channel_id=channel.id, kind="interactive",
+                   wa_message_id=mid, now=now)
+        if examples:
+            from career.onboarding.achievement_render import (
+                format_examples_message,
+            )
+
+            mid2 = whatsapp_client.send_text(
+                channel.phone_e164, format_examples_message(examples)
+            )
+            record_out(session, tenant_id=journey.tenant_id,
+                       channel_id=channel.id, kind="text",
+                       wa_message_id=mid2, now=now)
+        counts["swept"] += 1
+    session.flush()
+    return counts
