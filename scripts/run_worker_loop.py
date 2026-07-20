@@ -23,7 +23,10 @@ from sqlalchemy.orm import Session
 from career.config import get_settings
 from career.db.models import CustomerChannel
 from career.logging_filters import install_secret_redaction
-from career.onboarding.achievement_render import AnthropicAchievementRenderer
+from career.onboarding.achievement_render import (
+    AnthropicAchievementRenderer,
+    AnthropicExamplesWriter,
+)
 from career.onboarding.extraction import AnthropicExtractor
 from career.onboarding.orchestrator import Deps, send_due_reminders
 from career.salla.client import HttpSallaClient
@@ -120,6 +123,8 @@ def main() -> None:  # pragma: no cover — the C7.8 live runner
         storage=storage,
         extractor=AnthropicExtractor(api_key=settings.anthropic_api_key),
         achievement_renderer=AnthropicAchievementRenderer(
+            api_key=settings.anthropic_api_key),
+        examples_writer=AnthropicExamplesWriter(
             api_key=settings.anthropic_api_key),
     )
     admin: TelegramAdminClient

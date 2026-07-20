@@ -416,3 +416,72 @@ def test_edit_button_clears_pending_and_reprompts(
         assert "بكلماتك" in (deps.whatsapp_client.sent[-1].body or "")
     finally:
         _cleanup_conversation(owner_session, a)
+
+
+# ── the icebreaker examples (كاسر التجمّد) ───────────────────────────────────
+
+
+def test_scrub_rejects_digits_and_foreign_latin() -> None:
+    from career.onboarding.achievement_render import scrub_examples
+
+    raw = [
+        "كنت مسؤول عن مراقبة الشبكة وحل الأعطال",     # clean → keep
+        "دربت ٥ موظفين جدد",                           # digit → drop
+        "رفعت الأداء 20 بالمية",                        # digit → drop
+        "نظمت الشغل باستخدام Jira",                     # foreign Latin → drop
+        "طورت تقارير SAP الشهرية",                      # SAP in payload → keep
+    ]
+    clean = scrub_examples(
+        raw, role_payload_text="SAP Business Analyst — تحليل أنظمة"
+    )
+    assert clean == [
+        "كنت مسؤول عن مراقبة الشبكة وحل الأعطال",
+        "طورت تقارير SAP الشهرية",
+    ]
+
+
+def test_examples_message_is_numbered_and_bidi_pure() -> None:
+    from career.onboarding.achievement_render import format_examples_message
+
+    msg = format_examples_message(["أول", "ثاني", "ثالث"])
+    assert "١) أول" in msg and "٢) ثاني" in msg and "٣) ثالث" in msg
+    assert "اختر رقم" in msg
+
+
+def test_pick_example_maps_arabic_and_western_digits() -> None:
+    from career.onboarding import enrichment as enr
+
+    state = {"examples": ["أ", "ب", "ج"]}
+    assert enr.pick_example(state, "١") == "أ"
+    assert enr.pick_example(state, "2") == "ب"
+    assert enr.pick_example(state, "٣") == "ج"
+    assert enr.pick_example(state, "٤") is None
+    assert enr.pick_example({}, "1") is None
+
+
+def test_picked_example_becomes_the_answer(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """Reply «١» → the stored example text is rendered + confirm prompt."""
+    a, _ = two_tenants
+    deps, channel_id, _role = _seed_enrichment_conversation(
+        owner_session, a, bullet="Monitored the network and resolved faults."
+    )
+    try:
+        owner_session.execute(_sql(
+            "UPDATE onboarding_sessions SET context = jsonb_set(context,"
+            " '{enrichment,examples}',"
+            " '[\"كنت مسؤول عن مراقبة الشبكة وحل الأعطال\"]') WHERE"
+            " tenant_id = :t"), {"t": a})
+        owner_session.commit()
+        assert _orch.handle_enrichment(
+            owner_session, channel_id=channel_id, text="١", deps=deps, now=_NOW)
+        owner_session.commit()
+        src = owner_session.execute(_sql(
+            "SELECT payload->>'arabic_source' FROM profile_facts WHERE"
+            " tenant_id = :t AND category = 'achievement'"), {"t": a}
+        ).scalar_one()
+        assert src == "كنت مسؤول عن مراقبة الشبكة وحل الأعطال"
+        assert deps.whatsapp_client.sent[-1].kind == "interactive"
+    finally:
+        _cleanup_conversation(owner_session, a)

@@ -92,6 +92,8 @@ class DailyDeps:
     admin_client: TelegramAdminClient
     llm: generate.LlmClient
     daily_template: TemplateSpec = field(default_factory=lambda: DAILY_UTILITY)
+    #: F-ENRICH icebreaker writer (optional — None skips the examples menu).
+    examples_writer: Any = None
 
 
 def _load_bank(session: Session, tenant_id: uuid.UUID) -> dict[str, list[dict[str, Any]]]:
@@ -398,6 +400,13 @@ def _maybe_arm_enrichment(
             session, tenant_id=tenant_id, role_fact_id=role.id,
             journey_context=context, trigger="lazy_generation", now=now,
         ):
+            # icebreaker examples (D14) — optional garnish, scrubbed of any
+            # digit/foreign-Latin so a pick can never inject a false atom
+            examples = enr.prepare_examples(
+                session, role_fact_id=role.id, writer=deps.examples_writer
+            )
+            if examples:
+                context["enrichment"]["examples"] = examples
             journey.context = context
             mid = deps.whatsapp_client.send_interactive(
                 channel.phone_e164,
@@ -406,6 +415,17 @@ def _maybe_arm_enrichment(
             )
             record_out(session, tenant_id=tenant_id, channel_id=channel.id,
                        kind="interactive", wa_message_id=mid, now=now)
+            if examples:
+                from career.onboarding.achievement_render import (
+                    format_examples_message,
+                )
+
+                mid2 = deps.whatsapp_client.send_text(
+                    channel.phone_e164, format_examples_message(examples)
+                )
+                record_out(session, tenant_id=tenant_id,
+                           channel_id=channel.id, kind="text",
+                           wa_message_id=mid2, now=now)
             session.flush()
     except Exception:  # noqa: BLE001 — enrichment never breaks delivery
         logger.warning("enrichment arm failed", exc_info=True)

@@ -215,3 +215,105 @@ class AnthropicAchievementRenderer:  # pragma: no cover — live boundary
                 except ValueError:
                     return {"is_achievement": False}
         return {"is_achievement": False}
+
+
+# ── the icebreaker examples (كاسر التجمّد, D14 message set) ──────────────────
+
+_EXAMPLES_SYSTEM = (
+    "You write EXACTLY three short example achievement lines in colloquial "
+    "Saudi Arabic for a job-seeker's specific past role, so they can pick the "
+    "one closest to what they actually did. Base the examples ONLY on the "
+    "role title and description given. STRICT RULES: no numbers or "
+    "percentages of any kind, no tool/product/company names that are not in "
+    "the given text, each line under 12 words, first-person past tense "
+    "(كنت مسؤول عن…, طورت…, دربت…). Plausible everyday activities for this "
+    "role — never impressive-sounding inventions."
+)
+
+_EXAMPLES_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["examples"],
+    "properties": {
+        "examples": {
+            "type": "array", "minItems": 3, "maxItems": 3,
+            "items": {"type": "string"},
+        },
+    },
+}
+
+_ANY_DIGIT_RE = re.compile(r"[0-9٠-٩۰-۹]")
+
+
+def scrub_examples(examples: list[str], *, role_payload_text: str) -> list[str]:
+    """Deterministic gate on model-written examples (they become the
+    customer's answer verbatim when picked, so they must be un-poisonable):
+    drop any example carrying a digit, or a Latin token not present in the
+    role's own confirmed payload."""
+    allowed_latin = {m.lower() for m in _LATIN_RUN.findall(role_payload_text)}
+    clean: list[str] = []
+    for ex in examples:
+        text = str(ex).strip()
+        if not text or _ANY_DIGIT_RE.search(text):
+            continue
+        latin = {m.lower() for m in _LATIN_RUN.findall(text)}
+        if latin - allowed_latin:
+            continue
+        clean.append(text)
+    return clean
+
+
+def format_examples_message(examples: list[str]) -> str:
+    """The approved icebreaker wrapper — numbered menu, pick or edit or
+    write your own (bidi-pure: each line is direction-pure Arabic)."""
+    numbered = "\n".join(
+        f"{'١٢٣'[i]}) {ex}" for i, ex in enumerate(examples[:3])
+    )
+    return (
+        "عشان أسهّلها عليك، هذي أمثلة قريبة من مجالك — أي وحدة تشبه شغلك؟\n"
+        "اختر رقم، أو عدّلها بكلماتك، أو اكتب من عندك:\n\n"
+        f"{numbered}\n\n"
+        "قل لي بس ١ أو ٢ أو ٣ وأنا أكمّل الباقي 👌"
+    )
+
+
+class ExamplesWriter(Protocol):
+    def write(self, role_title: str, role_description: str) -> list[str]:
+        """Three colloquial example lines for this role (may be empty)."""
+        ...
+
+
+class AnthropicExamplesWriter:  # pragma: no cover — live boundary
+    """One structured call; the deterministic scrub_examples gate follows."""
+
+    def __init__(self, api_key: str | None = None, client: Any | None = None,
+                 model: str = _MODEL) -> None:
+        if client is None:
+            import anthropic
+
+            client = anthropic.Anthropic(api_key=api_key)
+        self._client = client
+        self._model = model
+
+    def write(self, role_title: str, role_description: str) -> list[str]:
+        import json
+
+        prompt = f"الدور: {role_title}\nالوصف: {role_description or '—'}"
+        response = self._client.messages.create(
+            model=self._model, max_tokens=1024,
+            thinking={"type": "adaptive"}, system=_EXAMPLES_SYSTEM,
+            output_config={
+                "format": {"type": "json_schema", "schema": _EXAMPLES_SCHEMA}
+            },
+            messages=[{"role": "user", "content": prompt}],
+        )
+        if response.stop_reason != "end_turn":
+            return []
+        for block in response.content:
+            text = getattr(block, "text", None)
+            if getattr(block, "type", "") == "text" and isinstance(text, str):
+                try:
+                    return [str(e) for e in json.loads(text).get("examples", [])]
+                except (ValueError, AttributeError):
+                    return []
+        return []

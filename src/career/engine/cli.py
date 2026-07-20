@@ -199,6 +199,7 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
     if args.deliver and settings.whatsapp_access_token and report.per_tenant:
         from career.cv.daily_run import DailyDeps, run_daily_delivery
         from career.cv.generate import AnthropicLlmClient
+        from career.onboarding.achievement_render import AnthropicExamplesWriter
         from career.storage import FilesystemStorageAdapter
         from career.whatsapp.client import HttpWhatsAppClient
 
@@ -212,6 +213,9 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
             ),
             admin_client=admin,
             llm=AnthropicLlmClient(api_key=settings.anthropic_api_key),
+            examples_writer=AnthropicExamplesWriter(
+                api_key=settings.anthropic_api_key
+            ),
         )
         engine2 = create_engine(settings.owner_database_url, future=True)
         try:

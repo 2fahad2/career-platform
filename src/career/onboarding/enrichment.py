@@ -316,3 +316,39 @@ def personalize(text: str, name: str | None) -> str:
 def ack_thanks(name: str | None) -> str:
     return personalize(_ACK_THANKS, name)
 
+
+
+# ── the icebreaker examples menu (كاسر التجمّد) ──────────────────────────────
+
+_PICK_MAP = {"1": 0, "١": 0, "2": 1, "٢": 1, "3": 2, "٣": 2}
+
+
+def prepare_examples(
+    session: Session, *, role_fact_id: uuid.UUID, writer: Any
+) -> list[str]:
+    """Three scrubbed colloquial examples for the role, or [] (no examples →
+    the opening question stands alone; never blocks the nudge)."""
+    from career.onboarding.achievement_render import scrub_examples
+
+    role = session.get(ProfileFact, role_fact_id)
+    if role is None or writer is None:
+        return []
+    payload = role.payload or {}
+    title = str(payload.get("title") or "")
+    description = str(payload.get("description") or "")
+    try:
+        raw = list(writer.write(title, description))
+    except Exception:  # noqa: BLE001 — examples are optional garnish
+        return []
+    return scrub_examples(
+        raw, role_payload_text=f"{title} {description}"
+    )[:3]
+
+
+def pick_example(state: dict[str, Any], body: str) -> str | None:
+    """«١»/«2»… → the stored example text, else None."""
+    idx = _PICK_MAP.get(body.strip())
+    examples = state.get("examples") or []
+    if idx is None or idx < 0 or idx >= len(examples):
+        return None
+    return str(examples[idx])

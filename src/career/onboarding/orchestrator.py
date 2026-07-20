@@ -75,6 +75,9 @@ class Deps:
     #: F-ENRICH renderer (colloquial answer → grounded English bullet). None
     #: disables the enrichment branch — the rest of onboarding is unaffected.
     achievement_renderer: Any = None
+    #: F-ENRICH icebreaker examples writer (3 scrubbed colloquial examples).
+    #: None → the opening question ships without the examples menu.
+    examples_writer: Any = None
 
 
 class JourneyNotFound(Exception):
@@ -297,6 +300,11 @@ def _handle_enrichment_text(
 
     if role_id is None or not body:
         return
+    # «١/٢/٣» adopts the matching icebreaker example as the answer
+    state0 = context.get("enrichment") or {}
+    picked = enr.pick_example(state0, body)
+    if picked is not None:
+        body = picked
     result = enr.handle_answer(
         session, tenant_id=channel.tenant_id, role_fact_id=role_id,
         arabic_answer=body, renderer=deps.achievement_renderer, now=now,
