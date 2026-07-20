@@ -226,9 +226,15 @@ def render_tenant_card(card: dict[str, Any]) -> tuple[str, Keyboard]:
             f"⏱ دقائق دعم: {support_min or 0}"
             f" · 👁 مراجعات بشرية: {review_count or 0}"
         )
+    # the mutating action depends on the subscription state (design doc §4)
+    if str(card.get("sub_status")) == "PAUSED":
+        action_button = ("▶️ استئناف الخدمة", f"v1|act|{code}|resume")
+    else:
+        action_button = ("⏸️ إيقاف مؤقت", f"v1|act|{code}|pause")
     keyboard: Keyboard = [
         [("⏱ +5 دقائق دعم", f"v1|log|{code}|support5"),
          ("👁 +مراجعة بشرية", f"v1|log|{code}|review")],
+        [action_button],
         [("👥 القائمة", "v1|customers|0"), _HOME],
     ]
     return "\n".join(lines), keyboard

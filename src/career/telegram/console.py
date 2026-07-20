@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
@@ -44,6 +44,19 @@ logger = logging.getLogger("career.telegram.console")
 _RIYADH = ZoneInfo("Asia/Riyadh")
 
 EXPIRED_BUTTON_AR = "انتهت صلاحية الزر — أرسل /start"
+ACTION_EXPIRED_AR = "انتهت صلاحية التأكيد (٥ دقائق) — أعد المحاولة"
+
+#: Double-confirm nonces for mutating actions (design doc §4). Single operator,
+#: single process → an in-memory map is enough; each nonce is one-shot and
+#: expires in 5 minutes. nonce → (action, code, expiry).
+_ACTION_TTL_SECONDS = 300
+_pending_actions: dict[str, tuple[str, str, datetime]] = {}
+
+#: The mutating actions the console may perform — all pure-DB authorities.
+_ACTIONS = {
+    "pause": ("⏸️ إيقاف مؤقت", "أوقفنا خدمة {code} مؤقتًا"),
+    "resume": ("▶️ استئناف", "استأنفنا خدمة {code}"),
+}
 
 
 class HealthProbes(Protocol):
@@ -101,6 +114,31 @@ def _screen(
             return None
         card = _tenant_card(session, code=code, now=now)
         return views.render_tenant_card(card) if card else None
+    if name == "act":
+        # v1|act|<TEN>|<action> → a confirm card carrying a one-shot nonce
+        parts2 = arg.split("|")
+        if len(parts2) != 2 or parts2[1] not in _ACTIONS:
+            return None
+        code, action = parts2
+        if _tenant_card(session, code=code, now=now) is None:
+            return None
+        nonce = _new_nonce(action, code, now)
+        label = _ACTIONS[action][0]
+        return (
+            f"⚠️ تأكيد: {label} للعميل {code}؟\nالزر صالح ٥ دقائق.",
+            [[("✅ تأكيد نهائي", f"v1|confirm|{nonce}")],
+             [("↩️ إلغاء", f"v1|tenant|{code}")]],
+        )
+    if name == "confirm":
+        result = _run_action(session, nonce=arg, now=now)
+        if result is None:
+            return None
+        code, done_msg = result
+        card = _tenant_card(session, code=code, now=now)
+        if card is None:
+            return (done_msg, [[("🏠 الرئيسية", "v1|menu")]])
+        text, keyboard = views.render_tenant_card(card)
+        return (f"✅ {done_msg}\n\n{text}", keyboard)
     if name == "soon":
         return views.render_soon(arg)
     return None
@@ -260,8 +298,6 @@ def _business_data(
 ) -> dict[str, Any]:
     cutoff = None
     if range_key in ("7", "30"):
-        from datetime import timedelta
-
         cutoff = now - timedelta(days=int(range_key))
 
     subs_query = select(Subscription.plan_code, func.count(),
@@ -342,6 +378,47 @@ def _business_data(
     }
 
 
+def _new_nonce(action: str, code: str, now: datetime) -> str:
+    # deterministic-free id from the DB (Math.random/uuid4 both fine live;
+    # the clock is injected so tests stay reproducible)
+    import uuid as _uuid
+
+    nonce = _uuid.uuid4().hex
+    # opportunistic sweep of expired nonces
+    for key in [k for k, (_, _, exp) in _pending_actions.items() if exp < now]:
+        _pending_actions.pop(key, None)
+    _pending_actions[nonce] = (
+        action, code, now + timedelta(seconds=_ACTION_TTL_SECONDS)
+    )
+    return nonce
+
+
+def _run_action(
+    session: Session, *, nonce: str, now: datetime
+) -> tuple[str, str] | None:
+    """Consume the one-shot nonce and perform the pure-DB action. Returns
+    (code, done_message) or None (expired/unknown → caller acks EXPIRED)."""
+    entry = _pending_actions.pop(nonce, None)
+    if entry is None:
+        return None
+    action, code, expiry = entry
+    if expiry < now or action not in _ACTIONS:
+        return None
+    tenant = session.execute(
+        select(Tenant).where(Tenant.code == code)
+    ).scalars().first()
+    if tenant is None:
+        return None
+    from career.onboarding import privacy
+
+    if action == "pause":
+        privacy.pause_subscription(session, tenant_id=tenant.id)
+    elif action == "resume":
+        privacy.resume_subscription(session, tenant_id=tenant.id)
+    session.commit()
+    return code, _ACTIONS[action][1].format(code=code)
+
+
 def _log_manual_usage(
     session: Session, *, code: str, kind: str, now: datetime
 ) -> bool:
@@ -405,13 +482,16 @@ def handle_update(
         message_id = ((callback.get("message") or {}).get("message_id"))
         parts = data.split("|")
         screen = None
+        is_confirm = len(parts) >= 2 and parts[0] == "v1" and parts[1] == "confirm"
         if len(parts) >= 2 and parts[0] == "v1":
             name = parts[1]
             arg = "|".join(parts[2:]) if len(parts) > 2 else ""
             screen = _screen(session, name, arg, probes=probes, now=now)
         if screen is None or message_id is None:
+            # a stale/used confirmation nonce gets its own clearer message
             return [Outcome(kind="ack", callback_query_id=cbq_id,
-                            text=EXPIRED_BUTTON_AR)]
+                            text=ACTION_EXPIRED_AR if is_confirm
+                            else EXPIRED_BUTTON_AR)]
         text, keyboard = screen
         return [
             Outcome(kind="ack", callback_query_id=cbq_id),

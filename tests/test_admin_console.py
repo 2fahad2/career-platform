@@ -269,3 +269,89 @@ def test_manual_usage_buttons_log_and_rerender(
     owner_session.execute(sql_text(
         "DELETE FROM usage_events WHERE tenant_id = :t"), {"t": t1})
     owner_session.commit()
+
+
+def test_pause_action_double_confirm_nonce_flow(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """Phase 4: tenant card → pause → confirm card w/ one-shot nonce →
+    confirm executes; a reused or stale nonce is refused."""
+    import career.telegram.console as console
+
+    t1, _ = two_tenants
+    code = owner_session.execute(
+        sql_text("SELECT code FROM tenants WHERE id = :t"), {"t": t1}
+    ).scalar_one()
+    owner_session.execute(sql_text(
+        "INSERT INTO subscriptions (id, tenant_id, plan_code, status,"
+        " salla_order_id) VALUES (:i, :t, 'professional', 'ACTIVE', :o)"),
+        {"i": str(uuid.uuid4()), "t": t1, "o": f"O-{uuid.uuid4()}"})
+    owner_session.commit()
+    try:
+        # tap «pause» → a confirm card carrying a nonce
+        out = handle_update(
+            owner_session, _cbq(ADMIN, f"v1|act|{code}|pause"),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+        )
+        confirm_btn = out[1].keyboard[0][0][1]
+        assert confirm_btn.startswith("v1|confirm|")
+        assert "تأكيد" in out[1].text
+
+        # confirm → paused + card re-rendered
+        done = handle_update(
+            owner_session, _cbq(ADMIN, confirm_btn), admin_chat_id=ADMIN,
+            probes=FakeProbes(), now=NOW,
+        )
+        assert "أوقفنا" in done[1].text
+        status = owner_session.execute(sql_text(
+            "SELECT status FROM subscriptions WHERE tenant_id = :t"),
+            {"t": t1}).scalar_one()
+        assert status == "PAUSED"
+
+        # the SAME nonce again → refused (one-shot)
+        again = handle_update(
+            owner_session, _cbq(ADMIN, confirm_btn), admin_chat_id=ADMIN,
+            probes=FakeProbes(), now=NOW,
+        )
+        assert again[0].text == console.ACTION_EXPIRED_AR
+    finally:
+        owner_session.execute(sql_text(
+            "DELETE FROM subscriptions WHERE tenant_id = :t"), {"t": t1})
+        owner_session.commit()
+
+
+def test_action_nonce_expires_after_five_minutes(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    from datetime import timedelta
+
+    import career.telegram.console as console
+
+    t1, _ = two_tenants
+    code = owner_session.execute(
+        sql_text("SELECT code FROM tenants WHERE id = :t"), {"t": t1}
+    ).scalar_one()
+    owner_session.execute(sql_text(
+        "INSERT INTO subscriptions (id, tenant_id, plan_code, status,"
+        " salla_order_id) VALUES (:i, :t, 'professional', 'ACTIVE', :o)"),
+        {"i": str(uuid.uuid4()), "t": t1, "o": f"O-{uuid.uuid4()}"})
+    owner_session.commit()
+    try:
+        out = handle_update(
+            owner_session, _cbq(ADMIN, f"v1|act|{code}|pause"),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+        )
+        confirm_btn = out[1].keyboard[0][0][1]
+        late = handle_update(
+            owner_session, _cbq(ADMIN, confirm_btn), admin_chat_id=ADMIN,
+            probes=FakeProbes(), now=NOW + timedelta(minutes=6),
+        )
+        assert late[0].text == console.ACTION_EXPIRED_AR
+        status = owner_session.execute(sql_text(
+            "SELECT status FROM subscriptions WHERE tenant_id = :t"),
+            {"t": t1}).scalar_one()
+        assert status == "ACTIVE"                     # never executed
+    finally:
+        owner_session.execute(sql_text(
+            "DELETE FROM subscriptions WHERE tenant_id = :t"), {"t": t1})
+        owner_session.commit()
