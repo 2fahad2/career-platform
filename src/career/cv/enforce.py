@@ -21,8 +21,11 @@ MAX_ACHIEVEMENTS_PER_JOB = 4
 MAX_PROJECTS = 2
 MAX_SKILLS = 14
 
-#: Designer pacing (§1.5): rank 1 & 2 → 4 bullets, rank 3 → 3, rank 4+ → 2.
-BULLET_PACING = (4, 4, 3, 2)
+#: Bullet pacing (§1.5). The conservative designer taper (4,4,3,2) left real,
+#: confirmed-bank achievements unused on later roles and under-filled the
+#: page (Fahad review). Use the full per-role allowance — still hard-capped
+#: at MAX_ACHIEVEMENTS_PER_JOB, still real content only, never padded.
+BULLET_PACING = (4, 4, 4, 4)
 
 _WORD_RE = re.compile(r"[a-z0-9+#]+")
 

@@ -3,8 +3,8 @@
 LEGACY §1.9 rules ported onto OUR sources (D6: the confirmed achievement bank
 + customer profile, never a master_cv.json): display_company order, the
 Security+ display rule, defaults, current-role detection, first-wins skill
-dedupe, language formatting. §1.5 caps (400/4/4/2/14) + designer pacing
-[4,4,3,2] with achievements verbatim first and JD-keyword-ranked
+dedupe, language formatting. §1.5 caps (400/4/4/2/14) + full per-role pacing
+[4,4,4,4] with achievements verbatim first and JD-keyword-ranked
 responsibilities filling the rest — NO invention, every bullet originates
 from the bank. §1.6 the complete-sentence authority (career_core). The
 pre-render validator blocks on issues (Arabic leak, bad email, short summary)
@@ -158,7 +158,7 @@ def test_enforce_caps_and_designer_pacing() -> None:
     assert len(result.selected_experience) == 4          # max entries
     assert len(result.selected_skills) == 14             # max skills
     counts = [len(e.achievements) for e in result.selected_experience]
-    assert counts == [4, 4, 3, 2]                        # pacing [4,4,3,2]
+    assert counts == [4, 4, 4, 4]                        # full pacing [4,4,4,4]
     assert len(result.tailored_summary) <= 400
     # achievements come first, verbatim
     top = result.selected_experience[0]
