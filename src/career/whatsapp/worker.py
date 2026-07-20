@@ -270,6 +270,14 @@ def _handle_message(
             session.commit()
             return
 
+        # F-ENRICH (§13): an open enrichment session consumes this reply
+        if onboarding is not None and text_body and \
+                orchestrator.handle_enrichment(
+                    session, channel_id=channel.id, text=text_body,
+                    deps=onboarding, now=now):
+            session.commit()
+            return
+
         from career.cv import deliver as cv_deliver
         from career.cv.daily_run import close_from_delivery
 

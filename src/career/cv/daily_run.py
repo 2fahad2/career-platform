@@ -36,6 +36,7 @@ from career.db.models import (
     Delivery,
     ForbiddenClaim,
     JobPosting,
+    OnboardingSession,
     ProfileFact,
     Tenant,
     TenantDayState,
@@ -102,7 +103,11 @@ def _load_bank(session: Session, tenant_id: uuid.UUID) -> dict[str, list[dict[st
     ).scalars().all()
     bank: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
-        bank.setdefault(row.category, []).append(dict(row.payload or {}))
+        payload = dict(row.payload or {})
+        # inject the fact id so F-ENRICH conversation achievements can be
+        # folded into their parent role (normalize.build_master_cv).
+        payload["_fact_id"] = str(row.id)
+        bank.setdefault(row.category, []).append(payload)
     return bank
 
 
@@ -350,7 +355,59 @@ def _run_tenant(
     day_state = close_from_delivery(
         session, delivery=delivery, now=now, suppressor=suppressor
     )
+    # F-ENRICH (§13): if delivery landed and a role is thin, arm ONE
+    # enrichment nudge — the opening message is sent by the conversation
+    # worker (open window), never here, and never affects the day's state.
+    if day_state is not None and day_state.state in ("DELIVERED", "PARTIAL_DELIVERY"):
+        _maybe_arm_enrichment(session, tenant_id=tenant_id, deps=deps, now=now)
     return day_state  # None ⇒ held; the descend path closes it later
+
+
+def _maybe_arm_enrichment(
+    session: Session, *, tenant_id: uuid.UUID, deps: DailyDeps, now: datetime
+) -> None:
+    """Detect a thin role and, when the customer's window is OPEN (they just
+    received today's delivery, so it usually is), arm a once-ever nudge and
+    send the opening Saudi-colloquial question. Best-effort; never raises into
+    the delivery path, never blocks it."""
+    try:
+        from career.onboarding import enrichment as enr
+
+        thin = enr.thin_roles(session, tenant_id=tenant_id)
+        if not thin:
+            return
+        channel = session.execute(
+            select(CustomerChannel).where(CustomerChannel.tenant_id == tenant_id)
+        ).scalars().first()
+        if channel is None or window_state(
+            last_inbound_at=channel.last_inbound_at,
+            opt_out_at=channel.opt_out_at, now=now,
+        ) is not WindowState.OPEN:
+            return  # closed window → a future open-window run catches it
+        journey = session.execute(
+            select(OnboardingSession).where(
+                OnboardingSession.tenant_id == tenant_id,
+                OnboardingSession.state == "ACTIVE",
+            )
+        ).scalars().first()
+        if journey is None:
+            return
+        context = dict(journey.context or {})
+        role = thin[0]
+        if enr.enqueue_enrichment(
+            session, tenant_id=tenant_id, role_fact_id=role.id,
+            journey_context=context, trigger="lazy_generation", now=now,
+        ):
+            journey.context = context
+            mid = deps.whatsapp_client.send_text(
+                channel.phone_e164,
+                enr.opening_message(session, role_fact_id=role.id),
+            )
+            record_out(session, tenant_id=tenant_id, channel_id=channel.id,
+                       kind="text", wa_message_id=mid, now=now)
+            session.flush()
+    except Exception:  # noqa: BLE001 — enrichment never breaks delivery
+        logger.warning("enrichment arm failed", exc_info=True)
 
 
 def expire_stale_held_deliveries(

@@ -72,6 +72,9 @@ class Deps:
     storage: StorageAdapter
     extractor: ExtractorClient
     upload_limits: Limits | None = None
+    #: F-ENRICH renderer (colloquial answer → grounded English bullet). None
+    #: disables the enrichment branch — the rest of onboarding is unaffected.
+    achievement_renderer: Any = None
 
 
 class JourneyNotFound(Exception):
@@ -203,6 +206,105 @@ def handle_standing_command(
     _handle_privacy_command(session, journey, channel, deps, command, now=now)
     session.flush()
     return True
+
+
+def handle_enrichment(
+    session: Session, *, channel_id: uuid.UUID, text: str,
+    deps: Deps, now: datetime,
+) -> bool:
+    """F-ENRICH (§13): route a reply while an enrichment session is open.
+    Returns True when handled. No-op (False) when nothing is open or the
+    renderer isn't wired — the caller falls through to its other branches."""
+    from career.onboarding import enrichment as enr
+
+    if deps.achievement_renderer is None:
+        return False
+    channel = session.get(CustomerChannel, channel_id)
+    if channel is None:
+        return False
+    journey = session.execute(
+        select(OnboardingSession).where(
+            OnboardingSession.tenant_id == channel.tenant_id
+        )
+    ).scalar_one_or_none()
+    if journey is None or journey.state != "ACTIVE":
+        return False
+    context = dict(journey.context or {})
+    state = context.get("enrichment") or {}
+    if not state.get("open"):
+        return False
+
+    tenant_id = channel.tenant_id
+    body = text.strip()
+    profile = session.execute(
+        select(CustomerProfile).where(CustomerProfile.tenant_id == tenant_id)
+    ).scalars().first()
+    name = profile.cv_full_name if profile else None
+    role_id = uuid.UUID(str(state["current"])) if state.get("current") else None
+    pending = state.get("pending_fact_id")
+
+    def _send(msg: str) -> None:
+        mid = deps.whatsapp_client.send_text(channel.phone_e164, msg)
+        record_out(session, tenant_id=tenant_id, channel_id=channel.id,
+                   kind="text", wa_message_id=mid, now=now)
+
+    # awaiting confirmation of a rendered bullet
+    if pending:
+        if body == enr._CONFIRM_OK and role_id is not None:
+            enr.confirm_answer(session, tenant_id=tenant_id,
+                               pending_fact_id=uuid.UUID(str(pending)),
+                               role_fact_id=role_id, now=now)
+            enr.close_session(context)
+            _send(enr.ack_thanks(name))
+        elif body == enr._CONFIRM_DEL:
+            enr.reject_answer(session, tenant_id=tenant_id,
+                              pending_fact_id=uuid.UUID(str(pending)))
+            context["enrichment"] = {**state, "pending_fact_id": None}
+            _send("تمام حذفناها. تبي تعطيني صياغة ثانية ولا نعدّي؟")
+        else:  # edit / re-answer → treat body as a fresh answer
+            context["enrichment"] = {**state, "pending_fact_id": None}
+            _handle_enrichment_text(session, deps, channel, context, role_id,
+                                    body, name, now, _send)
+        journey.context = context
+        session.flush()
+        return True
+
+    # awaiting the achievement answer (or a skip)
+    if body in enr.SKIP_LABELS and role_id is not None:
+        enr.skip_role(session, tenant_id=tenant_id, role_fact_id=role_id, now=now)
+        enr.close_session(context)
+        _send(enr._ACK_SKIP)
+        journey.context = context
+        session.flush()
+        return True
+
+    _handle_enrichment_text(session, deps, channel, context, role_id, body,
+                            name, now, _send)
+    journey.context = context
+    session.flush()
+    return True
+
+
+def _handle_enrichment_text(
+    session: Session, deps: Deps, channel: CustomerChannel,
+    context: dict[str, Any], role_id: uuid.UUID | None, body: str,
+    name: str | None, now: datetime, send: Any,
+) -> None:
+    from career.onboarding import enrichment as enr
+
+    if role_id is None or not body:
+        return
+    result = enr.handle_answer(
+        session, tenant_id=channel.tenant_id, role_fact_id=role_id,
+        arabic_answer=body, renderer=deps.achievement_renderer, now=now,
+    )
+    state = context.get("enrichment") or {}
+    if result["status"] == "confirm":
+        context["enrichment"] = {**state, "pending_fact_id": result["pending_fact_id"]}
+        send(result["prompt"])
+    else:  # reask — the answer wasn't usable
+        send("ما قدرت أطلّع منها إنجاز واضح — جرّب تفصّل أكثر، أو "
+             "اكتب «تخطّي هذا الدور».")
 
 
 def _channel(session: Session, channel_id: uuid.UUID) -> CustomerChannel:

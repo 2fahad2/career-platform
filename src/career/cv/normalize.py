@@ -111,6 +111,26 @@ def build_master_cv(
             seen.add(key)
             skills.append(name)
 
+    # F-ENRICH (§13/D14): fold each CONFIRMED conversation-achievement fact
+    # into its parent role's bullets. Achievement facts carry
+    # ``experience_fact_id``; experience payloads carry ``_fact_id`` (injected
+    # by the bank loader). Absent those keys, nothing folds — safe for callers
+    # that don't wire enrichment.
+    extra_by_role: dict[str, list[str]] = {}
+    for item in bank.get("achievement", []):
+        role_id = _text(item.get("experience_fact_id"))
+        text = _text(item.get("text"))
+        if role_id and text:
+            extra_by_role.setdefault(role_id, []).append(text)
+    exp_payloads: list[dict[str, Any]] = []
+    for payload in bank.get("experience", []):
+        role_id = _text(payload.get("_fact_id"))
+        extra = extra_by_role.get(role_id) if role_id else None
+        if extra:
+            payload = {**payload,
+                       "achievements": [*(payload.get("achievements") or []), *extra]}
+        exp_payloads.append(payload)
+
     return MasterCV(
         contact=ContactInfo(
             name=_text(contact.get("name")),
@@ -122,7 +142,7 @@ def build_master_cv(
         ),
         headline=_text(headline) or None,
         summary=_text(summary),
-        experience=[_experience(p) for p in bank.get("experience", [])],
+        experience=[_experience(p) for p in exp_payloads],
         education=[_education(p) for p in bank.get("education", [])],
         skills=skills,
         certifications=[_certification(p) for p in bank.get("certification", [])],

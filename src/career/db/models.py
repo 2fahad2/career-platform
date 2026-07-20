@@ -1100,3 +1100,34 @@ class AdminBotState(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+class RoleEnrichment(Base):
+    """The once-ever ledger for the thin-role enrichment nudge (F-ENRICH,
+    §13). One row per (tenant, role fact); presence ⟹ never re-ask."""
+
+    __tablename__ = "role_enrichments"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "fact_id",
+                         name="uq_role_enrichments_tenant_fact"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    fact_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("profile_facts.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    status: Mapped[str] = mapped_column(String(16), nullable=False)   # ASKED|ENRICHED|SKIPPED
+    trigger: Mapped[str] = mapped_column(String(32), nullable=False)
+    asked_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    answered_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
