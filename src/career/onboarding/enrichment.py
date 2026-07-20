@@ -60,6 +60,27 @@ _CONFIRM_OK = "مضبوط ✅"
 _CONFIRM_EDIT = "أبي أعدّل ✏️"
 _CONFIRM_DEL = "احذفها ❌"
 
+#: Interactive button ids (≤256 chars) — the tap arrives as the id via
+#: _button_id_of; typed labels keep working as a fallback for old clients.
+BTN_SKIP = "enr_skip"
+BTN_NONE = "enr_none"
+BTN_OK = "enr_ok"
+BTN_EDIT = "enr_edit"
+BTN_DEL = "enr_del"
+
+#: (id, title) pairs for send_interactive — titles ≤20 chars (Graph limit).
+OPENING_BUTTONS: tuple[tuple[str, str], ...] = (
+    (BTN_SKIP, _SKIP_ROLE),
+    (BTN_NONE, _NOTHING),
+)
+CONFIRM_BUTTONS: tuple[tuple[str, str], ...] = (
+    (BTN_OK, _CONFIRM_OK),
+    (BTN_EDIT, _CONFIRM_EDIT),
+    (BTN_DEL, _CONFIRM_DEL),
+)
+
+_EDIT_PROMPT = "تمام، اكتب لي إياها بكلماتك وأنا أعيد صياغتها 👌"
+
 _ACK_THANKS = "تسلم يا [name] 🙏 هالمعلومة فرقت مرة وبتقوّي سيرتك فعلاً."
 _ACK_SKIP = "تمام، عدّينا هالجزء وسيرتك زينة 👍"
 _ACK_DONE = "خلّصنا، مشكور على وقتك 🌟"
@@ -167,7 +188,10 @@ def enrichment_buttons(has_more: bool) -> tuple[str, ...]:
     return (*base, _STOP_ALL) if has_more else base
 
 
-SKIP_LABELS = frozenset({_SKIP_ROLE, _NOTHING, _STOP_ALL})
+SKIP_LABELS = frozenset({_SKIP_ROLE, _NOTHING, _STOP_ALL, BTN_SKIP, BTN_NONE})
+OK_LABELS = frozenset({_CONFIRM_OK, BTN_OK})
+EDIT_LABELS = frozenset({_CONFIRM_EDIT, BTN_EDIT})
+DEL_LABELS = frozenset({_CONFIRM_DEL, BTN_DEL})
 
 
 # ── answer handling (the render → pending → confirm → bank chain) ────────────

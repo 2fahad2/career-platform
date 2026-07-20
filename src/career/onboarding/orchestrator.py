@@ -250,18 +250,21 @@ def handle_enrichment(
 
     # awaiting confirmation of a rendered bullet
     if pending:
-        if body == enr._CONFIRM_OK and role_id is not None:
+        if body in enr.OK_LABELS and role_id is not None:
             enr.confirm_answer(session, tenant_id=tenant_id,
                                pending_fact_id=uuid.UUID(str(pending)),
                                role_fact_id=role_id, now=now)
             enr.close_session(context)
             _send(enr.ack_thanks(name))
-        elif body == enr._CONFIRM_DEL:
+        elif body in enr.DEL_LABELS:
             enr.reject_answer(session, tenant_id=tenant_id,
                               pending_fact_id=uuid.UUID(str(pending)))
             context["enrichment"] = {**state, "pending_fact_id": None}
             _send("تمام حذفناها. تبي تعطيني صياغة ثانية ولا نعدّي؟")
-        else:  # edit / re-answer → treat body as a fresh answer
+        elif body in enr.EDIT_LABELS:
+            context["enrichment"] = {**state, "pending_fact_id": None}
+            _send(enr._EDIT_PROMPT)
+        else:  # typed correction → treat body as a fresh answer
             context["enrichment"] = {**state, "pending_fact_id": None}
             _handle_enrichment_text(session, deps, channel, context, role_id,
                                     body, name, now, _send)
@@ -301,7 +304,11 @@ def _handle_enrichment_text(
     state = context.get("enrichment") or {}
     if result["status"] == "confirm":
         context["enrichment"] = {**state, "pending_fact_id": result["pending_fact_id"]}
-        send(result["prompt"])
+        mid = deps.whatsapp_client.send_interactive(
+            channel.phone_e164, result["prompt"], enr.CONFIRM_BUTTONS
+        )
+        record_out(session, tenant_id=channel.tenant_id, channel_id=channel.id,
+                   kind="interactive", wa_message_id=mid, now=now)
     else:  # reask — the answer wasn't usable
         send("ما قدرت أطلّع منها إنجاز واضح — جرّب تفصّل أكثر، أو "
              "اكتب «تخطّي هذا الدور».")

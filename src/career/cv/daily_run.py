@@ -399,12 +399,13 @@ def _maybe_arm_enrichment(
             journey_context=context, trigger="lazy_generation", now=now,
         ):
             journey.context = context
-            mid = deps.whatsapp_client.send_text(
+            mid = deps.whatsapp_client.send_interactive(
                 channel.phone_e164,
                 enr.opening_message(session, role_fact_id=role.id),
+                enr.OPENING_BUTTONS,
             )
             record_out(session, tenant_id=tenant_id, channel_id=channel.id,
-                       kind="text", wa_message_id=mid, now=now)
+                       kind="interactive", wa_message_id=mid, now=now)
             session.flush()
     except Exception:  # noqa: BLE001 — enrichment never breaks delivery
         logger.warning("enrichment arm failed", exc_info=True)

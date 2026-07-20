@@ -270,10 +270,12 @@ def _handle_message(
             session.commit()
             return
 
-        # F-ENRICH (§13): an open enrichment session consumes this reply
+        # F-ENRICH (§13): an open enrichment session consumes this reply —
+        # button taps route by machine id, typed labels keep working.
         if onboarding is not None and text_body and \
                 orchestrator.handle_enrichment(
-                    session, channel_id=channel.id, text=text_body,
+                    session, channel_id=channel.id,
+                    text=_button_id_of(msg) or text_body,
                     deps=onboarding, now=now):
             session.commit()
             return

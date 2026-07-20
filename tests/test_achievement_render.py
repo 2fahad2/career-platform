@@ -280,3 +280,139 @@ def test_handle_answer_ungrounded_stores_nothing(
         owner_session.execute(_sql(
             "DELETE FROM profile_facts WHERE tenant_id = :t"), {"t": a})
         owner_session.commit()
+
+
+# ── the interactive-button conversation (orchestrator level) ─────────────────
+
+import json as _json  # noqa: E402
+
+from career.onboarding import orchestrator as _orch  # noqa: E402
+from career.whatsapp.client import FakeWhatsAppClient  # noqa: E402
+
+
+def _seed_enrichment_conversation(
+    session: Session, tenant_id: str, bullet: str = "Improved reporting."
+) -> tuple:
+    """tenant → sub + channel + ACTIVE journey with an OPEN enrichment
+    session on a seeded thin role. Returns (deps, channel_id, role_id)."""
+    tid = _uuid.UUID(tenant_id)
+    role_id = _seed_role(session, tid, [])
+    sub_id, channel_id = _uuid.uuid4(), _uuid.uuid4()
+    session.execute(_sql(
+        "INSERT INTO subscriptions (id, tenant_id, plan_code, status,"
+        " salla_order_id, amount_sar, currency) VALUES (:i, :t, 'basic',"
+        " 'ACTIVE', :o, 149, 'SAR')"),
+        {"i": str(sub_id), "t": tenant_id, "o": f"O-{_uuid.uuid4()}"})
+    session.execute(_sql(
+        "INSERT INTO customer_channels (id, tenant_id, subscription_id,"
+        " provider, phone_e164, verified_at, opt_in_at, last_inbound_at)"
+        " VALUES (:i, :t, :s, 'whatsapp', :p, :n, :n, :n)"),
+        {"i": str(channel_id), "t": tenant_id, "s": str(sub_id),
+         "p": "+966500000001", "n": _NOW})
+    session.execute(_sql(
+        "INSERT INTO role_enrichments (id, tenant_id, fact_id, status,"
+        " trigger, asked_at) VALUES (:i, :t, :f, 'ASKED', 'lazy_generation',"
+        " :n)"),
+        {"i": str(_uuid.uuid4()), "t": tenant_id, "f": str(role_id), "n": _NOW})
+    ctx = {"enrichment": {"open": True, "current": str(role_id), "queue": [],
+                          "opened_at": _NOW.isoformat()}}
+    session.execute(_sql(
+        "INSERT INTO onboarding_sessions (id, tenant_id, subscription_id,"
+        " channel_id, state, context) VALUES (:i, :t, :s, :c, 'ACTIVE',"
+        " CAST(:x AS jsonb))"),
+        {"i": str(_uuid.uuid4()), "t": tenant_id, "s": str(sub_id),
+         "c": str(channel_id), "x": _json.dumps(ctx)})
+    session.commit()
+    deps = _orch.Deps(
+        whatsapp_client=FakeWhatsAppClient(), scanner=object(),
+        storage=object(), extractor=object(),
+        achievement_renderer=_StubRenderer(bullet),
+    )
+    return deps, channel_id, role_id
+
+
+def _cleanup_conversation(session: Session, tenant_id: str) -> None:
+    for table in ("delivery_messages", "role_enrichments", "onboarding_sessions",
+                  "customer_channels", "subscriptions", "profile_facts"):
+        session.execute(_sql(
+            f"DELETE FROM {table} WHERE tenant_id = :t"), {"t": tenant_id})
+    session.commit()
+
+
+def test_button_ids_route_answer_confirm_and_promote(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """Answer → interactive confirm prompt (3 buttons) → BTN_OK tap →
+    CUSTOMER_CONFIRMED + ENRICHED + thanks."""
+    from career.onboarding import enrichment as enr
+
+    a, _ = two_tenants
+    deps, channel_id, role_id = _seed_enrichment_conversation(owner_session, a)
+    try:
+        handled = _orch.handle_enrichment(
+            owner_session, channel_id=channel_id,
+            text="قللت وقت التقارير", deps=deps, now=_NOW)
+        assert handled
+        sent = deps.whatsapp_client.sent
+        assert sent[-1].kind == "interactive"
+        assert len(sent[-1].buttons) == 3          # مضبوط/أعدّل/احذفها
+        # tap arrives as the machine id
+        assert _orch.handle_enrichment(
+            owner_session, channel_id=channel_id, text=enr.BTN_OK,
+            deps=deps, now=_NOW)
+        owner_session.commit()
+        status = owner_session.execute(_sql(
+            "SELECT status FROM profile_facts WHERE tenant_id = :t"
+            " AND category = 'achievement'"), {"t": a}).scalar_one()
+        assert status == "CUSTOMER_CONFIRMED"
+        enrolled = owner_session.execute(_sql(
+            "SELECT status FROM role_enrichments WHERE fact_id = :f"),
+            {"f": str(role_id)}).scalar_one()
+        assert enrolled == "ENRICHED"
+        assert "تسلم" in (deps.whatsapp_client.sent[-1].body or "")
+    finally:
+        _cleanup_conversation(owner_session, a)
+
+
+def test_skip_button_id_closes_role_skipped(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    from career.onboarding import enrichment as enr
+
+    a, _ = two_tenants
+    deps, channel_id, role_id = _seed_enrichment_conversation(owner_session, a)
+    try:
+        assert _orch.handle_enrichment(
+            owner_session, channel_id=channel_id, text=enr.BTN_SKIP,
+            deps=deps, now=_NOW)
+        owner_session.commit()
+        enrolled = owner_session.execute(_sql(
+            "SELECT status FROM role_enrichments WHERE fact_id = :f"),
+            {"f": str(role_id)}).scalar_one()
+        assert enrolled == "SKIPPED"
+        assert "سيرتك زينة" in (deps.whatsapp_client.sent[-1].body or "")
+    finally:
+        _cleanup_conversation(owner_session, a)
+
+
+def test_edit_button_clears_pending_and_reprompts(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    from career.onboarding import enrichment as enr
+
+    a, _ = two_tenants
+    deps, channel_id, _role = _seed_enrichment_conversation(owner_session, a)
+    try:
+        _orch.handle_enrichment(owner_session, channel_id=channel_id,
+                                text="قللت وقت التقارير", deps=deps, now=_NOW)
+        assert _orch.handle_enrichment(
+            owner_session, channel_id=channel_id, text=enr.BTN_EDIT,
+            deps=deps, now=_NOW)
+        owner_session.commit()
+        ctx = owner_session.execute(_sql(
+            "SELECT context FROM onboarding_sessions WHERE tenant_id = :t"),
+            {"t": a}).scalar_one()
+        assert not (ctx.get("enrichment") or {}).get("pending_fact_id")
+        assert "بكلماتك" in (deps.whatsapp_client.sent[-1].body or "")
+    finally:
+        _cleanup_conversation(owner_session, a)
