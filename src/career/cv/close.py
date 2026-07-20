@@ -32,6 +32,10 @@ DAILY_STATES = (
     "CV_GENERATION_FAILED",
     "WHATSAPP_FAILED",
     "LEDGER_FAILED",
+    # CHANGELOG §12 (Fahad, option A): event-driven — written ONLY when the
+    # delivery was skipped because the customer opted out of messages. The
+    # seven computational states above stay untouched.
+    "SKIPPED_OPTED_OUT",
 )
 
 
@@ -123,6 +127,38 @@ def close_tenant_day(
         session.add(row)
     else:
         row.state = state_value
+        row.counts = counts
+        row.recorded_at = now
+    session.flush()
+    return row
+
+
+def close_skipped_opted_out(
+    session: Session,
+    *,
+    tenant_id: uuid.UUID,
+    run_date: date,
+    now: datetime,
+    gate_passes: int,
+) -> TenantDayState:
+    """CHANGELOG §12: the eighth honest state — opted-out customer whose day
+    had gate passes. Recorded, never counted as success or failure."""
+    counts = {"gate_passes": gate_passes, "cv_resolved": 0, "cv_failed": 0,
+              "delivered": 0, "failed_sends": 0}
+    row = session.execute(
+        select(TenantDayState).where(
+            TenantDayState.tenant_id == tenant_id,
+            TenantDayState.run_date == run_date,
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        row = TenantDayState(
+            id=uuid.uuid4(), tenant_id=tenant_id, run_date=run_date,
+            state="SKIPPED_OPTED_OUT", counts=counts, recorded_at=now,
+        )
+        session.add(row)
+    else:
+        row.state = "SKIPPED_OPTED_OUT"
         row.counts = counts
         row.recorded_at = now
     session.flush()

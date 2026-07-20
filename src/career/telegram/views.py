@@ -20,6 +20,7 @@ _STATE_AR = {
     "CV_GENERATION_FAILED": "🔴 فشل توليد السيرة",
     "WHATSAPP_FAILED": "🔴 فشل واتساب",
     "LEDGER_FAILED": "🔴 فشل السجل",
+    "SKIPPED_OPTED_OUT": "🚫 موقف الرسائل — تُخطي",
 }
 
 _RUN_AR = {

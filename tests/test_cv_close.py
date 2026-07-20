@@ -58,10 +58,12 @@ def test_ledger_failure_dominates_everything() -> None:
     ) == "LEDGER_FAILED"
 
 
-def test_the_vocabulary_is_exactly_the_seven() -> None:
+def test_the_vocabulary_is_exactly_the_eight() -> None:
+    # CHANGELOG §12: seven computational states + the event-driven eighth
     assert set(close.DAILY_STATES) == {
         "DELIVERED", "NO_MATCHES", "PARTIAL_DELIVERY", "DISCOVERY_FAILED",
         "CV_GENERATION_FAILED", "WHATSAPP_FAILED", "LEDGER_FAILED",
+        "SKIPPED_OPTED_OUT",
     }
 
 

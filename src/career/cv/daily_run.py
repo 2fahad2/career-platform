@@ -340,6 +340,13 @@ def _run_tenant(
             cv_resolved=len(resolved), cv_failed=cv_failed + len(bundle_failures),
             failed=[str(e.get("group")) for e in bundle.get("jobs", [])],
         )
+    from career.whatsapp.delivery import DELIVERY_NO_SEND
+    if delivery.status == DELIVERY_NO_SEND:
+        # CHANGELOG §12: opted-out with matches — the eighth honest state
+        return close_mod.close_skipped_opted_out(
+            session, tenant_id=tenant_id, run_date=run_date, now=now,
+            gate_passes=gate_passes,
+        )
     day_state = close_from_delivery(
         session, delivery=delivery, now=now, suppressor=suppressor
     )

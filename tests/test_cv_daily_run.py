@@ -652,3 +652,32 @@ def test_canary_runs_first_with_delay_before_the_rest(
             "DELETE FROM tenant_day_states WHERE tenant_id IN (:a, :b)"),
             {"a": a, "b": b})
         owner_session.commit()
+
+
+def test_opted_out_with_matches_records_the_eighth_state(
+    owner_session: Session, clean_billing: None, tmp_path: Any
+) -> None:
+    """CHANGELOG §12 (Fahad, option A): opted-out customer with gate passes
+    closes SKIPPED_OPTED_OUT — recorded, never success nor failure."""
+    tid, channel = _seed_active_tenant(owner_session)
+    try:
+        owner_session.execute(sql_text(
+            "UPDATE customer_channels SET opt_out_at = :n WHERE id = :id"),
+            {"n": NOW, "id": str(channel.id)})
+        owner_session.commit()
+        report = _engine_report(owner_session, tid)
+        deps = _deps(tmp_path)
+        states = daily_run.run_daily_delivery(
+            owner_session, report=report, deps=deps, now=NOW,
+        )
+        owner_session.commit()
+        assert states[tid].state == "SKIPPED_OPTED_OUT"
+        assert states[tid].counts["gate_passes"] >= 1
+        assert deps.whatsapp_client.sent == []           # nothing reached them
+        suppressed = owner_session.execute(sql_text(
+            "SELECT count(*) FROM tenant_job_suppressions WHERE tenant_id=:t"),
+            {"t": str(tid)}).scalar_one()
+        assert suppressed == 0                           # skip ≠ delivered
+    finally:
+        owner_session.rollback()
+        _cleanup(owner_session, tid)
