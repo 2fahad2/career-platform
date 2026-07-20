@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -29,6 +30,7 @@ from sqlalchemy.orm import Session
 from career.db.models import TenantJobDecision
 from career.onboarding.paths import DEFAULT_FAMILIES, PathFamily
 from career_core.gate import (
+    COMPANY_TIERS_VERSION,
     classify_company_tier,
     company_quality_score,
     compute_fit_score,
@@ -180,6 +182,41 @@ def _location_verdict(policy: TenantGatePolicy, location: str | None) -> tuple[s
 # ── the gate ─────────────────────────────────────────────────────────────────
 
 
+@lru_cache(maxsize=64)
+def _fit_vocab(paths_key: tuple[str, ...]) -> tuple[dict[str, int], tuple[str, ...]]:
+    """Signals + strong tokens derived from the tenant's APPROVED families
+    (locked decision: nothing specialization-specific pinned in code).
+    Generic Saudi-market tokens stay — they are market, not specialization."""
+    from career.onboarding.paths import DEFAULT_FAMILIES
+
+    by_key = {f.key: f for f in DEFAULT_FAMILIES}
+    signals: dict[str, int] = {
+        "saudi": 3, "ksa": 3, "riyadh": 3, "vision 2030": 5,
+        "pmp": 5, "governance": 5, "stakeholder": 4,
+    }
+    tokens: list[str] = []
+    for key in paths_key:
+        fam = by_key.get(key)
+        if fam is None:
+            continue
+        for alias in fam.query_aliases:
+            signals[alias.lower()] = 9
+            tokens.append(alias.lower())
+    return signals, tuple(tokens)
+
+
+def _paths_key(approved_paths: dict[str, str | None]) -> tuple[str, ...]:
+    return tuple(sorted({v for v in approved_paths.values() if v}))
+
+
+def _tenant_fit_signals(approved_paths: dict[str, str | None]) -> dict[str, int]:
+    return _fit_vocab(_paths_key(approved_paths))[0]
+
+
+def _tenant_strong_tokens(approved_paths: dict[str, str | None]) -> tuple[str, ...]:
+    return _fit_vocab(_paths_key(approved_paths))[1]
+
+
 def evaluate(policy: TenantGatePolicy, posting: PostingFacts) -> GateVerdict:
     reasons: dict[str, Any] = {}
     near_reasons: list[str] = []
@@ -199,7 +236,13 @@ def evaluate(policy: TenantGatePolicy, posting: PostingFacts) -> GateVerdict:
         company_tier=tier,
         source_quality_score=sq,
     )
-    fit = compute_fit_score(posting.title, posting.company, posting.location or "")
+    fit = compute_fit_score(
+        posting.title, posting.company, posting.location or "",
+        signals=_tenant_fit_signals(policy.approved_paths),
+        strong_tokens=_tenant_strong_tokens(policy.approved_paths),
+        hard_reject=(),   # locked decision: no pre-pinned rejects — the role
+                          # axis handles family matching
+    )
     location_state, location_detail = _location_verdict(policy, posting.location)
 
     reasons.update({
@@ -209,6 +252,7 @@ def evaluate(policy: TenantGatePolicy, posting: PostingFacts) -> GateVerdict:
         "salary_estimate": list(salary.estimated_range) if salary.estimated_range else None,
         "company_tier": tier,
         "company_tier_reason": tier_reason,
+        "company_tiers_version": COMPANY_TIERS_VERSION,
         "cq_score": cq,
         "sq_score": sq,
         "location": location_state if location_state != "PASS" else "PASS",

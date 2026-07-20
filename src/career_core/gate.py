@@ -25,6 +25,10 @@ from career_core.salary import (
 MAX_GATE_SEND = 8
 
 # ── §4.1 Company TIER classification ─────────────────────────────────────────
+#: §06: classification data is versioned — the version rides every decision
+#: row so «ليش صنفناها كذا؟» is answerable historically.
+COMPANY_TIERS_VERSION = "company_tiers_v1"
+
 TIER1_KEYWORDS = frozenset({
     "sama", "saudi central bank", "central bank of saudi", "neom", "saudi aramco",
     "aramco", "sabic", "qiddiya", "gosi", "zatca", "zakat", "public investment fund",
@@ -310,15 +314,22 @@ def compute_fit_score(
     location: str = "",
     *,
     signals: dict[str, int] | None = None,
+    strong_tokens: tuple[str, ...] | None = None,
+    hard_reject: tuple[str, ...] | None = None,
 ) -> FitResult:
+    """Legacy defaults preserved; the commercial engine passes TENANT-derived
+    signals/tokens (locked decision: «لا قوائم تخصصات مثبتة في الكود») and an
+    empty hard_reject — the role axis already handles family matching."""
     title_l = (title or "").lower()
-    if any(t in title_l for t in _FIT_HARD_REJECT):
+    rejects = _FIT_HARD_REJECT if hard_reject is None else hard_reject
+    if any(t in title_l for t in rejects):
         return FitResult(0, "LOW", "hard_reject_dev_or_support_title")
     blob = f"{title_l} {(company or '').lower()} {(location or '').lower()}"
     sig = signals if signals is not None else FIT_SCORE_SIGNALS
 
     score = 0
-    for tok in STRONG_TITLE_TOKENS:  # ONE title-family bonus max
+    tokens = STRONG_TITLE_TOKENS if strong_tokens is None else strong_tokens
+    for tok in tokens:  # ONE title-family bonus max
         if tok in title_l:
             score += 20
             break
