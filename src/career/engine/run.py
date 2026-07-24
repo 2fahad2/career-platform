@@ -15,15 +15,22 @@ engine at all; delivery is C7's job.
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from career.db.models import DiscoveryRun, JobPosting, SearchPolicy, TenantJobDecision
+from career.db.models import (
+    DiscoveryRun,
+    JobPosting,
+    SearchPolicy,
+    Tenant,
+    TenantJobDecision,
+)
 from career.engine import identity as engine_identity
 from career.engine import ranking as engine_ranking
 from career.engine.enrichment import PageFetcher, enrich_posting
@@ -224,6 +231,7 @@ def _upsert_pool(
             salary_raw=job.salary_raw,
             source=job.source,
             route=job.route or {},
+            posted_at=_parse_posted_at(job.posted_at_raw, now=now),
             first_seen_at=now,
             last_seen_at=now,
         )
@@ -232,6 +240,32 @@ def _upsert_pool(
         counts["new"] += 1
     owner_session.flush()
     return postings, counts
+
+
+
+_RELATIVE_POSTED_RE = re.compile(
+    r"(\d+)\s*(hour|day|week|month)s?\s*ago", re.IGNORECASE
+)
+
+
+def _parse_posted_at(raw: str | None, *, now: datetime) -> datetime | None:
+    """AUDIT ك-16: fetchers collected posted_at_raw but it was dropped at
+    insert — the §06 freshness lane never fired in production. Handles the
+    two real shapes: ISO dates (JobSpy date_posted) and Google's relative
+    "N days ago" strings."""
+    if not raw:
+        return None
+    text = str(raw).strip()
+    m = _RELATIVE_POSTED_RE.search(text)
+    if m:
+        n, unit = int(m.group(1)), m.group(2).lower()
+        hours = {"hour": 1, "day": 24, "week": 168, "month": 720}[unit] * n
+        return now - timedelta(hours=hours)
+    try:
+        parsed = datetime.fromisoformat(text[:19])
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+    except ValueError:
+        return None
 
 
 def _to_candidate(posting: JobPosting, verdict: GateVerdict) -> RankCandidate:
@@ -387,6 +421,10 @@ def run_nightly(
             ],
             "counts": decisions,
         }
-        counts.setdefault("tenants", {})[str(tenant_id)] = decisions
+        # AUDIT ك-17: journal + admin alerts print these counts — key by
+        # TEN code, never the raw tenant uuid (§15.13).
+        tenant_row = owner_session.get(Tenant, tenant_id)
+        tenant_key = tenant_row.code if tenant_row is not None else "TEN-????"
+        counts.setdefault("tenants", {})[tenant_key] = decisions
 
     return _finish("partial" if failed_sources else "completed", per_tenant)

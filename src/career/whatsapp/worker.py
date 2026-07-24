@@ -310,7 +310,18 @@ def _handle_message(
         if landed is not None:
             # the held day closes when its bundle actually lands; the same
             # inbound may ALSO be an enrichment answer — fall through.
-            close_from_delivery(session, delivery=landed, now=now)
+            closed = close_from_delivery(session, delivery=landed, now=now)
+            if closed is not None:
+                # AUDIT ك-15: held days were skipped by the nightly rollup
+                from career.cv import close as close_mod
+
+                try:
+                    close_mod.rollup_costs(
+                        session, tenant_id=landed.tenant_id,
+                        day=closed.run_date,
+                    )
+                except Exception:  # noqa: BLE001 — accounting never blocks
+                    logger.warning("descend cost rollup failed", exc_info=True)
 
         # F-ENRICH (§13): an open enrichment session consumes this reply —
         # button taps route by machine id (also when the tap carries no

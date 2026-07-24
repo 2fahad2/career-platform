@@ -725,3 +725,51 @@ def test_tenant_crash_is_isolated_and_closed_honestly(
             "DELETE FROM tenant_day_states WHERE tenant_id IN (:a, :b)"),
             {"a": a, "b": b})
         owner_session.commit()
+
+
+def test_delivered_day_arms_enrichment_for_thin_role(
+    owner_session: Session, clean_billing: None, tmp_path: Any
+) -> None:
+    """AUDIT ك-14: the lazy trigger must actually fire from a delivery day —
+    a DELIVERED tenant with a thin role gets the ASKED ledger row, the open
+    cursor, and the opening interactive question."""
+    import json as _j
+
+    tid, channel = _seed_active_tenant(owner_session)
+    try:
+        # ACTIVE journey + a thin confirmed role
+        owner_session.execute(sql_text(
+            "INSERT INTO onboarding_sessions (id, tenant_id, subscription_id,"
+            " channel_id, state) SELECT :i, :t, s.id, :c, 'ACTIVE'"
+            " FROM subscriptions s WHERE s.tenant_id = :t"),
+            {"i": str(uuid.uuid4()), "t": str(tid), "c": str(channel.id)})
+        owner_session.execute(sql_text(
+            "INSERT INTO profile_facts (id, tenant_id, category, payload,"
+            " status, source) VALUES (:i, :t, 'experience',"
+            " CAST(:p AS jsonb), 'CUSTOMER_CONFIRMED', 'test')"),
+            {"i": str(uuid.uuid4()), "t": str(tid),
+             "p": _j.dumps({"title": "IT Analyst", "employer": "X",
+                            "start_date": "2022-01", "end_date": "",
+                            "achievements": []})})
+        owner_session.commit()
+        deps = _deps(tmp_path)
+        daily_run._maybe_arm_enrichment(
+            owner_session, tenant_id=tid, deps=deps, now=NOW)
+        owner_session.commit()
+        status = owner_session.execute(sql_text(
+            "SELECT status FROM role_enrichments WHERE tenant_id = :t"),
+            {"t": str(tid)}).scalar_one()
+        assert status == "ASKED"
+        sent = deps.whatsapp_client.sent
+        assert sent and sent[-1].kind == "interactive"
+        ctx = owner_session.execute(sql_text(
+            "SELECT context FROM onboarding_sessions WHERE tenant_id = :t"),
+            {"t": str(tid)}).scalar_one()
+        assert (ctx.get("enrichment") or {}).get("open") is True
+    finally:
+        owner_session.rollback()
+        for table in ("role_enrichments", "delivery_messages",
+                      "onboarding_sessions", "profile_facts"):
+            owner_session.execute(sql_text(
+                f"DELETE FROM {table} WHERE tenant_id = :t"), {"t": str(tid)})
+        owner_session.commit()

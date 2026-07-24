@@ -257,8 +257,18 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
                     canary_delay_seconds=3600.0,
                 )
                 # read INSIDE the session — the rows expire on close
+                # AUDIT ك-17: TEN codes in the journal, never raw uuids
+                dcodes = {
+                    row.id: row.code
+                    for row in session.execute(
+                        select(Tenant.id, Tenant.code).where(
+                            Tenant.id.in_(list(states))
+                        )
+                    ).all()
+                } if states else {}
                 summary["delivery"] = {
-                    str(tid): state.state for tid, state in states.items()
+                    dcodes.get(tid, "TEN-????"): state.state
+                    for tid, state in states.items()
                 }
                 session.commit()
         finally:

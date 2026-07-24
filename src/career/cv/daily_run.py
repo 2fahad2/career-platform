@@ -23,7 +23,7 @@ from decimal import Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from career.cv import close as close_mod
@@ -162,6 +162,38 @@ def _send_zero_day(
         logger.warning("zero-day note failed", exc_info=True)
 
 
+
+class MonthlyCapBudget:
+    """AUDIT ك-11: the plan's monthly_cv_safety_cap, finally read and
+    enforced. Counts this month's llm_generation usage events for the tenant;
+    at/over the cap, generation is blocked (the honest fallback CV path still
+    runs — delivery never silently dies)."""
+
+    def __init__(self, session: Session, *, tenant_id: uuid.UUID,
+                 cap: int, now: datetime) -> None:
+        self._session = session
+        self._tenant_id = tenant_id
+        self._cap = int(cap)
+        self._now = now
+
+    def allow(self) -> tuple[bool, str | None]:
+        from career.db.models import UsageEvent
+
+        month_start = self._now.replace(
+            day=1, hour=0, minute=0, second=0, microsecond=0
+        )
+        used = self._session.execute(
+            select(func.count()).select_from(UsageEvent).where(
+                UsageEvent.tenant_id == self._tenant_id,
+                UsageEvent.kind == "llm_generation",
+                UsageEvent.occurred_at >= month_start,
+            )
+        ).scalar_one()
+        if used >= self._cap:
+            return False, f"monthly_cv_safety_cap reached ({used}/{self._cap})"
+        return True, None
+
+
 def close_from_delivery(
     session: Session,
     *,
@@ -256,6 +288,21 @@ def _run_tenant(
         ).all()
     ]
 
+    # AUDIT ك-11: the plan's monthly safety cap, read from entitlements —
+    # no entitlement row ⇒ no cap (None), never an invented number.
+    from career.db.models import PlanEntitlement, Subscription
+
+    cap_row = session.execute(
+        select(PlanEntitlement.monthly_cv_safety_cap)
+        .join(Subscription, Subscription.plan_code == PlanEntitlement.plan_code)
+        .where(Subscription.tenant_id == tenant_id)
+        .order_by(Subscription.created_at.desc())
+    ).scalars().first()
+    monthly_budget = (
+        MonthlyCapBudget(session, tenant_id=tenant_id, cap=cap_row, now=now)
+        if cap_row is not None else None
+    )
+
     jobs: list[dict[str, Any]] = []
     for item in final:
         posting = session.get(JobPosting, uuid.UUID(str(item["posting_id"])))
@@ -289,6 +336,7 @@ def _run_tenant(
                 years_experience=profile.years_experience,
                 job_title=str(job["title"]), company=str(job["company"]),
                 jd_text=str(job["jd_text"]),
+                budget=monthly_budget,
                 forbidden_claims=forbidden,
             )
             # audit fix D: the LLM spend happened HERE — record it before
@@ -468,6 +516,14 @@ def expire_stale_held_deliveries(
             failed_groups=groups,
             suppressor=suppressor,
         )
+        try:
+            # AUDIT ك-15: expired days carried real usage (generation) that
+            # never reached cost_allocations — roll it up here too (§14).
+            close_mod.rollup_costs(
+                session, tenant_id=delivery.tenant_id, day=delivery.run_date
+            )
+        except Exception:  # noqa: BLE001 — accounting never blocks expiry
+            logger.warning("expiry cost rollup failed", exc_info=True)
     return len(stale)
 
 

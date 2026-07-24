@@ -30,9 +30,17 @@ _ARABIC_RE = re.compile(r"[؀-ۿݐ-ݿﭐ-﷿ﹰ-﻿]")
 
 
 def _arabic_leak_fields(cv: TailoredCV) -> list[str]:
+    """AUDIT ك-13: EVERY field the template renders is scanned — the bank
+    stores facts in their source language by design, so headline, education,
+    certifications and languages could all leak Arabic onto the English PDF
+    (only summary/experience/skills were checked before)."""
     leaks: list[str] = []
     if _ARABIC_RE.search(cv.tailored_summary):
         leaks.append("summary")
+    if _ARABIC_RE.search(cv.job_title or "") or _ARABIC_RE.search(
+        cv.master_cv.headline or ""
+    ):
+        leaks.append("headline")
     for exp in cv.selected_experience:
         blob = " ".join([exp.title, exp.company, *exp.achievements,
                          *exp.responsibilities])
@@ -41,6 +49,18 @@ def _arabic_leak_fields(cv: TailoredCV) -> list[str]:
             break
     if any(_ARABIC_RE.search(s) for s in cv.selected_skills):
         leaks.append("skills")
+    for edu in cv.master_cv.education:
+        if _ARABIC_RE.search(
+            " ".join([edu.degree, edu.field_of_study or "", edu.institution])
+        ):
+            leaks.append("education")
+            break
+    for cert in cv.master_cv.certifications:
+        if _ARABIC_RE.search(f"{cert.name} {cert.issuer}"):
+            leaks.append("certifications")
+            break
+    if any(_ARABIC_RE.search(lang) for lang in cv.master_cv.languages):
+        leaks.append("languages")
     return leaks
 
 

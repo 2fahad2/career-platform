@@ -9,8 +9,10 @@ then locks them down with Row-Level Security (§15.10). Isolation rests on:
   * The application connecting as career_app — a non-superuser role granted only
     CRUD — so RLS applies to it (the owner bypasses RLS and provisions tenants).
   * Policies keyed on the transaction-local GUC app.tenant_id (read AND write).
-  * documents additionally FORCEd, so RLS binds even if reached via the owner
-    (defence in depth); tenants is ENABLE-only so the owner can seed the registry.
+  * documents additionally FORCEd for catalog uniformity. NOTE (D16, audit
+    2026-07-24): the deployed owner role is a SUPERUSER and bypasses RLS
+    regardless of FORCE — real isolation rests on the restricted career_app
+    role; tenants is ENABLE-only so the owner can seed the registry.
 The career_app role itself is created by the Postgres init script
 (docker/initdb/10-app-role.sh) before migrations run.
 """
