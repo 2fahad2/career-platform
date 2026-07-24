@@ -18,6 +18,7 @@ All customer-facing copy is Saudi colloquial, approved by the operator
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime, timedelta
 from typing import Any
@@ -34,6 +35,8 @@ from career.onboarding.achievement_render import (
     render_achievement,
 )
 from career.onboarding.confirmation import BANK_STATUSES
+
+_logger = logging.getLogger("career.enrichment")
 
 THIN_ACHIEVEMENT_THRESHOLD = 2
 MAX_ENRICH_ROLES_PER_SESSION = 2
@@ -98,11 +101,22 @@ def _confirm_prompt(english: str, arabic_gloss: str) -> str:
 # ── detection ────────────────────────────────────────────────────────────────
 
 
-def _role_end_key(payload: dict[str, Any]) -> tuple[int, str]:
-    """Recency sort: current roles (no end date) first, then latest end."""
-    end = str(payload.get("end_date") or "").strip()
-    current = not end or end.lower() in ("present", "current", "الحالي", "حاليا")
-    return (0 if current else 1, "" if current else end)
+def _split_by_recency(facts: list[ProfileFact]) -> list[ProfileFact]:
+    """Current roles (no/placeholder end date) first, then ended roles by
+    LATEST end date first. AUDIT ك-5: the previous single-key ascending sort
+    picked the OLDEST-ended role before recent ones — and burned the
+    once-ever ledger on the wrong role."""
+    current: list[ProfileFact] = []
+    ended: list[ProfileFact] = []
+    for fact in facts:
+        end = str((fact.payload or {}).get("end_date") or "").strip()
+        if not end or end.lower() in ("present", "current", "الحالي", "حاليا"):
+            current.append(fact)
+        else:
+            ended.append(fact)
+    ended.sort(key=lambda f: str((f.payload or {}).get("end_date") or ""),
+               reverse=True)
+    return current + ended
 
 
 def thin_roles(session: Session, *, tenant_id: uuid.UUID) -> list[ProfileFact]:
@@ -133,7 +147,7 @@ def thin_roles(session: Session, *, tenant_id: uuid.UUID) -> list[ProfileFact]:
         inline = len((fact.payload or {}).get("achievements") or [])
         return inline + linked.get(str(fact.id), 0)
 
-    recent = sorted(exp, key=lambda f: _role_end_key(f.payload or {}))[:2]
+    recent = _split_by_recency(exp)[:2]
     return [f for f in recent if count(f) < THIN_ACHIEVEMENT_THRESHOLD]
 
 
@@ -219,6 +233,7 @@ def handle_answer(
     arabic_answer: str,
     renderer: AchievementRenderer,
     now: datetime,
+    known_name: str | None = None,
 ) -> dict[str, Any]:
     """Render + ground the colloquial answer. On success store a PENDING
     (EXTRACTED) achievement fact and return a confirm prompt; on failure
@@ -226,8 +241,10 @@ def handle_answer(
     # the answer is a customer-stated fact — strip PII before the model call.
     from career.onboarding.extraction import assert_no_pii, strip_pii
 
-    stripped = strip_pii(arabic_answer, known_name=None)
-    assert_no_pii(stripped.text, known_name=None)
+    # AUDIT ك-9: the customer's name must be stripped too (constant §15.8) —
+    # the caller passes it from the profile; None was a silent hole.
+    stripped = strip_pii(arabic_answer, known_name=known_name)
+    assert_no_pii(stripped.text, known_name=known_name)
 
     vocab = _bank_vocabulary(session, tenant_id=tenant_id)
     rendered = render_achievement(
@@ -428,36 +445,47 @@ def run_hourly_sweep(
             opt_out_at=channel.opt_out_at, now=now,
         ) is not WindowState.OPEN:
             continue
-        if not enqueue_enrichment(
-            session, tenant_id=journey.tenant_id, role_fact_id=role.id,
-            journey_context=context, trigger="post_activation_sweep", now=now,
-        ):
-            continue
-        examples = prepare_examples(
-            session, role_fact_id=role.id, writer=examples_writer
-        )
-        if examples:
-            context["enrichment"]["examples"] = examples
-        journey.context = context
-        mid = whatsapp_client.send_interactive(
-            channel.phone_e164,
-            opening_message(session, role_fact_id=role.id),
-            OPENING_BUTTONS,
-        )
-        record_out(session, tenant_id=journey.tenant_id,
-                   channel_id=channel.id, kind="interactive",
-                   wa_message_id=mid, now=now)
-        if examples:
-            from career.onboarding.achievement_render import (
-                format_examples_message,
-            )
+        # AUDIT ك-8: one journey's failure must not poison the others — a
+        # savepoint isolates this journey's rows, so a send exception rolls
+        # back ONLY its ASKED row (no duplicate nudge next hour for customers
+        # who already received theirs) and the sweep continues.
+        try:
+            with session.begin_nested():
+                if not enqueue_enrichment(
+                    session, tenant_id=journey.tenant_id, role_fact_id=role.id,
+                    journey_context=context,
+                    trigger="post_activation_sweep", now=now,
+                ):
+                    continue
+                examples = prepare_examples(
+                    session, role_fact_id=role.id, writer=examples_writer
+                )
+                if examples:
+                    context["enrichment"]["examples"] = examples
+                journey.context = context
+                mid = whatsapp_client.send_interactive(
+                    channel.phone_e164,
+                    opening_message(session, role_fact_id=role.id),
+                    OPENING_BUTTONS,
+                )
+                record_out(session, tenant_id=journey.tenant_id,
+                           channel_id=channel.id, kind="interactive",
+                           wa_message_id=mid, now=now)
+                if examples:
+                    from career.onboarding.achievement_render import (
+                        format_examples_message,
+                    )
 
-            mid2 = whatsapp_client.send_text(
-                channel.phone_e164, format_examples_message(examples)
-            )
-            record_out(session, tenant_id=journey.tenant_id,
-                       channel_id=channel.id, kind="text",
-                       wa_message_id=mid2, now=now)
+                    mid2 = whatsapp_client.send_text(
+                        channel.phone_e164, format_examples_message(examples)
+                    )
+                    record_out(session, tenant_id=journey.tenant_id,
+                               channel_id=channel.id, kind="text",
+                               wa_message_id=mid2, now=now)
+        except Exception:  # noqa: BLE001 — isolate, log, move on
+            _logger.warning("enrichment sweep failed for one journey",
+                            exc_info=True)
+            continue
         counts["swept"] += 1
     session.flush()
     return counts

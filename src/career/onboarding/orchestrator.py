@@ -308,6 +308,7 @@ def _handle_enrichment_text(
     result = enr.handle_answer(
         session, tenant_id=channel.tenant_id, role_fact_id=role_id,
         arabic_answer=body, renderer=deps.achievement_renderer, now=now,
+        known_name=name,
     )
     state = context.get("enrichment") or {}
     if result["status"] == "confirm":

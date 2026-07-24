@@ -31,6 +31,15 @@ def _require_db() -> bool:
 def owner_engine() -> Iterator[Engine]:
     """Engine for the owner role — bypasses RLS, used to seed/clean tenants."""
     settings = get_settings()
+    # AUDIT ك-4: the owner role is an RLS-bypassing superuser and fixtures
+    # INSERT/DELETE tenants — one wrong env var must NEVER point this at a
+    # live database. Hard guard, not convention: the DB name must end _test.
+    if not settings.db_name.endswith("_test"):
+        pytest.exit(
+            f"REFUSING to run: DB_NAME={settings.db_name!r} is not a *_test "
+            "database — tests run ONLY against the disposable career_test DB",
+            returncode=3,
+        )
     engine = create_engine(settings.owner_database_url, future=True)
     try:
         with engine.connect() as conn:

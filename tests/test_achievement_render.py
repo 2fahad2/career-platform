@@ -600,3 +600,69 @@ def test_sweep_respects_age_gate_and_closed_window(
     finally:
         _cleanup_conversation(owner_session, a)
         _cleanup_conversation(owner_session, b)
+
+
+# ── AUDIT ك-5: recency ordering regression ───────────────────────────────────
+
+
+def test_thin_roles_picks_most_recent_ended_roles(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """Three ended thin roles with distinct end dates → the TWO most recent
+    are candidates, the oldest is excluded (was inverted before the fix)."""
+    import json as _j
+
+    from career.onboarding import enrichment as enr
+
+    a, _ = two_tenants
+    tid = _uuid.UUID(a)
+    ids = {}
+    for title, end in (("Old", "2015-01"), ("Mid", "2020-06"), ("New", "2024-12")):
+        fid = _uuid.uuid4()
+        owner_session.execute(_sql(
+            "INSERT INTO profile_facts (id, tenant_id, category, payload,"
+            " status, source) VALUES (:id, :t, 'experience',"
+            " CAST(:p AS jsonb), 'CUSTOMER_CONFIRMED', 'test')"),
+            {"id": str(fid), "t": a,
+             "p": _j.dumps({"title": title, "employer": "X",
+                            "start_date": "2010-01", "end_date": end,
+                            "achievements": []})})
+        ids[title] = fid
+    owner_session.commit()
+    try:
+        thin = enr.thin_roles(owner_session, tenant_id=tid)
+        picked = [str((f.payload or {}).get("title")) for f in thin]
+        assert picked == ["New", "Mid"]          # most recent first, Old excluded
+    finally:
+        owner_session.execute(_sql(
+            "DELETE FROM profile_facts WHERE tenant_id = :t"), {"t": a})
+        owner_session.commit()
+
+
+def test_current_role_sorts_before_ended_roles(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    import json as _j
+
+    from career.onboarding import enrichment as enr
+
+    a, _ = two_tenants
+    tid = _uuid.UUID(a)
+    for title, end in (("Ended", "2024-12"), ("Current", "")):
+        owner_session.execute(_sql(
+            "INSERT INTO profile_facts (id, tenant_id, category, payload,"
+            " status, source) VALUES (:id, :t, 'experience',"
+            " CAST(:p AS jsonb), 'CUSTOMER_CONFIRMED', 'test')"),
+            {"id": str(_uuid.uuid4()), "t": a,
+             "p": _j.dumps({"title": title, "employer": "X",
+                            "start_date": "2020-01", "end_date": end,
+                            "achievements": []})})
+    owner_session.commit()
+    try:
+        thin = enr.thin_roles(owner_session, tenant_id=tid)
+        assert [str((f.payload or {}).get("title")) for f in thin] == \
+            ["Current", "Ended"]
+    finally:
+        owner_session.execute(_sql(
+            "DELETE FROM profile_facts WHERE tenant_id = :t"), {"t": a})
+        owner_session.commit()

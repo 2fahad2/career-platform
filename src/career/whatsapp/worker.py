@@ -270,22 +270,15 @@ def _handle_message(
             session.commit()
             return
 
-        # F-ENRICH (§13): an open enrichment session consumes this reply —
-        # button taps route by machine id, typed labels keep working.
-        if onboarding is not None and text_body and \
-                orchestrator.handle_enrichment(
-                    session, channel_id=channel.id,
-                    text=_button_id_of(msg) or text_body,
-                    deps=onboarding, now=now):
-            session.commit()
-            return
-
         from career.cv import deliver as cv_deliver
         from career.cv.daily_run import close_from_delivery
 
-        outcome = cv_deliver.parse_outcome_button(
-            _button_id_of(msg) or text_body
-        )
+        # AUDIT ك-6: branch priority is load-bearing. Outcome buttons and the
+        # held-bundle descend must BEAT the enrichment branch — otherwise an
+        # open enrichment session eats «قدمت» taps (outcome never recorded)
+        # and blocks a held delivery from landing for up to 72h.
+        effective = _button_id_of(msg) or text_body
+        outcome = cv_deliver.parse_outcome_button(effective)
         if outcome is not None:
             outcome_kind, job_ref = outcome
             cv_deliver.record_outcome(
@@ -296,13 +289,26 @@ def _handle_message(
                 channel.phone_e164,
                 "شكرًا! سجلنا ملاحظتك — تساعدنا نحسّن اختياراتنا لك. 🙏",
             )
-        else:
-            landed = descend_pending_delivery(
-                session, channel, whatsapp_client=whatsapp_client, now=now
-            )
-            if landed is not None:
-                # the held day closes when its bundle actually lands
-                close_from_delivery(session, delivery=landed, now=now)
+            session.commit()
+            return
+
+        landed = descend_pending_delivery(
+            session, channel, whatsapp_client=whatsapp_client, now=now
+        )
+        if landed is not None:
+            # the held day closes when its bundle actually lands; the same
+            # inbound may ALSO be an enrichment answer — fall through.
+            close_from_delivery(session, delivery=landed, now=now)
+
+        # F-ENRICH (§13): an open enrichment session consumes this reply —
+        # button taps route by machine id (also when the tap carries no
+        # title, minor audit fix), typed labels keep working.
+        if onboarding is not None and effective and \
+                orchestrator.handle_enrichment(
+                    session, channel_id=channel.id, text=effective,
+                    deps=onboarding, now=now):
+            session.commit()
+            return
     session.commit()
 
 
