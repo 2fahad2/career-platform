@@ -39,7 +39,6 @@ from career.onboarding.confirmation import BANK_STATUSES
 _logger = logging.getLogger("career.enrichment")
 
 THIN_ACHIEVEMENT_THRESHOLD = 2
-MAX_ENRICH_ROLES_PER_SESSION = 2
 ENRICH_SESSION_TTL = timedelta(hours=72)
 SWEEP_AFTER_DAYS = 3
 
@@ -183,8 +182,9 @@ def enqueue_enrichment(
         id=uuid.uuid4(), tenant_id=tenant_id, fact_id=role_fact_id,
         status="ASKED", trigger=trigger, asked_at=now,
     ))
+    # one role per session by design (anti-nag) — no queue scaffolding
     journey_context["enrichment"] = {
-        "open": True, "current": str(role_fact_id), "queue": [],
+        "open": True, "current": str(role_fact_id),
         "opened_at": now.isoformat(),
     }
     session.flush()
@@ -197,12 +197,8 @@ def opening_message(session: Session, *, role_fact_id: uuid.UUID) -> str:
     return _ask(title)
 
 
-def enrichment_buttons(has_more: bool) -> tuple[str, ...]:
-    base = (_SKIP_ROLE, _NOTHING)
-    return (*base, _STOP_ALL) if has_more else base
-
-
-SKIP_LABELS = frozenset({_SKIP_ROLE, _NOTHING, _STOP_ALL, BTN_SKIP, BTN_NONE})
+SKIP_LABELS = frozenset({_SKIP_ROLE, _NOTHING, _STOP_ALL, BTN_SKIP,
+                         BTN_NONE, "نعدّي", "نعدي", "نكمّل", "نكمل"})
 OK_LABELS = frozenset({_CONFIRM_OK, BTN_OK})
 EDIT_LABELS = frozenset({_CONFIRM_EDIT, BTN_EDIT})
 DEL_LABELS = frozenset({_CONFIRM_DEL, BTN_DEL})

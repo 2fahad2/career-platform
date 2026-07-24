@@ -223,11 +223,19 @@ class HttpWhatsAppClient:
         if self._storage is None:
             raise WhatsAppSendError("no storage wired for document refs")
         data = self._storage.get(document_ref)
+        # audit minor: every upload was pinned application/pdf — the privacy
+        # export (بياناتي.json) arrived mislabeled and often unopenable.
+        mime = {
+            ".json": "application/json",
+            ".pdf": "application/pdf",
+            ".docx": ("application/vnd.openxmlformats-officedocument"
+                      ".wordprocessingml.document"),
+        }.get("." + filename.rsplit(".", 1)[-1].lower(), "application/pdf")
         status, body = self._transport.post(
             f"{self._base_url}/{self._phone_number_id}/media",
             headers=self._headers(),
             data={"messaging_product": "whatsapp"},
-            files={"file": (filename, data, "application/pdf")},
+            files={"file": (filename, data, mime)},
         )
         if status != 200:
             code = (body.get("error") or {}).get("code", "?")

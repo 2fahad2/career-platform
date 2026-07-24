@@ -34,6 +34,9 @@ def run_migrations_offline() -> None:
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
         compare_type=True,
+        # audit minor REJECTED after trial: compare_server_default=True
+        # surfaces 38 cosmetic python-default vs server-default diffs and
+        # would fail CI permanently — documented in AUDIT-2026-07-23.md.
     )
     with context.begin_transaction():
         context.run_migrations()

@@ -16,6 +16,7 @@ from typing import Any
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     ForeignKey,
@@ -1092,6 +1093,8 @@ class AdminBotState(Base):
     owner-written, no tenant data (no RLS, like webhook_events)."""
 
     __tablename__ = "admin_bot_state"
+    # audit minor: mirror the 0014 single-row CHECK so model and schema agree
+    __table_args__ = (CheckConstraint("id = 1", name="ck_admin_bot_state_singleton"),)
 
     id: Mapped[int] = mapped_column(SmallInteger, primary_key=True, default=1)
     update_offset: Mapped[int] = mapped_column(
