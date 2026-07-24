@@ -19,6 +19,16 @@ SQLAlchemy + Alembic · Docker Compose · pytest · Anthropic API only for LLM.
 
 ---
 
+## Current status 📊
+
+| | |
+|---|---|
+| 🧪 Test suite | **716 passing** (fresh-run gated commits, disposable `career_test` DB only — enforced by a hard guard) |
+| 🗄️ Schema | migration `0018`, live-verified drift-free (host **and** deployed container) |
+| 🔍 Last full audit | 2026-07-23, 42-agent adversarial sweep — all 5 critical + 20/23 major findings **fixed** (see `docs/AUDIT-2026-07-23.md`) |
+| 🚀 Live | worker loop, admin watchtower bot, nightly engine timer (04:30 Riyadh) — real customer journey completed end-to-end incl. first real CV delivery |
+| 🏗️ Phases | C1–C8 complete · C9 (production env + launch waves) gated on the Salla store go-live |
+
 ## System overview
 
 ```text
@@ -86,7 +96,7 @@ bank-vocabulary whitelist, invented-content, forbidden claims, Arabic-leak →
 **atomic publish** (PDF + sha-bound sidecar) → `validate_cv_binding` is the
 sole send authority → grouped WhatsApp delivery (card → document → outcome
 buttons per job) → suppression ledger for delivered only → **exactly one of
-seven honest day states** per tenant. Identity is injected locally at
+eight honest day states** per tenant (incl. `SKIPPED_OPTED_OUT`). Identity is injected locally at
 assembly — **no LLM call ever sees PII**.
 
 **5 · Acquisition funnel (C8).**
@@ -94,6 +104,15 @@ assembly — **no LLM call ever sees PII**.
 deterministic scoring via the same path-scoring engine → one-page Arabic RTL
 PDF report + WhatsApp summary → an upgrade purchase from the same phone
 **inherits** the funnel tenant (half-ready onboarding, nothing deleted).
+
+**6 · Thin-role enrichment (F-ENRICH) 🪄.**
+When a delivered day tailors a CV for a role with <2 confirmed achievements,
+ONE friendly Saudi-colloquial nudge is armed (once-ever ledger, open-window
+only, never blocks delivery) → the customer answers in dialect (or picks a
+digit from a scrubbed examples menu) → Claude renders ONE English bullet →
+a **deterministic cross-lingual grounding guard** rejects any number/entity
+absent from the raw Arabic → the customer confirms (English + Arabic gloss)
+→ only then does the bullet join the bank as `CUSTOMER_CONFIRMED`.
 
 ---
 
@@ -264,6 +283,10 @@ PDF report + WhatsApp summary → an upgrade purchase from the same phone
 | `0012` | Funnel sessions. |
 | `0013` | The `cv_analysis` plan row. |
 | `0014` | Admin-bot cursor. |
+| `0015` | Funnel-session DELETE grant (privacy erasure). |
+| `0016` | `subscriptions.order_phone_e164` — zero-touch activation. |
+| `0017` | 🆕 `role_enrichments` — the F-ENRICH once-ever ledger. |
+| `0018` | `outbox_events` FORCE RLS (caught by the RLS meta-test). |
 
 ### `scripts/` — live runners
 
@@ -360,7 +383,9 @@ WHATSAPP_APP_SECRET=wa_app_secret_123 WHATSAPP_VERIFY_TOKEN=wa_verify_123 \
 CI_REQUIRE_DB=1 python -m pytest tests/ -q
 ```
 
-**646 tests**, zero skips with a full environment: adversarial RLS, webhook
+**716 tests**, zero skips with a full environment: adversarial RLS (plus a
+catalog **meta-test** enforcing ENABLE+FORCE+policy on every tenant table),
+webhook
 idempotency, upload attack files, CV binding/quarantine, the seven-state
 failure matrix, delivery failure isolation, golden Arabic renderers,
 byte-verbatim template/prompt guards, full journey E2Es from raw Meta
