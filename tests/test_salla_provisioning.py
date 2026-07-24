@@ -182,3 +182,37 @@ def test_cataloged_product_with_no_pricing_fails_closed(
         product_catalog=CATALOG, expected_pricing={},
     )
     assert result.status is ProvisionStatus.AMOUNT_MISMATCH
+
+
+def test_bank_transfer_confirmation_event_provisions(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """AUDIT ك-18: order.status.updated (merchant confirms the transfer)
+    must provision — it was ignored forever."""
+    order_id = f"ORD-{uuid.uuid4()}"
+    client = FakeSallaClient({order_id: _order(order_id)})
+    _post_webhook(order_id, "order.status.updated")
+    results = process_pending_webhooks(
+        owner_session, salla_client=client, product_catalog=CATALOG,
+        expected_pricing=PRICING)
+    assert results and results[0].status is ProvisionStatus.PROVISIONED
+
+
+def test_tenant_code_survives_deletion_gap(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """AUDIT ك-19: with tenants {2,7} present, the next code is TEN-0008 —
+    never a reissued TEN-0003 (row-count scheme) that explodes the unique
+    constraint."""
+    from career.db.models import Tenant as _T
+    for n in (2, 7):
+        owner_session.add(_T(id=uuid.uuid4(), code=f"TEN-{n:04d}"))
+    owner_session.commit()
+    try:
+        from career.salla.provisioning import _next_tenant_code
+        assert _next_tenant_code(owner_session) == "TEN-0008"
+    finally:
+        from sqlalchemy import text as _t
+        owner_session.execute(_t(
+            "DELETE FROM tenants WHERE code IN ('TEN-0002', 'TEN-0007')"))
+        owner_session.commit()

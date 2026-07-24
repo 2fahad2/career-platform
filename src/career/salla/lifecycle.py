@@ -23,7 +23,11 @@ from sqlalchemy.orm import Session
 
 from career.db.models import CustomerChannel, Subscription, SubscriptionEvent
 from career.salla import subscriptions as sub_states
-from career.whatsapp.templates import RECOVERY, RENEWAL_REMINDER
+from career.whatsapp.templates import (
+    RECOVERY,
+    RENEWAL_REMINDER,
+    WELCOME_ACTIVATION,
+)
 
 logger = logging.getLogger("career.salla")
 
@@ -85,7 +89,42 @@ def sweep_subscription_lifecycle(
 ) -> dict[str, int]:
     """One idempotent pass over every timed subscription. Returns honest
     counters for the admin summary."""
-    counts = {"reminded": 0, "graced": 0, "expired": 0, "recovered": 0}
+    counts = {"reminded": 0, "graced": 0, "expired": 0, "recovered": 0,
+              "unclaimed_reminded": 0, "unclaimed_expired": 0}
+
+    # AUDIT ك-20: the §05 claim deadline was approved policy with a checker
+    # nobody called — a buyer who never activates kept a clockless
+    # PAID_UNCLAIMED subscription forever, with no reminder. Now: one nudge
+    # at day 5, honest expiry at day 7 (claim_deadline_passed authority).
+    from career.onboarding.policy import (
+        DEFAULT_CLAIM_DEADLINE_DAYS,
+        claim_deadline_passed,
+    )
+
+    unclaimed = session.execute(
+        select(Subscription).where(
+            Subscription.status == sub_states.PAID_UNCLAIMED
+        )
+    ).scalars().all()
+    for sub in unclaimed:
+        paid_at = sub.created_at
+        if paid_at is None:
+            continue
+        if claim_deadline_passed(paid_at, now=now):
+            sub_states.transition(
+                session, sub, sub_states.EXPIRED,
+                event_type="claim_deadline_elapsed",
+                salla_order_id=sub.salla_order_id,
+            )
+            counts["unclaimed_expired"] += 1
+        elif (
+            now > paid_at + timedelta(days=DEFAULT_CLAIM_DEADLINE_DAYS - 2)
+            and not _event_exists(session, sub.id, "claim_reminder")
+        ):
+            phone = sub.order_phone_e164 or _channel_phone(session, sub.tenant_id)
+            if _send_template(whatsapp_client, phone, WELCOME_ACTIVATION):
+                _mark(session, sub, "claim_reminder")
+                counts["unclaimed_reminded"] += 1
 
     subs = session.execute(
         select(Subscription).where(

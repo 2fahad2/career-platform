@@ -118,7 +118,8 @@ def test_cv_analysis_one_shot_is_untouched(
     owner_session.commit()
     counts = sweep_subscription_lifecycle(owner_session, now=NOW)
     owner_session.commit()
-    assert counts == {"reminded": 0, "graced": 0, "expired": 0, "recovered": 0}
+    assert counts == {"reminded": 0, "graced": 0, "expired": 0, "recovered": 0,
+                      "unclaimed_reminded": 0, "unclaimed_expired": 0}
 
 
 def test_amount_or_currency_mismatch_never_provisions(
@@ -153,3 +154,60 @@ def test_amount_or_currency_mismatch_never_provisions(
         expected_pricing={"prod_pro": (Decimal("279.00"), "SAR")},
     )
     assert ok.status == "provisioned"
+
+
+def test_unclaimed_subscription_expires_after_claim_deadline(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """AUDIT ك-20: PAID_UNCLAIMED older than 7 days expires honestly."""
+    order_id = f"ORD-{uuid.uuid4()}"
+    client = FakeSallaClient({
+        order_id: SallaOrder(order_id, "paid", "prod_pro",
+                             Decimal("279.00"), "SAR")
+    })
+    result = provision_order(owner_session, order_id, salla_client=client,
+                             product_catalog={"prod_pro": "professional"},
+                             expected_pricing=_PR)
+    owner_session.commit()
+    # age the subscription 8 days back
+    owner_session.execute(sql_text(
+        "UPDATE subscriptions SET created_at = now() - interval '8 days'"
+        " WHERE id = :i"), {"i": result.subscription_id})
+    owner_session.commit()
+    counts = sweep_subscription_lifecycle(
+        owner_session, now=datetime.now(UTC), whatsapp_client=None)
+    owner_session.commit()
+    assert counts["unclaimed_expired"] == 1
+    status = owner_session.execute(sql_text(
+        "SELECT status FROM subscriptions WHERE id = :i"),
+        {"i": result.subscription_id}).scalar_one()
+    assert status == "EXPIRED"
+
+
+def test_unclaimed_gets_one_reminder_before_deadline(
+    owner_session: Session, clean_billing: None
+) -> None:
+    order_id = f"ORD-{uuid.uuid4()}"
+    client = FakeSallaClient({
+        order_id: SallaOrder(order_id, "paid", "prod_pro",
+                             Decimal("279.00"), "SAR",
+                             customer_phone="0555000111")
+    })
+    result = provision_order(owner_session, order_id, salla_client=client,
+                             product_catalog={"prod_pro": "professional"},
+                             expected_pricing=_PR)
+    owner_session.commit()
+    owner_session.execute(sql_text(
+        "UPDATE subscriptions SET created_at = now() - interval '6 days'"
+        " WHERE id = :i"), {"i": result.subscription_id})
+    owner_session.commit()
+    wa = FakeWhatsAppClient()
+    counts = sweep_subscription_lifecycle(
+        owner_session, now=datetime.now(UTC), whatsapp_client=wa)
+    owner_session.commit()
+    assert counts["unclaimed_reminded"] == 1
+    assert any(m.kind == "template" for m in wa.sent)
+    # idempotent — second sweep sends nothing
+    counts2 = sweep_subscription_lifecycle(
+        owner_session, now=datetime.now(UTC), whatsapp_client=wa)
+    assert counts2["unclaimed_reminded"] == 0

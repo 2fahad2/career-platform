@@ -60,9 +60,17 @@ class ProvisionResult:
 
 
 def _next_tenant_code(session: Session) -> str:
-    # TEN-0001 is reserved for the operator (canary); real customers start above.
-    count = session.execute(select(func.count()).select_from(Tenant)).scalar_one()
-    return f"TEN-{count + 1:04d}"
+    """AUDIT ك-19: max existing suffix + 1 — the old row-count scheme reissued
+    a taken code after ANY tenant deletion, exploding the unique constraint
+    and re-poisoning the queue every 3s. TEN-0001 stays reserved for the
+    operator: real codes never go below TEN-0002."""
+    codes = session.execute(select(Tenant.code)).scalars().all()
+    top = 0
+    for code in codes:
+        tail = code.rsplit("-", 1)[-1]
+        if tail.isdigit():
+            top = max(top, int(tail))
+    return f"TEN-{max(top, 1) + 1:04d}"
 
 
 def _mark_webhook(session: Session, webhook_event: WebhookEvent | None, status: str) -> None:
@@ -190,7 +198,13 @@ def provision_order(
     )
 
 
-_PROVISION_EVENTS = frozenset({"order.payment.updated", "order.created"})
+# AUDIT ك-18: order.status.updated carries the merchant's bank-transfer
+# confirmation — provisioning re-verifies status=="paid" via the Salla
+# API, so routing it here is safe and idempotent (was: ignored forever,
+# so a bank-transfer buyer never provisioned).
+_PROVISION_EVENTS = frozenset(
+    {"order.payment.updated", "order.created", "order.status.updated"}
+)
 _LIFECYCLE_EVENTS = frozenset(sub_states._ORDER_EVENT_TO_STATE)
 
 
@@ -222,11 +236,27 @@ def process_pending_webhooks(
     results: list[ProvisionResult] = []
     for ev in events:
         if ev.event_type in _PROVISION_EVENTS:
-            result = provision_order(
-                owner_session, ev.salla_order_id,
-                salla_client=salla_client, product_catalog=product_catalog,
-                webhook_event=ev, expected_pricing=expected_pricing,
-            )
+            try:
+                result = provision_order(
+                    owner_session, ev.salla_order_id,
+                    salla_client=salla_client, product_catalog=product_catalog,
+                    webhook_event=ev, expected_pricing=expected_pricing,
+                )
+            except Exception:  # noqa: BLE001 — AUDIT ك-19: a poisoned event
+                # must not jam the whole queue in a 3-second retry loop
+                logger.error("provisioning crashed for one event",
+                             exc_info=True)
+                owner_session.rollback()
+                _mark_webhook(owner_session, ev, "failed")
+                owner_session.commit()
+                if admin_client is not None:
+                    try:
+                        admin_client.send_admin(
+                            "🔴 حدث سلة مسموم عُزل (failed) — راجع السجل"
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.warning("poison alert failed", exc_info=True)
+                continue
             if (result.status == ProvisionStatus.AMOUNT_MISMATCH
                     and admin_client is not None):
                 try:

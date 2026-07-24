@@ -442,3 +442,32 @@ def test_rejected_file_returns_honestly(
             sql_text("DELETE FROM tenants WHERE id = :t"), {"t": str(tenant_id)}
         )
         owner_session.commit()
+
+
+def test_privacy_commands_work_for_funnel_customers(
+    owner_session: Session, clean_billing: None, tmp_path
+) -> None:
+    """AUDIT ك-7: «حالة اشتراكي» (and every standing command) must be handled
+    for a funnel customer BEFORE reaching the funnel branch — previously the
+    command was consumed as a career-path answer or refused for lack of an
+    onboarding journey."""
+    from career.whatsapp.worker import _handle_message
+
+    token = _provision_funnel(owner_session)
+    phone = f"+96650{uuid.uuid4().int % 10_000_000:07d}"
+    deps = _deps(tmp_path)
+    admin = FakeTelegramAdminClient()
+    # activate → the funnel conversation opens
+    _handle_message(owner_session, _msg_text(phone, f"تفعيل {token}"),
+                    whatsapp_client=deps.whatsapp_client, admin_client=admin,
+                    now=NOW, onboarding=deps)
+    owner_session.commit()
+    before = len(deps.whatsapp_client.sent)
+    # mid-funnel privacy command must NOT be consumed as a funnel answer
+    _handle_message(owner_session, _msg_text(phone, "حالة اشتراكي"),
+                    whatsapp_client=deps.whatsapp_client, admin_client=admin,
+                    now=NOW, onboarding=deps)
+    owner_session.commit()
+    sent = deps.whatsapp_client.sent
+    assert len(sent) > before
+    assert "اشتراك" in (sent[-1].body or "")

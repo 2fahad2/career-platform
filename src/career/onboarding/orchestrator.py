@@ -199,14 +199,10 @@ def handle_standing_command(
     channel = session.get(CustomerChannel, channel_id)
     if channel is None:
         return False
-    journey = session.execute(
-        select(OnboardingSession).where(
-            OnboardingSession.tenant_id == channel.tenant_id
-        )
-    ).scalar_one_or_none()
-    if journey is None:
-        return False
-    _handle_privacy_command(session, journey, channel, deps, command, now=now)
+    # AUDIT ك-7: no journey required — funnel customers (cv_analysis) have
+    # no OnboardingSession, yet the §05/§12 lifetime commands are theirs too.
+    _handle_privacy_command(session, channel.tenant_id, channel, deps,
+                            command, now=now)
     session.flush()
     return True
 
@@ -544,7 +540,8 @@ def handle_text(
     # Standing commands work at every state (§05/§12).
     command = _PRIVACY_COMMANDS.get(body)
     if command is not None:
-        _handle_privacy_command(session, journey, channel, deps, command, now=now)
+        _handle_privacy_command(session, journey.tenant_id, channel, deps,
+                                command, now=now)
         session.flush()
         return
 
@@ -906,10 +903,9 @@ def _handle_policy_choice(
 
 
 def _handle_privacy_command(
-    session: Session, journey: OnboardingSession, channel: CustomerChannel,
+    session: Session, tenant_id: uuid.UUID, channel: CustomerChannel,
     deps: Deps, command: str, *, now: datetime,
 ) -> None:
-    tenant_id = journey.tenant_id
     if command == "status":
         _send(
             session, deps, channel,

@@ -228,6 +228,18 @@ def _handle_message(
         return
     from career.funnel import flow as funnel_flow
 
+    # AUDIT ك-7: standing privacy commands work for EVERY paying customer at
+    # EVERY stage — funnel customers included (PDPL + the welcome message's
+    # own promise). Before this, «حذف بياناتي» during the funnel was consumed
+    # as a career-path answer, and after it there was no journey so the
+    # handler refused — the commands were dead for the funnel lifecycle.
+    if onboarding is not None and text_body and \
+            orchestrator.handle_standing_command(
+                session, channel_id=channel.id, text=text_body,
+                deps=onboarding, now=now):
+        session.commit()
+        return
+
     funnel = (
         funnel_flow.incomplete_funnel(session, channel.tenant_id)
         if onboarding else None
