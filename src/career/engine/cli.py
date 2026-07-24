@@ -27,7 +27,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 from career.config import get_settings
-from career.db.models import Tenant
+from career.db.models import DiscoveryRun, Tenant
 from career.engine.enrichment import UrllibPageFetcher
 from career.engine.run import RunReport, run_nightly
 from career.engine.sources import HttpSearchApiClient, PythonJobSpyClient
@@ -44,9 +44,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--digest-only",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="record the run as digest-only (D9). DEFAULT until C7 delivery "
-             "exists; --no-digest-only is the explicit off form.",
+        default=None,
+        help="record the run as digest-only (D9: no send, no ledgers). "
+             "AUDIT ح-3: the default now FOLLOWS --deliver (delivering run "
+             "⇒ not digest-only) so the record can never contradict what "
+             "actually happened; pass the flag explicitly to override.",
     )
     # None ⇒ fall back to Settings (§06: caps live in configuration)
     parser.add_argument("--max-per-query", type=int, default=None)
@@ -133,7 +135,9 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
                 fetcher=UrllibPageFetcher(),
                 now=datetime.now(UTC),
                 tenant_ids=args.tenant,
-                digest_only=args.digest_only,
+                # ح-3: honest default — the record mirrors the actual intent
+                digest_only=(args.digest_only if args.digest_only is not None
+                             else not args.deliver),
                 max_per_query=args.max_per_query or settings.engine_max_per_query,
                 retrieval_cap=args.retrieval_cap or settings.engine_retrieval_cap,
                 enrich_cap=args.enrich_cap or settings.engine_enrich_cap,
@@ -196,7 +200,22 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
         logger.warning("searchapi credit check failed", exc_info=True)
 
     # ── the delivery phase (C7): engine result → CV → WhatsApp → close ──
-    if args.deliver and settings.whatsapp_access_token and report.per_tenant:
+    delivery_phase_ran = bool(
+        args.deliver and settings.whatsapp_access_token and report.per_tenant
+    )
+    if args.digest_only is None and not delivery_phase_ran:
+        # ح-3: intended to deliver but the phase never ran (no creds / no
+        # tenants) — flip the record so it never claims sends that didn't
+        # happen NOR a digest that actually delivered.
+        try:
+            with Session(engine) as session:
+                run_row = session.get(DiscoveryRun, report.run_id)
+                if run_row is not None:
+                    run_row.digest_only = True
+                    session.commit()
+        except Exception:  # noqa: BLE001 — honesty patch must not kill the run
+            logger.warning("digest-only backfill failed", exc_info=True)
+    if delivery_phase_ran:
         from career.cv.daily_run import DailyDeps, run_daily_delivery
         from career.cv.generate import AnthropicLlmClient
         from career.onboarding.achievement_render import AnthropicExamplesWriter

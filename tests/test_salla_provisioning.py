@@ -28,6 +28,9 @@ from career.salla.webhook import receive_webhook
 
 SECRET = "test_secret_123"
 CATALOG = {"prod_pro": "professional", "prod_riyal": "basic"}
+# AUDIT ح-4: the gate fails closed for cataloged products without pricing
+PRICING = {"prod_pro": (Decimal("279.00"), "SAR"),
+           "prod_riyal": (Decimal("1.00"), "SAR")}
 
 
 def _order(order_id: str, *, status: str = "paid", product: str = "prod_pro",
@@ -49,9 +52,8 @@ def test_paid_order_provisions_one_subscription(
 ) -> None:
     order_id = f"ORD-{uuid.uuid4()}"
     client = FakeSallaClient({order_id: _order(order_id)})
-    result = provision_order(
-        owner_session, order_id, salla_client=client, product_catalog=CATALOG,
-    )
+    result = provision_order(owner_session, order_id, salla_client=client, product_catalog=CATALOG,
+    expected_pricing=PRICING)
     assert result.status is ProvisionStatus.PROVISIONED
     assert result.activation_token  # raw token returned once
     assert _sub_count(owner_engine, order_id) == 1
@@ -78,8 +80,10 @@ def test_duplicate_provision_is_idempotent(
 ) -> None:
     order_id = f"ORD-{uuid.uuid4()}"
     client = FakeSallaClient({order_id: _order(order_id)})
-    first = provision_order(owner_session, order_id, salla_client=client, product_catalog=CATALOG)
-    second = provision_order(owner_session, order_id, salla_client=client, product_catalog=CATALOG)
+    first = provision_order(owner_session, order_id, salla_client=client, product_catalog=CATALOG,
+    expected_pricing=PRICING)
+    second = provision_order(owner_session, order_id, salla_client=client, product_catalog=CATALOG,
+    expected_pricing=PRICING)
     assert first.status is ProvisionStatus.PROVISIONED
     assert second.status is ProvisionStatus.ALREADY_PROVISIONED
     assert second.subscription_id == first.subscription_id
@@ -91,7 +95,8 @@ def test_unpaid_order_not_provisioned(
 ) -> None:
     order_id = f"ORD-{uuid.uuid4()}"
     client = FakeSallaClient({order_id: _order(order_id, status="pending")})
-    result = provision_order(owner_session, order_id, salla_client=client, product_catalog=CATALOG)
+    result = provision_order(owner_session, order_id, salla_client=client, product_catalog=CATALOG,
+    expected_pricing=PRICING)
     assert result.status is ProvisionStatus.NOT_PAID
     assert _sub_count(owner_engine, order_id) == 0
 
@@ -101,7 +106,8 @@ def test_unknown_product_ignored(
 ) -> None:
     order_id = f"ORD-{uuid.uuid4()}"
     client = FakeSallaClient({order_id: _order(order_id, product="prod_unknown")})
-    result = provision_order(owner_session, order_id, salla_client=client, product_catalog=CATALOG)
+    result = provision_order(owner_session, order_id, salla_client=client, product_catalog=CATALOG,
+    expected_pricing=PRICING)
     assert result.status is ProvisionStatus.UNKNOWN_PRODUCT
     assert _sub_count(owner_engine, order_id) == 0
 
@@ -137,7 +143,7 @@ def test_end_to_end_duplicate_webhook_one_subscription(
     _post_webhook(order_id, "order.payment.updated")
     _post_webhook(order_id, "order.payment.updated")
     results = process_pending_webhooks(
-        owner_session, salla_client=client, product_catalog=CATALOG,
+        owner_session, salla_client=client, product_catalog=CATALOG, expected_pricing=PRICING,
     )
     provisioned = [r for r in results if r.status is ProvisionStatus.PROVISIONED]
     assert len(provisioned) == 1
@@ -149,10 +155,12 @@ def test_refund_suspends_immediately(
 ) -> None:
     order_id = f"ORD-{uuid.uuid4()}"
     client = FakeSallaClient({order_id: _order(order_id)})
-    provision_order(owner_session, order_id, salla_client=client, product_catalog=CATALOG)
+    provision_order(owner_session, order_id, salla_client=client, product_catalog=CATALOG,
+    expected_pricing=PRICING)
 
     _post_webhook(order_id, "order.refunded")
-    process_pending_webhooks(owner_session, salla_client=client, product_catalog=CATALOG)
+    process_pending_webhooks(owner_session, salla_client=client, product_catalog=CATALOG,
+    expected_pricing=PRICING)
 
     with Session(owner_engine) as s:
         status = s.execute(
@@ -160,3 +168,17 @@ def test_refund_suspends_immediately(
             {"o": order_id},
         ).scalar_one()
     assert status == st.REFUNDED  # service off immediately
+
+
+def test_cataloged_product_with_no_pricing_fails_closed(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """AUDIT ح-4: a paid order for a cataloged product with NO pricing entry
+    must NOT provision — it fails to manual review (was: check skipped)."""
+    order_id = f"ORD-{uuid.uuid4()}"
+    client = FakeSallaClient({order_id: _order(order_id)})
+    result = provision_order(
+        owner_session, order_id, salla_client=client,
+        product_catalog=CATALOG, expected_pricing={},
+    )
+    assert result.status is ProvisionStatus.AMOUNT_MISMATCH

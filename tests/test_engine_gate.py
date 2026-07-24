@@ -272,3 +272,48 @@ def test_decisions_persist_per_tenant_run_job(owner_engine: Engine) -> None:
             s.execute(sql_text("DELETE FROM discovery_runs WHERE id = :id"), {"id": run_id})
             s.execute(sql_text("DELETE FROM job_postings WHERE id = :id"), {"id": posting_id})
             s.commit()
+
+
+# ── AUDIT ح-2: software_engineering family must pass the gate ────────────────
+
+
+def test_software_engineering_tenant_is_not_hard_rejected() -> None:
+    """A tenant whose approved path IS software_engineering must score dev
+    titles normally — the legacy dev/support hard-reject blocked the family
+    structurally (live-proven: tier-1 company + 30k salary → 0)."""
+    from career.engine.gate import (
+        _paths_key,
+        _tenant_reject_tokens,
+        build_role_map,
+    )
+    from career_core.gate import compute_role_match_score
+
+    paths = {"primary": "software_engineering", "secondary": None}
+    rejects = _tenant_reject_tokens(_paths_key(paths))
+    assert "software engineer" not in rejects
+    assert "software developer" not in rejects
+    score = compute_role_match_score(
+        "Senior Software Engineer",
+        "Design and build Python microservices",
+        role_map=build_role_map(paths),
+        reject_tokens=rejects,
+    )
+    assert score > 0
+
+
+def test_non_dev_tenant_still_rejects_dev_titles() -> None:
+    from career.engine.gate import _paths_key, _tenant_reject_tokens
+    from career_core.gate import compute_role_match_score
+
+    paths = {"primary": "service_delivery", "secondary": None}
+    rejects = _tenant_reject_tokens(_paths_key(paths))
+    assert "software engineer" in rejects
+    assert compute_role_match_score(
+        "Java Developer", None, reject_tokens=rejects
+    ) == 0
+
+
+def test_legacy_default_reject_behavior_unchanged() -> None:
+    from career_core.gate import compute_role_match_score
+
+    assert compute_role_match_score("Backend Developer", None) == 0

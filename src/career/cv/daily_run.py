@@ -524,6 +524,28 @@ def run_daily_delivery(
             )
         except Exception:  # noqa: BLE001 — tenant isolation is the contract
             logger.error("tenant delivery crashed", exc_info=True)
+            # AUDIT ح-1/ك-10: roll back ONLY this tenant's uncommitted work
+            # (earlier tenants are already committed), then close the day
+            # honestly — a crashed pipeline is CV_GENERATION_FAILED, never a
+            # silent no-state day (§15.12).
+            session.rollback()
+            try:
+                counts_in = payload.get("counts") or {}
+                passes = int(counts_in.get("passed",
+                                           len(payload.get("final") or [])))
+                fallback = close_mod.close_tenant_day(
+                    session, tenant_id=tenant_id,
+                    run_date=now.astimezone(_RIYADH).date(), now=now,
+                    discovery_ok=True, gate_passes=passes,
+                    cv_resolved=0, cv_failed=max(passes, 1),
+                    delivered_groups=[], failed_groups=[],
+                    suppressor=suppressor,
+                )
+                states[tenant_id] = fallback
+                session.commit()
+            except Exception:  # noqa: BLE001 — fallback must not cascade
+                logger.error("fallback day close failed", exc_info=True)
+                session.rollback()
             continue
         if state is not None:
             states[tenant_id] = state
@@ -534,6 +556,11 @@ def run_daily_delivery(
                 )
             except Exception:  # noqa: BLE001 — accounting never breaks the day
                 logger.warning("cost rollup failed", exc_info=True)
+        # ح-1: DURABILITY POINT — WhatsApp messages for this tenant are
+        # already on the wire; their delivery rows, ledger and day state
+        # must survive any later crash (and the canary hour-long sleep no
+        # longer holds an open transaction). §15.3/§15.12.
+        session.commit()
 
     rows: list[tuple[str, str, dict[str, int]]] = []
     for tenant_id, state in states.items():

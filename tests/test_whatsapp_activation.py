@@ -27,7 +27,8 @@ def _provision(owner_session: Session, order_id: str) -> str:
         order_id: SallaOrder(order_id, "paid", "prod_pro", Decimal("279.00"), "SAR")
     })
     result = provision_order(owner_session, order_id, salla_client=client,
-                             product_catalog=CATALOG)
+                             product_catalog=CATALOG,
+                             expected_pricing={k: (Decimal("279.00"), "SAR") for k in CATALOG})
     assert result.activation_token is not None
     return result.activation_token
 

@@ -51,6 +51,7 @@ def test_paid_order_sends_welcome_and_any_reply_claims_it(
     results = process_pending_webhooks(
         owner_session, salla_client=salla,
         product_catalog={"prod_pro": "professional"},
+        expected_pricing={"prod_pro": (Decimal("279.00"), "SAR")},
         admin_client=FakeTelegramAdminClient(),
         whatsapp_number_e164="+15551594303", whatsapp_client=wa,
     )

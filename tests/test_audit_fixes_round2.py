@@ -19,6 +19,8 @@ from career.whatsapp.activation_flow import activate
 from career.whatsapp.client import FakeWhatsAppClient
 from career.whatsapp.worker import process_pending_whatsapp
 
+_PR = {"prod_pro": (Decimal("279.00"), "SAR"), "prod_basic": (Decimal("149"), "SAR")}
+
 NOW = datetime(2026, 7, 15, 9, 0, tzinfo=UTC)
 
 
@@ -29,7 +31,8 @@ def _tenant_with_channel(owner_session: Session):
                              Decimal("279.00"), "SAR")
     })
     token = provision_order(owner_session, order_id, salla_client=client,
-                            product_catalog={"prod_pro": "professional"}
+                            product_catalog={"prod_pro": "professional"},
+                            expected_pricing=_PR
                             ).activation_token
     phone = f"+96650{uuid.uuid4().int % 10_000_000:07d}"
     activate(owner_session, token=token, from_phone=phone, display_name=None,

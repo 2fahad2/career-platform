@@ -91,6 +91,7 @@ def _seed_active_tenant(owner: Session) -> tuple[uuid.UUID, CustomerChannel]:
     result = provision_order(
         owner, order_id, salla_client=client,
         product_catalog={"prod_basic": "basic"},
+        expected_pricing={k: (Decimal("149"), "SAR") for k in {"prod_basic": "basic"}},
     )
     assert result.activation_token is not None
     phone = f"+96650{uuid.uuid4().int % 10_000_000:07d}"
@@ -681,3 +682,46 @@ def test_opted_out_with_matches_records_the_eighth_state(
     finally:
         owner_session.rollback()
         _cleanup(owner_session, tid)
+
+
+def test_tenant_crash_is_isolated_and_closed_honestly(
+    owner_session: Session, clean_billing: None, tmp_path: Any,
+    two_tenants: tuple[str, str],
+) -> None:
+    """AUDIT ح-1/ك-10: tenant B crashing mid-run must not touch tenant A's
+    committed day, and B's day closes honestly (CV_GENERATION_FAILED) —
+    never a silent no-state day."""
+    a, b = two_tenants
+    ta, tb = uuid.UUID(a), uuid.UUID(b)
+    report = engine_run.RunReport(
+        uuid.uuid4(), "completed", {},
+        {ta: {"final": [], "counts": {"passed": 0}},
+         tb: {"final": [], "counts": {"passed": 2}}},
+    )
+    original = daily_run._run_tenant
+
+    def _exploding(session, *, tenant_id, **kw):  # type: ignore[no-untyped-def]
+        if tenant_id == tb:
+            raise RuntimeError("boom mid-tenant")
+        return original(session, tenant_id=tenant_id, **kw)
+
+    try:
+        daily_run._run_tenant = _exploding
+        states = daily_run.run_daily_delivery(
+            owner_session, report=report, deps=_deps(tmp_path), now=NOW,
+        )
+        owner_session.commit()
+        # tenant A closed normally (no matches day) and survived B's crash
+        assert states[ta].state == "NO_MATCHES"
+        # tenant B got the honest fallback state, durably committed
+        row = owner_session.execute(sql_text(
+            "SELECT state FROM tenant_day_states WHERE tenant_id = :t"),
+            {"t": b}).scalar_one()
+        assert row == "CV_GENERATION_FAILED"
+    finally:
+        daily_run._run_tenant = original
+        owner_session.rollback()
+        owner_session.execute(sql_text(
+            "DELETE FROM tenant_day_states WHERE tenant_id IN (:a, :b)"),
+            {"a": a, "b": b})
+        owner_session.commit()

@@ -17,6 +17,9 @@ from career.telegram.admin import FakeTelegramAdminClient
 from career.whatsapp.activation_flow import activate
 from career.whatsapp.client import FakeWhatsAppClient
 
+_PR = {"prod_pro": (Decimal("279.00"), "SAR"), "prod_basic": (Decimal("149"), "SAR"),
+       "prod_cv": (Decimal("29.00"), "SAR")}
+
 NOW = datetime(2026, 7, 15, 9, 0, tzinfo=UTC)
 
 
@@ -27,7 +30,8 @@ def _active_sub(owner_session: Session, *, period_end: datetime) -> uuid.UUID:
                              Decimal("279.00"), "SAR")
     })
     result = provision_order(owner_session, order_id, salla_client=client,
-                             product_catalog={"prod_pro": "professional"})
+                             product_catalog={"prod_pro": "professional"},
+                             expected_pricing=_PR)
     phone = f"+96650{uuid.uuid4().int % 10_000_000:07d}"
     activate(owner_session, token=result.activation_token, from_phone=phone,
              display_name=None, now=NOW, whatsapp_client=FakeWhatsAppClient(),
@@ -105,7 +109,8 @@ def test_cv_analysis_one_shot_is_untouched(
         order_id: SallaOrder(order_id, "paid", "prod_cv", Decimal("29.00"), "SAR")
     })
     result = provision_order(owner_session, order_id, salla_client=client,
-                             product_catalog={"prod_cv": "cv_analysis"})
+                             product_catalog={"prod_cv": "cv_analysis"},
+                             expected_pricing=_PR)
     owner_session.execute(sql_text(
         "UPDATE subscriptions SET status = 'ACTIVE',"
         " current_period_end = :e WHERE id = :id"),

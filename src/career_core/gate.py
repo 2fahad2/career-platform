@@ -161,10 +161,19 @@ def compute_role_match_score(
     *,
     role_map: dict[str, int] | None = None,
     skill_hits: dict[str, int] | None = None,
+    reject_tokens: tuple[str, ...] | None = None,
 ) -> int:
-    """Six additive dimensions, capped at 100. Hard reject → 0 (dev/support title)."""
+    """Six additive dimensions, capped at 100. Hard reject → 0.
+
+    AUDIT ح-2: the dev/support hard-reject is now a PARAMETER. None keeps the
+    legacy behavior (personal-project heritage); the commercial engine passes
+    a tenant-derived list so a family the tenant actually approved (e.g.
+    software_engineering) is never structurally blocked."""
     title_l = (title or "").lower()
-    if any(t in title_l for t in _DEV_TOKENS) or any(t in title_l for t in _SUPPORT_TOKENS):
+    rejects = (
+        _DEV_TOKENS + _SUPPORT_TOKENS if reject_tokens is None else reject_tokens
+    )
+    if any(t in title_l for t in rejects):
         return 0
     blob = f"{title_l} {(jd_text or '').lower()}"
     rm = role_map if role_map is not None else DEFAULT_ROLE_MAP

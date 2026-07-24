@@ -123,6 +123,29 @@ class GateVerdict:
     gate_policy_version: str = GATE_POLICY_VERSION
 
 
+# ── AUDIT ح-2: tenant-aware hard rejects ─────────────────────────────────────
+# The legacy dev/support reject lists blocked ANY tenant from dev/support
+# titles — structurally blocking the software_engineering family forever
+# (proven live: tier-1 company, explicit 30k salary → score 0). The reject
+# list is now derived per tenant: a token claimed by any APPROVED family's
+# title_tokens is never rejected for that tenant.
+
+
+@lru_cache(maxsize=64)
+def _tenant_reject_tokens(paths_key: tuple[str, ...]) -> tuple[str, ...]:
+    from career_core.gate import _DEV_TOKENS, _SUPPORT_TOKENS
+
+    approved_tokens: set[str] = set()
+    keys = set(paths_key)
+    for family in DEFAULT_FAMILIES:
+        if family.key in keys:
+            approved_tokens |= {t.lower() for t in family.title_tokens}
+    return tuple(
+        t for t in (*_DEV_TOKENS, *_SUPPORT_TOKENS)
+        if not any(t in tok or tok in t for tok in approved_tokens)
+    )
+
+
 # ── D10: role weights from the approved paths ────────────────────────────────
 
 
@@ -226,7 +249,8 @@ def evaluate(policy: TenantGatePolicy, posting: PostingFacts) -> GateVerdict:
     sq = source_quality_score(posting.url)
     role_map = build_role_map(policy.approved_paths)
     role_score = compute_role_match_score(
-        posting.title, posting.jd_text, role_map=role_map
+        posting.title, posting.jd_text, role_map=role_map,
+        reject_tokens=_tenant_reject_tokens(_paths_key(policy.approved_paths)),
     )
     salary = score_salary_gate(
         posting.title,

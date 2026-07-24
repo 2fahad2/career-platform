@@ -168,6 +168,7 @@ def _channel(owner_session: Session) -> CustomerChannel:
     token = provision_order(
         owner_session, order_id, salla_client=client,
         product_catalog={"prod_pro": "professional"},
+        expected_pricing={k: (Decimal("279.00"), "SAR") for k in {"prod_pro": "professional"}},
     ).activation_token
     assert token is not None
     phone = f"+96650{uuid.uuid4().int % 10_000_000:07d}"

@@ -27,6 +27,7 @@ from career.whatsapp.templates import DAILY_UTILITY
 
 NOW = datetime(2026, 7, 15, 9, 0, tzinfo=UTC)
 CATALOG = {"prod_pro": "professional"}
+_PR = {k: (Decimal("279.00"), "SAR") for k in CATALOG}
 BUNDLE = {"parts": [
     {"kind": "text", "body": "#1 IT Operations Manager @ NEOM"},
     {"kind": "document", "ref": "tenants/x/cv1.pdf", "filename": "CV.pdf", "caption": "CV #1"},
@@ -40,7 +41,8 @@ def _channel(owner_session: Session, *, last_inbound_at: datetime | None, opt_ou
         order_id: SallaOrder(order_id, "paid", "prod_pro", Decimal("279.00"), "SAR")
     })
     token = provision_order(owner_session, order_id, salla_client=client,
-                            product_catalog=CATALOG).activation_token
+                            product_catalog=CATALOG,
+                            expected_pricing=_PR).activation_token
     assert token is not None
     phone = f"+96650{uuid.uuid4().int % 10_000_000:07d}"
     activate(owner_session, token=token, from_phone=phone, display_name=None, now=NOW,

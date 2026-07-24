@@ -116,18 +116,25 @@ def provision_order(
         owner_session.commit()
         return ProvisionResult(ProvisionStatus.UNKNOWN_PRODUCT)
 
-    # §09 binding pattern: match (product, amount, currency) — a paid order
-    # whose amount/currency deviates from the configured price never
-    # provisions (fail closed; expected_pricing empty = check disabled).
+    # §09 binding pattern: match (product, amount, currency). AUDIT ح-4:
+    # FAIL CLOSED — a cataloged product with NO pricing entry is a mismatch
+    # (was: check silently skipped, so a tampered/discounted paid order
+    # provisioned at any amount when the pricing env var was absent).
     expected = (expected_pricing or {}).get(order.product_id)
-    if expected is not None:
-        exp_amount, exp_currency = expected
-        if (order.amount != exp_amount
-                or (order.currency or "").upper() != exp_currency.upper()):
-            logger.warning("order amount/currency mismatch — not provisioning")
-            _mark_webhook(owner_session, webhook_event, "failed")
-            owner_session.commit()
-            return ProvisionResult(ProvisionStatus.AMOUNT_MISMATCH)
+    if expected is None:
+        logger.error(
+            "no expected pricing for cataloged product — failing closed"
+        )
+        _mark_webhook(owner_session, webhook_event, "failed")
+        owner_session.commit()
+        return ProvisionResult(ProvisionStatus.AMOUNT_MISMATCH)
+    exp_amount, exp_currency = expected
+    if (order.amount != exp_amount
+            or (order.currency or "").upper() != exp_currency.upper()):
+        logger.warning("order amount/currency mismatch — not provisioning")
+        _mark_webhook(owner_session, webhook_event, "failed")
+        owner_session.commit()
+        return ProvisionResult(ProvisionStatus.AMOUNT_MISMATCH)
 
     # Provision: tenant → subscription(PAID_UNCLAIMED) → activation token.
     tenant = Tenant(id=uuid.uuid4(), code=_next_tenant_code(owner_session))

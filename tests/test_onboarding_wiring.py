@@ -54,7 +54,8 @@ def _provision_token(owner_session: Session) -> tuple[str, str]:
         order_id: SallaOrder(order_id, "paid", "prod_basic", Decimal("149.00"), "SAR")
     })
     result = provision_order(
-        owner_session, order_id, salla_client=client, product_catalog=CATALOG
+        owner_session, order_id, salla_client=client, product_catalog=CATALOG,
+        expected_pricing={k: (Decimal("149"), "SAR") for k in CATALOG}
     )
     assert result.activation_token is not None and result.tenant_id is not None
     return result.activation_token, result.tenant_id

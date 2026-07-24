@@ -57,8 +57,10 @@ def _provision_token(owner_session: Session) -> str:
     client = FakeSallaClient({
         order_id: SallaOrder(order_id, "paid", "prod_pro", Decimal("279.00"), "SAR")
     })
+    pricing = {k: (Decimal("279.00"), "SAR") for k in CATALOG}
     tok = provision_order(owner_session, order_id, salla_client=client,
-                          product_catalog=CATALOG).activation_token
+                          product_catalog=CATALOG,
+                          expected_pricing=pricing).activation_token
     assert tok is not None
     return tok
 

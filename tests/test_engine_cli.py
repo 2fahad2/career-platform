@@ -17,7 +17,9 @@ from career.engine.ranking import Composition
 
 def test_parser_defaults_are_the_documented_run_shape() -> None:
     args = cli.build_parser().parse_args([])
-    assert args.digest_only is True                 # D9: default, not opt-in
+    # AUDIT ح-3: the default is None ⇒ derived from --deliver at run time
+    # (delivering run ⇒ digest_only False) so the record never lies.
+    assert args.digest_only is None
     # §06: caps live in Settings — None means «use configuration»
     assert args.max_per_query is None
     assert args.retrieval_cap is None

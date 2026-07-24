@@ -144,6 +144,21 @@ def main() -> None:  # pragma: no cover — the C7.8 live runner
     salla = HttpSallaClient(settings.salla_api_key)
     catalog = _salla_catalog(settings.salla_product_catalog)
     pricing = _salla_pricing(settings.salla_product_pricing)
+    # AUDIT ح-4: the triple-match gate now fails closed per product, and a
+    # coverage hole is announced at boot instead of discovered at refund time.
+    uncovered = sorted(set(catalog) - set(pricing))
+    if uncovered:
+        logger.error(
+            "SALLA_PRODUCT_PRICING misses cataloged products %s — their "
+            "orders will FAIL CLOSED to manual review", uncovered,
+        )
+        try:
+            admin.send_admin(
+                "⚠️ تسعيرة سلة ناقصة لمنتجات في الكتالوج — طلباتها ستُحوّل "
+                "للمراجعة اليدوية حتى تكتمل التسعيرة"
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("pricing warning notify failed", exc_info=True)
     last_reminder_sweep = 0.0
     last_window_nudge: date | None = None
     last_weekly_report: date | None = None

@@ -67,6 +67,7 @@ def _provision_funnel(owner: Session) -> str:
     result = provision_order(
         owner, order_id, salla_client=client,
         product_catalog={"prod_cv": "cv_analysis"},
+        expected_pricing={k: (Decimal("29"), "SAR") for k in {"prod_cv": "cv_analysis"}},
     )
     assert result.activation_token is not None
     return result.activation_token
@@ -195,6 +196,7 @@ def test_upgrade_relinks_and_opens_half_ready_onboarding(
         upgrade = provision_order(
             owner_session, order_id, salla_client=client,
             product_catalog={"prod_basic": "basic"},
+            expected_pricing={"prod_basic": (Decimal("149"), "SAR")},
         )
         assert upgrade.activation_token is not None
         handle(_msg_text(phone, f"تفعيل {upgrade.activation_token}"), 10)
@@ -264,6 +266,7 @@ def test_expired_upgrade_token_never_relinks(
         upgrade = provision_order(
             owner_session, order_id, salla_client=client,
             product_catalog={"prod_basic": "basic"},
+            expected_pricing={"prod_basic": (Decimal("149"), "SAR")},
         )
         assert upgrade.activation_token is not None
         # expire the upgrade token BEFORE the customer taps it
@@ -335,6 +338,7 @@ def test_second_analysis_purchase_restarts_the_funnel(
         second = provision_order(
             owner_session, order_id, salla_client=client,
             product_catalog={"prod_cv": "cv_analysis"},
+            expected_pricing={k: (Decimal("29"), "SAR") for k in {"prod_cv": "cv_analysis"}},
         )
         assert second.activation_token is not None
         handle(_msg_text(phone, f"تفعيل {second.activation_token}"), 10)
