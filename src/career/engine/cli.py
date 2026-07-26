@@ -243,12 +243,17 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
                 if settings.canary_test_phone:
                     from career.db.models import CustomerChannel
 
+                    # live-bug fix: Meta stores the phone without «+»,
+                    # settings carry it — match every spelling (phones.py)
+                    from career.whatsapp.phones import phone_variants
+
                     canary_tid = session.execute(
                         select(CustomerChannel.tenant_id).where(
-                            CustomerChannel.phone_e164
-                            == settings.canary_test_phone
+                            CustomerChannel.phone_e164.in_(
+                                phone_variants(settings.canary_test_phone)
+                            )
                         )
-                    ).scalar_one_or_none()
+                    ).scalars().first()
                 states = run_daily_delivery(
                     session, report=report, deps=deps,
                     now=datetime.now(UTC),

@@ -204,10 +204,13 @@ def main() -> None:  # pragma: no cover — the C7.8 live runner
                 today = now.astimezone(_RIYADH).date()
                 if settings.canary_test_phone and last_window_nudge != today:
                     with Session(engine) as session:
+                        from career.whatsapp.phones import phone_variants
+
                         ch = session.execute(
                             select(CustomerChannel).where(
-                                CustomerChannel.phone_e164
-                                == settings.canary_test_phone
+                                CustomerChannel.phone_e164.in_(
+                                    phone_variants(settings.canary_test_phone)
+                                )
                             )
                         ).scalars().first()
                         # read INSIDE the session — rows expire on close
