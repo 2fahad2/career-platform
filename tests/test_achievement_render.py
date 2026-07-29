@@ -994,3 +994,168 @@ def test_draft_payload_stays_a_closed_set(
         assert "panel" not in payload and "why" not in payload
     finally:
         _cleanup_conversation(owner_session, a)
+
+
+# ══ F-INTENT §15: wider understanding, routed to the right place ═══════════
+
+
+class _IntentStub:
+    def __init__(self, intent: str, topic: str = "other") -> None:
+        self._intent, self._topic = intent, topic
+        self.calls = 0
+
+    def classify(self, reply: str, *, draft: str | None) -> dict:
+        self.calls += 1
+        return {"intent": self._intent, "topic": self._topic,
+                "confidence": 0.95}
+
+
+def _seeded_draft(session: Session, tenant: str):
+    """A conversation with one draft on screen, ready for the next reply."""
+    r = _RecordingRenderer([_bullet()])
+    deps, channel_id, role_id = _seed_enrichment_conversation(session, tenant)
+    deps.achievement_renderer = r
+    _orch.handle_enrichment(session, channel_id=channel_id,
+                            text="قللت وقت التقارير", deps=deps, now=_NOW)
+    return deps, channel_id, role_id, r
+
+
+def test_off_topic_status_request_is_served_and_the_draft_survives(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """«وش وضع اشتراكي» mid-enrichment must answer the SUBSCRIPTION, not be
+    rendered as an achievement — and the pending line must still be there."""
+    a, _ = two_tenants
+    deps, channel_id, _role, r = _seeded_draft(owner_session, a)
+    deps.intent_classifier = _IntentStub("off_topic", "subscription_status")
+    try:
+        calls_before = len(r.calls)
+        _orch.handle_enrichment(owner_session, channel_id=channel_id,
+                                text="وش وضع اشتراكي", deps=deps, now=_NOW)
+        owner_session.commit()
+        assert len(r.calls) == calls_before, "an off-topic ask was rendered"
+        bodies = " ".join((m.body or "") for m in deps.whatsapp_client.sent[-2:])
+        assert "اشتراك" in bodies                  # the status summary landed
+        assert "محفوظ زي ما هو" in bodies          # and the line was reassured
+        ctx = owner_session.execute(_sql(
+            "SELECT context FROM onboarding_sessions WHERE tenant_id = :t"),
+            {"t": a}).scalar_one()
+        enrich = ctx.get("enrichment") or {}
+        assert enrich.get("open") is True          # cursor untouched
+        assert enrich.get("pending_fact_id")       # the draft is still waiting
+    finally:
+        _cleanup_conversation(owner_session, a)
+
+
+def test_asking_for_a_human_points_at_support(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    a, _ = two_tenants
+    deps, channel_id, _role, r = _seeded_draft(owner_session, a)
+    deps.intent_classifier = _IntentStub("off_topic", "human")
+    try:
+        _orch.handle_enrichment(owner_session, channel_id=channel_id,
+                                text="أبي أكلم واحد من عندكم", deps=deps,
+                                now=_NOW)
+        owner_session.commit()
+        body = deps.whatsapp_client.sent[-1].body or ""
+        assert "دعم" in body and "محفوظ" in body
+        assert r.calls[-1][0] == "قللت وقت التقارير"   # nothing new rendered
+    finally:
+        _cleanup_conversation(owner_session, a)
+
+
+def test_dispute_drops_the_draft_and_apologises(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """«هذا غلط» must never be argued with: the claim goes, and we ask for
+    their words instead."""
+    a, _ = two_tenants
+    deps, channel_id, _role, _r = _seeded_draft(owner_session, a)
+    deps.intent_classifier = _IntentStub("dispute")
+    try:
+        _orch.handle_enrichment(owner_session, channel_id=channel_id,
+                                text="لا هذا غلط ما كنت مسؤول عن كذا",
+                                deps=deps, now=_NOW)
+        owner_session.commit()
+        body = deps.whatsapp_client.sent[-1].body or ""
+        assert "شلت السطر" in body
+        status = owner_session.execute(_sql(
+            "SELECT status FROM profile_facts WHERE tenant_id = :t"
+            " AND category = 'achievement'"), {"t": a}).scalar_one()
+        assert status == "CUSTOMER_REJECTED"
+        # §15.5: a rejected claim is forbidden from ever resurfacing
+        n = owner_session.execute(_sql(
+            "SELECT count(*) FROM forbidden_claims WHERE tenant_id = :t"),
+            {"t": a}).scalar_one()
+        assert n == 1
+    finally:
+        _cleanup_conversation(owner_session, a)
+
+
+def test_a_question_is_answered_not_rendered(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    a, _ = two_tenants
+    deps, channel_id, _role, r = _seeded_draft(owner_session, a)
+    deps.intent_classifier = _IntentStub("question")
+    try:
+        calls_before = len(r.calls)
+        _orch.handle_enrichment(owner_session, channel_id=channel_id,
+                                text="وش تسوون بسيرتي بالضبط؟", deps=deps,
+                                now=_NOW)
+        owner_session.commit()
+        assert len(r.calls) == calls_before
+        body = deps.whatsapp_client.sent[-1].body or ""
+        assert "ما نضيف" in body and "بضغطة منك" in body
+    finally:
+        _cleanup_conversation(owner_session, a)
+
+
+def test_stop_intent_closes_the_role_kindly(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    a, _ = two_tenants
+    deps, channel_id, role_id, _r = _seeded_draft(owner_session, a)
+    deps.intent_classifier = _IntentStub("stop")
+    try:
+        _orch.handle_enrichment(owner_session, channel_id=channel_id,
+                                text="خلاص ما ابي اكمل هالشي", deps=deps,
+                                now=_NOW)
+        owner_session.commit()
+        status = owner_session.execute(_sql(
+            "SELECT status FROM role_enrichments WHERE fact_id = :f"),
+            {"f": str(role_id)}).scalar_one()
+        assert status == "SKIPPED"
+        assert "سيرتك زينة" in (deps.whatsapp_client.sent[-1].body or "")
+    finally:
+        _cleanup_conversation(owner_session, a)
+
+
+def test_a_down_classifier_keeps_the_deterministic_behaviour(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """The model being unavailable must be invisible to the customer."""
+    a, _ = two_tenants
+
+    class _Down:
+        def classify(self, reply: str, *, draft: str | None) -> dict:
+            raise RuntimeError("classifier down")
+
+    original = "قللت وقت التقارير"
+    r = _RecordingRenderer([_bullet(), _bullet("Reduced reporting turnaround.")])
+    deps, channel_id, _role = _seed_enrichment_conversation(owner_session, a)
+    deps.achievement_renderer = r
+    deps.intent_classifier = _Down()
+    try:
+        _orch.handle_enrichment(owner_session, channel_id=channel_id,
+                                text=original, deps=deps, now=_NOW)
+        before = len(r.calls)
+        _orch.handle_enrichment(owner_session, channel_id=channel_id,
+                                text="ابدع", deps=deps, now=_NOW)
+        owner_session.commit()
+        post = r.calls[before:]
+        assert post and all(c[0] == original for c in post)
+        assert all(c[2] == "stronger" for c in post)
+    finally:
+        _cleanup_conversation(owner_session, a)

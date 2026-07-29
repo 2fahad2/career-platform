@@ -29,6 +29,7 @@ from career.onboarding.achievement_render import (
 )
 from career.onboarding.bullet_panel import AnthropicBulletJudge
 from career.onboarding.extraction import AnthropicExtractor
+from career.onboarding.intent import AnthropicIntentClassifier
 from career.onboarding.orchestrator import Deps, send_due_reminders
 from career.salla.client import HttpSallaClient
 from career.salla.provisioning import process_pending_webhooks
@@ -128,6 +129,8 @@ def main() -> None:  # pragma: no cover — the C7.8 live runner
         examples_writer=AnthropicExamplesWriter(
             api_key=settings.anthropic_api_key),
         bullet_judge=AnthropicBulletJudge(api_key=settings.anthropic_api_key),
+        intent_classifier=AnthropicIntentClassifier(
+            api_key=settings.anthropic_api_key),
     )
     admin: TelegramAdminClient
     if settings.telegram_admin_bot_token and settings.telegram_admin_chat_id:

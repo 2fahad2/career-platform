@@ -81,6 +81,9 @@ class Deps:
     #: F-PANEL judge (§14-أ). None → the longest grounded candidate wins, so
     #: the customer is never blocked by a missing reviewer.
     bullet_judge: Any = None
+    #: F-INTENT classifier (§15). None → the deterministic keyword classifier
+    #: is used alone; understanding degrades, the conversation never breaks.
+    intent_classifier: Any = None
 
 
 class JourneyNotFound(Exception):
@@ -145,6 +148,16 @@ _PAUSED = "تم الإيقاف المؤقت. الفترة الحالية لا ت
 _RESUMED = "تم الاستئناف ✅"
 _EXPORT_ACK = "📁 هذي نسخة كاملة من بياناتك المحفوظة عندنا (ملف JSON)."
 _NUDGE_REMINDER = "وقفنا عند خطوة بسيطة — نكمل إعداد خدمتك؟ 👇"
+#: §15: after serving an off-topic ask mid-enrichment, tell the customer the
+#: line is still waiting — nothing was lost, and they choose when to return.
+_ENRICH_RESUME_HINT = (
+    "وسطرك اللي كنا نجهزه محفوظ زي ما هو 👌\n"
+    "متى ما حبيت نكمّله، اكتب لي وأنا جاهز"
+)
+_ENRICH_SUPPORT_HINT = (
+    "أبشر — أرسل كلمة «دعم» وأوصلك بأحد من الفريق 🙏\n"
+    "وسطرك اللي كنا نجهزه محفوظ زي ما هو"
+)
 
 _APPROVE_BUTTONS = ("اعتماد المقترح", "أبي مساري كما هو")
 _POLICY_BUTTON = "تأكيد وبدء البحث"
@@ -281,10 +294,44 @@ def handle_enrichment(
             _regenerate(session, deps, channel, context, role_id, "rephrase",
                         name, now, _send, _send_buttons)
         else:
-            intent = enr.classify_reply(
-                body, has_previous_answer=bool(state.get("arabic_source"))
+            from career.onboarding import intent as intent_mod
+
+            resolved, topic = _resolve_enrichment_intent(
+                session, deps, tenant_id=tenant_id, body=body, state=state,
+                pending=pending,
             )
-            if intent == enr.INTENT_AFFIRM:
+            if resolved == intent_mod.OFF_TOPIC and _serve_off_topic(
+                session, deps, channel, topic=topic, body=body, now=now,
+                send=_send,
+            ):
+                session.flush()
+                return True          # cursor untouched: they resume as-is
+            if resolved == intent_mod.STOP and role_id is not None:
+                enr.skip_role(session, tenant_id=tenant_id,
+                              role_fact_id=role_id, now=now)
+                enr.close_session(context)
+                _send(enr._ACK_SKIP)
+                journey.context = context
+                session.flush()
+                return True
+            if resolved == intent_mod.DISPUTE:
+                # they say the draft misstates something — never argue: drop it
+                # and rebuild from their own words (constant 5 in spirit).
+                enr.reject_answer(session, tenant_id=tenant_id,
+                                  pending_fact_id=uuid.UUID(str(pending)))
+                context["enrichment"] = {
+                    **state, "pending_fact_id": None, "draft_fact_id": None,
+                }
+                _send_buttons(enr._DISPUTED_ASK, enr.RETRY_BUTTONS)
+                journey.context = context
+                session.flush()
+                return True
+            if resolved == intent_mod.QUESTION:
+                _send_buttons(enr._ANSWER_MY_QUESTION, enr.RETRY_BUTTONS)
+                journey.context = context
+                session.flush()
+                return True
+            if resolved == intent_mod.AFFIRM:
                 # warmth, not consent (constant 5) — re-show and ask for the tap
                 draft = enr.draft_of(
                     session, tenant_id=tenant_id,
@@ -295,7 +342,7 @@ def handle_enrichment(
                                   enr.CONFIRM_BUTTONS)
                 else:
                     _send_buttons(enr._NEED_A_BIT_MORE, enr.RETRY_BUTTONS)
-            elif intent == enr.INTENT_INSTRUCTION:
+            elif resolved == intent_mod.REVISE:
                 context["enrichment"] = {**state, "pending_fact_id": None}
                 _regenerate(session, deps, channel, context, role_id,
                             enr.classify_edit_intent(body), name, now,
@@ -327,17 +374,32 @@ def handle_enrichment(
 
     if state.get("arabic_source"):
         # mid-edit: «أبي أعدّل» cleared the draft, so this free text arrives
-        # here — it must STILL be classified, or an editing note gets rendered
+        # here — it must STILL be understood, or an editing note gets rendered
         # as if it were the achievement (the 29-July incident).
-        intent = enr.classify_reply(body, has_previous_answer=True)
-        if intent == enr.INTENT_INSTRUCTION:
+        from career.onboarding import intent as intent_mod
+
+        resolved, topic = _resolve_enrichment_intent(
+            session, deps, tenant_id=tenant_id, body=body, state=state,
+            pending=None,
+        )
+        if resolved == intent_mod.OFF_TOPIC and _serve_off_topic(
+            session, deps, channel, topic=topic, body=body, now=now, send=_send,
+        ):
+            session.flush()
+            return True
+        if resolved == intent_mod.QUESTION:
+            _send_buttons(enr._ANSWER_MY_QUESTION, enr.RETRY_BUTTONS)
+            journey.context = context
+            session.flush()
+            return True
+        if resolved == intent_mod.REVISE:
             _regenerate(session, deps, channel, context, role_id,
                         enr.classify_edit_intent(body), name, now,
                         _send, _send_buttons)
             journey.context = context
             session.flush()
             return True
-        if intent == enr.INTENT_AFFIRM:
+        if resolved == intent_mod.AFFIRM:
             draft_id = state.get("draft_fact_id")
             draft = (
                 enr.draft_of(session, tenant_id=tenant_id,
@@ -359,6 +421,55 @@ def handle_enrichment(
     journey.context = context
     session.flush()
     return True
+
+
+def _resolve_enrichment_intent(
+    session: Session, deps: Deps, *, tenant_id: uuid.UUID, body: str,
+    state: dict[str, Any], pending: Any,
+) -> tuple[str, str]:
+    """What does this reply want? (§15) Deterministic keywords stay the fast
+    path and the fallback; the model handles the wide middle."""
+    from career.onboarding import enrichment as enr
+    from career.onboarding import intent as intent_mod
+
+    deterministic = {
+        enr.INTENT_AFFIRM: intent_mod.AFFIRM,
+        enr.INTENT_INSTRUCTION: intent_mod.REVISE,
+        enr.INTENT_NEW_ANSWER: intent_mod.ANSWER,
+    }[enr.classify_reply(body, has_previous_answer=bool(state.get("arabic_source")))]
+
+    draft_text: str | None = None
+    fact_id = pending or state.get("draft_fact_id")
+    if fact_id:
+        found = enr.draft_of(session, tenant_id=tenant_id,
+                             fact_id=uuid.UUID(str(fact_id)))
+        draft_text = found[0] if found else None
+    return intent_mod.resolve_intent(
+        body, draft=draft_text, classifier=deps.intent_classifier,
+        deterministic=deterministic,
+    )
+
+
+def _serve_off_topic(
+    session: Session, deps: Deps, channel: CustomerChannel, *, topic: str,
+    body: str, now: datetime, send: Any,
+) -> bool:
+    """Route a request that has nothing to do with the draft (§15). True when
+    it was served — the enrichment cursor is left untouched, so the customer
+    resumes exactly where they were."""
+    from career.onboarding import intent as intent_mod
+
+    command = intent_mod.command_for_topic(topic)
+    if command is not None and handle_standing_command(
+        session, channel_id=channel.id, text=command, deps=deps, now=now
+    ):
+        send(_ENRICH_RESUME_HINT)
+        return True
+    if topic in ("human", "billing"):
+        # «دعم» is the one escalation path the whole product already trusts
+        send(_ENRICH_SUPPORT_HINT)
+        return True
+    return False
 
 
 def _dispatch_enrichment_result(
