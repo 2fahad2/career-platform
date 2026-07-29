@@ -145,26 +145,51 @@ EDIT_INTENTS: dict[str, str] = {
     "rephrase": "Rephrase it differently with the same meaning.",
 }
 
-#: Saudi-colloquial cues → intent. Unmatched text falls back to «rephrase»:
-#: a harmless, always-safe direction.
+#: Arabic normalisation, shared by every text comparison in the feature: a
+#: customer types «مضبوط ✅» or «مضبوط» or «مضبووط», «أقوى» or «اقوي» — all
+#: must compare equal. Diacritics/tatweel go, hamza forms and taa-marbuta
+#: fold, punctuation and emoji drop, Latin lowercases.
+_DIACRITICS = re.compile(r"[\u064B-\u0652\u0670\u0640\u06D6-\u06ED]")
+_AR_FOLD = str.maketrans({
+    "أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا",
+    "ى": "ي", "ة": "ه", "ؤ": "و", "ئ": "ي",
+})
+_NON_WORD = re.compile(r"[^\w\s]", re.UNICODE)
+
+
+def normalize_ar(text: str | None) -> str:
+    r"""Fold an Arabic reply to a comparable form. Arabic-Indic digits survive
+    (they are ``\w``) — the grounding guard still needs to see them."""
+    body = _DIACRITICS.sub("", str(text or ""))
+    body = body.translate(_AR_FOLD)
+    body = _NON_WORD.sub(" ", body)
+    return " ".join(body.lower().split())
+
+
+#: Saudi-colloquial cues → intent, in NORMALISED form (so no duplicate hamza
+#: spellings are needed). Unmatched text falls back to «rephrase»: harmless
+#: and always safe, which is what makes a hostile note toothless.
 _INTENT_CUES: tuple[tuple[tuple[str, ...], str], ...] = (
-    (("ابدع", "أبدع", "اقوى", "أقوى", "قوي", "قوّي", "احترافي", "أحترافي",
-      "افخم", "أفخم", "حسن", "حسّن", "طور", "طوّر"), "stronger"),
-    (("اقصر", "أقصر", "اختصر", "قصر", "قصّر", "طويلة", "طويله"), "shorter"),
-    (("ابسط", "أبسط", "بسط", "بسّط", "سهل", "سهّل", "صعبة", "صعبه"), "simpler"),
+    (("ابدع", "اقوي", "قوي", "احترافي", "افخم", "حسن", "طور", "احلي",
+      "افضل", "اجمل"), "stronger"),
+    (("اقصر", "اختصر", "قصر", "طويله", "مختصر"), "shorter"),
+    (("ابسط", "بسط", "سهل", "صعبه", "وضح", "اوضح"), "simpler"),
 )
 
 
 def classify_edit_intent(text: str | None) -> str:
     """Map a customer's editing note onto a FIXED intent key. Never returns
     their words — only one of EDIT_INTENTS' keys."""
-    body = (text or "").strip()
+    body = normalize_ar(text)
     for cues, intent in _INTENT_CUES:
         if any(cue in body for cue in cues):
             return intent
     return "rephrase"
 
 
+# Kept deliberately: the single-shot ancestor of run_panel (bullet_panel.py).
+# D14 documents it, three tests pin it, and it is the documented fallback when
+# no panel/judge is wired.
 def render_achievement(
     renderer: AchievementRenderer,
     *,

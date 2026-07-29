@@ -78,6 +78,9 @@ class Deps:
     #: F-ENRICH icebreaker examples writer (3 scrubbed colloquial examples).
     #: None → the opening question ships without the examples menu.
     examples_writer: Any = None
+    #: F-PANEL judge (§14-أ). None → the longest grounded candidate wins, so
+    #: the customer is never blocked by a missing reviewer.
+    bullet_judge: Any = None
 
 
 class JourneyNotFound(Exception):
@@ -247,32 +250,67 @@ def handle_enrichment(
         record_out(session, tenant_id=tenant_id, channel_id=channel.id,
                    kind="text", wa_message_id=mid, now=now)
 
+    def _send_buttons(msg: str, buttons: Any) -> None:
+        mid = deps.whatsapp_client.send_interactive(
+            channel.phone_e164, msg, buttons
+        )
+        record_out(session, tenant_id=tenant_id, channel_id=channel.id,
+                   kind="interactive", wa_message_id=mid, now=now)
+
     # awaiting confirmation of a rendered bullet
     if pending:
-        if body in enr.OK_LABELS and role_id is not None:
+        if enr.matches(body, enr.OK_LABELS) and role_id is not None:
             enr.confirm_answer(session, tenant_id=tenant_id,
                                pending_fact_id=uuid.UUID(str(pending)),
                                role_fact_id=role_id, now=now)
             enr.close_session(context)
             _send(enr.ack_thanks(name))
-        elif body in enr.DEL_LABELS:
+        elif enr.matches(body, enr.DEL_LABELS):
             enr.reject_answer(session, tenant_id=tenant_id,
                               pending_fact_id=uuid.UUID(str(pending)))
+            context["enrichment"] = {
+                **state, "pending_fact_id": None, "draft_fact_id": None,
+            }
+            _send_buttons(enr._DELETED_ASK, enr.RETRY_BUTTONS)
+        elif enr.matches(body, enr.EDIT_LABELS):
+            # keep draft_fact_id: the next render reuses the row (no orphans)
             context["enrichment"] = {**state, "pending_fact_id": None}
-            _send("تمام حذفناها. تبي تعطيني صياغة ثانية ولا نعدّي؟")
-        elif body in enr.EDIT_LABELS:
+            _send_buttons(enr._EDIT_PROMPT, enr.RETRY_BUTTONS)
+        elif enr.matches(body, enr.AGAIN_LABELS):
             context["enrichment"] = {**state, "pending_fact_id": None}
-            _send(enr._EDIT_PROMPT)
-        else:  # typed correction → treat body as a fresh answer
-            context["enrichment"] = {**state, "pending_fact_id": None}
-            _handle_enrichment_text(session, deps, channel, context, role_id,
-                                    body, name, now, _send)
+            _regenerate(session, deps, channel, context, role_id, "rephrase",
+                        name, now, _send, _send_buttons)
+        else:
+            intent = enr.classify_reply(
+                body, has_previous_answer=bool(state.get("arabic_source"))
+            )
+            if intent == enr.INTENT_AFFIRM:
+                # warmth, not consent (constant 5) — re-show and ask for the tap
+                draft = enr.draft_of(
+                    session, tenant_id=tenant_id,
+                    fact_id=uuid.UUID(str(pending)),
+                )
+                if draft is not None:
+                    _send_buttons(enr.confirm_again_prompt(*draft),
+                                  enr.CONFIRM_BUTTONS)
+                else:
+                    _send_buttons(enr._NEED_A_BIT_MORE, enr.RETRY_BUTTONS)
+            elif intent == enr.INTENT_INSTRUCTION:
+                context["enrichment"] = {**state, "pending_fact_id": None}
+                _regenerate(session, deps, channel, context, role_id,
+                            enr.classify_edit_intent(body), name, now,
+                            _send, _send_buttons)
+            else:
+                context["enrichment"] = {**state, "pending_fact_id": None}
+                _handle_enrichment_text(session, deps, channel, context,
+                                        role_id, body, name, now, _send,
+                                        _send_buttons)
         journey.context = context
         session.flush()
         return True
 
     # awaiting the achievement answer (or a skip)
-    if body in enr.SKIP_LABELS and role_id is not None:
+    if enr.matches(body, enr.SKIP_LABELS) and role_id is not None:
         enr.skip_role(session, tenant_id=tenant_id, role_fact_id=role_id, now=now)
         enr.close_session(context)
         _send(enr._ACK_SKIP)
@@ -280,43 +318,159 @@ def handle_enrichment(
         session.flush()
         return True
 
+    if enr.matches(body, enr.AGAIN_LABELS) and state.get("arabic_source"):
+        _regenerate(session, deps, channel, context, role_id, "rephrase",
+                    name, now, _send, _send_buttons)
+        journey.context = context
+        session.flush()
+        return True
+
+    if state.get("arabic_source"):
+        # mid-edit: «أبي أعدّل» cleared the draft, so this free text arrives
+        # here — it must STILL be classified, or an editing note gets rendered
+        # as if it were the achievement (the 29-July incident).
+        intent = enr.classify_reply(body, has_previous_answer=True)
+        if intent == enr.INTENT_INSTRUCTION:
+            _regenerate(session, deps, channel, context, role_id,
+                        enr.classify_edit_intent(body), name, now,
+                        _send, _send_buttons)
+            journey.context = context
+            session.flush()
+            return True
+        if intent == enr.INTENT_AFFIRM:
+            draft_id = state.get("draft_fact_id")
+            draft = (
+                enr.draft_of(session, tenant_id=tenant_id,
+                             fact_id=uuid.UUID(str(draft_id)))
+                if draft_id else None
+            )
+            if draft is not None:
+                context["enrichment"] = {**state, "pending_fact_id": draft_id}
+                _send_buttons(enr.confirm_again_prompt(*draft),
+                              enr.CONFIRM_BUTTONS)
+            else:
+                _send_buttons(enr._NEED_A_BIT_MORE, enr.RETRY_BUTTONS)
+            journey.context = context
+            session.flush()
+            return True
+
     _handle_enrichment_text(session, deps, channel, context, role_id, body,
-                            name, now, _send)
+                            name, now, _send, _send_buttons)
     journey.context = context
     session.flush()
     return True
 
 
+def _dispatch_enrichment_result(
+    session: Session, deps: Deps, channel: CustomerChannel,
+    context: dict[str, Any], result: dict[str, Any], send: Any,
+    send_buttons: Any, now: datetime,
+) -> None:
+    """ONE place maps a handle_answer result to a reply, so no status can ever
+    fall through to silence (§14-ب). Every branch offers ≥2 forward paths."""
+    from career.onboarding import enrichment as enr
+
+    state = context.get("enrichment") or {}
+    source = result.get("arabic_source") or state.get("arabic_source") or ""
+    # persisted for EVERY status — that is what makes «كلامك محفوظ عندي» honest
+    state = {**state, "arabic_source": source}
+
+    if result.get("status") == "confirm":
+        context["enrichment"] = {
+            **state,
+            "pending_fact_id": result["pending_fact_id"],
+            "draft_fact_id": result["pending_fact_id"],
+        }
+        prompt = (
+            enr.regenerated_prompt(result["english_bullet"],
+                                   result["arabic_gloss"])
+            if result.get("regenerated") else result["prompt"]
+        )
+        send_buttons(prompt, enr.CONFIRM_BUTTONS)
+        return
+
+    context["enrichment"] = state
+    if result.get("status") == "soft_fail":
+        send_buttons(enr._TRY_AGAIN_SOON, enr.RETRY_BUTTONS)
+        return
+    # no_bullet — and the defensive default for any future status
+    send_buttons(
+        enr._NEED_A_BIT_MORE,
+        enr.RETRY_BUTTONS if source else enr.SKIP_ONLY_BUTTONS,
+    )
+
+
+def _regenerate(
+    session: Session, deps: Deps, channel: CustomerChannel,
+    context: dict[str, Any], role_id: uuid.UUID | None, edit_intent: str,
+    name: str | None, now: datetime, send: Any, send_buttons: Any,
+) -> None:
+    """Re-run the panel over the STORED original answer with the customer's
+    direction applied — never over their editing note (§14-ب)."""
+    from career.onboarding import enrichment as enr
+
+    state = context.get("enrichment") or {}
+    source = state.get("arabic_source") or ""
+    draft_id = state.get("draft_fact_id")
+    if not source:
+        send_buttons(enr._NEED_A_BIT_MORE, enr.SKIP_ONLY_BUTTONS)
+        return
+    if int(state.get("attempts", 0)) >= enr.MAX_PANEL_ATTEMPTS:
+        # §14-ج: stop spending model calls; offer the best draft we have
+        draft = (
+            enr.draft_of(session, tenant_id=channel.tenant_id,
+                         fact_id=uuid.UUID(str(draft_id)))
+            if draft_id else None
+        )
+        if draft is not None:
+            context["enrichment"] = {**state, "pending_fact_id": draft_id}
+            send_buttons(enr.final_offer_prompt(*draft), enr.FINAL_BUTTONS)
+        else:
+            if role_id is not None:
+                enr.skip_role(session, tenant_id=channel.tenant_id,
+                              role_fact_id=role_id, now=now)
+            enr.close_session(context)
+            send(enr._LETS_MOVE_ON)
+        return
+    if role_id is None:
+        send_buttons(enr._NEED_A_BIT_MORE, enr.RETRY_BUTTONS)
+        return
+    result = enr.handle_answer(
+        session, tenant_id=channel.tenant_id, role_fact_id=role_id,
+        arabic_answer=source, renderer=deps.achievement_renderer, now=now,
+        known_name=name, judge=deps.bullet_judge, edit_intent=edit_intent,
+        draft_fact_id=uuid.UUID(str(draft_id)) if draft_id else None,
+    )
+    context["enrichment"] = {**state, "attempts": int(state.get("attempts", 0)) + 1}
+    _dispatch_enrichment_result(session, deps, channel, context, result,
+                                send, send_buttons, now)
+
+
 def _handle_enrichment_text(
     session: Session, deps: Deps, channel: CustomerChannel,
     context: dict[str, Any], role_id: uuid.UUID | None, body: str,
-    name: str | None, now: datetime, send: Any,
+    name: str | None, now: datetime, send: Any, send_buttons: Any,
 ) -> None:
     from career.onboarding import enrichment as enr
 
     if role_id is None or not body:
         return
     # «١/٢/٣» adopts the matching icebreaker example as the answer
-    state0 = context.get("enrichment") or {}
-    picked = enr.pick_example(state0, body)
+    state = context.get("enrichment") or {}
+    picked = enr.pick_example(state, body)
     if picked is not None:
         body = picked
+    draft_id = state.get("draft_fact_id")
     result = enr.handle_answer(
         session, tenant_id=channel.tenant_id, role_fact_id=role_id,
         arabic_answer=body, renderer=deps.achievement_renderer, now=now,
-        known_name=name,
+        known_name=name, judge=deps.bullet_judge,
+        fallback_source=str(state.get("arabic_source") or ""),
+        draft_fact_id=uuid.UUID(str(draft_id)) if draft_id else None,
     )
-    state = context.get("enrichment") or {}
-    if result["status"] == "confirm":
-        context["enrichment"] = {**state, "pending_fact_id": result["pending_fact_id"]}
-        mid = deps.whatsapp_client.send_interactive(
-            channel.phone_e164, result["prompt"], enr.CONFIRM_BUTTONS
-        )
-        record_out(session, tenant_id=channel.tenant_id, channel_id=channel.id,
-                   kind="interactive", wa_message_id=mid, now=now)
-    else:  # reask — the answer wasn't usable
-        send("ما قدرت أطلّع منها إنجاز واضح — جرّب تفصّل أكثر، أو "
-             "اكتب «تخطّي هذا الدور».")
+    context["enrichment"] = {**state, "attempts": int(state.get("attempts", 0)) + 1}
+    _dispatch_enrichment_result(session, deps, channel, context, result,
+                                send, send_buttons, now)
 
 
 def _channel(session: Session, channel_id: uuid.UUID) -> CustomerChannel:

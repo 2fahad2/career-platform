@@ -32,8 +32,14 @@ from career.db.models import (
 )
 from career.onboarding.achievement_render import (
     AchievementRenderer,
-    render_achievement,
+    classify_edit_intent,
+    normalize_ar,
 )
+
+#: re-exported for the orchestrator (enr.classify_edit_intent) — the closed
+#: intent set lives with the renderer, the conversation reads it from here.
+__all__ = ["classify_edit_intent", "classify_reply", "handle_answer", "matches"]
+from career.onboarding.bullet_panel import PANEL_ANGLES, run_panel
 from career.onboarding.confirmation import BANK_STATUSES
 
 _logger = logging.getLogger("career.enrichment")
@@ -61,6 +67,7 @@ _STOP_ALL = "كفى خلصنا"
 _CONFIRM_OK = "مضبوط ✅"
 _CONFIRM_EDIT = "أبي أعدّل ✏️"
 _CONFIRM_DEL = "احذفها ❌"
+_AGAIN = "صيغة ثانية 🔄"
 
 #: Interactive button ids (≤256 chars) — the tap arrives as the id via
 #: _button_id_of; typed labels keep working as a fallback for old clients.
@@ -69,6 +76,7 @@ BTN_NONE = "enr_none"
 BTN_OK = "enr_ok"
 BTN_EDIT = "enr_edit"
 BTN_DEL = "enr_del"
+BTN_AGAIN = "enr_again"
 
 #: (id, title) pairs for send_interactive — titles ≤20 chars (Graph limit).
 OPENING_BUTTONS: tuple[tuple[str, str], ...] = (
@@ -80,8 +88,83 @@ CONFIRM_BUTTONS: tuple[tuple[str, str], ...] = (
     (BTN_EDIT, _CONFIRM_EDIT),
     (BTN_DEL, _CONFIRM_DEL),
 )
+#: Recovery keyboards — every non-confirm message carries ≥2 forward paths.
+RETRY_BUTTONS: tuple[tuple[str, str], ...] = (
+    (BTN_AGAIN, _AGAIN), (BTN_SKIP, _SKIP_ROLE),
+)
+FINAL_BUTTONS: tuple[tuple[str, str], ...] = (
+    (BTN_OK, _CONFIRM_OK), (BTN_SKIP, _SKIP_ROLE),
+)
+SKIP_ONLY_BUTTONS: tuple[tuple[str, str], ...] = ((BTN_SKIP, _SKIP_ROLE),)
 
-_EDIT_PROMPT = "تمام، اكتب لي إياها بكلماتك وأنا أعيد صياغتها 👌"
+#: §14-ج: no model call past this many panel turns for one role.
+MAX_PANEL_ATTEMPTS = 4
+
+# ── copy that never dead-ends (§14-ب) ───────────────────────────────────────
+# Rules these must all keep: no «ما قدرت / ما فهمت / تعذّر / فشل», never blame
+# the customer, and always ≥2 concrete forward paths. A static test enforces
+# it so a future edit cannot quietly reintroduce a dead end.
+
+_EDIT_PROMPT = (                       # the ROOT CAUSE of the 29-July incident:
+    "تمام 👌 قل لي وش تبي أعدّل وأنا أعيد صياغتها\n"
+    "مثال: خلّها أقوى · اختصرها · بسّطها · صيغة ثانية\n"
+    "ولو تبي تكتبها بكلماتك من جديد، اكتبها وأنا أصيغها لك"
+)
+
+_NEED_A_BIT_MORE = (                   # replaces the dead end
+    "وصلني كلامك وأنا معك 🙏\n"
+    "عشان أطلّعها بأقوى صورة، عطني تفصيلة صغيرة: وش كان دورك بالضبط، "
+    "ووش تغيّر بعد شغلك؟\n"
+    "أو قل لي بس «خلّها أقوى» وأنا أعيد الصياغة\n"
+    "وإن كان الوقت ما يناسبك، اضغط «تخطّي هذا الدور» ونكمل ولا يهمك 👌"
+)
+
+_TRY_AGAIN_SOON = (                    # model boundary down, or a PII refusal
+    "كلامك وصلني ومحفوظ عندي 🙏\n"
+    "الصياغة تأخّرت شوي من عندي — اضغط «صيغة ثانية» بعد دقيقة وأجهّزها لك\n"
+    "أو اضغط «تخطّي هذا الدور» ونكمل ولا يهمك 👌"
+)
+
+_DELETED_ASK = (
+    "تمام، شلتها ✅\n"
+    "نجرّب صيغة ثانية من نفس كلامك، ولا نعدّي هالدور؟"
+)
+
+_LETS_MOVE_ON = (                      # attempts exhausted with no draft
+    "ما عليك، نكمل الحين وسيرتك زينة بدون هالسطر 👌\n"
+    "وبنرجع لك بفرصك المختارة كل صباح مثل ما اتفقنا 🌟"
+)
+
+
+def regenerated_prompt(english: str, arabic_gloss: str) -> str:
+    return (
+        "سمعتك 👌 هذي صيغة جديدة:\n"
+        f"{english}\n"
+        f"ومعناه بالعربي: {arabic_gloss}\n"
+        "كذا أحسن؟"
+    )
+
+
+def confirm_again_prompt(english: str, arabic_gloss: str) -> str:
+    """A typed «تمام» is warmth, not consent — re-show and ask for the tap
+    instead of promoting (constant 5, §14-ج)."""
+    return (
+        "أبشر 🙏 بس أحتاج ضغطة منك عشان أضيفها لسيرتك\n"
+        f"{english}\n"
+        f"ومعناه بالعربي: {arabic_gloss}\n"
+        "اضغط «مضبوط ✅» وتدخل سيرتك، أو «أبي أعدّل ✏️» وأعيد الصياغة"
+    )
+
+
+def final_offer_prompt(english: str, arabic_gloss: str) -> str:
+    """The attempt cap: stop regenerating, offer the best draft we have."""
+    return (
+        "جرّبنا كذا صيغة، وهذي أقربها لكلامك 👇\n"
+        f"{english}\n"
+        f"ومعناه بالعربي: {arabic_gloss}\n"
+        "لو تناسبك اضغط «مضبوط ✅» وتدخل سيرتك\n"
+        "ولو ما ناسبتك اضغط «تخطّي هذا الدور» ونكمل ولا يهمك 👌"
+    )
 
 _ACK_THANKS = "تسلم يا [name] 🙏 هالمعلومة فرقت مرة وبتقوّي سيرتك فعلاً."
 _ACK_SKIP = "تمام، عدّينا هالجزء وسيرتك زينة 👍"
@@ -185,7 +268,7 @@ def enqueue_enrichment(
     # one role per session by design (anti-nag) — no queue scaffolding
     journey_context["enrichment"] = {
         "open": True, "current": str(role_fact_id),
-        "opened_at": now.isoformat(),
+        "opened_at": now.isoformat(), "attempts": 0,
     }
     session.flush()
     return True
@@ -198,10 +281,102 @@ def opening_message(session: Session, *, role_fact_id: uuid.UUID) -> str:
 
 
 SKIP_LABELS = frozenset({_SKIP_ROLE, _NOTHING, _STOP_ALL, BTN_SKIP,
-                         BTN_NONE, "نعدّي", "نعدي", "نكمّل", "نكمل"})
-OK_LABELS = frozenset({_CONFIRM_OK, BTN_OK})
+                         BTN_NONE, "نعدّي", "نعدي", "نكمّل", "نكمل",
+                         "نعدي هالدور", "عدها", "تخطى", "تخطي"})
+OK_LABELS = frozenset({_CONFIRM_OK, BTN_OK, "مضبوط"})
 EDIT_LABELS = frozenset({_CONFIRM_EDIT, BTN_EDIT})
 DEL_LABELS = frozenset({_CONFIRM_DEL, BTN_DEL})
+AGAIN_LABELS = frozenset({_AGAIN, BTN_AGAIN, "صيغة ثانية", "صيغه ثانيه",
+                          "ثانية", "غيرها"})
+
+#: Normalised once at import — «مضبوط» typed must equal «مضبوط ✅» tapped.
+_NORMALISED: dict[str, frozenset[str]] = {}
+
+
+def matches(body: str, labels: frozenset[str]) -> bool:
+    """Button ids and typed Arabic labels both resolve, diacritic- and
+    emoji-insensitively (§14-ج)."""
+    key = id(labels)
+    cache = _NORMALISED.get(str(key))
+    if cache is None:
+        cache = frozenset(normalize_ar(x) for x in labels)
+        _NORMALISED[str(key)] = cache
+    return normalize_ar(body) in cache
+
+
+# ── which of three things a free-text reply is, while a draft is on screen ──
+# Deterministic by design (no fifth network call): the classifier's failure
+# mode is self-healing — an instruction misread as an answer comes back as
+# «not_achievement» and the ladder in handle_answer retries it as an
+# instruction. Positive-evidence-only, so the DANGEROUS direction (a real
+# achievement swallowed as an editing note) cannot happen.
+
+INTENT_AFFIRM = "affirm"
+INTENT_INSTRUCTION = "instruction"
+INTENT_NEW_ANSWER = "new_answer"
+
+_INSTRUCTION_TOKENS = frozenset({
+    "ابدع", "بدع", "اختصر", "قصر", "اقصر", "طول", "قوي", "قو", "حسن", "عدل",
+    "غير", "صيغ", "صغ", "اعد", "نقح", "بسط", "وضح", "فصل", "كبر", "صغر", "زد",
+    "زيد", "ضيف", "اضف", "انقص", "شل", "احذف", "رتب", "خفف", "نمق", "خلها",
+    "احترافي", "احترافيه", "اقوي", "احلي", "افضل", "اجمل", "اطول", "اوضح",
+    "مختصر", "مختصره", "طويله", "قصيره", "ضعيفه", "باهته", "جافه",
+    "عجبتني", "عجبني",
+})
+_META_TOKENS = frozenset({
+    "كلامي", "كلمي", "كلامك", "الصياغه", "صياغه", "صياغتها", "السطر", "سطر",
+    "الجمله", "جمله", "النص", "العباره", "الترجمه", "ترجمه", "ترجمت",
+    "ترجمتها", "المسوده", "بالانجليزي", "الانجليزي",
+})
+_WORK_TOKENS = frozenset({
+    "كنت", "مسوول", "مسيول", "اشرفت", "ادرت", "دربت", "طورت", "حللت", "نظمت",
+    "انشات", "بنيت", "سويت", "عملت", "شغلت", "راقبت", "قللت", "زدت", "رفعت",
+    "حسنت", "قدت", "تابعت", "جهزت", "صممت", "كتبت", "درست", "خدمت", "ساعدت",
+    "دعمت", "انجزت", "حققت", "اطلقت", "نفذت", "قدمت", "استلمت", "سلمت",
+    "تعاملت", "تواصلت", "فريق", "مشروع", "مشاريع", "عميل", "عملاء", "قسم",
+    "تقارير",
+})
+_AFFIRM_TOKENS = frozenset({
+    "ايه", "ايوه", "اي", "نعم", "اوك", "اوكي", "تمام", "ماشي", "زين", "زينه",
+    "اكيد", "يب", "تم", "yes", "ok",
+})
+
+
+def _hits(tokens: set[str], lexicon: frozenset[str]) -> set[str]:
+    """Lexicon hits, tolerating one trailing enclitic pronoun («اختصرها»)."""
+    out: set[str] = set()
+    for t in tokens:
+        forms = {t} | {
+            t[: -len(sfx)] for sfx in ("ها", "هم", "ه")
+            if t.endswith(sfx) and len(t) - len(sfx) >= 3
+        }
+        if forms & lexicon:
+            out.add(t)
+    return out
+
+
+def classify_reply(text: str, *, has_previous_answer: bool) -> str:
+    """AFFIRM / INSTRUCTION / NEW_ANSWER. Default is NEW_ANSWER so a genuine
+    achievement is never silently swallowed as an editing note."""
+    if not has_previous_answer:
+        return INTENT_NEW_ANSWER      # nothing to regenerate from
+    tokens = set(normalize_ar(text).split())
+    if not tokens:
+        return INTENT_NEW_ANSWER
+    if tokens <= _AFFIRM_TOKENS:
+        return INTENT_AFFIRM
+    work = _hits(tokens, _WORK_TOKENS) | {
+        t for t in tokens
+        if t.endswith("ت") and len(t) >= 4
+        and t not in _META_TOKENS and t not in _INSTRUCTION_TOKENS
+    }
+    if _hits(tokens, _META_TOKENS) or _hits(tokens, _INSTRUCTION_TOKENS):
+        # instruction words present — unless the reply also carries real work
+        # content, in which case it is a fresh answer that happens to comment
+        return INTENT_NEW_ANSWER if len(work) >= 2 else INTENT_INSTRUCTION
+    if not work and len(tokens) <= 5:
+        return INTENT_INSTRUCTION     # a short reaction, not an achievement
+    return INTENT_NEW_ANSWER
 
 
 # ── answer handling (the render → pending → confirm → bank chain) ────────────
@@ -221,6 +396,54 @@ def _bank_vocabulary(session: Session, *, tenant_id: uuid.UUID) -> set[str]:
     return bank_vocabulary(bank)
 
 
+def draft_of(
+    session: Session, *, tenant_id: uuid.UUID, fact_id: uuid.UUID
+) -> tuple[str, str] | None:
+    """(english, arabic_gloss) of a still-pending draft, or None."""
+    fact = session.get(ProfileFact, fact_id)
+    if (fact is None or fact.tenant_id != tenant_id
+            or fact.status != "EXTRACTED"):
+        return None
+    payload = fact.payload or {}
+    return str(payload.get("text") or ""), str(payload.get("arabic_gloss") or "")
+
+
+def _upsert_draft(
+    session: Session, *, tenant_id: uuid.UUID, role_fact_id: uuid.UUID,
+    draft_fact_id: uuid.UUID | None, rendered: dict[str, Any],
+    arabic_answer: str, edit_intent: str,
+) -> ProfileFact:
+    """Reuse the pending row across regenerations instead of orphaning one per
+    attempt. PAYLOAD IS A CLOSED SET: bank_vocabulary() scans every string
+    value of confirmed facts, so no model-authored English (the judge's
+    reason, panel bookkeeping) may ever be stored here — it would silently
+    widen the §10.2 invention whitelist. Those go to the log."""
+    payload = {
+        "text": rendered["english_bullet"],
+        "experience_fact_id": str(role_fact_id),
+        "arabic_source": arabic_answer,           # audit only, never rendered
+        "arabic_gloss": rendered["arabic_gloss"],  # confirm UI only
+        "lang": "en",
+    }
+    if edit_intent:
+        payload["edit_intent"] = edit_intent
+    if draft_fact_id is not None:
+        existing = session.get(ProfileFact, draft_fact_id)
+        if (existing is not None and existing.tenant_id == tenant_id
+                and existing.status == "EXTRACTED"):
+            existing.payload = payload
+            session.flush()
+            return existing
+    fact = ProfileFact(
+        id=uuid.uuid4(), tenant_id=tenant_id, category="achievement",
+        payload=payload, status="EXTRACTED",
+        source="conversation_achievement",
+    )
+    session.add(fact)
+    session.flush()
+    return fact
+
+
 def handle_answer(
     session: Session,
     *,
@@ -230,43 +453,93 @@ def handle_answer(
     renderer: AchievementRenderer,
     now: datetime,
     known_name: str | None = None,
+    judge: Any = None,
+    edit_intent: str = "",
+    fallback_source: str = "",
+    draft_fact_id: uuid.UUID | None = None,
 ) -> dict[str, Any]:
-    """Render + ground the colloquial answer. On success store a PENDING
-    (EXTRACTED) achievement fact and return a confirm prompt; on failure
-    return a re-ask. Never stores an ungrounded bullet."""
-    # the answer is a customer-stated fact — strip PII before the model call.
+    """Run the quality panel over the answer and return a DISCRIMINATED result
+    the orchestrator can always answer warmly:
+
+    * ``confirm``   — a grounded winner is on the draft row, show the buttons
+    * ``no_bullet`` — nothing survived; ``reason`` says why (they differ in UX)
+    * ``soft_fail`` — our boundary failed (model down / PII refusal), not them
+
+    Never returns a bare failure the caller could turn into silence."""
     from career.onboarding.extraction import assert_no_pii, strip_pii
 
-    # AUDIT ك-9: the customer's name must be stripped too (constant §15.8) —
-    # the caller passes it from the profile; None was a silent hole.
-    stripped = strip_pii(arabic_answer, known_name=known_name)
-    assert_no_pii(stripped.text, known_name=known_name)
+    # AUDIT ك-9 + constant §15.8: strip BEFORE any model call, and the
+    # customer's name too. A refusal here is OUR problem, never theirs.
+    try:
+        stripped = strip_pii(arabic_answer, known_name=known_name)
+        assert_no_pii(stripped.text, known_name=known_name)
+    except Exception:  # noqa: BLE001 — never echo or log the text itself
+        _logger.warning("PII gate refused an enrichment answer")
+        return {"status": "soft_fail", "arabic_source": ""}
 
-    vocab = _bank_vocabulary(session, tenant_id=tenant_id)
-    rendered = render_achievement(
-        renderer, arabic_answer=stripped.text, vocabulary=vocab
-    )
-    if rendered is None:
-        return {"status": "reask"}
+    source = stripped.text
+    try:
+        vocab = _bank_vocabulary(session, tenant_id=tenant_id)
+        result = run_panel(
+            renderer, arabic_answer=source, vocabulary=vocab,
+            instruction=edit_intent, judge=judge,
+        )
+    except Exception:  # noqa: BLE001 — a dead boundary is a soft failure
+        _logger.warning("enrichment panel failed", exc_info=True)
+        return {"status": "soft_fail", "arabic_source": source}
 
-    fact = ProfileFact(
-        id=uuid.uuid4(), tenant_id=tenant_id, category="achievement",
-        payload={
-            "text": rendered["english_bullet"],
-            "experience_fact_id": str(role_fact_id),
-            "arabic_source": arabic_answer,          # audit only, never rendered
-            "arabic_gloss": rendered["arabic_gloss"],  # confirm UI only
-            "lang": "en",
-        },
-        status="EXTRACTED", source="conversation_achievement",
+    _logger.info("enrichment panel %s", result.get("panel"))
+    regenerated = bool(edit_intent)
+    status = result.get("status")
+
+    # LADDER — each branch fires at most one extra panel.
+    if status == "not_achievement" and fallback_source and fallback_source != source:
+        # the reply was an instruction we misread as an answer: retry against
+        # the stored original, which is what the customer actually meant.
+        try:
+            result = run_panel(
+                renderer, arabic_answer=fallback_source, vocabulary=vocab,
+                instruction=edit_intent or "rephrase", judge=judge,
+            )
+            _logger.info("enrichment panel (self-heal) %s", result.get("panel"))
+            if result.get("status") == "ok":
+                source, regenerated, status = fallback_source, True, "ok"
+        except Exception:  # noqa: BLE001
+            _logger.warning("self-heal panel failed", exc_info=True)
+    elif status == "ungrounded":
+        # every draft invented something — one cheap plainer attempt, no judge
+        try:
+            retry = run_panel(
+                renderer, arabic_answer=source, vocabulary=vocab,
+                instruction="simpler", judge=None, angles=(PANEL_ANGLES[0],),
+            )
+            _logger.info("enrichment panel (plainer) %s", retry.get("panel"))
+            if retry.get("status") == "ok":
+                result, status = retry, "ok"
+        except Exception:  # noqa: BLE001
+            _logger.warning("plainer retry failed", exc_info=True)
+
+    if status != "ok":
+        return {
+            "status": "no_bullet",
+            "reason": str(status or "unknown"),
+            "arabic_source": source,
+        }
+
+    fact = _upsert_draft(
+        session, tenant_id=tenant_id, role_fact_id=role_fact_id,
+        draft_fact_id=draft_fact_id, rendered=result,
+        arabic_answer=source, edit_intent=edit_intent,
     )
-    session.add(fact)
-    session.flush()
     return {
         "status": "confirm",
         "pending_fact_id": str(fact.id),
+        "english_bullet": result["english_bullet"],
+        "arabic_gloss": result["arabic_gloss"],
+        "arabic_source": source,
+        "regenerated": regenerated,
         "prompt": _confirm_prompt(
-            rendered["english_bullet"], rendered["arabic_gloss"]
+            result["english_bullet"], result["arabic_gloss"]
         ),
     }
 

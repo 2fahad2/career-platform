@@ -277,7 +277,8 @@ def test_handle_answer_ungrounded_stores_nothing(
         out = enr.handle_answer(
             owner_session, tenant_id=tid, role_fact_id=role_id,
             arabic_answer="قللت الوقت بشكل كبير", renderer=r, now=_NOW)
-        assert out["status"] == "reask"
+        assert out["status"] == "no_bullet"      # renamed by F-PANEL §14-ب
+        assert out["reason"] == "ungrounded"
         n = owner_session.execute(_sql(
             "SELECT count(*) FROM profile_facts WHERE tenant_id = :t"
             " AND category = 'achievement'"), {"t": a}).scalar_one()
@@ -683,3 +684,313 @@ def test_examples_schema_has_no_unsupported_array_constraints() -> None:
     arr = _EXAMPLES_SCHEMA["properties"]["examples"]
     assert "maxItems" not in arr
     assert arr.get("minItems", 0) in (0, 1)
+
+
+# ══ F-PANEL part B: intent classification + zero dead ends (§14-ب/ج) ═══════
+
+
+class _RecordingRenderer:
+    """Records every (arabic_answer, angle, instruction) it is asked for."""
+
+    def __init__(self, results: list) -> None:
+        self.results = results
+        self.calls: list[tuple[str, str, str]] = []
+
+    def render(self, arabic_answer: str, *, angle: str = "",
+               instruction: str = "") -> dict:
+        self.calls.append((arabic_answer, angle, instruction))
+        r = self.results[min(len(self.calls) - 1, len(self.results) - 1)]
+        return r(arabic_answer) if callable(r) else r
+
+
+def _bullet(text: str = "Improved reporting.") -> dict:
+    return {"is_achievement": True, "english_bullet": text,
+            "qualitative_only": True, "arabic_gloss": "حسّنت التقارير"}
+
+
+# ── the classifier (no DB) ──────────────────────────────────────────────────
+
+
+def test_the_owners_live_message_is_an_instruction() -> None:
+    """REGRESSION, 29-July rehearsal: «مضروبه ترجمت كلامي بس ابدع» is feedback
+    on the draft. Reading it as a fresh achievement is what produced the
+    dead-end reply the owner rejected."""
+    from career.onboarding.enrichment import INTENT_INSTRUCTION, classify_reply
+
+    assert classify_reply("مضروبه ترجمت كلامي بس ابدع",
+                          has_previous_answer=True) == INTENT_INSTRUCTION
+
+
+def test_instruction_forms_are_recognised() -> None:
+    from career.onboarding.enrichment import INTENT_INSTRUCTION, classify_reply
+
+    for text in ("ابدع", "اختصرها", "حلوة بس", "خلّها أقوى", "ما عجبتني",
+                 "الصياغة طويلة", "وضّح دوري أكثر"):
+        assert classify_reply(text, has_previous_answer=True) == \
+            INTENT_INSTRUCTION, text
+
+
+def test_real_answers_are_never_swallowed_as_instructions() -> None:
+    from career.onboarding.enrichment import INTENT_NEW_ANSWER, classify_reply
+
+    for text in ("كنت مسؤول عن مراقبة الشبكة وحل الأعطال",
+                 "دربت خمسة موظفين جدد",
+                 "قدت فريق ٥ وقللت وقت الحل",
+                 "أشرفت على فريق الصيانة وقللت الأعطال"):
+        assert classify_reply(text, has_previous_answer=True) == \
+            INTENT_NEW_ANSWER, text
+
+
+def test_mixed_reply_prefers_the_answer() -> None:
+    """Facts must never be dropped: an answer that also comments is an answer."""
+    from career.onboarding.enrichment import INTENT_NEW_ANSWER, classify_reply
+
+    assert classify_reply("لا ابدع اكثر كنت مسؤول عن كل الفروع وطورت النظام",
+                          has_previous_answer=True) == INTENT_NEW_ANSWER
+
+
+def test_affirmations_are_their_own_intent() -> None:
+    from career.onboarding.enrichment import INTENT_AFFIRM, classify_reply
+
+    for text in ("تمام", "ايه", "أوكي", "زين", "تم"):
+        assert classify_reply(text, has_previous_answer=True) == \
+            INTENT_AFFIRM, text
+
+
+def test_without_a_previous_answer_everything_is_an_answer() -> None:
+    from career.onboarding.enrichment import INTENT_NEW_ANSWER, classify_reply
+
+    assert classify_reply("ابدع", has_previous_answer=False) == \
+        INTENT_NEW_ANSWER
+
+
+def test_lexicons_are_stored_normalised() -> None:
+    """«مسؤول» normalises to «مسوول» — an un-normalised token would never
+    match and the classifier would silently misread real answers."""
+    from career.onboarding import enrichment as enr
+    from career.onboarding.achievement_render import normalize_ar
+
+    for lex in (enr._INSTRUCTION_TOKENS, enr._META_TOKENS,
+                enr._WORK_TOKENS, enr._AFFIRM_TOKENS):
+        for tok in lex:
+            assert normalize_ar(tok) == tok, tok
+
+
+def test_typed_labels_match_tapped_ones() -> None:
+    from career.onboarding import enrichment as enr
+
+    assert enr.matches("مضبوط", enr.OK_LABELS)
+    assert enr.matches("مضبوط ✅", enr.OK_LABELS)
+    assert enr.matches("نعدي هالدور", enr.SKIP_LABELS)
+    assert enr.matches("enr_again", enr.AGAIN_LABELS)
+    assert not enr.matches("ابدع", enr.OK_LABELS)
+
+
+# ── the copy: no dead ends anywhere, and bidi-pure builders ─────────────────
+
+
+def test_no_enrichment_copy_blames_the_customer() -> None:
+    """STATIC GUARD (§14-ب): a future edit cannot quietly reintroduce a dead
+    end. Forbidden phrasings + every recovery message must offer a way out."""
+    import inspect
+
+    from career.onboarding import enrichment as enr
+
+    forbidden = ("ما قدرت", "ما فهمت", "تعذّر", "فشل", "غير واضح")
+    for name, value in vars(enr).items():
+        if name.startswith("__") or not isinstance(value, str):
+            continue
+        if not inspect.getmodule(enr):
+            continue
+        for bad in forbidden:
+            assert bad not in value, f"{name} contains «{bad}»"
+
+    ways_out = ("تخطّي هذا الدور", "صيغة ثانية", "بكلماتك", "أعيد الصياغة")
+    for msg in (enr._NEED_A_BIT_MORE, enr._TRY_AGAIN_SOON,
+                enr._DELETED_ASK, enr._EDIT_PROMPT):
+        assert any(w in msg for w in ways_out), msg
+
+
+def test_prompt_builders_keep_lines_direction_pure() -> None:
+    """The English bullet gets its own line; no Arabic line carries Latin."""
+    import re
+
+    from career.onboarding import enrichment as enr
+
+    latin = re.compile(r"[A-Za-z]")
+    arabic = re.compile(r"[؀-ۿ]")
+    for build in (enr.regenerated_prompt, enr.confirm_again_prompt,
+                  enr.final_offer_prompt):
+        lines = build("Improved reporting.", "حسّنت التقارير").split("\n")
+        latin_lines = [ln for ln in lines if latin.search(ln)]
+        assert len(latin_lines) == 1, build.__name__
+        assert not arabic.search(latin_lines[0]), build.__name__
+
+
+# ── the conversation (DB) ───────────────────────────────────────────────────
+
+
+def test_feedback_regenerates_from_the_original_arabic(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """THE incident, fixed: «ابدع» after «أبي أعدّل» must re-render the ORIGINAL
+    answer with a stronger direction — never render the word «ابدع» itself."""
+    from career.onboarding import enrichment as enr
+
+    a, _ = two_tenants
+    original = "قللت وقت التقارير"
+    r = _RecordingRenderer([_bullet(), _bullet("Reduced reporting turnaround.")])
+    deps, channel_id, _role = _seed_enrichment_conversation(owner_session, a)
+    deps.achievement_renderer = r
+    try:
+        _orch.handle_enrichment(owner_session, channel_id=channel_id,
+                                text=original, deps=deps, now=_NOW)
+        _orch.handle_enrichment(owner_session, channel_id=channel_id,
+                                text=enr.BTN_EDIT, deps=deps, now=_NOW)
+        before = len(r.calls)
+        _orch.handle_enrichment(owner_session, channel_id=channel_id,
+                                text="ابدع", deps=deps, now=_NOW)
+        owner_session.commit()
+        post = r.calls[before:]
+        assert post, "no render after the instruction"
+        assert all(c[0] == original for c in post), post
+        assert all(c[2] == "stronger" for c in post), post
+        # exactly ONE draft row — the regeneration reuses it, no orphans
+        n = owner_session.execute(_sql(
+            "SELECT count(*) FROM profile_facts WHERE tenant_id = :t"
+            " AND category = 'achievement'"), {"t": a}).scalar_one()
+        assert n == 1
+        last = deps.whatsapp_client.sent[-1]
+        assert last.kind == "interactive" and len(last.buttons) == 3
+        assert "صيغة جديدة" in (last.body or "")
+    finally:
+        _cleanup_conversation(owner_session, a)
+
+
+def test_feedback_never_dead_ends(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """Even when every regeneration fails, the reply is warm and offers exits."""
+    from career.onboarding import enrichment as enr
+
+    a, _ = two_tenants
+    r = _RecordingRenderer([_bullet(), {"is_achievement": False}])
+    deps, channel_id, _role = _seed_enrichment_conversation(owner_session, a)
+    deps.achievement_renderer = r
+    try:
+        _orch.handle_enrichment(owner_session, channel_id=channel_id,
+                                text="قللت وقت التقارير", deps=deps, now=_NOW)
+        _orch.handle_enrichment(owner_session, channel_id=channel_id,
+                                text=enr.BTN_EDIT, deps=deps, now=_NOW)
+        _orch.handle_enrichment(owner_session, channel_id=channel_id,
+                                text="ابدع", deps=deps, now=_NOW)
+        owner_session.commit()
+        body = deps.whatsapp_client.sent[-1].body or ""
+        assert "ما قدرت" not in body
+        assert "تخطّي هذا الدور" in body
+        assert deps.whatsapp_client.sent[-1].kind == "interactive"
+        status = owner_session.execute(_sql(
+            "SELECT status FROM profile_facts WHERE tenant_id = :t"
+            " AND category = 'achievement'"), {"t": a}).scalar_one()
+        assert status == "EXTRACTED"          # nothing promoted
+    finally:
+        _cleanup_conversation(owner_session, a)
+
+
+def test_typed_affirmation_never_promotes(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """Constant 5: «تمام» is warmth, not consent — re-ask for the tap."""
+    a, _ = two_tenants
+    r = _RecordingRenderer([_bullet()])
+    deps, channel_id, _role = _seed_enrichment_conversation(owner_session, a)
+    deps.achievement_renderer = r
+    try:
+        _orch.handle_enrichment(owner_session, channel_id=channel_id,
+                                text="قللت وقت التقارير", deps=deps, now=_NOW)
+        calls_before = len(r.calls)
+        _orch.handle_enrichment(owner_session, channel_id=channel_id,
+                                text="تمام", deps=deps, now=_NOW)
+        owner_session.commit()
+        assert len(r.calls) == calls_before, "affirmation must not re-render"
+        status = owner_session.execute(_sql(
+            "SELECT status FROM profile_facts WHERE tenant_id = :t"
+            " AND category = 'achievement'"), {"t": a}).scalar_one()
+        assert status == "EXTRACTED"
+        assert "أحتاج ضغطة" in (deps.whatsapp_client.sent[-1].body or "")
+    finally:
+        _cleanup_conversation(owner_session, a)
+
+
+def test_renderer_down_gives_a_warm_reply_not_silence(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    a, _ = two_tenants
+
+    class _Dead:
+        def render(self, arabic_answer: str, *, angle: str = "",
+                   instruction: str = "") -> dict:
+            raise RuntimeError("boundary down")
+
+    deps, channel_id, _role = _seed_enrichment_conversation(owner_session, a)
+    deps.achievement_renderer = _Dead()
+    try:
+        before = len(deps.whatsapp_client.sent)
+        _orch.handle_enrichment(owner_session, channel_id=channel_id,
+                                text="قللت وقت التقارير", deps=deps, now=_NOW)
+        owner_session.commit()
+        assert len(deps.whatsapp_client.sent) > before, "silence is the bug"
+        body = deps.whatsapp_client.sent[-1].body or ""
+        assert "تخطّي هذا الدور" in body
+        for bad in ("ما قدرت", "تعذّر", "فشل"):
+            assert bad not in body
+        n = owner_session.execute(_sql(
+            "SELECT count(*) FROM profile_facts WHERE tenant_id = :t"
+            " AND category = 'achievement'"), {"t": a}).scalar_one()
+        assert n == 0
+    finally:
+        _cleanup_conversation(owner_session, a)
+
+
+def test_typed_skip_phrase_is_never_rendered(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    a, _ = two_tenants
+    r = _RecordingRenderer([_bullet()])
+    deps, channel_id, role_id = _seed_enrichment_conversation(owner_session, a)
+    deps.achievement_renderer = r
+    try:
+        _orch.handle_enrichment(owner_session, channel_id=channel_id,
+                                text="نعدي هالدور", deps=deps, now=_NOW)
+        owner_session.commit()
+        assert r.calls == []
+        status = owner_session.execute(_sql(
+            "SELECT status FROM role_enrichments WHERE fact_id = :f"),
+            {"f": str(role_id)}).scalar_one()
+        assert status == "SKIPPED"
+    finally:
+        _cleanup_conversation(owner_session, a)
+
+
+def test_draft_payload_stays_a_closed_set(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """bank_vocabulary() scans every string value of confirmed facts, so no
+    model-authored English (judge reasons, panel bookkeeping) may be stored —
+    it would silently widen the invented-content whitelist."""
+    a, _ = two_tenants
+    deps, channel_id, _role = _seed_enrichment_conversation(owner_session, a)
+    deps.achievement_renderer = _RecordingRenderer([_bullet()])
+    try:
+        _orch.handle_enrichment(owner_session, channel_id=channel_id,
+                                text="قللت وقت التقارير", deps=deps, now=_NOW)
+        owner_session.commit()
+        payload = owner_session.execute(_sql(
+            "SELECT payload FROM profile_facts WHERE tenant_id = :t"
+            " AND category = 'achievement'"), {"t": a}).scalar_one()
+        allowed = {"text", "experience_fact_id", "arabic_source",
+                   "arabic_gloss", "lang", "edit_intent"}
+        assert set(payload) <= allowed, set(payload) - allowed
+        assert "panel" not in payload and "why" not in payload
+    finally:
+        _cleanup_conversation(owner_session, a)
