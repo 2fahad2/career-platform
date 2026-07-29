@@ -92,6 +92,13 @@ jobs:
           sudo apt-get install -y shellcheck >/dev/null 2>&1 || true
           shellcheck ops/backup/*.sh
 
+      - name: Dependency lockfile is present and parseable
+        run: |
+          test -s requirements.lock || { echo "requirements.lock missing"; exit 1; }
+          pins=$(grep -cE '^[A-Za-z0-9_.-]+==' requirements.lock)
+          echo "pinned packages: $pins"
+          test "$pins" -ge 40 || { echo "lockfile looks truncated"; exit 1; }
+
       - name: Apply migrations (alembic)
         run: alembic upgrade head
 

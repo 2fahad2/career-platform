@@ -37,3 +37,4 @@ backups/
 
 # Local runtime
 *.log
+conversation-archive/
