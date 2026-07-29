@@ -235,10 +235,12 @@ _EXAMPLES_SCHEMA = {
     "additionalProperties": False,
     "required": ["examples"],
     "properties": {
-        "examples": {
-            "type": "array", "minItems": 3, "maxItems": 3,
-            "items": {"type": "string"},
-        },
+        # LIVE BUG (29 July): structured-output schemas accept neither
+        # minItems>1 nor maxItems — with minItems/maxItems=3 EVERY call 400'd,
+        # and the swallowed error left the icebreaker silently dead from the
+        # day it shipped. The count lives in the prompt; prepare_examples
+        # trims to three after the deterministic scrub gate.
+        "examples": {"type": "array", "items": {"type": "string"}},
     },
 }
 

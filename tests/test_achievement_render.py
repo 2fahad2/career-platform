@@ -666,3 +666,14 @@ def test_current_role_sorts_before_ended_roles(
         owner_session.execute(_sql(
             "DELETE FROM profile_facts WHERE tenant_id = :t"), {"t": a})
         owner_session.commit()
+
+
+def test_examples_schema_has_no_unsupported_array_constraints() -> None:
+    """LIVE BUG (29 July): structured outputs reject minItems>1 and maxItems.
+    With them present EVERY examples call 400'd and the swallowed error left
+    the icebreaker dead in production. Keep the schema constraint-free."""
+    from career.onboarding.achievement_render import _EXAMPLES_SCHEMA
+
+    arr = _EXAMPLES_SCHEMA["properties"]["examples"]
+    assert "maxItems" not in arr
+    assert arr.get("minItems", 0) in (0, 1)

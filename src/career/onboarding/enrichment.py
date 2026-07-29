@@ -353,6 +353,8 @@ def prepare_examples(
         raw = list(writer.write(title, description))
     except Exception:  # noqa: BLE001 — examples are optional garnish
         return []
+    # the model is asked for three in the prompt; the schema can't enforce a
+    # count (live 400 on minItems/maxItems), so trim after the scrub gate.
     return scrub_examples(
         raw, role_payload_text=f"{title} {description}"
     )[:3]
