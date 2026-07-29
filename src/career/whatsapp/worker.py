@@ -188,6 +188,15 @@ def _handle_message(
         if claimed is not None:
             _finish_activation(claimed)
             return
+        # A prospect asking to see the work before paying — the store copy
+        # promises «راسلنا واتساب بكلمة عينة», so keep it here, before the
+        # activation-code fallback (no tenant exists yet, nothing is written).
+        from career.whatsapp import samples as wa_samples
+
+        if wa_samples.is_sample_request(text_body) and wa_samples.send_samples(
+            whatsapp_client, from_phone
+        ):
+            return
         # Unknown number, no claimable order → generic help (in-window).
         whatsapp_client.send_text(from_phone, _UNRECOGNIZED)
         return

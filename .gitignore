@@ -7,7 +7,11 @@
 !.env.production.example
 
 # Tenant object storage — PDFs and per-tenant data never enter git.
-data/
+data/*
+# ...except the public «عينة» artefacts — they must ship with the code
+!data/samples/
+data/samples/*
+!data/samples/*.pdf
 
 # Python
 __pycache__/
