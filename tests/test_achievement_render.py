@@ -73,9 +73,12 @@ class _FakeRenderer:
         self._results = results
         self.calls = 0
 
-    def render(self, arabic_answer: str) -> dict:
+    def render(self, arabic_answer: str, *, angle: str = "",
+               instruction: str = "") -> dict:
         r = self._results[min(self.calls, len(self._results) - 1)]
         self.calls += 1
+        self.last_angle = angle
+        self.last_instruction = instruction
         return r
 
 
@@ -152,7 +155,10 @@ class _StubRenderer:
     def __init__(self, bullet: str, gloss: str = "ملخص") -> None:
         self._bullet, self._gloss = bullet, gloss
 
-    def render(self, arabic_answer: str) -> dict:
+    def render(self, arabic_answer: str, *, angle: str = "",
+               instruction: str = "") -> dict:
+        self.last_angle = angle
+        self.last_instruction = instruction
         return {"is_achievement": True, "english_bullet": self._bullet,
                 "qualitative_only": True, "arabic_gloss": self._gloss}
 

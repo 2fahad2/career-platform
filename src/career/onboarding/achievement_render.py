@@ -115,8 +115,14 @@ def bullet_is_grounded(
 
 
 class AchievementRenderer(Protocol):
-    def render(self, arabic_answer: str) -> dict[str, Any]:
-        """{is_achievement, english_bullet, qualitative_only, arabic_gloss}."""
+    def render(
+        self, arabic_answer: str, *, angle: str = "", instruction: str = ""
+    ) -> dict[str, Any]:
+        """{is_achievement, english_bullet, qualitative_only, arabic_gloss}.
+
+        ``angle`` steers one panel candidate (F-PANEL §14); ``instruction``
+        carries the customer's own editing note («ابدع», «اختصرها»). Neither
+        may loosen the grounding rules — the deterministic guard runs after."""
         ...
 
 
@@ -124,18 +130,58 @@ class RenderFailed(Exception):
     """The renderer produced nothing usable after the bounded retry."""
 
 
+#: The ONLY editing directions we will ever put in a prompt (review finding
+#: 2026-07-30). The customer's own words are NEVER interpolated: they are
+#: classified into one of these fixed English strings first. This closes the
+#: prompt-injection surface, removes any PII path into the model (§15.8), and
+#: denies the one invention the deterministic guard cannot catch — invented
+#: SCOPE or SENIORITY in plain prose («قل إني كنت مدير الفرع») passes the
+#: number/entity checks, so we refuse to relay such a request at all.
+EDIT_INTENTS: dict[str, str] = {
+    "stronger": "Make it read stronger and more accomplished — sharper verbs, "
+                "clearer ownership — while adding NO fact the Arabic lacks.",
+    "shorter": "Make it shorter and tighter without dropping substance.",
+    "simpler": "Use plainer, simpler English.",
+    "rephrase": "Rephrase it differently with the same meaning.",
+}
+
+#: Saudi-colloquial cues → intent. Unmatched text falls back to «rephrase»:
+#: a harmless, always-safe direction.
+_INTENT_CUES: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("ابدع", "أبدع", "اقوى", "أقوى", "قوي", "قوّي", "احترافي", "أحترافي",
+      "افخم", "أفخم", "حسن", "حسّن", "طور", "طوّر"), "stronger"),
+    (("اقصر", "أقصر", "اختصر", "قصر", "قصّر", "طويلة", "طويله"), "shorter"),
+    (("ابسط", "أبسط", "بسط", "بسّط", "سهل", "سهّل", "صعبة", "صعبه"), "simpler"),
+)
+
+
+def classify_edit_intent(text: str | None) -> str:
+    """Map a customer's editing note onto a FIXED intent key. Never returns
+    their words — only one of EDIT_INTENTS' keys."""
+    body = (text or "").strip()
+    for cues, intent in _INTENT_CUES:
+        if any(cue in body for cue in cues):
+            return intent
+    return "rephrase"
+
+
 def render_achievement(
     renderer: AchievementRenderer,
     *,
     arabic_answer: str,
     vocabulary: set[str],
+    instruction: str = "",
 ) -> dict[str, Any] | None:
     """Render + ground with ONE bounded regeneration. Returns the accepted
     payload {english_bullet, arabic_gloss, qualitative_only} or None when the
     answer is not an achievement or nothing grounded survives (never invents
     a fallback — a missing bullet is honest, a false one is not)."""
+    # review finding #1: only forward what we actually have, so a renderer
+    # with the narrow signature keeps working (and a drifted real renderer
+    # still fails loudly rather than silently).
+    extra: dict[str, Any] = {"instruction": instruction} if instruction else {}
     for _attempt in range(2):
-        result = renderer.render(arabic_answer)
+        result = renderer.render(arabic_answer, **extra)
         if not result.get("is_achievement"):
             return None
         english = str(result.get("english_bullet") or "").strip()
@@ -196,14 +242,29 @@ class AnthropicAchievementRenderer:  # pragma: no cover — live boundary
         self._client = client
         self._model = model
 
-    def render(self, arabic_answer: str) -> dict[str, Any]:
+    def render(
+        self, arabic_answer: str, *, angle: str = "", instruction: str = ""
+    ) -> dict[str, Any]:
         import json
 
+        # _SYSTEM stays byte-frozen: it is the authority channel. The angle
+        # is ours (a fixed literal); the editing direction is a FIXED string
+        # from EDIT_INTENTS — never the customer's own text (§15.9 spirit).
+        system = _SYSTEM
+        if angle:
+            system += f"\n\nEMPHASIS FOR THIS DRAFT: {angle}"
+        user_text = arabic_answer
+        if instruction:
+            direction = EDIT_INTENTS.get(instruction, EDIT_INTENTS["rephrase"])
+            user_text = (
+                f"{arabic_answer}\n\n---\nThe job-seeker asked for a "
+                f"revision. Direction: {direction}"
+            )
         response = self._client.messages.create(
             model=self._model, max_tokens=_MAX_TOKENS,
-            thinking={"type": "adaptive"}, system=_SYSTEM,
+            thinking={"type": "adaptive"}, system=system,
             output_config={"format": {"type": "json_schema", "schema": _SCHEMA}},
-            messages=[{"role": "user", "content": arabic_answer}],
+            messages=[{"role": "user", "content": user_text}],
         )
         if response.stop_reason != "end_turn":
             return {"is_achievement": False}
