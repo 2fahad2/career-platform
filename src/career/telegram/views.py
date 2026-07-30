@@ -259,6 +259,13 @@ def render_business(range_key: str, data: dict[str, Any]) -> tuple[str, Keyboard
     upgrades = data.get("funnel_upgrades")
     if upgrades is not None:
         lines.append(f"ترقيات القمع (تحليل ← اشتراك): {upgrades}")
+    # the store page shows a live seat count — the operator sees the same truth
+    if data.get("seats_cap") is not None:
+        from career.salla.seats import Seats, seats_line_ar
+
+        lines.append(seats_line_ar(Seats(
+            cap=int(data["seats_cap"]), taken=int(data.get("seats_taken", 0)),
+        )))
     delivered = data.get("delivered_days")
     if delivered is not None:
         lines.append(f"أيام تسليم ناجحة: {delivered}")

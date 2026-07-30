@@ -341,6 +341,11 @@ def _business_data(
         ).all()
     }
 
+    # the store page promises a live seat count — read the real one
+    from career.salla.seats import founding_seats
+
+    seats = founding_seats(session)
+
     delivered_query = select(func.count()).select_from(TenantDayState).where(
         TenantDayState.state == "DELIVERED"
     )
@@ -395,6 +400,9 @@ def _business_data(
         "llm_generations": int(usage_row[0]),
         "llm_cost_usd": usage_row[1],
         "message_statuses": message_statuses,
+        "seats_taken": seats.taken,
+        "seats_remaining": seats.remaining,
+        "seats_cap": seats.cap,
     }
 
 
