@@ -23,7 +23,11 @@ from career.funnel.evaluation import evaluate
 from career.funnel.report import render_report_pdf, whatsapp_summary
 from career.onboarding.consents import PURPOSES, missing_required, record_consent
 from career.onboarding.consents import _load_records as _consent_records
-from career.onboarding.extraction import run_extraction, strip_pii
+from career.onboarding.extraction import (
+    infer_header_name,
+    run_extraction,
+    strip_pii,
+)
 from career.onboarding.orchestrator import Deps
 from career.onboarding.upload import process_cv_upload
 from career.storage import tenant_key
@@ -236,11 +240,15 @@ def handle_funnel_document(
         )
         return
     text = deps.storage.get(text_storage_key).decode("utf-8")
-    stripped = strip_pii(text, known_name=None)
+    # §15.8 + the published privacy page: «اسمك لا يُرسل إلى أي نموذج». The
+    # funnel never asks for a name, so recover it from the CV header —
+    # otherwise the name line reached the model verbatim (closure audit ح-3).
+    header_name = infer_header_name(text)
+    stripped = strip_pii(text, known_name=header_name)
     contact_found = any(k.startswith("[EMAIL_") for k in stripped.replacements)
     run_extraction(
-        session, tenant_id=row.tenant_id, cv_text=text, known_name=None,
-        extractor=deps.extractor,
+        session, tenant_id=row.tenant_id, cv_text=text,
+        known_name=header_name, extractor=deps.extractor,
     )
     row.context = {**row.context, "contact_found": contact_found}
     row.state = STATE_PATH

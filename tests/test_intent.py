@@ -95,3 +95,41 @@ def test_every_mapped_command_is_a_real_privacy_command() -> None:
 
     for command in it.TOPIC_TO_COMMAND.values():
         assert command in _PRIVACY_COMMANDS, command
+
+
+# ── §15.8: the model must never see raw customer text ───────────────────────
+
+
+class _Spy:
+    """Records exactly what crossed the boundary to the provider."""
+
+    def __init__(self) -> None:
+        self.saw: list[str] = []
+
+    def classify(self, reply: str, *, draft: str | None) -> dict[str, Any]:
+        self.saw.append(reply)
+        return {"intent": "revise", "topic": "other", "confidence": 0.9}
+
+
+def test_the_classifier_never_sees_a_phone_number() -> None:
+    spy = _Spy()
+    it.resolve_intent("رقمي 0501234567 كلمني", draft=None, classifier=spy,
+                      deterministic=it.ANSWER)
+    assert spy.saw, "classifier was not called"
+    assert "0501234567" not in spy.saw[0]
+    assert "[PHONE_1]" in spy.saw[0]
+
+
+def test_the_classifier_never_sees_the_customers_name() -> None:
+    spy = _Spy()
+    it.resolve_intent("انا فهد وابي اعدلها", draft=None, classifier=spy,
+                      deterministic=it.ANSWER, known_name="فهد")
+    assert "فهد" not in spy.saw[0]
+    assert "[NAME]" in spy.saw[0]
+
+
+def test_the_classifier_never_sees_an_email() -> None:
+    spy = _Spy()
+    it.resolve_intent("ايميلي a@b.com", draft=None, classifier=spy,
+                      deterministic=it.ANSWER)
+    assert "a@b.com" not in spy.saw[0]

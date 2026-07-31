@@ -143,14 +143,29 @@ def resolve_intent(
     draft: str | None,
     classifier: IntentClassifier | None,
     deterministic: str,
+    known_name: str | None = None,
 ) -> tuple[str, str]:
     """(intent, topic). ``deterministic`` is the keyword classifier's verdict,
     used when the model is unavailable or unhelpful — never overridden by a
-    low-confidence guess."""
+    low-confidence guess.
+
+    §15.8: the reply is PII-stripped BEFORE the model sees it. The classifier
+    only ever returns a label, so the stripped text costs us nothing — while
+    the raw text would have carried names and 05… numbers straight to the
+    provider (closure audit ح-4). The CALLER keeps the original for the rest
+    of the turn; only this classification path sees the stripped copy."""
     if classifier is None:
         return deterministic, "other"
+    from career.onboarding.extraction import assert_no_pii, strip_pii
+
     try:
-        verdict = classifier.classify(body, draft=draft)
+        safe = strip_pii(body, known_name=known_name).text
+        assert_no_pii(safe, known_name=known_name)
+    except Exception:  # noqa: BLE001 — never echo or log the text itself
+        logger.warning("intent reply failed the PII gate — staying deterministic")
+        return deterministic, "other"
+    try:
+        verdict = classifier.classify(safe, draft=draft)
     except Exception:  # noqa: BLE001 — a down classifier must not block anyone
         logger.warning("intent classification failed", exc_info=True)
         return deterministic, "other"

@@ -471,3 +471,29 @@ def test_privacy_commands_work_for_funnel_customers(
     sent = deps.whatsapp_client.sent
     assert len(sent) > before
     assert "اشتراك" in (sent[-1].body or "")
+
+
+def test_cv_header_name_is_stripped_before_the_model(tmp_path) -> None:
+    """The funnel never asks for a name, so the CV header was reaching the
+    model verbatim while the privacy page promised otherwise (closure ح-3)."""
+    from career.onboarding.extraction import infer_header_name, strip_pii
+
+    cv = (
+        "Faisal Al-Otaibi\n"
+        "faisal@example.com | +966 50 000 0000\n\n"
+        "SUMMARY\nBusiness analyst with six years of experience.\n"
+    )
+    name = infer_header_name(cv)
+    assert name == "Faisal Al-Otaibi"
+    safe = strip_pii(cv, known_name=name).text
+    assert "Faisal" not in safe and "Al-Otaibi" not in safe
+    assert "[NAME]" in safe
+
+
+def test_header_inference_skips_section_headings() -> None:
+    from career.onboarding.extraction import infer_header_name
+
+    assert infer_header_name("CURRICULUM VITAE\nSUMMARY\n") is None
+    assert infer_header_name("السيرة الذاتية\nنبذة عني\n") is None
+    assert infer_header_name("Senior Analyst, Riyadh\n") is None   # punctuation
+    assert infer_header_name("Team of 5 engineers\n") is None       # digits

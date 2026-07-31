@@ -298,7 +298,7 @@ def handle_enrichment(
 
             resolved, topic = _resolve_enrichment_intent(
                 session, deps, tenant_id=tenant_id, body=body, state=state,
-                pending=pending,
+                pending=pending, known_name=name,
             )
             if resolved == intent_mod.OFF_TOPIC and _serve_off_topic(
                 session, deps, channel, topic=topic, body=body, now=now,
@@ -380,7 +380,7 @@ def handle_enrichment(
 
         resolved, topic = _resolve_enrichment_intent(
             session, deps, tenant_id=tenant_id, body=body, state=state,
-            pending=None,
+            pending=None, known_name=name,
         )
         if resolved == intent_mod.OFF_TOPIC and _serve_off_topic(
             session, deps, channel, topic=topic, body=body, now=now, send=_send,
@@ -425,7 +425,7 @@ def handle_enrichment(
 
 def _resolve_enrichment_intent(
     session: Session, deps: Deps, *, tenant_id: uuid.UUID, body: str,
-    state: dict[str, Any], pending: Any,
+    state: dict[str, Any], pending: Any, known_name: str | None = None,
 ) -> tuple[str, str]:
     """What does this reply want? (§15) Deterministic keywords stay the fast
     path and the fallback; the model handles the wide middle."""
@@ -446,7 +446,7 @@ def _resolve_enrichment_intent(
         draft_text = found[0] if found else None
     return intent_mod.resolve_intent(
         body, draft=draft_text, classifier=deps.intent_classifier,
-        deterministic=deterministic,
+        deterministic=deterministic, known_name=known_name,
     )
 
 

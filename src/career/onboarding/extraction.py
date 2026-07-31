@@ -76,6 +76,50 @@ class StrippedText:
     replacements: dict[str, str]  # placeholder -> original (never leaves the server)
 
 
+#: CV section headings and role words that look like a name to a naive
+#: heuristic. Kept small and English/Arabic both, because a false positive
+#: only costs one redacted heading — a false negative leaks a real name.
+_HEADER_STOPWORDS: frozenset[str] = frozenset({
+    "curriculum", "vitae", "resume", "cv", "profile", "summary", "objective",
+    "contact", "experience", "education", "skills", "projects", "languages",
+    "certifications", "references", "personal", "information", "details",
+    "السيرة", "الذاتية", "سيرة", "ذاتية", "الملف", "الشخصي", "نبذة",
+    "الخبرات", "التعليم", "المهارات", "المشاريع", "اللغات", "الشهادات",
+    "معلومات", "الاتصال", "البيانات", "الشخصية",
+})
+
+
+def infer_header_name(text: str, *, max_lines: int = 6) -> str | None:
+    """The name printed at the top of a CV, or None.
+
+    Why this exists: the funnel product (49 SAR) never asks the customer for
+    their name — they just upload a CV — so ``known_name`` was None and the
+    name line went to the model verbatim, while the published privacy page
+    promises «اسمك ورقم جوالك لا يُرسلان إلى أي نموذج». This recovers a name
+    to strip when we were never told one.
+
+    Deliberately conservative: two-to-four alphabetic words, no digits, no
+    punctuation that names do not carry, and nothing that matches a section
+    heading. It may miss an unusual layout — the model still never sees an
+    email or a phone, and a miss is visible, whereas a wrong redaction only
+    costs a heading."""
+    for raw in text.splitlines()[:max_lines]:
+        line = raw.strip().strip("*_|—–-").strip()
+        if not (2 <= len(line.split()) <= 4) or len(line) > 60:
+            continue
+        if any(ch.isdigit() for ch in line) or "@" in line:
+            continue
+        if any(ch in line for ch in ",:;/\\()[]{}<>"):
+            continue
+        words = [w.strip(".").lower() for w in line.split()]
+        if any(w in _HEADER_STOPWORDS for w in words):
+            continue
+        if not all(w.replace("'", "").replace("-", "").isalpha() for w in words):
+            continue
+        return line
+    return None
+
+
 def strip_pii(text: str, *, known_name: str | None) -> StrippedText:
     """Replace emails, phone numbers and the customer's name with placeholders."""
     replacements: dict[str, str] = {}
