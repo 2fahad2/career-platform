@@ -92,21 +92,23 @@ jobs:
       - name: Shellcheck ops scripts
         run: |
           sudo apt-get install -y shellcheck >/dev/null 2>&1 || true
-          # The CV template names Liberation Sans first and DejaVu second, and
-          # the Arabic report needs Noto Naskh. Without them the runner
-          # rendered every PDF in whatever fallback fontconfig happened to
-          # pick — so CI was validating a different document than the one a
-          # paying customer receives, and the byte-determinism test passed or
-          # failed on font-cache warmth rather than on our code.
-          sudo apt-get install -y fonts-liberation fonts-dejavu-core \
-            fonts-noto-core fonts-noto-naskh-arabic >/dev/null
-          fc-cache -f >/dev/null
-          # fail loudly rather than render in a fallback face: a masked
-          # install is how CI ended up validating a document the customer
-          # never receives
-          fc-list | grep -qi liberation || { echo "Liberation missing"; exit 1; }
-          fc-list | grep -qi naskh || { echo "Noto Naskh missing"; exit 1; }
           shellcheck ops/backup/*.sh scripts/*.sh
+
+      - name: Install the fonts the documents are drawn with
+        run: |
+          # The CV template names Liberation Sans first and DejaVu second; the
+          # Arabic report needs Noto Naskh (shipped inside fonts-noto-core).
+          # Without these the runner rendered every PDF in whatever fallback
+          # fontconfig happened to pick — CI was validating a document the
+          # paying customer never receives. This step must come BEFORE any
+          # test that renders, and must fail loudly rather than mask a missing
+          # package behind `|| true`.
+          sudo apt-get update >/dev/null
+          sudo apt-get install -y fonts-liberation fonts-dejavu-core \
+            fonts-noto-core >/dev/null
+          fc-cache -f >/dev/null
+          fc-list | grep -qi liberation || { echo "Liberation Sans missing"; exit 1; }
+          fc-list | grep -qi naskh || { echo "Noto Naskh missing"; exit 1; }
 
       - name: Dependency lockfile is present and parseable
         run: |
