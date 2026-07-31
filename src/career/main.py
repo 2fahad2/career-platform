@@ -28,7 +28,17 @@ logging.basicConfig(level=get_settings().log_level)
 install_secret_redaction()
 logger = logging.getLogger("career")
 
-app = FastAPI(title="Career Platform", version=__version__)
+# The interactive docs and the OpenAPI schema are a map of the attack surface;
+# they exist only in development. Caddy's allow-list already hides them, but a
+# second server or a misconfigured proxy should not be all that stands between
+# the internet and a full route listing.
+_DEV = get_settings().env in {"dev", "development", "local"}
+app = FastAPI(
+    title="Career Platform", version=__version__,
+    docs_url="/docs" if _DEV else None,
+    redoc_url="/redoc" if _DEV else None,
+    openapi_url="/openapi.json" if _DEV else None,
+)
 
 # Salla event types we accept on the webhook endpoint (whitepaper §09).
 # app.store.authorize carries the Easy-Mode access/refresh tokens on install —
@@ -147,9 +157,32 @@ async def whatsapp_webhook(request: Request) -> JSONResponse:
     return JSONResponse(status_code=200, content={"status": result.status.value})
 
 
+#: /health is reachable from the public internet (Caddy allows it so Meta and
+#: Salla can see the service is up), and each call opened a fresh Postgres AND
+#: Redis connection — an unauthenticated way to exhaust the pool by holding
+#: down refresh. The result is cached for a few seconds: Docker probes every
+#: ten, so accuracy is unchanged, while a flood costs one connection pair per
+#: window instead of one per request.
+_HEALTH_TTL_SECONDS = 5.0
+_health_cache: tuple[float, dict[str, bool]] | None = None
+
+
+def _health_checks() -> dict[str, bool]:
+    global _health_cache
+    import time
+
+    now = time.monotonic()
+    cached = _health_cache
+    if cached is not None and now - cached[0] < _HEALTH_TTL_SECONDS:
+        return cached[1]
+    checks = {"database": _check_db(), "redis": _check_redis()}
+    _health_cache = (now, checks)
+    return checks
+
+
 @app.get("/health")
 def health() -> JSONResponse:
-    checks = {"database": _check_db(), "redis": _check_redis()}
+    checks = _health_checks()
     ok = all(checks.values())
     status_code = 200 if ok else 503
     return JSONResponse(
