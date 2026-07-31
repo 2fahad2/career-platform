@@ -30,6 +30,11 @@ DELIVERY_COMPLETED = "COMPLETED"
 DELIVERY_NO_SEND = "NO_SEND"
 DELIVERY_PARTIAL = "PARTIAL"      # some job groups failed — honest, never hidden
 
+#: How many times one held bundle may be re-attempted before we stop trying
+#: and close it honestly. A customer who taps and gets nothing deserves the
+#: next message to try again — but not forever, and not on every keystroke.
+MAX_DISPATCH_ATTEMPTS = 3
+
 
 def record_out(
     session: Session,
@@ -89,8 +94,8 @@ def _send_grouped_bundle(
             record_out(session, tenant_id=channel.tenant_id, channel_id=channel.id,
                        kind="text", wa_message_id=mid, delivery_id=delivery.id,
                        now=now)
-        except Exception:  # noqa: BLE001 — header failure ≠ job failures
-            logger.warning("bundle header send failed", exc_info=True)
+        except Exception as exc:  # noqa: BLE001 — header failure ≠ job failures
+            logger.error("bundle header send failed: %s", exc, exc_info=True)
 
     for entry in delivery.bundle.get("jobs", []):
         group = str(entry.get("group", ""))
@@ -101,8 +106,8 @@ def _send_grouped_bundle(
             record_out(session, tenant_id=channel.tenant_id, channel_id=channel.id,
                        kind="text", wa_message_id=mid, delivery_id=delivery.id,
                        now=now)
-        except Exception:  # noqa: BLE001 — card failed → document not attempted
-            logger.warning("job card send failed", exc_info=True)
+        except Exception as exc:  # noqa: BLE001 — card failed → document not attempted
+            logger.error("job card send failed: %s", exc, exc_info=True)
             failed.append(group)
             continue
         try:
@@ -114,8 +119,8 @@ def _send_grouped_bundle(
             record_out(session, tenant_id=channel.tenant_id, channel_id=channel.id,
                        kind="document", wa_message_id=mid, delivery_id=delivery.id,
                        now=now)
-        except Exception:  # noqa: BLE001 — card without its CV = job FAILED
-            logger.warning("job document send failed", exc_info=True)
+        except Exception as exc:  # noqa: BLE001 — card without its CV = job FAILED
+            logger.error("job document send failed: %s", exc, exc_info=True)
             failed.append(group)
             continue
         outcome = entry.get("outcome") or {}
@@ -138,24 +143,87 @@ def _send_grouped_bundle(
 
 def _dispatch_bundle(
     session: Session, channel: CustomerChannel, delivery: Delivery,
-    *, whatsapp_client: WhatsAppClient, now: datetime,
+    *, whatsapp_client: WhatsAppClient, now: datetime, retry_ok: bool = False,
 ) -> None:
-    """Send the held bundle and set the HONEST final status."""
+    """Send the held bundle and set the HONEST final status.
+
+    A tap that delivers NOTHING no longer consumes the bundle. The old code
+    stamped COMPLETED/PARTIAL unconditionally after the send loop, so when
+    every document failed the delivery left PENDING_WINDOW anyway — and both
+    the descend query and the stale sweep filter on PENDING_WINDOW, which
+    made the failure terminal and unreachable. The customer's one chance was
+    spent on an attempt that sent them nothing (live: 27 July, zero delivered
+    and no trace). Now a total failure stays claimable, up to
+    MAX_DISPATCH_ATTEMPTS, so the next inbound — or the operator's resend —
+    tries again.
+
+    ``retry_ok`` is True only for a HELD bundle (the descend and resend
+    paths). On the open-window direct path there was no template and no tap
+    to protect, and the day must still close with an honest state (§15.12),
+    so a total failure stays terminal exactly as before.
+    """
+    attempts = int(delivery.bundle.get("attempts", 0)) + 1
     if delivery.bundle.get("grouped"):
         delivered, failed = _send_grouped_bundle(
             session, channel, delivery, whatsapp_client=whatsapp_client, now=now
         )
         delivery.bundle = {
             **delivery.bundle,
+            "attempts": attempts,
             "results": {"delivered": delivered, "failed": failed},
         }
-        delivery.status = DELIVERY_COMPLETED if not failed else DELIVERY_PARTIAL
+        if delivered:
+            delivery.status = (
+                DELIVERY_COMPLETED if not failed else DELIVERY_PARTIAL
+            )
+        elif retry_ok and attempts < MAX_DISPATCH_ATTEMPTS:
+            logger.error(
+                "held bundle delivered nothing on attempt %d — staying "
+                "claimable for a retry", attempts,
+            )
+            delivery.status = DELIVERY_PENDING
+            return          # completed_at stays NULL: nothing completed
+        else:
+            logger.error(
+                "held bundle delivered nothing after %d attempts — closing "
+                "it honestly", attempts,
+            )
+            delivery.status = DELIVERY_PARTIAL
     else:
         _send_bundle_parts(
             session, channel, delivery, whatsapp_client=whatsapp_client, now=now
         )
+        delivery.bundle = {**delivery.bundle, "attempts": attempts}
         delivery.status = DELIVERY_COMPLETED
     delivery.completed_at = now
+
+
+def resend_pending_delivery(
+    session: Session, *, tenant_id: uuid.UUID,
+    whatsapp_client: WhatsAppClient, now: datetime,
+) -> Delivery | None:
+    """The operator's «إعادة إرسال»: re-attempt today's held bundle.
+
+    Until now a delivery that failed after the tap was terminal — there was
+    no retry path anywhere, for the customer OR the operator. This one is
+    deliberately blunt: it re-dispatches whatever is still claimable, and
+    returns None when there is nothing to resend.
+    """
+    delivery = session.execute(
+        select(Delivery)
+        .where(Delivery.tenant_id == tenant_id,
+               Delivery.status == DELIVERY_PENDING)
+        .order_by(Delivery.created_at)
+    ).scalars().first()
+    if delivery is None:
+        return None
+    channel = session.get(CustomerChannel, delivery.channel_id)
+    if channel is None or channel.opt_out_at is not None:
+        return None
+    delivery.opened_at = delivery.opened_at or now
+    _dispatch_bundle(session, channel, delivery,
+                     whatsapp_client=whatsapp_client, now=now, retry_ok=True)
+    return delivery
 
 
 def deliver_adaptive(
@@ -207,5 +275,5 @@ def descend_pending_delivery(
         return None
     delivery.opened_at = now
     _dispatch_bundle(session, channel, delivery,
-                     whatsapp_client=whatsapp_client, now=now)
+                     whatsapp_client=whatsapp_client, now=now, retry_ok=True)
     return delivery

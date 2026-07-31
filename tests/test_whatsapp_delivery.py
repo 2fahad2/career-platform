@@ -114,3 +114,126 @@ def test_opted_out_sends_nothing(
     owner_session.commit()
     assert delivery.status == DELIVERY_NO_SEND
     assert wa.sent == []
+
+
+# ── the tap must never be spent on an attempt that delivered nothing ─────────
+
+_GROUPED = {
+    "grouped": True,
+    "header": "فرصك اليوم",
+    "jobs": [{
+        "group": "g1",
+        "card": {"body": "#1 IT Operations Manager @ NEOM"},
+        "document": {"ref": "tenants/x/cv1.pdf", "filename": "CV.pdf",
+                     "caption": "CV #1"},
+    }],
+}
+
+
+class _DeadDocuments(FakeWhatsAppClient):
+    """Text lands, every document is rejected — the live 27 July shape."""
+
+    def send_document(self, *a, **k):  # noqa: ANN002, ANN003, ANN201
+        raise RuntimeError("graph HTTP 400 (code 131053)")
+
+
+def test_a_tap_that_delivered_nothing_stays_claimable(
+    owner_session: Session, clean_billing: None
+) -> None:
+    ch = _channel(owner_session, last_inbound_at=NOW - timedelta(hours=25))
+    dead = _DeadDocuments()
+    deliver_adaptive(owner_session, ch, _GROUPED, run_date=NOW.date(),
+                     whatsapp_client=dead, daily_template=DAILY_UTILITY, now=NOW)
+    owner_session.commit()
+
+    later = NOW + timedelta(minutes=5)
+    ch.last_inbound_at = later
+    descended = descend_pending_delivery(
+        owner_session, ch, whatsapp_client=dead, now=later)
+    owner_session.commit()
+
+    assert descended is not None
+    # nothing landed → the customer's one chance is NOT spent
+    assert descended.status == DELIVERY_PENDING
+    assert descended.completed_at is None
+    assert descended.bundle["attempts"] == 1
+
+
+def test_the_operator_can_resend_what_never_arrived(
+    owner_session: Session, clean_billing: None
+) -> None:
+    from career.whatsapp.delivery import resend_pending_delivery
+
+    ch = _channel(owner_session, last_inbound_at=NOW - timedelta(hours=25))
+    dead = _DeadDocuments()
+    deliver_adaptive(owner_session, ch, _GROUPED, run_date=NOW.date(),
+                     whatsapp_client=dead, daily_template=DAILY_UTILITY, now=NOW)
+    later = NOW + timedelta(minutes=5)
+    ch.last_inbound_at = later
+    descend_pending_delivery(owner_session, ch, whatsapp_client=dead, now=later)
+    owner_session.commit()
+
+    # the operator retries once the cause is fixed — with a working client
+    healthy = FakeWhatsAppClient()
+    again = resend_pending_delivery(
+        owner_session, tenant_id=ch.tenant_id, whatsapp_client=healthy,
+        now=later + timedelta(minutes=30),
+    )
+    owner_session.commit()
+
+    assert again is not None
+    assert again.status == DELIVERY_COMPLETED
+    assert [m.kind for m in healthy.sent] == ["text", "text", "document"]
+
+
+def test_retries_are_bounded_and_then_close_honestly(
+    owner_session: Session, clean_billing: None
+) -> None:
+    from career.whatsapp.delivery import (
+        DELIVERY_PARTIAL,
+        MAX_DISPATCH_ATTEMPTS,
+        resend_pending_delivery,
+    )
+
+    ch = _channel(owner_session, last_inbound_at=NOW - timedelta(hours=25))
+    dead = _DeadDocuments()
+    deliver_adaptive(owner_session, ch, _GROUPED, run_date=NOW.date(),
+                     whatsapp_client=dead, daily_template=DAILY_UTILITY, now=NOW)
+    owner_session.commit()
+
+    delivery = None
+    for i in range(MAX_DISPATCH_ATTEMPTS):
+        delivery = resend_pending_delivery(
+            owner_session, tenant_id=ch.tenant_id, whatsapp_client=dead,
+            now=NOW + timedelta(hours=i + 1),
+        )
+        owner_session.commit()
+
+    assert delivery is not None
+    assert delivery.status == DELIVERY_PARTIAL      # honest, not pending forever
+    assert delivery.bundle["attempts"] == MAX_DISPATCH_ATTEMPTS
+    # and there is nothing left to resend
+    assert resend_pending_delivery(
+        owner_session, tenant_id=ch.tenant_id, whatsapp_client=dead,
+        now=NOW + timedelta(days=1),
+    ) is None
+
+
+def test_a_resend_never_reaches_someone_who_opted_out(
+    owner_session: Session, clean_billing: None
+) -> None:
+    from career.whatsapp.delivery import resend_pending_delivery
+
+    ch = _channel(owner_session, last_inbound_at=NOW - timedelta(hours=25))
+    dead = _DeadDocuments()
+    deliver_adaptive(owner_session, ch, _GROUPED, run_date=NOW.date(),
+                     whatsapp_client=dead, daily_template=DAILY_UTILITY, now=NOW)
+    ch.opt_out_at = NOW + timedelta(minutes=1)
+    owner_session.commit()
+
+    healthy = FakeWhatsAppClient()
+    assert resend_pending_delivery(
+        owner_session, tenant_id=ch.tenant_id, whatsapp_client=healthy,
+        now=NOW + timedelta(hours=1),
+    ) is None
+    assert not healthy.sent

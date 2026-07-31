@@ -391,11 +391,15 @@ def _run_tenant(
             whatsapp_client=deps.whatsapp_client,
             daily_template=deps.daily_template, now=now,
         )
-    except Exception:  # noqa: BLE001 — a send-path crash (e.g. the morning
-        # template still PENDING at Meta) must close the day honestly, not
-        # vanish into a crash-skip (§15.12: no silent failure states).
-        logger.error("delivery send path crashed — closing WHATSAPP_FAILED",
-                     exc_info=True)
+    except Exception as exc:  # noqa: BLE001 — a send-path crash (e.g. the
+        # morning template still PENDING at Meta) must close the day
+        # honestly, not vanish into a crash-skip (§15.12: no silent states).
+        # The reason goes on the ERROR line itself: the operator's feed
+        # harvests «ERROR:» lines only, so a Meta code buried in a traceback
+        # continuation never reached them — five closed-window days failed
+        # with no diagnostic anyone could see (closure audit).
+        logger.error("delivery send path crashed — closing WHATSAPP_FAILED: %s",
+                     exc, exc_info=True)
         return _close(
             cv_resolved=len(resolved), cv_failed=cv_failed + len(bundle_failures),
             failed=[str(e.get("group")) for e in bundle.get("jobs", [])],
