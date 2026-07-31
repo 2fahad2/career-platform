@@ -290,14 +290,19 @@ def _run_tenant(
 
     # AUDIT ك-11: the plan's monthly safety cap, read from entitlements —
     # no entitlement row ⇒ no cap (None), never an invented number.
-    from career.db.models import PlanEntitlement, Subscription
+    from career.db.models import PlanEntitlement
 
+    # The cap belongs to the plan the customer is SERVED under. Joining on
+    # «newest row» was right only by accident of insert order — a second
+    # analysis purchase (cap 1) would have throttled a pass customer.
+    from career.salla.renewal import current_subscription
+
+    served = current_subscription(session, tenant_id)
     cap_row = session.execute(
-        select(PlanEntitlement.monthly_cv_safety_cap)
-        .join(Subscription, Subscription.plan_code == PlanEntitlement.plan_code)
-        .where(Subscription.tenant_id == tenant_id)
-        .order_by(Subscription.created_at.desc())
-    ).scalars().first()
+        select(PlanEntitlement.monthly_cv_safety_cap).where(
+            PlanEntitlement.plan_code == served.plan_code
+        )
+    ).scalars().first() if served is not None else None
     monthly_budget = (
         MonthlyCapBudget(session, tenant_id=tenant_id, cap=cap_row, now=now)
         if cap_row is not None else None

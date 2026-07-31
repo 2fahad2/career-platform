@@ -399,8 +399,14 @@ def run_nightly(
         )
         decisions["suppressed"] = len(candidates) - len(eligible)
         ranked = engine_ranking.rank(eligible)
+        # `or 1` masked a snapshotted 0 into 1 — a plan with no daily
+        # entitlement silently received one job a day. Only an ABSENT limit
+        # falls back; a real 0 composes an empty list and the day closes
+        # honestly as NO_MATCHES (§15.12).
+        daily_limit = policy.daily_job_limit
         composition = engine_ranking.compose_final_list(
-            ranked, daily_job_limit=policy.daily_job_limit or 1, now=now
+            ranked, daily_job_limit=1 if daily_limit is None else daily_limit,
+            now=now,
         )
         traces = engine_ranking.rank_traces(ranked, composition=composition)
 

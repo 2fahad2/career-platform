@@ -130,9 +130,11 @@ def export_bundle(session: Session, *, tenant_id: uuid.UUID) -> dict[str, object
         select(CareerPathAssessment).where(CareerPathAssessment.tenant_id == tenant_id)
         .order_by(CareerPathAssessment.created_at)
     ).scalars().all()
-    subscription = session.execute(
-        select(Subscription).where(Subscription.tenant_id == tenant_id)
-    ).scalars().first()
+    # the live row, not whichever came back first: an upgraded customer's
+    # data export used to name «cv_analysis» while they paid for a pass
+    from career.salla.renewal import current_subscription
+
+    subscription = current_subscription(session, tenant_id)
     funnels = session.execute(
         select(FunnelSession).where(FunnelSession.tenant_id == tenant_id)
         .order_by(FunnelSession.created_at)

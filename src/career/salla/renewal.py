@@ -78,10 +78,20 @@ _LIVENESS: dict[str, int] = {
 }
 
 
-def _sort_key(sub: Subscription) -> tuple[int, float, float]:
+def _sort_key(sub: Subscription) -> tuple[int, int, float, float]:
+    """Pass plans first, then liveness, then the newest period.
+
+    The plan rank leads deliberately. A tenant can hold a one-shot 29-SAR
+    analysis row alongside a real pass (the §04 upgrade path leaves both, by
+    design), and «the customer's subscription» is always the pass — the
+    analysis is a product they bought once, not the service they are on.
+    Getting this order wrong is what let an upgraded customer's search policy
+    be built from the analysis row's entitlements (daily_job_limit = 0).
+    """
     period_end = sub.current_period_end
     created = sub.created_at
     return (
+        0 if sub.plan_code in RENEWABLE_PLANS else 1,
         _LIVENESS.get(sub.status, 99),
         -(period_end.timestamp() if period_end is not None else 0.0),
         -(created.timestamp() if created is not None else 0.0),

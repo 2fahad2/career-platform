@@ -63,8 +63,14 @@ def derive_query_families(
 
     ``tenant_ids`` scopes the derivation (tests, targeted reruns); None means
     every tenant. Runs as the owner role — it spans tenants by design."""
+    # A pass, not any ACTIVE row: the one-shot analysis product entitles no
+    # daily search (daily_job_limit = 0 by design, migration 0013), so an
+    # ACTIVE analysis row must never enrol a tenant into tonight's families.
+    from career.salla.renewal import RENEWABLE_PLANS
+
     active_stmt = select(Subscription.tenant_id).where(
-        Subscription.status == sub_states.ACTIVE
+        Subscription.status == sub_states.ACTIVE,
+        Subscription.plan_code.in_(sorted(RENEWABLE_PLANS)),
     )
     if tenant_ids is not None:
         active_stmt = active_stmt.where(Subscription.tenant_id.in_(tenant_ids))

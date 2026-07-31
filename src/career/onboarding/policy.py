@@ -66,6 +66,35 @@ def _one_or_missing(session: Session, model: type[T], tenant_id: uuid.UUID, what
     return row
 
 
+def _subscription_of(session: Session, tenant_id: uuid.UUID) -> Subscription:
+    """THE subscription this tenant is being served under.
+
+    A tenant can hold several rows — the §04 funnel upgrade leaves the 29-SAR
+    analysis row beside the new pass, and every renewal (§16) adds one. The
+    old «whichever row came back first» could therefore hand back the
+    analysis row, which silently built the customer's search policy from its
+    entitlements (daily_job_limit = 0) and flipped the ONE-SHOT row to ACTIVE
+    while the pass they actually paid for stayed in ONBOARDING forever.
+
+    The journey knows its own subscription (``onboarding_sessions`` carries a
+    NOT NULL ``subscription_id`` set at the start), so ask it first; fall back
+    to the plan-aware ordering for tenants with no journey row.
+    """
+    from career.salla.renewal import current_subscription
+
+    journey = session.execute(
+        select(OnboardingSession).where(OnboardingSession.tenant_id == tenant_id)
+    ).scalars().first()
+    if journey is not None and journey.subscription_id is not None:
+        by_journey = session.get(Subscription, journey.subscription_id)
+        if by_journey is not None and by_journey.tenant_id == tenant_id:
+            return by_journey
+    subscription = current_subscription(session, tenant_id)
+    if subscription is None:
+        raise MissingPrerequisite("subscription")
+    return subscription
+
+
 def build_draft_policy(session: Session, *, tenant_id: uuid.UUID) -> SearchPolicy:
     """Derive the next-version draft from the approved assessment, the
     profile, and the plan entitlement snapshot."""
@@ -73,7 +102,7 @@ def build_draft_policy(session: Session, *, tenant_id: uuid.UUID) -> SearchPolic
     if assessment is None or not assessment.approved:
         raise MissingPrerequisite("approved career-path assessment")
     profile = _one_or_missing(session, CustomerProfile, tenant_id, "customer profile")
-    subscription = _one_or_missing(session, Subscription, tenant_id, "subscription")
+    subscription = _subscription_of(session, tenant_id)
 
     entitlement = session.execute(
         select(PlanEntitlement).where(PlanEntitlement.plan_code == subscription.plan_code)
@@ -201,7 +230,7 @@ def activate(session: Session, *, tenant_id: uuid.UUID, now: datetime) -> None:
     journey = _one_or_missing(session, OnboardingSession, tenant_id, "onboarding session")
     fsm.validate_transition(journey.state, "ACTIVE")
 
-    subscription = _one_or_missing(session, Subscription, tenant_id, "subscription")
+    subscription = _subscription_of(session, tenant_id)
     transition(
         session,
         subscription,
