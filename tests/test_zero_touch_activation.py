@@ -97,3 +97,53 @@ def test_unknown_phone_without_paid_order_still_gets_help(
         whatsapp_client=wa, admin_client=FakeTelegramAdminClient(), now=NOW,
     )
     assert any("رمز التفعيل" in (m.body or "") for m in wa.sent)
+
+
+# ── the shape Meta actually sends (closure audit, 31 July) ──────────────────
+
+
+def test_the_reply_activates_in_the_shape_meta_really_sends(
+    owner_session, clean_billing
+) -> None:
+    """CHANGELOG §11 promises the buyer «ردّ بأي رسالة للمتابعة». Salla phones
+    are stored normalized WITH a leading «+»; Meta delivers `from` WITHOUT one.
+    The lookup compared them exactly, so the promise could not fire for a
+    single real customer — and the existing test hid it by feeding the same
+    «+»-prefixed string as both sides.
+    """
+    import uuid as _uuid
+    from decimal import Decimal
+
+    from sqlalchemy import text as _sql
+
+    from career.salla.client import FakeSallaClient, SallaOrder
+    from career.salla.provisioning import provision_order
+    from career.telegram.admin import FakeTelegramAdminClient
+    from career.whatsapp.activation_flow import activate_by_order_phone
+    from career.whatsapp.client import FakeWhatsAppClient
+
+    digits = f"96650{_uuid.uuid4().int % 10_000_000:07d}"
+    order_id = f"ORD-{_uuid.uuid4()}"
+    order = SallaOrder(order_id, "paid", "prod_pro", Decimal("279.00"), "SAR",
+                       customer_phone=f"+{digits}")     # Salla shape
+    result = provision_order(
+        owner_session, order_id,
+        salla_client=FakeSallaClient({order_id: order}),
+        product_catalog={"prod_pro": "professional"},
+        expected_pricing={"prod_pro": (Decimal("279.00"), "SAR")},
+    )
+    assert result.activation_token is not None
+    owner_session.commit()
+
+    claimed = activate_by_order_phone(          # Meta shape: no leading «+»
+        owner_session, from_phone=digits, display_name=None,
+        now=datetime(2026, 7, 15, 9, 0, tzinfo=UTC),
+        whatsapp_client=FakeWhatsAppClient(),
+        admin_client=FakeTelegramAdminClient(),
+    )
+    owner_session.commit()
+
+    assert claimed is not None, "the buyer's instructed reply must claim it"
+    assert owner_session.execute(_sql(
+        "SELECT status FROM subscriptions WHERE id = :i"),
+        {"i": str(result.subscription_id)}).scalar_one() == "ONBOARDING"

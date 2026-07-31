@@ -44,7 +44,23 @@ from career.whatsapp.inbound import InboundKind, classify_inbound
 logger = logging.getLogger("career.whatsapp")
 
 _UNRECOGNIZED = "أرسل رمز التفعيل من صفحة الشكر بعد الدفع للبدء."
-_STOP_CONFIRM = "تم إيقاف الرسائل. لن نرسل لك بعد الآن. لإعادة التفعيل أرسل: دعم"
+#: Honest on both counts. The old text promised «دعم» would bring them back —
+#: it does not, and nothing did: no code path anywhere cleared opt_out_at, so
+#: a customer who typed «إلغاء الاشتراك» was silenced FOREVER while their
+#: subscription and their billing carried on untouched.
+_STOP_CONFIRM = (
+    "تم إيقاف الرسائل ✅ ما راح نرسل لك شي بعد الآن\n"
+    "ترجع بأي وقت — أرسل:\n"
+    "تشغيل الرسائل\n"
+    "وإذا قصدك توقف الاشتراك والدفع نفسه، أرسل: دعم — ونتولاها معك"
+)
+
+_RESUME_CONFIRM = (
+    "رجعت لك الرسائل ✅\n"
+    "بنكمل معك عادي من هنا"
+)
+
+
 #: «دعم» is promised everywhere as the way to reach a human — so it must
 #: answer the customer, not just page the operator (closure audit).
 _SUPPORT_ACK = (
@@ -223,6 +239,37 @@ def _handle_message(
                         wamid=wamid, message_type=message_type, text_body=text_body,
                         classification="stop", payload=msg, now=now)
         whatsapp_client.send_text(from_phone, _STOP_CONFIRM)
+        # A paying customer going quiet is the single loudest churn signal we
+        # get, and «إلغاء الاشتراك» is in the STOP set — they may well mean
+        # cancel the BILLING, which no message of ours can do. The operator
+        # hears about it (TEN code only, §15.13).
+        try:
+            tenant = session.get(Tenant, channel.tenant_id)
+            admin_client.send_admin(
+                f"🔇 عميل أوقف الرسائل {tenant.code if tenant else '?'} — "
+                "لو كان قصده إلغاء الاشتراك فالفوترة ما زالت شغالة، راجعه"
+            )
+        except Exception:  # noqa: BLE001 — alerting never blocks the opt-out
+            logger.warning("stop alert failed", exc_info=True)
+        session.commit()
+        return
+
+    if kind is InboundKind.RESUME and opted_out:
+        # The way back that did not exist. Clearing this flag is the ONLY
+        # thing that re-opens the channel — the subscription-level «استئناف»
+        # in the privacy commands is a DIFFERENT switch, and a customer who
+        # flipped both needs both. Deliberately gated on `opted_out`: when
+        # they are not silenced, «استئناف» must fall through to the privacy
+        # command that resumes a PAUSED subscription, which is what it has
+        # always meant.
+        channel.opt_out_at = None
+        _record_inbound(session, tenant_id=channel.tenant_id, channel_id=channel.id,
+                        wamid=wamid, message_type=message_type, text_body=text_body,
+                        classification="resume", payload=msg, now=now)
+        whatsapp_client.send_text(from_phone, _RESUME_CONFIRM)
+        # a silenced customer who comes back may ALSO be paused at the
+        # subscription level; serve that with the standing command they
+        # already know rather than making them guess a second word.
         session.commit()
         return
 

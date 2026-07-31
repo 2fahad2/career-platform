@@ -16,6 +16,7 @@ from enum import StrEnum
 class InboundKind(StrEnum):
     ACTIVATION = "activation"
     STOP = "stop"
+    RESUME = "resume"
     SUPPORT = "support"
     OTHER = "other"
 
@@ -26,6 +27,18 @@ _STOP_PHRASES = frozenset({
     "إيقاف", "ايقاف", "إيقاف الرسائل", "ايقاف الرسائل",
     "الغاء", "إلغاء", "الغاء الاشتراك", "إلغاء الاشتراك", "توقف",
 })
+#: The way BACK. Nothing anywhere cleared ``opt_out_at`` — a customer who
+#: stopped messages was silenced permanently while their subscription (and
+#: their billing) carried on, and the confirmation told them to send «دعم»,
+#: which does not clear it either. Meta's own convention is STOP/START, so
+#: both the English and the Arabic a Saudi customer would actually type are
+#: accepted, plus «استئناف» because our privacy copy already teaches it.
+_RESUME_PHRASES = frozenset({
+    "start", "unstop", "resume",
+    "تشغيل الرسائل", "شغل الرسائل", "ابدأ", "ابدا", "رجعني", "استئناف",
+    "استئناف الرسائل", "عودة", "رجّعني",
+})
+
 _SUPPORT_PHRASES = frozenset({"دعم", "support", "مساعدة", "help"})
 
 # Activation deep link prefills "تفعيل <token>" (or "activate <token>").
@@ -53,6 +66,8 @@ def classify_inbound(text: str | None) -> tuple[InboundKind, str | None]:
     low = norm.lower()
     if low in _STOP_PHRASES:
         return (InboundKind.STOP, None)
+    if low in _RESUME_PHRASES:
+        return (InboundKind.RESUME, None)
     if low in _SUPPORT_PHRASES:
         return (InboundKind.SUPPORT, None)
     return (InboundKind.OTHER, None)

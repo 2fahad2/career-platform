@@ -24,6 +24,7 @@ from career.telegram.admin import TelegramAdminClient
 from career.tokens import hash_token
 from career.whatsapp.client import WhatsAppClient
 from career.whatsapp.delivery import record_out
+from career.whatsapp.phones import phone_variants
 
 _WELCOME = "تم التفعيل ✅ أهلًا بك! لنبدأ إعداد خدمتك."
 _INVALID = "لم نتعرّف على رمز التفعيل. تأكّد من الرابط في صفحة الشكر بعد الدفع."
@@ -50,12 +51,16 @@ class ActivationResult:
 
 
 def _channel_for_phone(session: Session, phone: str) -> CustomerChannel | None:
+    """Tolerant of the ``+``. Meta delivers ``from`` WITHOUT it while the rest
+    of the system writes numbers with it, so an exact comparison silently
+    fails to find a channel that is right there (see career.whatsapp.phones).
+    Oldest first — the first binding of a number is the proven one."""
     return session.execute(
         select(CustomerChannel).where(
             CustomerChannel.provider == "whatsapp",
-            CustomerChannel.phone_e164 == phone,
-        )
-    ).scalar_one_or_none()
+            CustomerChannel.phone_e164.in_(phone_variants(phone)),
+        ).order_by(CustomerChannel.created_at, CustomerChannel.id)
+    ).scalars().first()
 
 
 def _is_funnel_only_tenant(owner_session: Session, tenant_id: uuid.UUID) -> bool:
@@ -91,9 +96,15 @@ def activate_by_order_phone(
     Returns None when no claimable subscription matches (caller falls back
     to the generic help); token expiry is deliberately NOT checked here (the
     proof is the reply, not the token's freshness)."""
+    # The ``+`` boundary, which had never been crossed on this path: Salla
+    # phones are stored normalized WITH a leading ``+`` while Meta delivers
+    # ``from`` WITHOUT one, so this exact comparison could not match a real
+    # customer even once. The welcome template tells the buyer «ردّ بأي رسالة
+    # للمتابعة» — that instructed reply landed on the generic «send your
+    # activation code» help, for a code we only ever send to the operator.
     sub = owner_session.execute(
         select(Subscription).where(
-            Subscription.order_phone_e164 == from_phone,
+            Subscription.order_phone_e164.in_(phone_variants(from_phone)),
             Subscription.status == sub_states.PAID_UNCLAIMED,
         ).order_by(Subscription.created_at)
     ).scalars().first()

@@ -268,3 +268,78 @@ def _worker_deps(wa: Any) -> Any:
         storage=FilesystemStorageAdapter(tempfile.mkdtemp()),
         extractor=_Extractor(),
     )
+
+
+# ── the way back from «إيقاف» (closure audit, 31 July) ──────────────────────
+
+
+def test_stopping_messages_is_not_a_life_sentence(owner_session, clean_billing):
+    from career.whatsapp.worker import _handle_message
+
+    """Nothing in the codebase ever cleared opt_out_at. A customer who typed
+    «إلغاء الاشتراك» was silenced permanently while their subscription — and
+    their billing — carried on, and the confirmation told them to send «دعم»,
+    which does not clear it either."""
+    from sqlalchemy import text as _sql
+
+    wa = FakeWhatsAppClient()
+    token = _provision_token(owner_session)
+    phone = _phone()
+    deps = _worker_deps(wa)
+    admin = FakeTelegramAdminClient()
+
+    def handle(body: str) -> None:
+        _handle_message(owner_session,
+                        _text_msg(f"wamid-{uuid.uuid4()}", phone, body),
+                        whatsapp_client=wa, admin_client=admin, now=NOW,
+                        onboarding=deps)
+
+    handle(f"تفعيل {token}")
+    handle("إلغاء الاشتراك")
+    owner_session.commit()
+    assert owner_session.execute(_sql(
+        "SELECT opt_out_at IS NOT NULL FROM customer_channels WHERE"
+        " phone_e164 = :p"), {"p": phone}).scalar_one() is True
+    # the confirmation must name a word that actually works
+    stop_reply = [m.body for m in wa.sent if m.kind == "text"][-1]
+    assert "تشغيل الرسائل" in (stop_reply or "")
+    # and the operator hears about it — this may be a billing cancellation
+    assert any("أوقف الرسائل" in m for m in admin.messages)
+
+    before = len(wa.sent)
+    handle("تشغيل الرسائل")
+    owner_session.commit()
+
+    assert owner_session.execute(_sql(
+        "SELECT opt_out_at IS NULL FROM customer_channels WHERE"
+        " phone_e164 = :p"), {"p": phone}).scalar_one() is True
+    assert len(wa.sent) > before          # they are answered, not ignored
+
+
+def test_resume_does_not_swallow_the_privacy_command(owner_session, clean_billing):
+    from career.whatsapp.worker import _handle_message
+
+    """«استئناف» is also the standing command that un-pauses a SUBSCRIPTION.
+    A customer who is not silenced must still reach it."""
+    from career.whatsapp.inbound import InboundKind, classify_inbound
+
+    kind, _ = classify_inbound("استئناف")
+    assert kind is InboundKind.RESUME     # classified…
+
+    wa = FakeWhatsAppClient()
+    token = _provision_token(owner_session)
+    phone = _phone()
+    deps = _worker_deps(wa)
+    _handle_message(owner_session,
+                    _text_msg(f"wamid-{uuid.uuid4()}", phone, f"تفعيل {token}"),
+                    whatsapp_client=wa, admin_client=FakeTelegramAdminClient(),
+                    now=NOW, onboarding=deps)
+    before = len(wa.sent)
+    _handle_message(owner_session,
+                    _text_msg(f"wamid-{uuid.uuid4()}", phone, "استئناف"),
+                    whatsapp_client=wa, admin_client=FakeTelegramAdminClient(),
+                    now=NOW, onboarding=deps)
+    owner_session.commit()
+
+    # …but NOT consumed by the resume branch when nothing was silenced
+    assert len(wa.sent) > before
