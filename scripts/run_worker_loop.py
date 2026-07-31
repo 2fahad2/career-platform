@@ -106,8 +106,8 @@ def _acquire_single_instance_lock(name: str) -> IO[str]:
 
 def main() -> None:  # pragma: no cover — the C7.8 live runner
     _lock = _acquire_single_instance_lock("worker")  # noqa: F841
-    install_secret_redaction()
     logging.basicConfig(level=logging.INFO)
+    install_secret_redaction()  # AFTER basicConfig — arms the handler it made
     settings = get_settings()
     if not settings.whatsapp_access_token:
         raise SystemExit("WHATSAPP_ACCESS_TOKEN is empty")

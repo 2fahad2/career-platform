@@ -95,8 +95,8 @@ def exit_code_for(status: str) -> int:
 
 def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
     # composition over tested parts; exercised live by the C6 exit gate.
-    install_secret_redaction()
     logging.basicConfig(level=logging.INFO)
+    install_secret_redaction()  # AFTER basicConfig — arms the handler it made
     args = build_parser().parse_args(argv)
 
     settings = get_settings()

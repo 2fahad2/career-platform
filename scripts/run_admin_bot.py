@@ -213,8 +213,8 @@ def _acquire_single_instance_lock(name: str) -> IO[str]:
 
 def main() -> None:  # pragma: no cover — live runner over tested parts
     _lock = _acquire_single_instance_lock("admin-bot")  # noqa: F841
-    install_secret_redaction()
     logging.basicConfig(level=logging.INFO)
+    install_secret_redaction()  # AFTER basicConfig — arms the handler it made
     settings = get_settings()
     if not (settings.telegram_admin_bot_token and settings.telegram_admin_chat_id):
         raise SystemExit("telegram admin credentials are empty")
