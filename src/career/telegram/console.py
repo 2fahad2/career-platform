@@ -37,6 +37,13 @@ from career.db.models import (
 )
 from career.telegram import views
 from career.telegram.admin import Keyboard
+from career.whatsapp.client import WhatsAppClient
+from career.whatsapp.delivery import (
+    DELIVERY_COMPLETED,
+    DELIVERY_PARTIAL,
+    DELIVERY_PENDING,
+    resend_pending_delivery,
+)
 from career.whatsapp.window import window_state
 
 logger = logging.getLogger("career.telegram.console")
@@ -52,10 +59,24 @@ ACTION_EXPIRED_AR = "انتهت صلاحية التأكيد (٥ دقائق) — 
 _ACTION_TTL_SECONDS = 300
 _pending_actions: dict[str, tuple[str, str, datetime]] = {}
 
-#: The mutating actions the console may perform — all pure-DB authorities.
+#: Honest per-outcome replies for «إعادة إرسال» — the operator is told exactly
+#: what landed, never a blanket "done". Every line is DIRECTION-PURE: the TEN
+#: code stands alone on its own line, because a mixed Arabic+Latin line is
+#: scrambled by the operator's client.
+RESEND_DONE_AR = "✅ أعدنا الإرسال ووصلت الحزمة كاملة للعميل\n{code}"
+RESEND_PARTIAL_AR = "🟠 أعدنا الإرسال ووصل جزء من الحزمة فقط والباقي فشل\n{code}"
+RESEND_FAILED_AR = (
+    "🔴 حاولنا الإرسال ولم يصل شيء — الحزمة ما زالت محفوظة وتقبل محاولة أخرى"
+    "\n{code}"
+)
+RESEND_NOTHING_AR = "⚪ لا توجد حزمة معلّقة لإعادة إرسالها لهذا العميل\n{code}"
+
+#: The mutating actions the console may perform. pause/resume are pure-DB;
+#: resend re-attempts a held bundle over WhatsApp (needs an injected client).
 _ACTIONS = {
-    "pause": ("⏸️ إيقاف مؤقت", "أوقفنا خدمة {code} مؤقتًا"),
-    "resume": ("▶️ استئناف", "استأنفنا خدمة {code}"),
+    "pause": ("⏸️ إيقاف مؤقت", "✅ أوقفنا الخدمة مؤقتًا للعميل\n{code}"),
+    "resume": ("▶️ استئناف", "✅ استأنفنا الخدمة للعميل\n{code}"),
+    "resend": ("📤 إعادة إرسال الحزمة", RESEND_NOTHING_AR),
 }
 
 
@@ -81,7 +102,8 @@ class Outcome:
 
 
 def _screen(
-    session: Session, name: str, arg: str, *, probes: HealthProbes, now: datetime
+    session: Session, name: str, arg: str, *, probes: HealthProbes,
+    now: datetime, whatsapp_client: WhatsAppClient | None = None,
 ) -> tuple[str, Keyboard] | None:
     if name == "menu":
         return views.render_menu()
@@ -96,7 +118,8 @@ def _screen(
             return None
         return views.render_customers(*_customers_data(session, page=page, now=now))
     if name == "tenant":
-        card = _tenant_card(session, code=arg, now=now)
+        card = _tenant_card(session, code=arg, now=now,
+                            whatsapp_client=whatsapp_client)
         return views.render_tenant_card(card) if card else None
     if name == "business":
         if arg not in ("7", "30", "all"):
@@ -112,7 +135,8 @@ def _screen(
         code, kind = parts2
         if not _log_manual_usage(session, code=code, kind=kind, now=now):
             return None
-        card = _tenant_card(session, code=code, now=now)
+        card = _tenant_card(session, code=code, now=now,
+                            whatsapp_client=whatsapp_client)
         return views.render_tenant_card(card) if card else None
     if name == "act":
         # v1|act|<TEN>|<action> → a confirm card carrying a one-shot nonce
@@ -120,25 +144,35 @@ def _screen(
         if len(parts2) != 2 or parts2[1] not in _ACTIONS:
             return None
         code, action = parts2
-        if _tenant_card(session, code=code, now=now) is None:
+        card = _tenant_card(session, code=code, now=now,
+                            whatsapp_client=whatsapp_client)
+        if card is None:
+            return None
+        if action == "resend" and not card.get("can_resend"):
+            # never mint a confirmation for a resend that can only answer
+            # "nothing to resend" (no held bundle / opted out / no client)
             return None
         nonce = _new_nonce(action, code, now)
         label = _ACTIONS[action][0]
+        # every line direction-pure: the TEN code stands alone
         return (
-            f"⚠️ تأكيد: {label} للعميل {code}؟\nالزر صالح ٥ دقائق.",
+            f"⚠️ تأكيد الإجراء التالي للعميل:\n{code}\n{label}\n"
+            "الزر صالح ٥ دقائق.",
             [[("✅ تأكيد نهائي", f"v1|confirm|{nonce}")],
              [("↩️ إلغاء", f"v1|tenant|{code}")]],
         )
     if name == "confirm":
-        result = _run_action(session, nonce=arg, now=now)
+        result = _run_action(session, nonce=arg, now=now,
+                             whatsapp_client=whatsapp_client)
         if result is None:
             return None
         code, done_msg = result
-        card = _tenant_card(session, code=code, now=now)
+        card = _tenant_card(session, code=code, now=now,
+                            whatsapp_client=whatsapp_client)
         if card is None:
             return (done_msg, [[("🏠 الرئيسية", "v1|menu")]])
         text, keyboard = views.render_tenant_card(card)
-        return (f"✅ {done_msg}\n\n{text}", keyboard)
+        return (f"{done_msg}\n\n{text}", keyboard)
     if name == "soon":
         return views.render_soon(arg)
     return None
@@ -225,7 +259,8 @@ def _customers_data(
 
 
 def _tenant_card(
-    session: Session, *, code: str, now: datetime
+    session: Session, *, code: str, now: datetime,
+    whatsapp_client: WhatsAppClient | None = None,
 ) -> dict[str, Any] | None:
     tenant = session.execute(
         select(Tenant).where(Tenant.code == code)
@@ -275,6 +310,15 @@ def _tenant_card(
             UsageEvent.kind == "human_review",
         )
     ).scalar_one()
+    # «إعادة إرسال» is offered ONLY when it can do something: a still-held
+    # bundle, a channel that did not opt out, and a client to send with.
+    held_bundles = session.execute(
+        select(func.count()).select_from(Delivery).where(
+            Delivery.tenant_id == tenant.id,
+            Delivery.status == DELIVERY_PENDING,
+        )
+    ).scalar_one()
+    window = _window_of(channel[0], channel[1], now) if channel else None
     return {
         "support_minutes": int(support_minutes or 0),
         "review_count": int(review_count),
@@ -283,7 +327,13 @@ def _tenant_card(
         "sub_status": sub.status if sub else None,
         "sub_age_days": (now - sub.created_at).days if sub else None,
         "journey_state": journey,
-        "window": _window_of(channel[0], channel[1], now) if channel else None,
+        "window": window,
+        "held_bundles": int(held_bundles),
+        "can_resend": bool(
+            whatsapp_client is not None
+            and int(held_bundles) > 0
+            and window != "opted_out"
+        ),
         "last_delivery": (
             {"run_date": delivery[0].isoformat(), "status": delivery[1]}
             if delivery else None
@@ -422,9 +472,10 @@ def _new_nonce(action: str, code: str, now: datetime) -> str:
 
 
 def _run_action(
-    session: Session, *, nonce: str, now: datetime
+    session: Session, *, nonce: str, now: datetime,
+    whatsapp_client: WhatsAppClient | None = None,
 ) -> tuple[str, str] | None:
-    """Consume the one-shot nonce and perform the pure-DB action. Returns
+    """Consume the one-shot nonce and perform the action. Returns
     (code, done_message) or None (expired/unknown → caller acks EXPIRED)."""
     entry = _pending_actions.pop(nonce, None)
     if entry is None:
@@ -443,6 +494,25 @@ def _run_action(
         privacy.pause_subscription(session, tenant_id=tenant.id)
     elif action == "resume":
         privacy.resume_subscription(session, tenant_id=tenant.id)
+    elif action == "resend":
+        if whatsapp_client is None:      # no client injected → nothing to do
+            return None
+        delivery = resend_pending_delivery(
+            session, tenant_id=tenant.id,
+            whatsapp_client=whatsapp_client, now=now,
+        )
+        # read the status BEFORE the commit expires the instance
+        status = None if delivery is None else str(delivery.status)
+        session.commit()
+        if status == DELIVERY_COMPLETED:
+            message = RESEND_DONE_AR
+        elif status == DELIVERY_PARTIAL:
+            message = RESEND_PARTIAL_AR
+        elif status == DELIVERY_PENDING:
+            message = RESEND_FAILED_AR
+        else:                            # nothing claimable (or opted out)
+            message = RESEND_NOTHING_AR
+        return code, message.format(code=code)
     session.commit()
     return code, _ACTIONS[action][1].format(code=code)
 
@@ -489,7 +559,11 @@ def handle_update(
     admin_chat_id: str,
     probes: HealthProbes,
     now: datetime,
+    whatsapp_client: WhatsAppClient | None = None,
 ) -> list[Outcome]:
+    """``whatsapp_client`` is injected by the runner (same style as every other
+    side-effecting path); without it the console stays read-only and the
+    «إعادة إرسال» button is never offered."""
     chat_id = _chat_id_of(update)
     if chat_id is None:
         return []
@@ -514,7 +588,8 @@ def handle_update(
         if len(parts) >= 2 and parts[0] == "v1":
             name = parts[1]
             arg = "|".join(parts[2:]) if len(parts) > 2 else ""
-            screen = _screen(session, name, arg, probes=probes, now=now)
+            screen = _screen(session, name, arg, probes=probes, now=now,
+                             whatsapp_client=whatsapp_client)
         if screen is None or message_id is None:
             # a stale/used confirmation nonce gets its own clearer message
             return [Outcome(kind="ack", callback_query_id=cbq_id,

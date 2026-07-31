@@ -226,6 +226,8 @@ def render_tenant_card(card: dict[str, Any]) -> tuple[str, Keyboard]:
             f"⏱ دقائق دعم: {support_min or 0}"
             f" · 👁 مراجعات بشرية: {review_count or 0}"
         )
+    if card.get("can_resend"):
+        lines.append("📤 توجد حزمة محفوظة لم تُسلَّم بعد")
     # the mutating action depends on the subscription state (design doc §4)
     if str(card.get("sub_status")) == "PAUSED":
         action_button = ("▶️ استئناف الخدمة", f"v1|act|{code}|resume")
@@ -234,9 +236,12 @@ def render_tenant_card(card: dict[str, Any]) -> tuple[str, Keyboard]:
     keyboard: Keyboard = [
         [("⏱ +5 دقائق دعم", f"v1|log|{code}|support5"),
          ("👁 +مراجعة بشرية", f"v1|log|{code}|review")],
-        [action_button],
-        [("👥 القائمة", "v1|customers|0"), _HOME],
     ]
+    # offered ONLY when a held bundle can actually be re-attempted
+    if card.get("can_resend"):
+        keyboard.append([("📤 إعادة إرسال الحزمة", f"v1|act|{code}|resend")])
+    keyboard.append([action_button])
+    keyboard.append([("👥 القائمة", "v1|customers|0"), _HOME])
     return "\n".join(lines), keyboard
 
 

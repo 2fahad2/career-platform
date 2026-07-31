@@ -397,3 +397,293 @@ def test_week_day_states_tally(
         owner_session.execute(sql_text(
             "DELETE FROM tenant_day_states WHERE tenant_id = :t"), {"t": t1})
         owner_session.commit()
+
+
+# ── «إعادة إرسال»: re-attempting a held-but-undelivered bundle ───────────────
+
+
+def _job(group: str) -> dict[str, Any]:
+    return {
+        "group": group,
+        "card": {"body": f"وظيفة {group}"},
+        "document": {"ref": f"key/{group}.pdf", "filename": "cv.pdf"},
+    }
+
+
+def _seed_held_bundle(
+    session: Session, tenant_id: str, *, jobs: list[dict[str, Any]],
+    opted_out: bool = False,
+) -> None:
+    """A PENDING_WINDOW delivery: the customer tapped nothing / the send
+    failed, so the bundle is still claimable."""
+    import json
+
+    channel_id = str(uuid.uuid4())
+    session.execute(sql_text(
+        "INSERT INTO customer_channels (id, tenant_id, provider, phone_e164,"
+        " last_inbound_at, opt_out_at)"
+        " VALUES (:i, :t, 'whatsapp', :p, :l, :o)"),
+        {"i": channel_id, "t": tenant_id,
+         "p": f"+96650{uuid.uuid4().int % 10**7:07d}",
+         "l": NOW, "o": NOW if opted_out else None})
+    session.execute(sql_text(
+        "INSERT INTO deliveries (id, tenant_id, channel_id, run_date, status,"
+        " bundle) VALUES (:i, :t, :c, :d, 'PENDING_WINDOW', :b)"),
+        {"i": str(uuid.uuid4()), "t": tenant_id, "c": channel_id,
+         "d": NOW.date().isoformat(),
+         "b": json.dumps({"grouped": True, "header": "حزمة اليوم",
+                          "jobs": jobs})})
+    session.commit()
+
+
+def _clear_delivery(session: Session, tenant_id: str) -> None:
+    for table in ("delivery_messages", "deliveries", "customer_channels"):
+        session.execute(
+            sql_text(f"DELETE FROM {table} WHERE tenant_id = :t"),
+            {"t": tenant_id},
+        )
+    session.commit()
+
+
+def _code_of(session: Session, tenant_id: str) -> str:
+    return str(session.execute(
+        sql_text("SELECT code FROM tenants WHERE id = :t"), {"t": tenant_id}
+    ).scalar_one())
+
+
+def _buttons(outcome: Any) -> list[str]:
+    return [b[1] for row in (outcome.keyboard or []) for b in row]
+
+
+def _fake_wa() -> Any:
+    from career.whatsapp.client import FakeWhatsAppClient
+
+    return FakeWhatsAppClient()
+
+
+def test_resend_button_hidden_without_a_held_bundle(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """No PENDING_WINDOW delivery → the button that could only answer
+    "nothing to resend" is never drawn, and the action is refused."""
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    card = handle_update(
+        owner_session, _cbq(ADMIN, f"v1|tenant|{code}"), admin_chat_id=ADMIN,
+        probes=FakeProbes(), now=NOW, whatsapp_client=_fake_wa(),
+    )
+    assert f"v1|act|{code}|resend" not in _buttons(card[1])
+    refused = handle_update(
+        owner_session, _cbq(ADMIN, f"v1|act|{code}|resend"),
+        admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+        whatsapp_client=_fake_wa(),
+    )
+    assert [o.kind for o in refused] == ["ack"]
+
+
+def test_resend_button_hidden_when_no_client_is_injected(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """A read-only console (no whatsapp client) never offers the action."""
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    _seed_held_bundle(owner_session, t1, jobs=[_job("g1")])
+    try:
+        card = handle_update(
+            owner_session, _cbq(ADMIN, f"v1|tenant|{code}"),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+        )
+        assert f"v1|act|{code}|resend" not in _buttons(card[1])
+    finally:
+        _clear_delivery(owner_session, t1)
+
+
+def test_resend_button_hidden_for_opted_out_channel(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """§ opt-out is absolute: a held bundle for a customer who stopped the
+    messages is not resendable, so no button and no confirmation."""
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    _seed_held_bundle(owner_session, t1, jobs=[_job("g1")], opted_out=True)
+    try:
+        card = handle_update(
+            owner_session, _cbq(ADMIN, f"v1|tenant|{code}"),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+            whatsapp_client=_fake_wa(),
+        )
+        assert f"v1|act|{code}|resend" not in _buttons(card[1])
+        refused = handle_update(
+            owner_session, _cbq(ADMIN, f"v1|act|{code}|resend"),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+            whatsapp_client=_fake_wa(),
+        )
+        assert [o.kind for o in refused] == ["ack"]
+    finally:
+        _clear_delivery(owner_session, t1)
+
+
+def test_resend_confirm_flow_delivers_the_held_bundle(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """card → «إعادة إرسال» → confirm card w/ one-shot nonce → the bundle is
+    actually re-sent, the reply is the honest COMPLETED one, and the button
+    disappears because nothing is held any more."""
+    import career.telegram.console as console
+
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    _seed_held_bundle(owner_session, t1, jobs=[_job("g1")])
+    wa = _fake_wa()
+    try:
+        card = handle_update(
+            owner_session, _cbq(ADMIN, f"v1|tenant|{code}"),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+            whatsapp_client=wa,
+        )
+        assert f"v1|act|{code}|resend" in _buttons(card[1])
+        assert "حزمة محفوظة" in card[1].text
+
+        act = handle_update(
+            owner_session, _cbq(ADMIN, f"v1|act|{code}|resend"),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+            whatsapp_client=wa,
+        )
+        confirm_btn = act[1].keyboard[0][0][1]
+        assert confirm_btn.startswith("v1|confirm|")
+        assert not wa.sent                       # confirmation sends nothing
+
+        done = handle_update(
+            owner_session, _cbq(ADMIN, confirm_btn), admin_chat_id=ADMIN,
+            probes=FakeProbes(), now=NOW, whatsapp_client=wa,
+        )
+        assert console.RESEND_DONE_AR.format(code=code) in done[1].text
+        assert [m.kind for m in wa.sent] == ["text", "text", "document"]
+        status = owner_session.execute(sql_text(
+            "SELECT status FROM deliveries WHERE tenant_id = :t"),
+            {"t": t1}).scalar_one()
+        assert status == "COMPLETED"
+        assert f"v1|act|{code}|resend" not in _buttons(done[1])
+
+        # the SAME nonce again → refused (one-shot, like pause/resume)
+        again = handle_update(
+            owner_session, _cbq(ADMIN, confirm_btn), admin_chat_id=ADMIN,
+            probes=FakeProbes(), now=NOW, whatsapp_client=wa,
+        )
+        assert again[0].text == console.ACTION_EXPIRED_AR
+    finally:
+        _clear_delivery(owner_session, t1)
+
+
+def test_resend_reply_is_honest_on_partial_delivery(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """One job lands, the other's CV fails → PARTIAL, said plainly."""
+    import career.telegram.console as console
+
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    _seed_held_bundle(owner_session, t1, jobs=[_job("g1"), _job("g2")])
+    wa = _fake_wa()
+    original = wa.send_document
+
+    def flaky_document(to_phone: str, ref: str, **kw: Any) -> str:
+        if ref.endswith("g2.pdf"):
+            raise RuntimeError("graph refused the media")
+        return original(to_phone, ref, **kw)
+
+    wa.send_document = flaky_document        # type: ignore[method-assign]
+    try:
+        act = handle_update(
+            owner_session, _cbq(ADMIN, f"v1|act|{code}|resend"),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+            whatsapp_client=wa,
+        )
+        done = handle_update(
+            owner_session, _cbq(ADMIN, act[1].keyboard[0][0][1]),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+            whatsapp_client=wa,
+        )
+        assert console.RESEND_PARTIAL_AR.format(code=code) in done[1].text
+        status = owner_session.execute(sql_text(
+            "SELECT status FROM deliveries WHERE tenant_id = :t"),
+            {"t": t1}).scalar_one()
+        assert status == "PARTIAL"
+    finally:
+        _clear_delivery(owner_session, t1)
+
+
+def test_resend_reply_is_honest_when_nothing_lands(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """Everything failed again → the bundle stays claimable and the operator
+    is told so (never a green ✅)."""
+    import career.telegram.console as console
+
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    _seed_held_bundle(owner_session, t1, jobs=[_job("g1")])
+    wa = _fake_wa()
+
+    def dead_text(to_phone: str, body: str) -> str:
+        raise RuntimeError("graph is down")
+
+    wa.send_text = dead_text                 # type: ignore[method-assign]
+    try:
+        act = handle_update(
+            owner_session, _cbq(ADMIN, f"v1|act|{code}|resend"),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+            whatsapp_client=wa,
+        )
+        done = handle_update(
+            owner_session, _cbq(ADMIN, act[1].keyboard[0][0][1]),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+            whatsapp_client=wa,
+        )
+        assert console.RESEND_FAILED_AR.format(code=code) in done[1].text
+        assert "✅" not in done[1].text.splitlines()[0]
+        status = owner_session.execute(sql_text(
+            "SELECT status FROM deliveries WHERE tenant_id = :t"),
+            {"t": t1}).scalar_one()
+        assert status == "PENDING_WINDOW"     # still claimable, not consumed
+        # still offered — the operator may try again
+        assert f"v1|act|{code}|resend" in _buttons(done[1])
+    finally:
+        _clear_delivery(owner_session, t1)
+
+
+def test_resend_replies_and_confirm_card_are_direction_pure(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """Fahad's client scrambles a line that mixes Arabic with Latin/digits:
+    every Arabic line we emit must be free of them (the TEN code lives on a
+    line of its own)."""
+    import re
+
+    import career.telegram.console as console
+
+    arabic = re.compile(r"[؀-ۿ]")
+    latin_or_digit = re.compile(r"[A-Za-z0-9]")
+
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    _seed_held_bundle(owner_session, t1, jobs=[_job("g1")])
+    try:
+        act = handle_update(
+            owner_session, _cbq(ADMIN, f"v1|act|{code}|resend"),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+            whatsapp_client=_fake_wa(),
+        )
+        texts = [act[1].text] + [
+            template.format(code=code) for template in (
+                console.RESEND_DONE_AR, console.RESEND_PARTIAL_AR,
+                console.RESEND_FAILED_AR, console.RESEND_NOTHING_AR,
+            )
+        ]
+        for text in texts:
+            assert code in text
+            for line in text.splitlines():
+                if arabic.search(line):
+                    assert not latin_or_digit.search(line), line
+    finally:
+        _clear_delivery(owner_session, t1)

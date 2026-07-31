@@ -24,8 +24,10 @@ from sqlalchemy.orm import Session
 
 from career.config import get_settings
 from career.logging_filters import install_secret_redaction
+from career.storage import FilesystemStorageAdapter
 from career.telegram.admin import HttpTelegramAdminClient, TelegramSendError
 from career.telegram.console import handle_update
+from career.whatsapp.client import HttpWhatsAppClient
 
 logger = logging.getLogger("career.admin_bot")
 
@@ -221,6 +223,14 @@ def main() -> None:  # pragma: no cover — live runner over tested parts
     client = HttpTelegramAdminClient(
         settings.telegram_admin_bot_token, settings.telegram_admin_chat_id
     )
+    # the ONLY side-effecting client the console needs: «إعادة إرسال»
+    # re-attempts a held bundle. Built here (same style as the worker loop)
+    # and injected — the console never constructs transports itself.
+    whatsapp = HttpWhatsAppClient(
+        settings.whatsapp_access_token,
+        settings.whatsapp_phone_number_id,
+        storage=FilesystemStorageAdapter(settings.storage_root),
+    )
     probes = LiveProbes(settings)
     try:
         client.send_admin("🏰 برج المراقبة جاهز — أرسل /start")
@@ -240,6 +250,7 @@ def main() -> None:  # pragma: no cover — live runner over tested parts
                         session, update,
                         admin_chat_id=settings.telegram_admin_chat_id,
                         probes=probes, now=datetime.now(UTC),
+                        whatsapp_client=whatsapp,
                     )
                     _store_offset(session, update_id)
                     session.commit()
