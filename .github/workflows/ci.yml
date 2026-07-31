@@ -92,7 +92,7 @@ jobs:
       - name: Shellcheck ops scripts
         run: |
           sudo apt-get install -y shellcheck >/dev/null 2>&1 || true
-          shellcheck ops/backup/*.sh
+          shellcheck ops/backup/*.sh scripts/*.sh
 
       - name: Dependency lockfile is present and parseable
         run: |

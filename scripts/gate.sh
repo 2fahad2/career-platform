@@ -7,7 +7,7 @@
 # while every local run looked green. A gate that only lives in the cloud is
 # a gate you find out about late. Run this before pushing.
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 
 fail=0
 step() {
@@ -19,7 +19,9 @@ step "ruff"        .venv/bin/ruff check src tests scripts
 step "mypy src"    .venv/bin/python -m mypy src/
 step "mypy scripts" .venv/bin/python -m mypy scripts/ --explicit-package-bases
 if command -v shellcheck >/dev/null 2>&1; then
-  step "shellcheck" shellcheck ops/backup/*.sh
+  # scripts/*.sh too: the recovery helpers are exactly the code that must not
+  # rot, because nobody runs them until the night everything is already wrong.
+  step "shellcheck" shellcheck ops/backup/*.sh scripts/*.sh
 else
   printf '\n▶ shellcheck\n  ! not installed — CI WILL still run it (apt-get install shellcheck)\n'
   fail=1

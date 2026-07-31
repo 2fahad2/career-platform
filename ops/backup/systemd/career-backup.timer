@@ -1,9 +1,0 @@
-[Unit]
-Description=Daily career backup at 03:30 Riyadh (before the daily run)
-
-[Timer]
-OnCalendar=*-*-* 03:30:00 Asia/Riyadh
-Persistent=true
-
-[Install]
-WantedBy=timers.target

@@ -36,6 +36,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# systemd gives this unit no HOME; without one restic cannot cache and refetches
+# the whole index from B2 on every drill.
+export HOME="${HOME:-/root}"
+
 echo "restore-test: pulling latest ${PG_DB}.dump from $RESTIC_REPOSITORY"
 restic dump --tag db latest "${PG_DB}.dump" > "$WORK/restore.dump"
 echo "restore-test: pulled $(du -h "$WORK/restore.dump" | cut -f1)"
@@ -84,5 +88,29 @@ if [[ -d "$STORAGE_ROOT" ]] && find "$STORAGE_ROOT" -type f | head -1 | grep -q 
 else
   echo "restore-test: no live storage files yet — storage check skipped" >&2
 fi
+
+# Config bundle restore (closure-audit item 10: the backup restored data but
+# never proved the SERVER could be rebuilt). Pull the config tarball and check
+# it actually carries the gateway config, the units and the manifest — a bundle
+# that restores empty is worse than none, because it is believed.
+echo "restore-test: restoring config bundle"
+restic dump --tag config latest career-config.tar.gz > "$WORK/career-config.tar.gz"
+mkdir -p "$WORK/config-restore"
+tar -xzf "$WORK/career-config.tar.gz" -C "$WORK/config-restore"
+CONFIG_ROOT="$WORK/config-restore/config"
+CONFIG_UNITS="$(find "$CONFIG_ROOT/systemd" -name 'career-*' -type f 2>/dev/null | wc -l)"
+if [[ ! -s "$CONFIG_ROOT/caddy/Caddyfile" ]]; then
+  echo "restore-test: FAILED — config bundle has no Caddyfile" >&2
+  exit 1
+fi
+if [[ ! -s "$CONFIG_ROOT/MANIFEST.txt" ]]; then
+  echo "restore-test: FAILED — config bundle has no manifest" >&2
+  exit 1
+fi
+if [[ "$CONFIG_UNITS" -lt 5 ]]; then
+  echo "restore-test: FAILED — config bundle has only $CONFIG_UNITS unit files" >&2
+  exit 1
+fi
+echo "restore-test: config bundle verified (Caddyfile + $CONFIG_UNITS units + manifest)"
 
 echo "restore-test: PASSED — backup is recoverable"

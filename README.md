@@ -128,7 +128,7 @@ absent from the raw Arabic → the customer confirms (English + Arabic gloss)
 | `Dockerfile` | The api container image. |
 | `alembic.ini` | Migrations entry point (owner role). |
 | `.env.example` `.env.staging.example` `.env.production.example` | Complete templates for every setting; real `.env*` files are untracked. |
-| `Caddyfile` | TLS termination; exposes only `/webhooks/*` and `/health`. |
+| _(no root `Caddyfile`)_ | The live gateway config is `/etc/caddy/Caddyfile` on the host — TLS termination, exposing only `/webhooks/*` and `/health`. It is not tracked here; `backup.sh` captures it in the `config` snapshot and `docs/RUNBOOK-DISASTER-RECOVERY.md` restores it. |
 
 ### `src/career_core/` — pure kernel (no I/O, no DB)
 
@@ -302,12 +302,13 @@ absent from the raw Arabic → the customer confirms (English + Arabic gloss)
 
 | Path | Purpose |
 |------|---------|
-| `engine/systemd/career-worker.service` | Conversation loop (Restart=always). |
-| `engine/systemd/career-engine-nightly.{service,timer}` | 04:30 Riyadh nightly (Persistent=true). |
-| `engine/systemd/career-admin-bot.service` | Watchtower (isolated from the worker). |
-| `backup/backup.sh` | Encrypted restic backup to B2: pg_dump + host storage root + volume. |
-| `backup/restore-test.sh` | Monthly restore drill (tables + RLS assertions). |
-| `backup/systemd/*` | Daily backup + monthly restore-test timers. |
+| `systemd/career-worker.service` | Conversation loop (Restart=always). |
+| `systemd/career-engine-nightly.{service,timer}` | 04:30 Riyadh nightly (Persistent=true). |
+| `systemd/career-admin-bot.service` | Watchtower (isolated from the worker). |
+| `systemd/career-backup.{service,timer}` `systemd/career-restore-test.{service,timer}` | Daily backup + monthly restore drill. |
+| `systemd/career-alert@.service` | `OnFailure=` handler: tells the operator a unit stayed down. |
+| `backup/backup.sh` | Encrypted restic backup to B2: pg_dump + host storage root + volume + host config bundle. |
+| `backup/restore-test.sh` | Monthly restore drill (tables, RLS, a real tenant file, the config bundle). |
 
 ### `docs/`
 
