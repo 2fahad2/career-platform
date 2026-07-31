@@ -12,8 +12,14 @@ if [[ ! -f "$ENV_FILE" ]]; then
   echo "restore-test: env file not found: $ENV_FILE" >&2
   exit 2
 fi
-# shellcheck disable=SC1090
-set -a; source "$ENV_FILE"; set +a
+# The env file is chosen at runtime, so shellcheck cannot follow it. The
+# directive must sit immediately above the `source` STATEMENT — on the old
+# one-liner it bound to `set -a` instead and SC1090 still fired, which failed
+# CI on every push for ten days while nothing ran it locally.
+set -a
+# shellcheck source=/dev/null
+source "$ENV_FILE"
+set +a
 
 : "${RESTIC_REPOSITORY:?RESTIC_REPOSITORY must be set}"
 : "${RESTIC_PASSWORD:?RESTIC_PASSWORD must be set}"
