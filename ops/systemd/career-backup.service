@@ -1,0 +1,9 @@
+[Unit]
+Description=Career platform encrypted off-server backup (restic -> B2)
+Wants=network-online.target
+After=network-online.target docker.service
+OnFailure=career-alert@%n.service
+
+[Service]
+Type=oneshot
+ExecStart=/root/career/ops/backup/backup.sh

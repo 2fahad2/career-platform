@@ -1,0 +1,9 @@
+[Unit]
+Description=Monthly restore test at 04:30 Riyadh on the 1st
+
+[Timer]
+OnCalendar=*-*-01 04:30:00 Asia/Riyadh
+Persistent=true
+
+[Install]
+WantedBy=timers.target

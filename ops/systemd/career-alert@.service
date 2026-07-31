@@ -1,0 +1,9 @@
+# OnFailure handler — one instance per failing unit (career-alert@<unit>).
+# Reached only when a unit gives up for good; a self-healing restart is silent
+# by design, because an alert that fires on every blip gets muted by week two.
+[Unit]
+Description=Alert the operator that %i stopped for good
+
+[Service]
+Type=oneshot
+ExecStart=/root/career/scripts/alert_unit_failure.sh %i

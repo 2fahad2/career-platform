@@ -1,0 +1,9 @@
+[Unit]
+Description=Career platform monthly restore test (proves backups are recoverable)
+Wants=network-online.target
+After=network-online.target docker.service
+OnFailure=career-alert@%n.service
+
+[Service]
+Type=oneshot
+ExecStart=/root/career/ops/backup/restore-test.sh
