@@ -20,7 +20,7 @@ RUN apt-get update \
         curl \
         libglib2.0-0 libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz0b \
         libcairo2 libgdk-pixbuf-2.0-0 libffi8 shared-mime-info \
-        fonts-dejavu-core fonts-noto-core \
+        fonts-liberation fonts-dejavu-core fonts-noto-core \
     && rm -rf /var/lib/apt/lists/*
 
 # Install dependencies first for better layer caching.

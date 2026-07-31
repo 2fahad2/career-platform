@@ -92,6 +92,15 @@ jobs:
       - name: Shellcheck ops scripts
         run: |
           sudo apt-get install -y shellcheck >/dev/null 2>&1 || true
+          # The CV template names Liberation Sans first and DejaVu second, and
+          # the Arabic report needs Noto Naskh. Without them the runner
+          # rendered every PDF in whatever fallback fontconfig happened to
+          # pick — so CI was validating a different document than the one a
+          # paying customer receives, and the byte-determinism test passed or
+          # failed on font-cache warmth rather than on our code.
+          sudo apt-get install -y fonts-liberation fonts-dejavu-core \
+            fonts-noto-core fonts-noto-naskh-arabic >/dev/null 2>&1 || true
+          fc-cache -f >/dev/null 2>&1 || true
           shellcheck ops/backup/*.sh scripts/*.sh
 
       - name: Dependency lockfile is present and parseable
