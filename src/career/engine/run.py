@@ -19,6 +19,7 @@ import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import select
@@ -108,11 +109,16 @@ def _discover(
     searchapi: SearchApiClient,
     jobspy_client: JobSpyClient,
     max_per_query: int,
-) -> tuple[list[DiscoveredJob], dict[str, Any]]:
+) -> tuple[list[DiscoveredJob], dict[str, Any], dict[str, int]]:
     """The digest path (§5.2): exactly two fetchers, each isolated — a failing
-    source degrades the run, never crashes it, and its reason is sanitized."""
+    source degrades the run, never crashes it, and its reason is sanitized.
+
+    The third return value is billed SearchAPI credits per family (§14): the
+    provider charges per query, so the run's real discovery cost is the number
+    of alias×location queries that actually reached it."""
     jobs: list[DiscoveredJob] = []
     sources: dict[str, Any] = {}
+    searches: dict[str, int] = {}
 
     try:
         fetched = 0
@@ -122,12 +128,18 @@ def _discover(
                 searchapi, aliases=family.aliases, locations=family.locations,
                 family=family.family, max_per_query=max_per_query,
             )
+            # a query that never reached the provider (transport error) is not
+            # a billed credit — query_errors is exactly that count
+            billed = (len(family.aliases) * len(family.locations)
+                      - int(skips.get("query_errors", 0)))
+            searches[family.family] = searches.get(family.family, 0) + max(billed, 0)
             jobs.extend(family_jobs)
             fetched += len(family_jobs)
             for key, value in skips.items():
                 skips_total[key] = skips_total.get(key, 0) + value
         sources["searchapi_google_jobs"] = {
             "status": "ok", "fetched": fetched, "skips": skips_total,
+            "searches": sum(searches.values()),
         }
     except Exception as exc:  # noqa: BLE001 — isolation is the contract (§5.2)
         logger.warning("google_jobs discovery failed", exc_info=True)
@@ -152,7 +164,45 @@ def _discover(
         logger.warning("jobspy discovery failed", exc_info=True)
         sources["jobspy"] = {"status": "error", "reason": type(exc).__name__}
 
-    return jobs, sources
+    return jobs, sources, searches
+
+
+def record_search_costs(
+    owner_session: Session,
+    *,
+    families: list[QueryFamily],
+    searches: dict[str, int],
+    run_id: uuid.UUID,
+    now: datetime,
+) -> None:
+    """§14: split the run's SearchAPI credits across the tenants that caused
+    them. A family exists ONLY because some ACTIVE tenants approved that path
+    (D5), and the query serves all of them at once — so the honest allocation
+    is the family's credits divided evenly among its members, not the whole
+    bill charged to whoever happens to be first. Best-effort: discovery must
+    never fail over accounting."""
+    from career.config import get_settings
+    from career.cv.close import record_usage
+
+    try:
+        price = Decimal(str(get_settings().searchapi_usd_per_search))
+        for family in families:
+            count = int(searches.get(family.family, 0))
+            members = list(family.tenant_ids)
+            if count <= 0 or not members:
+                continue
+            share = Decimal(count) / Decimal(len(members))
+            for tenant_id in members:
+                record_usage(
+                    owner_session, tenant_id=tenant_id, kind="search_api",
+                    run_id=run_id, now=now,
+                    # the credit count rides in input_tokens: usage_events is
+                    # «units consumed», and for this provider a unit is a query
+                    input_tokens=count,
+                    cost_usd=(price * share).quantize(Decimal("0.000001")),
+                )
+    except Exception:  # noqa: BLE001 — accounting never breaks the run
+        logger.warning("searchapi cost allocation failed", exc_info=True)
 
 
 #: §06 posting window for the repost quadruple — beyond it, a same-looking
@@ -318,8 +368,16 @@ def run_nightly(
         return _finish("no_active_tenants", {})
 
     # 2) discovery — two isolated fetchers
-    jobs, sources = _discover(families, searchapi, jobspy_client, max_per_query)
+    jobs, sources, searches = _discover(
+        families, searchapi, jobspy_client, max_per_query
+    )
     counts["sources"] = sources
+    # §14: the credits are spent by now whatever happens next — meter before
+    # any early return, or a failed run looks free.
+    record_search_costs(
+        owner_session, families=families, searches=searches,
+        run_id=run.id, now=now,
+    )
     failed_sources = sum(1 for s in sources.values() if s["status"] == "error")
     if failed_sources == len(sources):
         return _finish("discovery_failed", {})

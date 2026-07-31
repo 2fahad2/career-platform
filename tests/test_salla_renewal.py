@@ -469,3 +469,61 @@ def test_a_pass_customer_can_buy_the_analysis_without_hitting_a_wall(
             {"t": str(tenant_id)}).all()
     ])
     assert "cv_analysis" in plans and "professional" in plans
+
+
+def test_paying_twice_before_activating_costs_neither_a_tenant_nor_a_day(
+    owner_session, clean_billing
+):
+    """The last open finding: with no channel yet there was nothing to match
+    on, so a second purchase opened a SECOND tenant, burned a second founding
+    seat and minted a token that dies at the claim deadline — thirty paid days
+    destroyed in silence."""
+    from career.db.models import Subscription
+    from career.salla import seats
+
+    phone = _phone()
+    before_tenants = owner_session.execute(sql_text(
+        "SELECT count(*) FROM tenants")).scalar_one()
+    first, _ = _buy(owner_session, phone=phone)
+    seats_after_first = seats.founding_seats(owner_session).taken
+
+    second, _ = _buy(owner_session, phone=phone)   # paid again, still unclaimed
+
+    assert second.status is ProvisionStatus.RENEWED
+    assert second.tenant_id == first.tenant_id
+    assert second.activation_token is None
+    assert owner_session.execute(sql_text(
+        "SELECT count(*) FROM tenants")).scalar_one() == before_tenants + 1
+    assert seats.founding_seats(owner_session).taken == seats_after_first
+
+    # their original token still works — no second activation to chase
+    outcome = activate(
+        owner_session, token=first.activation_token, from_phone=phone,
+        display_name=None, now=NOW, whatsapp_client=FakeWhatsAppClient(),
+        admin_client=FakeTelegramAdminClient(),
+    )
+    assert outcome.status is not None
+    tenant_id = uuid.UUID(str(first.tenant_id))
+
+    # and both payments become days: the merge happens when the period is
+    # stamped, so sixty days — not thirty with thirty quietly expired
+    activated = owner_session.get(
+        Subscription, uuid.UUID(str(first.subscription_id)))
+    assert activated is not None
+    activated.current_period_start = NOW
+    activated.current_period_end = NOW + timedelta(days=30)
+    merged = renewal.merge_prepaid_orders(
+        owner_session, tenant_id=tenant_id, activated=activated, now=NOW,
+    )
+    owner_session.commit()
+
+    assert merged == 1
+    assert activated.current_period_end == NOW + timedelta(days=60)
+    assert owner_session.execute(sql_text(
+        "SELECT status FROM subscriptions WHERE id = :i"),
+        {"i": str(second.subscription_id)}).scalar_one() == sub_states.EXPIRED
+    # the money trail survives the merge
+    assert owner_session.execute(sql_text(
+        "SELECT count(*) FROM subscription_events WHERE subscription_id = :i"
+        " AND event_type = 'merged_into_activation'"),
+        {"i": str(second.subscription_id)}).scalar_one() == 1

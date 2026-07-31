@@ -127,6 +127,10 @@ class RenewalTarget:
     period_start: datetime
     period_end: datetime
     needs_review: bool
+    #: Paid again BEFORE activating. Not a renewal of running service — the
+    #: existing token still activates them, and these days are merged into
+    #: the period stamped at activation.
+    prepaid: bool = False
 
     @property
     def new_status(self) -> str:
@@ -139,6 +143,8 @@ class RenewalTarget:
         day 7 with no alert. SUSPENDED is untouched by every sweep and the
         operator can move it straight to ACTIVE.
         """
+        if self.prepaid:
+            return sub_states.PAID_UNCLAIMED
         if self.needs_review:
             return sub_states.SUSPENDED
         if self.previous_status == sub_states.PAUSED:
@@ -170,17 +176,41 @@ def find_renewal(
             CustomerChannel.provider == "whatsapp",
         ).order_by(CustomerChannel.created_at, CustomerChannel.id)
     ).scalars().all()
-    if not channels:
-        return None
-    channel = channels[0]
+    if channels:
+        tenant_id = channels[0].tenant_id
+    else:
+        # No channel yet — they paid and have not activated. Buying twice in
+        # that window used to open a SECOND tenant, burn a second founding
+        # seat and mint a second token that dies at the claim deadline. The
+        # order phone on the unclaimed row identifies them just as well.
+        unclaimed = session.execute(
+            select(Subscription).where(
+                Subscription.order_phone_e164.in_(variants),
+                Subscription.status == sub_states.PAID_UNCLAIMED,
+                Subscription.plan_code.in_(sorted(RENEWABLE_PLANS)),
+            ).order_by(Subscription.created_at, Subscription.id)
+        ).scalars().first()
+        if unclaimed is None:
+            return None
+        tenant_id = unclaimed.tenant_id
 
     prior = [
-        sub for sub in tenant_subscriptions(session, channel.tenant_id)
+        sub for sub in tenant_subscriptions(session, tenant_id)
         if sub.plan_code in RENEWABLE_PLANS
     ]
     if not prior:
         return None
     live = prior[0]
+    if live.status == sub_states.PAID_UNCLAIMED:
+        # A prepayment, not a renewal of running service: it keeps the
+        # unclaimed status (the first token still activates them) and its
+        # days are merged in at activation by merge_prepaid_orders.
+        return RenewalTarget(
+            tenant_id=tenant_id, previous_id=live.id,
+            previous_status=live.status, period_start=now,
+            period_end=now + timedelta(days=SUBSCRIPTION_DAYS),
+            needs_review=False, prepaid=True,
+        )
     if live.status not in _PRIOR_STATES and live.status not in _NEEDS_REVIEW:
         return None
 
@@ -188,13 +218,49 @@ def find_renewal(
     period_end = live.current_period_end
     start = period_end if period_end is not None and period_end > now else now
     return RenewalTarget(
-        tenant_id=channel.tenant_id,
+        tenant_id=tenant_id,
         previous_id=live.id,
         previous_status=live.status,
         period_start=start,
         period_end=start + timedelta(days=SUBSCRIPTION_DAYS),
         needs_review=live.status in _NEEDS_REVIEW,
     )
+
+
+def merge_prepaid_orders(
+    session: Session, *, tenant_id: uuid.UUID, activated: Subscription,
+    now: datetime,
+) -> int:
+    """Fold pre-activation extra purchases into the period being stamped.
+
+    Someone who buys twice before ever activating has paid for sixty days.
+    The activation path stamps thirty onto one row; the other row would have
+    sat PAID_UNCLAIMED until the claim deadline expired it — thirty paid days
+    destroyed in silence.
+
+    Each extra row is retired EXPIRED under a ``merged_into_activation``
+    event that names the row it was merged into, so the money trail stays
+    complete (its order id, amount and event are all intact) and the customer
+    gets every day they paid for. Returns how many were merged.
+    """
+    extras = [
+        sub for sub in tenant_subscriptions(session, tenant_id)
+        if sub.id != activated.id
+        and sub.plan_code in RENEWABLE_PLANS
+        and sub.status == sub_states.PAID_UNCLAIMED
+    ]
+    for extra in extras:
+        end = activated.current_period_end or now
+        activated.current_period_end = end + timedelta(days=SUBSCRIPTION_DAYS)
+        sub_states.transition(
+            session, extra, sub_states.EXPIRED,
+            event_type="merged_into_activation",
+            salla_order_id=extra.salla_order_id,
+            details={"merged_into": str(activated.id)},
+        )
+    if extras:
+        session.flush()
+    return len(extras)
 
 
 def resync_policy_limit(
@@ -238,7 +304,7 @@ def close_previous(
     need not move (EXPIRED, refunded, disputed) — the trail stays honest
     either way, and a renewal must never fail because of bookkeeping.
     """
-    if target.needs_review:
+    if target.needs_review or target.prepaid:
         return
     previous = session.get(Subscription, target.previous_id)
     if previous is None:

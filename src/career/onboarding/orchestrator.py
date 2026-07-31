@@ -456,9 +456,14 @@ def _resolve_enrichment_intent(
         found = enr.draft_of(session, tenant_id=tenant_id,
                              fact_id=uuid.UUID(str(fact_id)))
         draft_text = found[0] if found else None
+    from career.cv.close import LlmMeter
+
     return intent_mod.resolve_intent(
         body, draft=draft_text, classifier=deps.intent_classifier,
         deterministic=deterministic, known_name=known_name,
+        # §14: the classifier fires once per enrichment reply — metered here,
+        # where the tenant is known, on the same mechanism as every other call
+        meter=LlmMeter(session, tenant_id=tenant_id),
     )
 
 

@@ -19,7 +19,6 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
-from decimal import Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -64,19 +63,6 @@ logger = logging.getLogger("career.cv")
 #: A held bundle whose window never opened before the NEXT run day — the day
 #: must still close honestly instead of silently never existing (§15.12).
 DELIVERY_EXPIRED = "EXPIRED_WINDOW"
-
-#: claude-opus-4-8 list prices (USD per token) — the §14 cost fuel.
-_LLM_USD_PER_INPUT_TOKEN = Decimal("0.000005")
-_LLM_USD_PER_OUTPUT_TOKEN = Decimal("0.000025")
-
-
-def _llm_cost_usd(input_tokens: int, output_tokens: int) -> Decimal | None:
-    if input_tokens <= 0 and output_tokens <= 0:
-        return None
-    return (
-        _LLM_USD_PER_INPUT_TOKEN * input_tokens
-        + _LLM_USD_PER_OUTPUT_TOKEN * output_tokens
-    )
 
 #: Saudi weekend — Friday (4) and Saturday (5) in Python weekday numbering,
 #: computed in Asia/Riyadh explicitly (audit fix E: a UTC clock reads the
@@ -333,28 +319,24 @@ def _run_tenant(
 
     def _resolve(job: dict[str, Any]) -> publish.ResolveResult:
         def _generator() -> dict[str, str]:
-            in_before = int(getattr(deps.llm, "total_input_tokens", 0) or 0)
-            out_before = int(getattr(deps.llm, "total_output_tokens", 0) or 0)
-            tailored = generate.tailor_cv(
-                deps.llm, bank=bank,
-                current_title=profile.current_title,
-                years_experience=profile.years_experience,
-                job_title=str(job["title"]), company=str(job["company"]),
-                jd_text=str(job["jd_text"]),
-                budget=monthly_budget,
-                forbidden_claims=forbidden,
+            # audit fix D: the LLM spend happens HERE — the meter's `finally`
+            # records it even when tailoring raises, so a blocked CV can never
+            # leave its real token spend uncounted (§14).
+            meter = close_mod.LlmMeter(
+                session, tenant_id=tenant_id, now=now, run_id=report.run_id
             )
-            # audit fix D: the LLM spend happened HERE — record it before
-            # publish/render can fail, or the §14 cost fuel undercounts.
-            in_used = int(getattr(deps.llm, "total_input_tokens", 0) or 0) - in_before
-            out_used = int(getattr(deps.llm, "total_output_tokens", 0) or 0) - out_before
-            close_mod.record_usage(
-                session, tenant_id=tenant_id, kind="llm_generation",
-                run_id=report.run_id, now=now,
-                input_tokens=in_used or None,
-                output_tokens=out_used or None,
-                cost_usd=_llm_cost_usd(in_used, out_used),
-            )
+            # always=True: MonthlyCapBudget (ك-11) counts these rows, so the
+            # event must exist even if the transport reported no usage block
+            with meter.around("llm_generation", deps.llm, always=True):
+                tailored = generate.tailor_cv(
+                    deps.llm, bank=bank,
+                    current_title=profile.current_title,
+                    years_experience=profile.years_experience,
+                    job_title=str(job["title"]), company=str(job["company"]),
+                    jd_text=str(job["jd_text"]),
+                    budget=monthly_budget,
+                    forbidden_claims=forbidden,
+                )
             return publish.publish_cv_pair(
                 deps.storage, tenant_id=str(tenant_id),
                 cv=_inject_contact(tailored, contact),

@@ -83,4 +83,10 @@ def format_weekly_report(
         cost_part = f" (${cost})" if cost is not None else ""
         lines.append(f"🧠 نداءات Claude: {llm}{cost_part}")
 
+    # §14: the same spend block the business screen shows — ONE set of
+    # numbers, and bidi-pure (numbers and Latin keys on their own lines).
+    from career.telegram.views import cost_lines
+
+    lines.extend(cost_lines(business))
+
     return "\n".join(lines)

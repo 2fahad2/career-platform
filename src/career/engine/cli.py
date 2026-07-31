@@ -127,6 +127,24 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
     except Exception:  # noqa: BLE001 — the sweep never blocks the run
         logger.error("subscription lifecycle sweep failed", exc_info=True)
 
+    # §12 retention: kept in full while subscribed, 90 days after it ends,
+    # then professionally deleted. That was a published promise in the consent
+    # text, the whitepaper and the store's privacy page with no job behind it.
+    try:
+        from career.onboarding.retention import sweep_retention
+        from career.storage import FilesystemStorageAdapter
+
+        with Session(engine) as session:
+            counts = sweep_retention(
+                session, now=datetime.now(UTC),
+                storage=FilesystemStorageAdapter(settings.storage_root),
+            )
+            session.commit()
+        if counts.get("swept"):
+            logger.info("retention sweep: %s", counts)
+    except Exception:  # noqa: BLE001 — never blocks the run
+        logger.error("retention sweep failed", exc_info=True)
+
     try:
         with Session(engine) as session:
             report = run_nightly(

@@ -45,6 +45,21 @@ class Settings(BaseSettings):
     # SearchAPI.io — Google Jobs discovery source (C6, deviation D13).
     searchapi_api_key: str = Field(default="", alias="SEARCHAPI_API_KEY")
 
+    # §14 cost metering — provider list prices the operator must be able to
+    # correct without a deploy (§06: «قابلة للضبط في الإعدادات لا في الكود»).
+    # SearchAPI.io: USD per google_jobs search credit.
+    searchapi_usd_per_search: float = Field(
+        default=0.004, alias="SEARCHAPI_USD_PER_SEARCH"
+    )
+    # Meta prices a template message per CATEGORY and per market (Saudi
+    # Arabia); marketing costs multiples of utility, so they are separate.
+    whatsapp_usd_per_utility_message: float = Field(
+        default=0.0157, alias="WHATSAPP_USD_PER_UTILITY_MESSAGE"
+    )
+    whatsapp_usd_per_marketing_message: float = Field(
+        default=0.0384, alias="WHATSAPP_USD_PER_MARKETING_MESSAGE"
+    )
+
     # Engine caps (§06: «قابلة للضبط في الإعدادات لا في الكود»).
     engine_max_per_query: int = Field(default=5, alias="ENGINE_MAX_PER_QUERY")
     engine_retrieval_cap: int = Field(default=50, alias="ENGINE_RETRIEVAL_CAP")

@@ -12,14 +12,16 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Callable
-from datetime import date, datetime
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from datetime import UTC, date, datetime
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from career.db.models import CostAllocation, TenantDayState, UsageEvent
+from career.db.models import CostAllocation, DeliveryMessage, TenantDayState, UsageEvent
 from career.engine.ranking import record_suppression_by_url
 
 logger = logging.getLogger("career.cv")
@@ -180,6 +182,118 @@ def format_admin_summary(
     return "\n".join(lines)
 
 
+# ── the ONE price table (§14) ────────────────────────────────────────────────
+
+#: claude-opus-4-8 list prices, USD per token. Cache writes bill at 1.25× the
+#: input rate and cache reads at 0.1× — the API reports those two separately,
+#: so the meter must too: a cached workload priced at the plain input rate
+#: reads as ~10× its real cost, which is exactly the kind of wrong number that
+#: hides a runaway bill.
+LLM_USD_PER_INPUT_TOKEN = Decimal("0.000005")
+LLM_USD_PER_OUTPUT_TOKEN = Decimal("0.000025")
+LLM_USD_PER_CACHE_WRITE_TOKEN = Decimal("0.00000625")
+LLM_USD_PER_CACHE_READ_TOKEN = Decimal("0.0000005")
+
+#: Every metered LLM call site, one kind each. The operator's screens iterate
+#: THIS tuple, so a paid boundary that forgets to register here shows up as a
+#: missing category rather than as silence.
+LLM_KINDS: tuple[str, ...] = (
+    "llm_generation",    # CV tailoring (cv/generate.py)
+    "llm_extraction",    # CV fact extraction (onboarding/extraction.py)
+    "llm_render",        # achievement bullet render — 3 per panel
+    "llm_judge",         # bullet panel judge
+    "llm_examples",      # icebreaker examples writer
+    "llm_intent",        # conversation intent classifier
+)
+#: SearchAPI.io google_jobs credits (engine/sources.py), split across the
+#: tenants whose approved paths seeded the query family.
+SEARCH_KINDS: tuple[str, ...] = ("search_api",)
+#: Meta bills TEMPLATE messages per category and marketing costs ~2.4× utility,
+#: so one «messages» number would hide the expensive half.
+WHATSAPP_KINDS: tuple[str, ...] = ("wa_utility", "wa_marketing", "wa_unknown")
+#: Manual operator counters (telegram/console.py) — real cost, no dollar price.
+MANUAL_KINDS: tuple[str, ...] = ("support_minutes", "human_review")
+
+SPEND_KINDS: tuple[str, ...] = LLM_KINDS + SEARCH_KINDS + WHATSAPP_KINDS
+
+
+def llm_cost_usd(
+    input_tokens: int,
+    output_tokens: int,
+    cache_write_tokens: int = 0,
+    cache_read_tokens: int = 0,
+) -> Decimal | None:
+    """USD for one metered Claude call, or None when nothing was spent."""
+    if (input_tokens <= 0 and output_tokens <= 0
+            and cache_write_tokens <= 0 and cache_read_tokens <= 0):
+        return None
+    return (
+        LLM_USD_PER_INPUT_TOKEN * max(input_tokens, 0)
+        + LLM_USD_PER_OUTPUT_TOKEN * max(output_tokens, 0)
+        + LLM_USD_PER_CACHE_WRITE_TOKEN * max(cache_write_tokens, 0)
+        + LLM_USD_PER_CACHE_READ_TOKEN * max(cache_read_tokens, 0)
+    )
+
+
+# ── the client-side token counters (§14 fuel, no database) ───────────────────
+
+
+def _int_of(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):  # pragma: no cover — a drifted SDK shape
+        return 0
+
+
+class TokenCounter:
+    """Per-instance token totals for a live Anthropic client.
+
+    Every paid Claude boundary in the product mixes this in and calls
+    :meth:`absorb_usage` on the raw response, so the REAL numbers the API
+    reported are what get metered — never an estimate. The client itself never
+    touches the database: the call site (which knows the tenant) reads the
+    delta around one call and records it, which keeps every boundary
+    injectable and every test network-free.
+    """
+
+    def __init__(self) -> None:  # pragma: no cover — subclasses call this
+        self.reset_token_counters()
+
+    def reset_token_counters(self) -> None:
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
+        self.total_cache_write_tokens = 0
+        self.total_cache_read_tokens = 0
+
+    def absorb_usage(self, response: Any) -> None:
+        """Accumulate one response's usage. Tolerates a response with no usage
+        block (fakes, error paths) — accounting never breaks a customer turn."""
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+        self.total_input_tokens += _int_of(getattr(usage, "input_tokens", 0))
+        self.total_output_tokens += _int_of(getattr(usage, "output_tokens", 0))
+        self.total_cache_write_tokens += _int_of(
+            getattr(usage, "cache_creation_input_tokens", 0)
+        )
+        self.total_cache_read_tokens += _int_of(
+            getattr(usage, "cache_read_input_tokens", 0)
+        )
+
+
+_COUNTER_FIELDS = (
+    "total_input_tokens", "total_output_tokens",
+    "total_cache_write_tokens", "total_cache_read_tokens",
+)
+
+
+def token_snapshot(client: Any) -> tuple[int, int, int, int]:
+    """The four counters of a (possibly un-instrumented) client."""
+    return tuple(  # type: ignore[return-value]
+        _int_of(getattr(client, field, 0)) for field in _COUNTER_FIELDS
+    )
+
+
 # ── usage → cost allocations (§14) ───────────────────────────────────────────
 
 
@@ -192,11 +306,15 @@ def record_usage(
     run_id: uuid.UUID | None = None,
     input_tokens: int | None = None,
     output_tokens: int | None = None,
+    cache_write_tokens: int | None = None,
+    cache_read_tokens: int | None = None,
     cost_usd: Decimal | None = None,
 ) -> UsageEvent:
     row = UsageEvent(
         id=uuid.uuid4(), tenant_id=tenant_id, kind=kind, run_id=run_id,
         input_tokens=input_tokens, output_tokens=output_tokens,
+        cache_write_tokens=cache_write_tokens,
+        cache_read_tokens=cache_read_tokens,
         cost_usd=cost_usd, occurred_at=now,
     )
     session.add(row)
@@ -204,9 +322,170 @@ def record_usage(
     return row
 
 
+class LlmMeter:
+    """Binds (session, tenant) so the PURE pipeline functions can meter a live
+    Claude client without knowing anything about the database.
+
+    One :meth:`around` block = one ``usage_events`` row, categorised by kind
+    and carrying the real token numbers the API reported. Accounting is
+    best-effort by construction: a metering failure is logged and swallowed,
+    because a customer's CV must never fail over a bookkeeping row.
+    """
+
+    def __init__(
+        self,
+        session: Session,
+        *,
+        tenant_id: uuid.UUID,
+        now: datetime | None = None,
+        run_id: uuid.UUID | None = None,
+    ) -> None:
+        self._session = session
+        self._tenant_id = tenant_id
+        self._now = now
+        self._run_id = run_id
+
+    @contextmanager
+    def around(self, kind: str, client: Any, *, always: bool = False) -> Iterator[None]:
+        """``always`` records the row even when the client reported no tokens.
+        Required where the EVENT itself is load-bearing — MonthlyCapBudget
+        counts ``llm_generation`` rows, so a silent skip would disable the
+        plan's safety cap. Elsewhere a zero-token call is not spend and is
+        not written."""
+        before = token_snapshot(client)
+        try:
+            yield
+        finally:
+            self._record(kind, client, before, always=always)
+
+    def _record(
+        self, kind: str, client: Any, before: tuple[int, ...], *, always: bool = False
+    ) -> None:
+        after = token_snapshot(client)
+        used = [max(a - b, 0) for a, b in zip(after, before, strict=True)]
+        if not any(used) and not always:
+            return
+        try:
+            # a savepoint: this may run while an exception is unwinding, and a
+            # failed accounting flush must not poison the caller's transaction
+            with self._session.begin_nested():
+                record_usage(
+                    self._session, tenant_id=self._tenant_id, kind=kind,
+                    run_id=self._run_id, now=self._now or datetime.now(UTC),
+                    input_tokens=used[0] or None,
+                    output_tokens=used[1] or None,
+                    cache_write_tokens=used[2] or None,
+                    cache_read_tokens=used[3] or None,
+                    cost_usd=llm_cost_usd(*used),
+                )
+        except Exception:  # noqa: BLE001 — accounting never blocks a customer
+            logger.warning("llm usage record failed: kind=%s", kind, exc_info=True)
+
+
+@contextmanager
+def metered(meter: LlmMeter | None, kind: str, client: Any) -> Iterator[None]:
+    """``meter``-or-nothing, so a pure pipeline function never has to branch.
+    None means «no session here» (unit tests, previews) — not «free»."""
+    if meter is None or client is None:
+        yield
+        return
+    with meter.around(kind, client):
+        yield
+
+
+# ── WhatsApp: billed per template CATEGORY, derived from the ledger ──────────
+
+#: template category → usage kind. Unknown template names land in wa_unknown
+#: and are priced at the MARKETING (higher) rate: an unrecognised template must
+#: never make a bill look smaller than it is.
+_WA_KIND_BY_CATEGORY = {"utility": "wa_utility", "marketing": "wa_marketing"}
+
+
+def _wa_price(kind: str) -> Decimal:
+    from career.config import get_settings
+
+    settings = get_settings()
+    if kind == "wa_utility":
+        return Decimal(str(settings.whatsapp_usd_per_utility_message))
+    return Decimal(str(settings.whatsapp_usd_per_marketing_message))
+
+
+def _wa_kind_of(template_name: str | None) -> str:
+    from career.whatsapp.templates import REGISTRY
+
+    spec = REGISTRY.get(str(template_name or ""))
+    if spec is None:
+        return "wa_unknown"
+    return _WA_KIND_BY_CATEGORY.get(str(spec.category), "wa_unknown")
+
+
+def whatsapp_spend(
+    session: Session,
+    *,
+    tenant_id: uuid.UUID | None = None,
+    day: date | None = None,
+    since: datetime | None = None,
+) -> dict[str, tuple[int, Decimal]]:
+    """Billed WhatsApp spend as ``{kind: (messages, usd)}``.
+
+    Only TEMPLATE messages are billed, and Meta prices them per category, so
+    counting «messages» would hide that a marketing send costs ~2.4× a utility
+    one. Free-form service replies inside the open 24h window cost nothing and
+    are deliberately not counted; a send whose final status is ``failed`` was
+    never delivered and is not billed.
+
+    DERIVED from ``delivery_messages`` rather than recorded at the send sites:
+    those live in ``whatsapp/delivery.py`` and ``salla/`` (see the report), and
+    the ledger row is written in the same transaction as every send, so it is
+    the same truth — and staying derived keeps this idempotent for free.
+    """
+    query = select(DeliveryMessage.template_name, func.count()).where(
+        DeliveryMessage.kind == "template",
+        DeliveryMessage.status != "failed",
+    )
+    if tenant_id is not None:
+        query = query.where(DeliveryMessage.tenant_id == tenant_id)
+    if day is not None:
+        query = query.where(func.date(DeliveryMessage.created_at) == day)
+    if since is not None:
+        query = query.where(DeliveryMessage.created_at >= since)
+
+    out: dict[str, tuple[int, Decimal]] = {}
+    for template_name, count in session.execute(
+        query.group_by(DeliveryMessage.template_name)
+    ).all():
+        kind = _wa_kind_of(template_name)
+        events, cost = out.get(kind, (0, Decimal("0")))
+        out[kind] = (events + int(count), cost + _wa_price(kind) * int(count))
+    return out
+
+
+def _upsert_allocation(
+    session: Session, *, tenant_id: uuid.UUID, day: date, category: str,
+    events: int, cost_usd: Decimal,
+) -> None:
+    row = session.execute(
+        select(CostAllocation).where(
+            CostAllocation.tenant_id == tenant_id,
+            CostAllocation.day == day,
+            CostAllocation.category == category,
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        row = CostAllocation(
+            id=uuid.uuid4(), tenant_id=tenant_id, day=day, category=category,
+            events=events, cost_usd=cost_usd,
+        )
+        session.add(row)
+    else:
+        row.events = events
+        row.cost_usd = cost_usd
+
+
 def rollup_costs(session: Session, *, tenant_id: uuid.UUID, day: date) -> None:
-    """Recompute the day's per-category rollup from the raw events —
-    idempotent by construction (SET, not increment)."""
+    """Recompute the day's per-category rollup from the raw events PLUS the
+    derived WhatsApp template spend — idempotent by construction (SET, not
+    increment), so the whole day's bill lands in one table either way."""
     aggregated = session.execute(
         select(
             UsageEvent.kind,
@@ -220,22 +499,17 @@ def rollup_costs(session: Session, *, tenant_id: uuid.UUID, day: date) -> None:
         .group_by(UsageEvent.kind)
     ).all()
     for kind, events, cost in aggregated:
-        row = session.execute(
-            select(CostAllocation).where(
-                CostAllocation.tenant_id == tenant_id,
-                CostAllocation.day == day,
-                CostAllocation.category == kind,
-            )
-        ).scalar_one_or_none()
-        if row is None:
-            row = CostAllocation(
-                id=uuid.uuid4(), tenant_id=tenant_id, day=day, category=kind,
-                events=int(events), cost_usd=Decimal(cost),
-            )
-            session.add(row)
-        else:
-            row.events = int(events)
-            row.cost_usd = Decimal(cost)
+        _upsert_allocation(
+            session, tenant_id=tenant_id, day=day, category=kind,
+            events=int(events), cost_usd=Decimal(cost),
+        )
+    for kind, (events, cost) in whatsapp_spend(
+        session, tenant_id=tenant_id, day=day
+    ).items():
+        _upsert_allocation(
+            session, tenant_id=tenant_id, day=day, category=kind,
+            events=events, cost_usd=cost,
+        )
     session.flush()
 
 

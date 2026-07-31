@@ -239,6 +239,12 @@ def activate(session: Session, *, tenant_id: uuid.UUID, now: datetime) -> None:
     )
     subscription.current_period_start = now
     subscription.current_period_end = now + timedelta(days=_SUBSCRIPTION_DAYS)
+    # Paid twice before activating? Those days are theirs (§16).
+    from career.salla.renewal import merge_prepaid_orders
+
+    merge_prepaid_orders(
+        session, tenant_id=tenant_id, activated=subscription, now=now,
+    )
 
     journey.state = "ACTIVE"
     journey.state_entered_at = func.now()

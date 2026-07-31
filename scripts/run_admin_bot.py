@@ -224,8 +224,9 @@ def main() -> None:  # pragma: no cover — live runner over tested parts
         settings.telegram_admin_bot_token, settings.telegram_admin_chat_id
     )
     # the ONLY side-effecting client the console needs: «إعادة إرسال»
-    # re-attempts a held bundle. Built here (same style as the worker loop)
-    # and injected — the console never constructs transports itself.
+    # re-attempts a held bundle and «رد على العميل» sends one operator-typed
+    # message. Built here (same style as the worker loop) and injected — the
+    # console never constructs transports itself.
     whatsapp = HttpWhatsAppClient(
         settings.whatsapp_access_token,
         settings.whatsapp_phone_number_id,
@@ -257,7 +258,10 @@ def main() -> None:  # pragma: no cover — live runner over tested parts
                 for outcome in outcomes:
                     try:
                         if outcome.kind == "send":
-                            client.send_screen(outcome.text, outcome.keyboard)
+                            client.send_screen(
+                                outcome.text, outcome.keyboard,
+                                force_reply=outcome.force_reply,
+                            )
                         elif outcome.kind == "edit" and outcome.message_id:
                             client.edit_screen(
                                 outcome.message_id, outcome.text, outcome.keyboard

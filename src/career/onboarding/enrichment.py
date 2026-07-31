@@ -26,6 +26,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from career.cv.close import LlmMeter
 from career.db.models import (
     ProfileFact,
     RoleEnrichment,
@@ -492,11 +493,14 @@ def handle_answer(
         return {"status": "soft_fail", "arabic_source": ""}
 
     source = stripped.text
+    # §14: every panel below is billed Claude spend for THIS tenant — one
+    # meter, threaded down so the pure panel stays free of the database.
+    meter = LlmMeter(session, tenant_id=tenant_id, now=now)
     try:
         vocab = _bank_vocabulary(session, tenant_id=tenant_id)
         result = run_panel(
             renderer, arabic_answer=source, vocabulary=vocab,
-            instruction=edit_intent, judge=judge,
+            instruction=edit_intent, judge=judge, meter=meter,
         )
     except Exception:  # noqa: BLE001 — a dead boundary is a soft failure
         _logger.warning("enrichment panel failed", exc_info=True)
@@ -513,7 +517,7 @@ def handle_answer(
         try:
             result = run_panel(
                 renderer, arabic_answer=fallback_source, vocabulary=vocab,
-                instruction=edit_intent or "rephrase", judge=judge,
+                instruction=edit_intent or "rephrase", judge=judge, meter=meter,
             )
             _logger.info("enrichment panel (self-heal) %s", result.get("panel"))
             if result.get("status") == "ok":
@@ -526,6 +530,7 @@ def handle_answer(
             retry = run_panel(
                 renderer, arabic_answer=source, vocabulary=vocab,
                 instruction="simpler", judge=None, angles=(PANEL_ANGLES[0],),
+                meter=meter,
             )
             _logger.info("enrichment panel (plainer) %s", retry.get("panel"))
             if retry.get("status") == "ok":
@@ -627,7 +632,11 @@ def prepare_examples(
     session: Session, *, role_fact_id: uuid.UUID, writer: Any
 ) -> list[str]:
     """Three scrubbed colloquial examples for the role, or [] (no examples →
-    the opening question stands alone; never blocks the nudge)."""
+    the opening question stands alone; never blocks the nudge).
+
+    §14: «optional garnish» is still billed Claude spend — the role row names
+    the tenant, so the call is metered without threading a meter in."""
+    from career.cv.close import LlmMeter, metered
     from career.onboarding.achievement_render import scrub_examples
 
     role = session.get(ProfileFact, role_fact_id)
@@ -636,8 +645,10 @@ def prepare_examples(
     payload = role.payload or {}
     title = str(payload.get("title") or "")
     description = str(payload.get("description") or "")
+    meter = LlmMeter(session, tenant_id=role.tenant_id)
     try:
-        raw = list(writer.write(title, description))
+        with metered(meter, "llm_examples", writer):
+            raw = list(writer.write(title, description))
     except Exception:  # noqa: BLE001 — examples are optional garnish
         return []
     # the model is asked for three in the prompt; the schema can't enforce a

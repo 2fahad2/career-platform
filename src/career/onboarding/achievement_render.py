@@ -21,6 +21,7 @@ from __future__ import annotations
 import re
 from typing import Any, Protocol
 
+from career.cv.close import LlmMeter, TokenCounter, metered
 from career.cv.generate import _CERT_RE, _KNOWN_FRAMEWORKS
 from career.cv.validate import _ARABIC_RE
 
@@ -196,17 +197,23 @@ def render_achievement(
     arabic_answer: str,
     vocabulary: set[str],
     instruction: str = "",
+    meter: LlmMeter | None = None,
 ) -> dict[str, Any] | None:
     """Render + ground with ONE bounded regeneration. Returns the accepted
     payload {english_bullet, arabic_gloss, qualitative_only} or None when the
     answer is not an achievement or nothing grounded survives (never invents
-    a fallback — a missing bullet is honest, a false one is not)."""
+    a fallback — a missing bullet is honest, a false one is not).
+
+    ``meter`` (§14) records each render's real token spend against the tenant;
+    None keeps this pure for the unit tests that own its behaviour."""
     # review finding #1: only forward what we actually have, so a renderer
     # with the narrow signature keeps working (and a drifted real renderer
     # still fails loudly rather than silently).
     extra: dict[str, Any] = {"instruction": instruction} if instruction else {}
     for _attempt in range(2):
-        result = renderer.render(arabic_answer, **extra)
+        # the RETRY is a second billed call — meter inside the loop, not around
+        with metered(meter, "llm_render", renderer):
+            result = renderer.render(arabic_answer, **extra)
         if not result.get("is_achievement"):
             return None
         english = str(result.get("english_bullet") or "").strip()
@@ -254,9 +261,12 @@ _SCHEMA = {
 }
 
 
-class AnthropicAchievementRenderer:  # pragma: no cover — live boundary
+class AnthropicAchievementRenderer(TokenCounter):  # pragma: no cover — live
     """Mirrors AnthropicExtractor: injectable client, json_schema output,
-    stop_reason check. Safety comes from the deterministic guard, not this."""
+    stop_reason check. Safety comes from the deterministic guard, not this.
+
+    Metered (§14): the panel fires this THREE times per customer answer, so an
+    unmetered renderer was the single largest blind spot in the cost picture."""
 
     def __init__(self, api_key: str | None = None, client: Any | None = None,
                  model: str = _MODEL) -> None:
@@ -266,6 +276,7 @@ class AnthropicAchievementRenderer:  # pragma: no cover — live boundary
             client = anthropic.Anthropic(api_key=api_key)
         self._client = client
         self._model = model
+        self.reset_token_counters()
 
     def render(
         self, arabic_answer: str, *, angle: str = "", instruction: str = ""
@@ -291,6 +302,7 @@ class AnthropicAchievementRenderer:  # pragma: no cover — live boundary
             output_config={"format": {"type": "json_schema", "schema": _SCHEMA}},
             messages=[{"role": "user", "content": user_text}],
         )
+        self.absorb_usage(response)
         if response.stop_reason != "end_turn":
             return {"is_achievement": False}
         for block in response.content:
@@ -371,7 +383,7 @@ class ExamplesWriter(Protocol):
         ...
 
 
-class AnthropicExamplesWriter:  # pragma: no cover — live boundary
+class AnthropicExamplesWriter(TokenCounter):  # pragma: no cover — live
     """One structured call; the deterministic scrub_examples gate follows."""
 
     def __init__(self, api_key: str | None = None, client: Any | None = None,
@@ -382,6 +394,7 @@ class AnthropicExamplesWriter:  # pragma: no cover — live boundary
             client = anthropic.Anthropic(api_key=api_key)
         self._client = client
         self._model = model
+        self.reset_token_counters()
 
     def write(self, role_title: str, role_description: str) -> list[str]:
         import json
@@ -395,6 +408,7 @@ class AnthropicExamplesWriter:  # pragma: no cover — live boundary
             },
             messages=[{"role": "user", "content": prompt}],
         )
+        self.absorb_usage(response)
         if response.stop_reason != "end_turn":
             return []
         for block in response.content:

@@ -28,6 +28,7 @@ from typing import Any, Protocol
 
 from sqlalchemy.orm import Session
 
+from career.cv.close import LlmMeter, TokenCounter
 from career.db.models import ProfileFact
 from career.onboarding.consents import require_required_consents
 
@@ -249,7 +250,7 @@ _SYSTEM = (
 )
 
 
-class AnthropicExtractor:
+class AnthropicExtractor(TokenCounter):
     """The real extractor — Claude only (D1). The SDK client is injectable so
     tests exercise the exact request shape with no network; retries for
     transient errors are the SDK's built-in exponential backoff."""
@@ -266,8 +267,7 @@ class AnthropicExtractor:
             client = anthropic.Anthropic(api_key=api_key)
         self._client = client
         self._model = model
-        self.total_input_tokens = 0
-        self.total_output_tokens = 0
+        self.reset_token_counters()
 
     def extract(self, cv_text: str) -> ExtractedFacts:
         if len(cv_text) > MAX_INPUT_CHARS:
@@ -282,10 +282,7 @@ class AnthropicExtractor:
             output_config={"format": {"type": "json_schema", "schema": _SCHEMA}},
             messages=[{"role": "user", "content": cv_text}],
         )
-        usage = getattr(response, "usage", None)
-        if usage is not None:
-            self.total_input_tokens += int(getattr(usage, "input_tokens", 0) or 0)
-            self.total_output_tokens += int(getattr(usage, "output_tokens", 0) or 0)
+        self.absorb_usage(response)
         if response.stop_reason != "end_turn":
             raise ExtractionFailed(f"stop_reason:{response.stop_reason}")
         # getattr-based extraction: works for SDK blocks and injected fakes
@@ -322,31 +319,6 @@ _CATEGORY_ITEMS: tuple[tuple[str, str], ...] = (
 )
 
 
-def _record_extraction_usage(
-    session: Session, *, tenant_id: uuid.UUID,
-    input_tokens: int, output_tokens: int,
-) -> None:
-    """§14 cost fuel: extraction spend lands in usage_events (best-effort —
-    accounting never blocks the customer journey)."""
-    if input_tokens <= 0 and output_tokens <= 0:
-        return
-    try:
-        from datetime import UTC, datetime
-        from decimal import Decimal
-
-        from career.cv.close import record_usage
-
-        cost = (Decimal("0.000005") * input_tokens
-                + Decimal("0.000025") * output_tokens)
-        record_usage(
-            session, tenant_id=tenant_id, kind="llm_extraction",
-            now=datetime.now(UTC), input_tokens=input_tokens,
-            output_tokens=output_tokens, cost_usd=cost,
-        )
-    except Exception:  # noqa: BLE001
-        logger.warning("extraction usage record failed", exc_info=True)
-
-
 def run_extraction(
     session: Session,
     *,
@@ -361,14 +333,11 @@ def run_extraction(
     stripped = strip_pii(cv_text, known_name=known_name)
     assert_no_pii(stripped.text, known_name=known_name)  # defense in depth
 
-    in_before = int(getattr(extractor, "total_input_tokens", 0) or 0)
-    out_before = int(getattr(extractor, "total_output_tokens", 0) or 0)
-    facts = extractor.extract(stripped.text)
-    _record_extraction_usage(
-        session, tenant_id=tenant_id,
-        input_tokens=int(getattr(extractor, "total_input_tokens", 0) or 0) - in_before,
-        output_tokens=int(getattr(extractor, "total_output_tokens", 0) or 0) - out_before,
-    )
+    # §14 cost fuel: the extraction spend is metered on the SAME mechanism as
+    # every other paid Claude boundary — one usage_events row with the real
+    # token numbers, attributed to this tenant.
+    with LlmMeter(session, tenant_id=tenant_id).around("llm_extraction", extractor):
+        facts = extractor.extract(stripped.text)
 
     rows: list[ProfileFact] = []
 

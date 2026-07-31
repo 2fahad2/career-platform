@@ -17,6 +17,7 @@ import re
 from collections.abc import Sequence
 from typing import Any, Protocol
 
+from career.cv.close import TokenCounter
 from career.cv.prompts import (
     EXPERIENCE_RANKING_PROMPT,
     JOB_ANALYSIS_PROMPT,
@@ -528,7 +529,7 @@ _MODEL = "claude-opus-4-8"
 _MAX_TOKENS = 2048
 
 
-class AnthropicLlmClient:
+class AnthropicLlmClient(TokenCounter):
     """Claude-only transport (D1). SDK client injectable — tests exercise the
     exact request shape with zero network; retries are the SDK's built-in.
     Token totals accumulate on the instance so the caller can meter the §14
@@ -546,8 +547,7 @@ class AnthropicLlmClient:
             client = anthropic.Anthropic(api_key=api_key)
         self._client = client
         self._model = model
-        self.total_input_tokens = 0
-        self.total_output_tokens = 0
+        self.reset_token_counters()
 
     def complete(self, prompt: str) -> str:
         response = self._client.messages.create(
@@ -556,10 +556,7 @@ class AnthropicLlmClient:
             thinking={"type": "adaptive"},
             messages=[{"role": "user", "content": prompt}],
         )
-        usage = getattr(response, "usage", None)
-        if usage is not None:
-            self.total_input_tokens += int(getattr(usage, "input_tokens", 0) or 0)
-            self.total_output_tokens += int(getattr(usage, "output_tokens", 0) or 0)
+        self.absorb_usage(response)
         if response.stop_reason != "end_turn":
             raise GenerationFailed(f"stop_reason:{response.stop_reason}")
         for block in response.content:

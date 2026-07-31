@@ -4,7 +4,7 @@ views. Renderers are golden-tested pure; DB screens run on career_test."""
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import text as sql_text
@@ -30,8 +30,13 @@ class FakeProbes:
         return self.errors
 
 
-def _msg(chat_id: str, text: str = "/start") -> dict[str, Any]:
-    return {"message": {"chat": {"id": int(chat_id)}, "text": text}}
+def _msg(
+    chat_id: str, text: str = "/start", reply_to: str | None = None
+) -> dict[str, Any]:
+    message: dict[str, Any] = {"chat": {"id": int(chat_id)}, "text": text}
+    if reply_to is not None:
+        message["reply_to_message"] = {"message_id": 7, "text": reply_to}
+    return {"message": message}
 
 
 def _cbq(chat_id: str, data: str, message_id: int = 10) -> dict[str, Any]:
@@ -229,8 +234,78 @@ def test_render_health_full_and_unknown() -> None:
 
 def test_render_today_without_any_run() -> None:
     text, _ = views.render_today(NOW.date(), None, [])
-    assert "لا تشغيلة مسجلة" in text
+    assert "ما صارت تشغيلة اليوم" in text
+    assert "ولا توجد أي تشغيلة مسجلة من قبل" in text
     assert "لا حالات عملاء" in text
+
+
+def test_render_today_names_yesterdays_run_as_yesterdays() -> None:
+    """AUDIT: a missing nightly run must READ as missing — the last run is
+    shown only under its OWN date, never as today's counters."""
+    text, _ = views.render_today(
+        NOW.date(), None, [],
+        {"run_date": "2026-07-14", "status": "completed"},
+    )
+    assert "ما صارت تشغيلة اليوم" in text
+    assert "آخر تشغيلة مسجلة كانت بتاريخ" in text
+    assert "2026-07-14" in text
+    assert "وحالتها: ✅ اكتملت" in text
+    # yesterday's date is never presented as the day being reported
+    assert text.splitlines()[1] == NOW.date().isoformat()
+
+
+def test_render_today_unknown_run_status_keeps_its_own_line() -> None:
+    text, _ = views.render_today(
+        NOW.date(), {"status": "weird_new_status", "counts": {}}, []
+    )
+    lines = text.splitlines()
+    assert "التشغيلة:" in lines
+    assert "weird_new_status" in lines
+
+
+def test_today_screen_says_no_run_when_the_night_did_not_fire(
+    owner_session: Session,
+) -> None:
+    """The bug this fixes: yesterday's run row used to be read with NO date
+    filter, so it sat under today's heading and looked like a good night."""
+    yesterday = (NOW.date() - timedelta(days=1)).isoformat()
+    old_id, today_id = str(uuid.uuid4()), str(uuid.uuid4())
+    owner_session.execute(sql_text(
+        "INSERT INTO discovery_runs (id, run_date, status, digest_only, counts,"
+        " started_at) VALUES (:i, :d, 'completed', false,"
+        " '{\"fetched\": 99, \"passed\": 7}'::jsonb, :s)"),
+        {"i": old_id, "d": yesterday, "s": NOW - timedelta(days=1)})
+    owner_session.commit()
+    try:
+        out = handle_update(
+            owner_session, _cbq(ADMIN, "v1|today"), admin_chat_id=ADMIN,
+            probes=FakeProbes(), now=NOW,
+        )
+        text = out[1].text
+        assert "ما صارت تشغيلة اليوم" in text
+        assert "99" not in text            # yesterday's counters stay away
+        assert yesterday in text           # but its date is shown, labelled
+
+        # and once today's run exists, TODAY's numbers are the ones shown
+        owner_session.execute(sql_text(
+            "INSERT INTO discovery_runs (id, run_date, status, digest_only,"
+            " counts, started_at) VALUES (:i, :d, 'partial', false,"
+            " '{\"fetched\": 12, \"passed\": 3}'::jsonb, :s)"),
+            {"i": today_id, "d": NOW.date().isoformat(), "s": NOW})
+        owner_session.commit()
+        out2 = handle_update(
+            owner_session, _cbq(ADMIN, "v1|today"), admin_chat_id=ADMIN,
+            probes=FakeProbes(), now=NOW,
+        )
+        assert "🟠 جزئية" in out2[1].text
+        assert "المكتشف: 12" in out2[1].text
+        assert "ما صارت تشغيلة اليوم" not in out2[1].text
+    finally:
+        owner_session.execute(
+            sql_text("DELETE FROM discovery_runs WHERE id IN (:a, :b)"),
+            {"a": old_id, "b": today_id},
+        )
+        owner_session.commit()
 
 
 def test_views_render_only_ten_codes_never_identity_fields() -> None:
@@ -687,3 +762,411 @@ def test_resend_replies_and_confirm_card_are_direction_pure(
                     assert not latin_or_digit.search(line), line
     finally:
         _clear_delivery(owner_session, t1)
+
+
+# ── «رد على العميل»: one free-form operator reply, on the same nonce ─────────
+
+
+def _seed_channel(
+    session: Session, tenant_id: str, *,
+    last_inbound_at: datetime | None = NOW, opted_out: bool = False,
+) -> str:
+    """A WhatsApp channel with no delivery attached — the plain «someone to
+    reply to» case."""
+    channel_id = str(uuid.uuid4())
+    session.execute(sql_text(
+        "INSERT INTO customer_channels (id, tenant_id, provider, phone_e164,"
+        " last_inbound_at, opt_out_at)"
+        " VALUES (:i, :t, 'whatsapp', :p, :l, :o)"),
+        {"i": channel_id, "t": tenant_id,
+         "p": f"+96650{uuid.uuid4().int % 10**7:07d}",
+         "l": last_inbound_at, "o": NOW if opted_out else None})
+    session.commit()
+    return channel_id
+
+
+def _open_reply_box(
+    session: Session, code: str, *, wa: Any, now: datetime = NOW
+) -> list[Any]:
+    return handle_update(
+        session, _cbq(ADMIN, f"v1|reply|{code}"), admin_chat_id=ADMIN,
+        probes=FakeProbes(), now=now, whatsapp_client=wa,
+    )
+
+
+def _prompt_text(outcomes: list[Any]) -> str:
+    return outcomes[1].text
+
+
+def test_reply_button_needs_a_channel_and_an_injected_client(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """No channel → nobody to reply to; no client → a read-only console."""
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    bare = handle_update(
+        owner_session, _cbq(ADMIN, f"v1|tenant|{code}"), admin_chat_id=ADMIN,
+        probes=FakeProbes(), now=NOW, whatsapp_client=_fake_wa(),
+    )
+    assert f"v1|reply|{code}" not in _buttons(bare[1])
+    _seed_channel(owner_session, t1)
+    try:
+        read_only = handle_update(
+            owner_session, _cbq(ADMIN, f"v1|tenant|{code}"),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+        )
+        assert f"v1|reply|{code}" not in _buttons(read_only[1])
+        with_client = handle_update(
+            owner_session, _cbq(ADMIN, f"v1|tenant|{code}"),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+            whatsapp_client=_fake_wa(),
+        )
+        assert f"v1|reply|{code}" in _buttons(with_client[1])
+    finally:
+        _clear_delivery(owner_session, t1)
+
+
+def test_reply_is_never_offered_to_someone_who_opted_out(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """Opt-out is absolute: no button, and the action refuses out loud."""
+    import career.telegram.console as console
+
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    _seed_channel(owner_session, t1, opted_out=True)
+    wa = _fake_wa()
+    try:
+        card = handle_update(
+            owner_session, _cbq(ADMIN, f"v1|tenant|{code}"),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+            whatsapp_client=wa,
+        )
+        assert f"v1|reply|{code}" not in _buttons(card[1])
+        refused = _open_reply_box(owner_session, code, wa=wa)
+        assert refused[1].kind == "edit"          # no reply box is opened
+        assert refused[1].force_reply is False
+        assert console.REPLY_OPTED_OUT_AR.format(code=code) == _prompt_text(refused)
+        assert not wa.sent
+    finally:
+        _clear_delivery(owner_session, t1)
+
+
+def test_reply_refuses_honestly_when_the_window_is_closed(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """§08: outside 24h only templates may go out. The operator is told the
+    real reason instead of typing into a void — and no nonce is minted."""
+    import career.telegram.console as console
+
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    _seed_channel(owner_session, t1, last_inbound_at=NOW - timedelta(hours=30))
+    wa = _fake_wa()
+    try:
+        card = handle_update(
+            owner_session, _cbq(ADMIN, f"v1|tenant|{code}"),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+            whatsapp_client=wa,
+        )
+        # still offered: the refusal explains, a missing button would not
+        assert f"v1|reply|{code}" in _buttons(card[1])
+        refused = _open_reply_box(owner_session, code, wa=wa)
+        assert refused[1].kind == "edit"
+        assert console.REPLY_CLOSED_AR.format(code=code) == _prompt_text(refused)
+        assert console._REPLY_MARKER not in _prompt_text(refused)
+        assert not wa.sent
+    finally:
+        _clear_delivery(owner_session, t1)
+
+
+def test_reply_free_text_reaches_the_customer_and_is_recorded(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """card → «رد على العميل» → force-reply prompt → the operator's typed
+    text is sent as-is and logged in delivery_messages like any outbound."""
+    import career.telegram.console as console
+
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    channel_id = _seed_channel(owner_session, t1)
+    phone = owner_session.execute(sql_text(
+        "SELECT phone_e164 FROM customer_channels WHERE id = :c"),
+        {"c": channel_id}).scalar_one()
+    wa = _fake_wa()
+    try:
+        prompt = _open_reply_box(owner_session, code, wa=wa)
+        assert [o.kind for o in prompt] == ["ack", "send"]
+        assert prompt[1].force_reply is True       # Telegram opens the box
+        assert prompt[1].keyboard is None
+        assert console._REPLY_MARKER in prompt[1].text
+        assert not wa.sent                         # the prompt sends nothing
+
+        body = "نشتغل على طلبك الآن ونرجع لك خلال ساعة"
+        done = handle_update(
+            owner_session, _msg(ADMIN, body, reply_to=prompt[1].text),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+            whatsapp_client=wa,
+        )
+        assert [o.kind for o in done] == ["send"]
+        assert done[0].text == console.REPLY_SENT_AR.format(code=code)
+        assert [(m.kind, m.to_phone, m.body) for m in wa.sent] == [
+            ("text", phone, body)
+        ]
+        # §14: recorded exactly like any other outbound
+        row = owner_session.execute(sql_text(
+            "SELECT kind, status, wa_message_id, delivery_id FROM"
+            " delivery_messages WHERE tenant_id = :t"), {"t": t1}).one()
+        assert row[0] == console.REPLY_KIND
+        assert row[1] == "sent"
+        assert row[2] == wa.sent[0].message_id
+        assert row[3] is None                      # not part of a delivery
+
+        # one-shot: replying to the same prompt again does nothing
+        again = handle_update(
+            owner_session, _msg(ADMIN, "مرة ثانية", reply_to=prompt[1].text),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+            whatsapp_client=wa,
+        )
+        assert again[0].text == console.ACTION_EXPIRED_AR
+        assert len(wa.sent) == 1
+    finally:
+        _clear_delivery(owner_session, t1)
+
+
+def test_reply_nonce_expires_after_five_minutes(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    import career.telegram.console as console
+
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    _seed_channel(owner_session, t1)
+    wa = _fake_wa()
+    try:
+        prompt = _open_reply_box(owner_session, code, wa=wa)
+        late = handle_update(
+            owner_session, _msg(ADMIN, "متأخر", reply_to=prompt[1].text),
+            admin_chat_id=ADMIN, probes=FakeProbes(),
+            now=NOW + timedelta(minutes=6), whatsapp_client=wa,
+        )
+        assert late[0].text == console.ACTION_EXPIRED_AR
+        assert not wa.sent
+    finally:
+        _clear_delivery(owner_session, t1)
+
+
+def test_reply_rechecks_the_window_at_send_time(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """The window may close while the operator types — the send-time check is
+    the one that protects the customer."""
+    import career.telegram.console as console
+
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    _seed_channel(owner_session, t1)
+    wa = _fake_wa()
+    try:
+        prompt = _open_reply_box(owner_session, code, wa=wa)
+        owner_session.execute(sql_text(
+            "UPDATE customer_channels SET last_inbound_at = :l"
+            " WHERE tenant_id = :t"),
+            {"l": NOW - timedelta(hours=30), "t": t1})
+        owner_session.commit()
+        out = handle_update(
+            owner_session, _msg(ADMIN, "نص", reply_to=prompt[1].text),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+            whatsapp_client=wa,
+        )
+        assert out[0].text == console.REPLY_CLOSED_AR.format(code=code)
+        assert not wa.sent
+        assert owner_session.execute(sql_text(
+            "SELECT count(*) FROM delivery_messages WHERE tenant_id = :t"),
+            {"t": t1}).scalar_one() == 0
+    finally:
+        _clear_delivery(owner_session, t1)
+
+
+def test_reply_rechecks_opt_out_at_send_time(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    import career.telegram.console as console
+
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    _seed_channel(owner_session, t1)
+    wa = _fake_wa()
+    try:
+        prompt = _open_reply_box(owner_session, code, wa=wa)
+        owner_session.execute(sql_text(
+            "UPDATE customer_channels SET opt_out_at = :o WHERE tenant_id = :t"),
+            {"o": NOW, "t": t1})
+        owner_session.commit()
+        out = handle_update(
+            owner_session, _msg(ADMIN, "نص", reply_to=prompt[1].text),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+            whatsapp_client=wa,
+        )
+        assert out[0].text == console.REPLY_OPTED_OUT_AR.format(code=code)
+        assert not wa.sent
+    finally:
+        _clear_delivery(owner_session, t1)
+
+
+def test_reply_refuses_empty_and_command_text(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """A fat-fingered /start must never reach a paying customer."""
+    import career.telegram.console as console
+
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    _seed_channel(owner_session, t1)
+    wa = _fake_wa()
+    try:
+        for body in ("   ", "/start"):
+            prompt = _open_reply_box(owner_session, code, wa=wa)
+            out = handle_update(
+                owner_session, _msg(ADMIN, body, reply_to=prompt[1].text),
+                admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+                whatsapp_client=wa,
+            )
+            assert out[0].text == console.REPLY_EMPTY_AR.format(code=code)
+        prompt = _open_reply_box(owner_session, code, wa=wa)
+        long_out = handle_update(
+            owner_session,
+            _msg(ADMIN, "ا" * (console.REPLY_MAX_CHARS + 1),
+                 reply_to=prompt[1].text),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+            whatsapp_client=wa,
+        )
+        assert long_out[0].text == console.REPLY_TOO_LONG_AR.format(code=code)
+        assert not wa.sent
+    finally:
+        _clear_delivery(owner_session, t1)
+
+
+def test_reply_reports_a_refused_send_and_records_nothing(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """WhatsApp refuses → the operator is told, and no phantom row is left in
+    the outbound log (never a green ✅ for a message that did not go)."""
+    import career.telegram.console as console
+
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    _seed_channel(owner_session, t1)
+    wa = _fake_wa()
+
+    def dead_text(to_phone: str, body: str) -> str:
+        raise RuntimeError("graph refused")
+
+    wa.send_text = dead_text                 # type: ignore[method-assign]
+    try:
+        prompt = _open_reply_box(owner_session, code, wa=wa)
+        out = handle_update(
+            owner_session, _msg(ADMIN, "نص", reply_to=prompt[1].text),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+            whatsapp_client=wa,
+        )
+        assert out[0].text == console.REPLY_FAILED_AR.format(code=code)
+        assert "✅" not in out[0].text
+        assert owner_session.execute(sql_text(
+            "SELECT count(*) FROM delivery_messages WHERE tenant_id = :t"),
+            {"t": t1}).scalar_one() == 0
+    finally:
+        _clear_delivery(owner_session, t1)
+
+
+def test_reply_never_leaks_the_phone_or_the_body_to_the_admin_channel(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """§15.13: the watchtower shows TEN codes only. Neither the prompt nor
+    the confirmation may carry the number we sent to."""
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    channel_id = _seed_channel(owner_session, t1)
+    phone = owner_session.execute(sql_text(
+        "SELECT phone_e164 FROM customer_channels WHERE id = :c"),
+        {"c": channel_id}).scalar_one()
+    wa = _fake_wa()
+    try:
+        prompt = _open_reply_box(owner_session, code, wa=wa)
+        body = "رقمي الخاص وتفاصيل لا يجب أن تعود للقناة الإدارية"
+        done = handle_update(
+            owner_session, _msg(ADMIN, body, reply_to=prompt[1].text),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+            whatsapp_client=wa,
+        )
+        for text in (prompt[1].text, done[0].text):
+            assert phone not in text
+            assert "+966" not in text
+            assert code in text
+        assert body not in done[0].text      # the body is never echoed back
+    finally:
+        _clear_delivery(owner_session, t1)
+
+
+def test_operator_text_without_a_prompt_is_still_just_the_menu(
+    owner_session: Session
+) -> None:
+    """Only a reply to OUR prompt is treated as a customer reply."""
+    out = handle_update(
+        owner_session, _msg(ADMIN, "نص عادي", reply_to="رسالة قديمة بلا علامة"),
+        admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+        whatsapp_client=_fake_wa(),
+    )
+    assert len(out) == 1
+    assert "برج المراقبة" in out[0].text
+
+
+def test_reply_strings_and_prompt_are_direction_pure(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """Same rule as the resend replies: no Latin/digits inside an Arabic
+    line — the TEN code and the nonce marker live on lines of their own."""
+    import re
+
+    import career.telegram.console as console
+
+    arabic = re.compile(r"[؀-ۿ]")
+    latin_or_digit = re.compile(r"[A-Za-z0-9]")
+
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    _seed_channel(owner_session, t1)
+    try:
+        prompt = _open_reply_box(owner_session, code, wa=_fake_wa())
+        texts = [prompt[1].text] + [
+            template.format(code=code) for template in (
+                console.REPLY_SENT_AR, console.REPLY_FAILED_AR,
+                console.REPLY_CLOSED_AR, console.REPLY_OPTED_OUT_AR,
+                console.REPLY_NO_CHANNEL_AR, console.REPLY_EMPTY_AR,
+                console.REPLY_TOO_LONG_AR,
+            )
+        ]
+        for text in texts:
+            assert code in text
+            for line in text.splitlines():
+                if arabic.search(line):
+                    assert not latin_or_digit.search(line), line
+    finally:
+        _clear_delivery(owner_session, t1)
+
+
+def test_today_screen_lines_are_direction_pure_where_arabic() -> None:
+    """The honest «no run today» lines keep the date and any unknown status
+    on their own lines."""
+    import re
+
+    arabic = re.compile(r"[؀-ۿ]")
+    latin_or_digit = re.compile(r"[A-Za-z0-9]")
+
+    text, _ = views.render_today(
+        NOW.date(), None, [],
+        {"run_date": "2026-07-14", "status": "completed"},
+    )
+    for line in text.splitlines():
+        if arabic.search(line):
+            assert not latin_or_digit.search(line), line

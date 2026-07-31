@@ -549,6 +549,11 @@ class UsageEvent(Base):
     )
     input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    #: Prompt-cache tokens, reported separately by the API and priced
+    #: differently (write 1.25× input, read 0.1× input) — folding them into
+    #: input_tokens would misprice every cached call (§14).
+    cache_write_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cache_read_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(10, 6), nullable=True)
     occurred_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Protocol
 
+from career.cv.close import LlmMeter, TokenCounter, metered
 from career.onboarding.achievement_render import (
     AchievementRenderer,
     bullet_is_grounded,
@@ -74,6 +75,7 @@ def run_panel(
     instruction: str = "",
     judge: BulletJudge | None = None,
     angles: tuple[str, ...] = PANEL_ANGLES,
+    meter: LlmMeter | None = None,
 ) -> dict[str, Any]:
     """A DISCRIMINATED result — the caller must be able to tell «that wasn't an
     achievement» (ask differently) from «every draft invented something» (try
@@ -84,16 +86,22 @@ def run_panel(
     * ``{"status": "not_achievement", "panel": …}``
     * ``{"status": "ungrounded", "panel": …}``
 
-    ``panel`` bookkeeping is for logs/tests only, never shown to a customer."""
+    ``panel`` bookkeeping is for logs/tests only, never shown to a customer.
+
+    ``meter`` (§14) is the cost side of the same story: the panel is the most
+    expensive turn in the product — up to three renders plus a judge call for
+    ONE customer sentence — and renders and judgement are billed separately, so
+    each is metered under its own category rather than lumped together."""
     render_calls = 0
     achievement_candidates = 0
     grounded: list[dict[str, Any]] = []
 
     for angle in angles:
         try:
-            result = renderer.render(
-                arabic_answer, angle=angle, instruction=instruction
-            )
+            with metered(meter, "llm_render", renderer):
+                result = renderer.render(
+                    arabic_answer, angle=angle, instruction=instruction
+                )
         except Exception:  # noqa: BLE001 — one dead angle must not kill the panel
             logger.warning("panel candidate failed", exc_info=True)
             continue
@@ -135,9 +143,10 @@ def run_panel(
     why = "single candidate" if len(grounded) == 1 else "judge unavailable"
     if judge is not None and len(grounded) > 1:
         try:
-            verdict = judge.judge(
-                arabic_answer, [c["english_bullet"] for c in grounded]
-            )
+            with metered(meter, "llm_judge", judge):
+                verdict = judge.judge(
+                    arabic_answer, [c["english_bullet"] for c in grounded]
+                )
             idx = int(verdict.get("winner_index", -1))
             if 0 <= idx < len(grounded):
                 winner = grounded[idx]
@@ -177,7 +186,7 @@ _JUDGE_SCHEMA = {
 }
 
 
-class AnthropicBulletJudge:  # pragma: no cover — live boundary
+class AnthropicBulletJudge(TokenCounter):  # pragma: no cover — live boundary
     def __init__(self, api_key: str | None = None, client: Any | None = None,
                  model: str = _JUDGE_MODEL) -> None:
         if client is None:
@@ -186,6 +195,7 @@ class AnthropicBulletJudge:  # pragma: no cover — live boundary
             client = anthropic.Anthropic(api_key=api_key)
         self._client = client
         self._model = model
+        self.reset_token_counters()
 
     def judge(
         self, arabic_answer: str, candidates: list[str]
@@ -207,6 +217,7 @@ class AnthropicBulletJudge:  # pragma: no cover — live boundary
             },
             messages=[{"role": "user", "content": prompt}],
         )
+        self.absorb_usage(response)
         if response.stop_reason != "end_turn":
             logger.warning("judge did not finish: stop_reason=%s",
                            response.stop_reason)

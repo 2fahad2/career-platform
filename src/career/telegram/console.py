@@ -14,8 +14,10 @@ every callback_data carries its full destination (``v1|screen|arg``).
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
@@ -42,6 +44,7 @@ from career.whatsapp.delivery import (
     DELIVERY_COMPLETED,
     DELIVERY_PARTIAL,
     DELIVERY_PENDING,
+    record_out,
     resend_pending_delivery,
 )
 from career.whatsapp.window import window_state
@@ -73,11 +76,49 @@ RESEND_NOTHING_AR = "⚪ لا توجد حزمة معلّقة لإعادة إرس
 
 #: The mutating actions the console may perform. pause/resume are pure-DB;
 #: resend re-attempts a held bundle over WhatsApp (needs an injected client).
+#: NOTE «رد على العميل» is deliberately NOT here: it does not use the
+#: confirm-card path (the typed text is the confirmation), so keeping it out
+#: makes a forged ``v1|confirm|<reply nonce>`` fall through _run_action's
+#: ``action not in _ACTIONS`` guard and do nothing.
 _ACTIONS = {
     "pause": ("⏸️ إيقاف مؤقت", "✅ أوقفنا الخدمة مؤقتًا للعميل\n{code}"),
     "resume": ("▶️ استئناف", "✅ استأنفنا الخدمة للعميل\n{code}"),
     "resend": ("📤 إعادة إرسال الحزمة", RESEND_NOTHING_AR),
 }
+
+# ── the operator's one free-form reply (audit: «دعم» paged and left them
+# hunting for the phone). Same one-shot nonce as every mutating action; the
+# nonce travels inside the prompt text so the pure console needs no new state
+# and no message-id bookkeeping — the operator's Telegram reply carries the
+# prompt back to us. Every outbound is recorded with record_out (§14) and the
+# admin channel still sees TEN codes only (§15.13): we never echo the body,
+# and we never print the phone we sent to.
+_REPLY_ACTION = "reply"
+_REPLY_MARKER = "#R-"
+_REPLY_MARKER_RE = re.compile(r"#R-([0-9a-f]{32})")
+#: delivery_messages.kind for an operator-typed message (fits String(32)).
+REPLY_KIND = "operator_reply"
+#: Meta's free-form text ceiling; a longer body is refused, never truncated.
+REPLY_MAX_CHARS = 4096
+
+REPLY_PROMPT_AR = (
+    "✍️ اكتب رسالتك للعميل\n{code}\n"
+    "ردًّا على هذه الرسالة نفسها — ترسل كما هي بلا تعديل\n"
+    "المهلة خمس دقائق\n{marker}"
+)
+REPLY_SENT_AR = "✅ أرسلنا ردك للعميل\n{code}"
+REPLY_FAILED_AR = (
+    "🔴 لم يصل الرد — واتساب رفض الإرسال ولم نسجّل شيئًا؛ أعد المحاولة"
+    "\n{code}"
+)
+REPLY_CLOSED_AR = (
+    "🌙 نافذة الأربع والعشرين ساعة مقفولة — لا يمكن إرسال رسالة حرة الآن\n"
+    "انتظر حتى يراسلك العميل ثم رد عليه\n{code}"
+)
+REPLY_OPTED_OUT_AR = "🚫 العميل أوقف الرسائل — لن نرسل له شيئًا\n{code}"
+REPLY_NO_CHANNEL_AR = "⚪ لا توجد قناة واتساب لهذا العميل — لا يوجد لمن نرد\n{code}"
+REPLY_EMPTY_AR = "⚪ لم نستلم نصًّا صالحًا — لم نرسل شيئًا\n{code}"
+REPLY_TOO_LONG_AR = "⚪ الرسالة أطول مما يقبله واتساب — اختصرها وأعد الإرسال\n{code}"
 
 
 class HealthProbes(Protocol):
@@ -99,6 +140,10 @@ class Outcome:
     keyboard: Keyboard | None = field(default=None)
     message_id: int | None = None
     callback_query_id: str | None = None
+    #: "send" only — ask Telegram to open the reply box on this message.
+    #: force_reply is not a valid markup for editMessageText, which is why
+    #: the reply prompt is a fresh message and not an in-place edit.
+    force_reply: bool = False
 
 
 def _screen(
@@ -180,13 +225,40 @@ def _screen(
 
 def _today_data(
     session: Session, *, now: datetime
-) -> tuple[Any, dict[str, Any] | None, list[tuple[str, str, dict[str, Any]]]]:
+) -> tuple[
+    Any, dict[str, Any] | None, list[tuple[str, str, dict[str, Any]]],
+    dict[str, Any] | None,
+]:
+    """(run_date, today's run or None, today's states, last run or None).
+
+    AUDIT FIX: the run used to be «the newest run, whatever day it belonged
+    to», while the day-states beside it were already filtered to today. On a
+    morning when the nightly timer did not fire, yesterday's counters sat at
+    the top of a screen headed «today» and the operator read a silent failure
+    as a good night. The run is now filtered to the SAME Riyadh date as the
+    states; when there is none, the last recorded run is returned separately
+    so the screen can say plainly that today has not run and still show when
+    the last one was.
+    """
     run_date = now.astimezone(_RIYADH).date()
     run_row = session.execute(
         select(DiscoveryRun.status, DiscoveryRun.counts)
+        .where(DiscoveryRun.run_date == run_date)
         .order_by(DiscoveryRun.started_at.desc()).limit(1)
     ).first()
     run = {"status": run_row[0], "counts": dict(run_row[1] or {})} if run_row else None
+    last_run: dict[str, Any] | None = None
+    if run is None:
+        # only consulted when today has no run at all — so this row can never
+        # be mistaken for today's; it is labelled with its own date.
+        last_row = session.execute(
+            select(DiscoveryRun.run_date, DiscoveryRun.status)
+            .order_by(DiscoveryRun.started_at.desc()).limit(1)
+        ).first()
+        if last_row is not None:
+            last_run = {
+                "run_date": last_row[0].isoformat(), "status": str(last_row[1]),
+            }
     # TEN codes + states + counts ONLY — the admin channel never sees PII
     # (§15.13); no profile/channel columns are ever selected here.
     rows = session.execute(
@@ -196,7 +268,7 @@ def _today_data(
         .order_by(Tenant.code)
     ).all()
     states = [(str(c), str(s), dict(k or {})) for c, s, k in rows]
-    return run_date, run, states
+    return run_date, run, states, last_run
 
 
 def _window_of(
@@ -334,6 +406,17 @@ def _tenant_card(
             and int(held_bundles) > 0
             and window != "opted_out"
         ),
+        # «رد على العميل» is offered whenever there is someone to reply to and
+        # a client to send with. A CLOSED window does NOT hide it — the card
+        # already shows the window state, and the tap answers with the real
+        # reason (and no reply box), which is more useful than a button that
+        # silently is not there. An opt-out does hide it: we never message
+        # someone who stopped the messages.
+        "can_reply": bool(
+            whatsapp_client is not None
+            and channel is not None
+            and window != "opted_out"
+        ),
         "last_delivery": (
             {"run_date": delivery[0].isoformat(), "status": delivery[1]}
             if delivery else None
@@ -405,12 +488,66 @@ def _business_data(
         )
     delivered_days = int(session.execute(delivered_query).scalar_one())
 
-    usage_query = select(
-        func.count(), func.coalesce(func.sum(UsageEvent.cost_usd), 0)
-    ).where(UsageEvent.kind.in_(("llm_generation", "llm_extraction")))
+    # §14 spend. Closure audit: this used to count exactly TWO categories, so
+    # the operator's «نداءات Claude» number silently ignored the panel, the
+    # judge, the examples writer, the intent classifier, every SearchAPI credit
+    # and every billed WhatsApp template. Now every metered kind lands here.
+    from career.cv import close as close_mod
+
+    spend_query = select(
+        UsageEvent.kind, func.count(),
+        func.coalesce(func.sum(UsageEvent.cost_usd), 0),
+    ).where(UsageEvent.kind.in_(close_mod.SPEND_KINDS))
     if cutoff is not None:
-        usage_query = usage_query.where(UsageEvent.occurred_at >= cutoff)
-    usage_row = session.execute(usage_query).one()
+        spend_query = spend_query.where(UsageEvent.occurred_at >= cutoff)
+    spend: dict[str, tuple[int, Decimal]] = {
+        str(kind): (int(events), Decimal(cost))
+        for kind, events, cost in session.execute(
+            spend_query.group_by(UsageEvent.kind)
+        ).all()
+    }
+    # WhatsApp is derived from the delivery ledger (its send sites live in
+    # modules this layer must not reach into) — same truth, same table.
+    for kind, (events, cost) in close_mod.whatsapp_spend(
+        session, since=cutoff
+    ).items():
+        prior_events, prior_cost = spend.get(kind, (0, Decimal("0")))
+        spend[kind] = (prior_events + events, prior_cost + cost)
+
+    llm_calls = sum(spend.get(k, (0, Decimal("0")))[0] for k in close_mod.LLM_KINDS)
+    llm_cost = sum(
+        (spend.get(k, (0, Decimal("0")))[1] for k in close_mod.LLM_KINDS),
+        Decimal("0"),
+    )
+    total_cost = sum((cost for _, cost in spend.values()), Decimal("0"))
+
+    # per-customer cost: the audit's actual question — «what does a customer
+    # cost me?» — plus the runaway-bill signal (who is the most expensive?)
+    per_tenant_query = select(
+        Tenant.code, func.coalesce(func.sum(UsageEvent.cost_usd), 0)
+    ).join(UsageEvent, UsageEvent.tenant_id == Tenant.id).where(
+        UsageEvent.kind.in_(close_mod.SPEND_KINDS)
+    )
+    if cutoff is not None:
+        per_tenant_query = per_tenant_query.where(UsageEvent.occurred_at >= cutoff)
+    cost_tenants_query = select(
+        func.count(func.distinct(UsageEvent.tenant_id))
+    ).where(UsageEvent.kind.in_(close_mod.SPEND_KINDS))
+    if cutoff is not None:
+        cost_tenants_query = cost_tenants_query.where(
+            UsageEvent.occurred_at >= cutoff
+        )
+    cost_tenants = int(session.execute(cost_tenants_query).scalar_one())
+
+    top_cost_tenants = [
+        (str(code), Decimal(cost))
+        for code, cost in session.execute(
+            per_tenant_query.group_by(Tenant.code)
+            .order_by(func.coalesce(func.sum(UsageEvent.cost_usd), 0).desc())
+            .limit(3)
+        ).all()
+        if Decimal(cost) > 0
+    ]
 
     # §14 reach metrics: outbound message statuses (read receipts flow into
     # delivery_messages.status via the Meta status callbacks)
@@ -447,8 +584,12 @@ def _business_data(
         "funnel_upgrades": upgrades,
         "delivered_days": delivered_days,
         "outcomes": outcomes,
-        "llm_generations": int(usage_row[0]),
-        "llm_cost_usd": usage_row[1],
+        "llm_generations": llm_calls,
+        "llm_cost_usd": llm_cost,
+        "spend_by_category": {k: (v[0], v[1]) for k, v in sorted(spend.items())},
+        "total_cost_usd": total_cost,
+        "cost_tenants": cost_tenants,
+        "top_cost_tenants": top_cost_tenants,
         "message_statuses": message_statuses,
         "seats_taken": seats.taken,
         "seats_remaining": seats.remaining,
@@ -517,6 +658,112 @@ def _run_action(
     return code, _ACTIONS[action][1].format(code=code)
 
 
+def _reply_target(
+    session: Session, *, code: str, now: datetime
+) -> tuple[Tenant, CustomerChannel | None, str | None] | None:
+    """(tenant, channel, window) for the code, or None when no such tenant."""
+    tenant = session.execute(
+        select(Tenant).where(Tenant.code == code)
+    ).scalars().first()
+    if tenant is None:
+        return None
+    channel = session.execute(
+        select(CustomerChannel).where(CustomerChannel.tenant_id == tenant.id)
+        .order_by(CustomerChannel.created_at)
+    ).scalars().first()
+    window = None if channel is None else _window_of(
+        channel.last_inbound_at, channel.opt_out_at, now
+    )
+    return tenant, channel, window
+
+
+def _reply_nonce_in(text: str) -> str | None:
+    """Pull our one-shot nonce back out of the prompt the operator replied to.
+    Correlating through the prompt TEXT (not its message id) keeps the console
+    pure: it never learns what id Telegram gave the message it asked us to
+    send."""
+    match = _REPLY_MARKER_RE.search(text or "")
+    return match.group(1) if match else None
+
+
+def _reply_prompt(
+    session: Session, *, code: str, now: datetime,
+    whatsapp_client: WhatsAppClient | None,
+) -> tuple[str, str, Keyboard | None] | None:
+    """Open the reply box — or refuse, out loud, with the real reason.
+
+    Returns (kind, text, keyboard) where kind is "send" (a force-reply prompt
+    carrying a fresh nonce) or "edit" (a refusal that replaces the card in
+    place); None when the tenant is unknown.
+    """
+    target = _reply_target(session, code=code, now=now)
+    if target is None:
+        return None
+    _tenant, channel, window = target
+    back: Keyboard = [[("↩️ رجوع", f"v1|tenant|{code}")]]
+    if whatsapp_client is None or channel is None:
+        return "edit", REPLY_NO_CHANNEL_AR.format(code=code), back
+    if window == "opted_out":
+        return "edit", REPLY_OPTED_OUT_AR.format(code=code), back
+    if window != "open":
+        # §08: outside 24h only approved templates may go out. Refuse here
+        # rather than accept text we would have to drop into the void.
+        return "edit", REPLY_CLOSED_AR.format(code=code), back
+    nonce = _new_nonce(_REPLY_ACTION, code, now)
+    return (
+        "send",
+        REPLY_PROMPT_AR.format(code=code, marker=f"{_REPLY_MARKER}{nonce}"),
+        None,
+    )
+
+
+def _run_reply(
+    session: Session, *, nonce: str, body: str, now: datetime,
+    whatsapp_client: WhatsAppClient | None,
+) -> str | None:
+    """Consume the one-shot nonce and send the operator's text to the
+    customer. Returns the honest Arabic answer, or None (expired/unknown
+    nonce → caller answers ACTION_EXPIRED_AR)."""
+    entry = _pending_actions.pop(nonce, None)
+    if entry is None:
+        return None
+    action, code, expiry = entry
+    if action != _REPLY_ACTION or expiry < now:
+        return None
+    target = _reply_target(session, code=code, now=now)
+    if target is None:
+        return None
+    tenant, channel, window = target
+    text = (body or "").strip()
+    if not text or text.startswith("/"):
+        # a mis-fired command must never reach a paying customer
+        return REPLY_EMPTY_AR.format(code=code)
+    if len(text) > REPLY_MAX_CHARS:
+        return REPLY_TOO_LONG_AR.format(code=code)
+    if whatsapp_client is None or channel is None:
+        return REPLY_NO_CHANNEL_AR.format(code=code)
+    # re-checked at SEND time, not only at prompt time: the window can close
+    # (or the customer can opt out) while the operator is typing.
+    if window == "opted_out":
+        return REPLY_OPTED_OUT_AR.format(code=code)
+    if window != "open":
+        return REPLY_CLOSED_AR.format(code=code)
+    try:
+        wa_message_id = whatsapp_client.send_text(channel.phone_e164, text)
+    except Exception:  # noqa: BLE001 — a refused send is reported, not raised
+        logger.error("operator reply send failed", exc_info=True)
+        session.rollback()
+        return REPLY_FAILED_AR.format(code=code)
+    # §14: the customer received it, so the conversation log and the reach
+    # metrics must carry it exactly like any other outbound.
+    record_out(
+        session, tenant_id=tenant.id, channel_id=channel.id, kind=REPLY_KIND,
+        wa_message_id=wa_message_id, now=now,
+    )
+    session.commit()
+    return REPLY_SENT_AR.format(code=code)
+
+
 def _log_manual_usage(
     session: Session, *, code: str, kind: str, now: datetime
 ) -> bool:
@@ -573,7 +820,22 @@ def handle_update(
 
     message = update.get("message")
     if message is not None:
-        # any text from the operator lands on the menu — one habit to learn
+        replied_to = str(
+            (message.get("reply_to_message") or {}).get("text") or ""
+        )
+        nonce = _reply_nonce_in(replied_to)
+        if nonce is not None:
+            # a reply to one of OUR prompts → this text goes to the customer
+            done = _run_reply(
+                session, nonce=nonce, body=str(message.get("text") or ""),
+                now=now, whatsapp_client=whatsapp_client,
+            )
+            return [Outcome(
+                kind="send", text=done or ACTION_EXPIRED_AR,
+                keyboard=[[("👥 العملاء", "v1|customers|0"),
+                           ("🏠 الرئيسية", "v1|menu")]],
+            )]
+        # any other text from the operator lands on the menu — one habit
         text, keyboard = views.render_menu()
         return [Outcome(kind="send", text=text, keyboard=keyboard)]
 
@@ -583,6 +845,25 @@ def handle_update(
         data = str(callback.get("data") or "")
         message_id = ((callback.get("message") or {}).get("message_id"))
         parts = data.split("|")
+        if len(parts) == 3 and parts[0] == "v1" and parts[1] == _REPLY_ACTION:
+            # the reply prompt must be a NEW message (force_reply is not a
+            # legal markup for editMessageText), so it bypasses _screen.
+            prompt = _reply_prompt(session, code=parts[2], now=now,
+                                   whatsapp_client=whatsapp_client)
+            if prompt is None:
+                return [Outcome(kind="ack", callback_query_id=cbq_id,
+                                text=EXPIRED_BUTTON_AR)]
+            # its own name: `keyboard` below is bound as non-optional, and
+            # the prompt's is optional (a force-reply prompt carries none)
+            kind, text, reply_keyboard = prompt
+            ack = Outcome(kind="ack", callback_query_id=cbq_id)
+            if kind == "send":
+                return [ack, Outcome(kind="send", text=text, force_reply=True)]
+            if message_id is None:
+                return [ack, Outcome(kind="send", text=text,
+                                     keyboard=reply_keyboard)]
+            return [ack, Outcome(kind="edit", message_id=int(message_id),
+                                 text=text, keyboard=reply_keyboard)]
         screen = None
         is_confirm = len(parts) >= 2 and parts[0] == "v1" and parts[1] == "confirm"
         if len(parts) >= 2 and parts[0] == "v1":

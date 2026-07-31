@@ -110,14 +110,24 @@ class HttpTelegramAdminClient:
         }, timeout=timeout + 10)   # transport must outlive the long poll
         return list(result or [])
 
-    def send_screen(self, text: str, keyboard: Keyboard | None = None) -> str:
+    def send_screen(
+        self, text: str, keyboard: Keyboard | None = None,
+        force_reply: bool = False,
+    ) -> str:
+        """``force_reply`` opens the operator's reply box on this message —
+        how the watchtower captures free text (the reply comes back as a
+        normal message update carrying ``reply_to_message``)."""
         payload: dict[str, Any] = {
             "chat_id": self._chat_id,
             "text": sanitize_secret_text(text),
             "disable_web_page_preview": True,
         }
         markup = self._markup(keyboard)
-        if markup:
+        if force_reply:
+            payload["reply_markup"] = {
+                "force_reply": True, "selective": True,
+            }
+        elif markup:
             payload["reply_markup"] = markup
         return str(self._call("sendMessage", payload)["message_id"])
 

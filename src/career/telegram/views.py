@@ -8,6 +8,7 @@ tested. The console layer is the only caller.
 from __future__ import annotations
 
 from datetime import date
+from decimal import Decimal
 from typing import Any
 
 from career.telegram.admin import Keyboard
@@ -44,20 +45,40 @@ def render_menu() -> tuple[str, Keyboard]:
     return text, keyboard
 
 
+def _status_lines(label: str, status: Any) -> list[str]:
+    """``label: <arabic status>`` — an UNKNOWN status keeps its own line so a
+    raw Latin value never lands inside an Arabic one (Fahad's client
+    scrambles a mixed line)."""
+    known = _RUN_AR.get(str(status))
+    if known:
+        return [f"{label}: {known}"]
+    return [f"{label}:", str(status)]
+
+
 def render_today(
     run_date: date,
     run: dict[str, Any] | None,
     states: list[tuple[str, str, dict[str, Any]]],
+    last_run: dict[str, Any] | None = None,
 ) -> tuple[str, Keyboard]:
-    """``run``: {status, counts} of the latest discovery run; ``states``:
-    (tenant_code, state, counts) rows for the day — TEN codes only."""
-    lines = [f"📊 يوم {run_date.isoformat()}"]
+    """``run``: {status, counts} of TODAY's discovery run — None means today
+    has not run, said in those words (never yesterday's numbers under a
+    «today» heading). ``last_run``: {run_date, status} of the most recent run
+    on any day, shown only in that case. ``states``: (tenant_code, state,
+    counts) rows for the day — TEN codes only."""
+    # date on its own line: a digit inside an Arabic line is scrambled
+    lines = ["📊 تقرير اليوم", run_date.isoformat()]
     if run is None:
-        lines.append("التشغيلة: ⚪ لا تشغيلة مسجلة بعد")
+        lines.append("التشغيلة: 🔴 ما صارت تشغيلة اليوم")
+        if last_run:
+            lines.append("آخر تشغيلة مسجلة كانت بتاريخ")
+            lines.append(str(last_run.get("run_date")))
+            lines.extend(_status_lines("وحالتها", last_run.get("status")))
+        else:
+            lines.append("ولا توجد أي تشغيلة مسجلة من قبل")
     else:
-        status = _RUN_AR.get(str(run.get("status")), str(run.get("status")))
         counts = run.get("counts") or {}
-        lines.append(f"التشغيلة: {status}")
+        lines.extend(_status_lines("التشغيلة", run.get("status")))
         fetched = counts.get("fetched")
         passed = counts.get("passed")
         if fetched is not None or passed is not None:
@@ -240,12 +261,54 @@ def render_tenant_card(card: dict[str, Any]) -> tuple[str, Keyboard]:
     # offered ONLY when a held bundle can actually be re-attempted
     if card.get("can_resend"):
         keyboard.append([("📤 إعادة إرسال الحزمة", f"v1|act|{code}|resend")])
+    # one free-form reply to the customer, straight from the watchtower —
+    # its own callback prefix, never the generic act/confirm path
+    if card.get("can_reply"):
+        keyboard.append([("✍️ رد على العميل", f"v1|reply|{code}")])
     keyboard.append([action_button])
     keyboard.append([("👥 القائمة", "v1|customers|0"), _HOME])
     return "\n".join(lines), keyboard
 
 
 _RANGE_AR = {"7": "٧ أيام", "30": "٣٠ يومًا", "all": "من البداية"}
+
+
+def cost_lines(data: dict[str, Any]) -> list[str]:
+    """The §14 spend block, shared by the business screen and the weekly
+    report so both quote ONE set of numbers.
+
+    Bidi discipline (Fahad's client scrambles mixed lines): every Arabic line
+    is pure Arabic, and every line carrying Latin category keys, TEN codes or
+    Latin digits is a line of its own. That is why the labels and the numbers
+    are never on the same line here.
+    """
+    total = data.get("total_cost_usd")
+    if total is None:
+        return []
+    lines = ["━━━━━━━━━━━━━━", "💵 التكلفة بالدولار — الإجمالي", f"{total:.4f}"]
+
+    tenants = int(data.get("cost_tenants") or 0)
+    if tenants:
+        lines.append("متوسط تكلفة العميل الواحد")
+        lines.append(f"{Decimal(total) / Decimal(tenants):.4f}")
+
+    by_category = data.get("spend_by_category") or {}
+    priced = [
+        (kind, events, cost)
+        for kind, (events, cost) in by_category.items()
+        if Decimal(cost) > 0
+    ]
+    if priced:
+        lines.append("تفصيل البنود")
+        for kind, events, cost in sorted(priced, key=lambda r: -Decimal(r[2])):
+            lines.append(f"{kind} x{events} {Decimal(cost):.4f}")
+
+    top = data.get("top_cost_tenants") or []
+    if top:
+        lines.append("أعلى العملاء تكلفة")
+        for code, cost in top:
+            lines.append(f"{code} {Decimal(cost):.4f}")
+    return lines
 
 
 def render_business(range_key: str, data: dict[str, Any]) -> tuple[str, Keyboard]:
@@ -297,6 +360,9 @@ def render_business(range_key: str, data: dict[str, Any]) -> tuple[str, Keyboard
         if failed:
             part += f" · فشل {failed}"
         lines.append(part)
+    # §14: what a customer actually costs, and who the runaway is — last,
+    # as its own block, so the numbers never share a line with Arabic
+    lines.extend(cost_lines(data))
     keyboard: Keyboard = [
         [("٧ أيام", "v1|business|7"), ("٣٠ يومًا", "v1|business|30"),
          ("الكل", "v1|business|all")],

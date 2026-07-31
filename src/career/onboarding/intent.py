@@ -27,6 +27,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Protocol
 
+from career.cv.close import LlmMeter, TokenCounter, metered
 from career.onboarding.achievement_render import normalize_ar
 
 logger = logging.getLogger("career.enrichment")
@@ -97,7 +98,7 @@ _SCHEMA = {
 }
 
 
-class AnthropicIntentClassifier:  # pragma: no cover — live boundary
+class AnthropicIntentClassifier(TokenCounter):  # pragma: no cover — live
     def __init__(self, api_key: str | None = None, client: Any | None = None,
                  model: str = _MODEL) -> None:
         if client is None:
@@ -106,6 +107,7 @@ class AnthropicIntentClassifier:  # pragma: no cover — live boundary
             client = anthropic.Anthropic(api_key=api_key)
         self._client = client
         self._model = model
+        self.reset_token_counters()
 
     def classify(self, reply: str, *, draft: str | None) -> dict[str, Any]:
         import json
@@ -119,6 +121,7 @@ class AnthropicIntentClassifier:  # pragma: no cover — live boundary
             output_config={"format": {"type": "json_schema", "schema": _SCHEMA}},
             messages=[{"role": "user", "content": prompt}],
         )
+        self.absorb_usage(response)
         if response.stop_reason != "end_turn":
             logger.warning("intent classifier did not finish: %s",
                            response.stop_reason)
@@ -144,6 +147,7 @@ def resolve_intent(
     classifier: IntentClassifier | None,
     deterministic: str,
     known_name: str | None = None,
+    meter: LlmMeter | None = None,
 ) -> tuple[str, str]:
     """(intent, topic). ``deterministic`` is the keyword classifier's verdict,
     used when the model is unavailable or unhelpful — never overridden by a
@@ -165,7 +169,11 @@ def resolve_intent(
         logger.warning("intent reply failed the PII gate — staying deterministic")
         return deterministic, "other"
     try:
-        verdict = classifier.classify(safe, draft=draft)
+        # §14: cheap per call, but it fires on EVERY reply of every enrichment
+        # turn — the category the operator most needs to see when a chatty
+        # customer quietly becomes the expensive one.
+        with metered(meter, "llm_intent", classifier):
+            verdict = classifier.classify(safe, draft=draft)
     except Exception:  # noqa: BLE001 — a down classifier must not block anyone
         logger.warning("intent classification failed", exc_info=True)
         return deterministic, "other"
