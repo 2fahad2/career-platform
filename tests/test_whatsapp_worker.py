@@ -188,3 +188,83 @@ def test_delivery_status_callback_updates_message(
             {"m": welcome_wamid},
         ).scalar_one()
     assert status == "delivered"
+
+
+# ── closure audit: a paying customer must never meet silence ────────────────
+
+
+def _activate(owner_session: Session, wa: Any, admin: Any, phone: str) -> None:
+    tok = _provision_token(owner_session)
+    activate(owner_session, token=tok, from_phone=phone, display_name=None,
+             now=NOW, whatsapp_client=wa, admin_client=admin)
+    owner_session.commit()
+
+
+def test_support_answers_the_customer_not_only_the_operator(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """«دعم» is printed in every error message and on the store page — it used
+    to page the operator and answer the CUSTOMER with nothing at all."""
+    from career.whatsapp.client import FakeWhatsAppClient
+    from career.whatsapp.worker import _handle_message
+
+    phone = _phone()
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    _activate(owner_session, wa, admin, phone)
+    before = len(wa.sent)
+    _handle_message(owner_session,
+                    _text_msg(f"wamid.{uuid.uuid4().hex}", phone, "دعم"),
+                    whatsapp_client=wa, admin_client=admin, now=NOW)
+    owner_session.commit()
+    assert len(wa.sent) > before, "the customer got silence"
+    assert "الفريق" in (wa.sent[-1].body or "")
+
+
+def test_data_rights_survive_an_opt_out(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """§12 + PDPL: an opt-out stops MARKETING, never the customer's own
+    export / delete / status requests — those died with it before."""
+    from career.whatsapp.client import FakeWhatsAppClient
+    from career.whatsapp.worker import _handle_message
+
+    phone = _phone()
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    _activate(owner_session, wa, admin, phone)
+    owner_session.execute(text(
+        "UPDATE customer_channels SET opt_out_at = :n WHERE phone_e164 = :p"),
+        {"n": NOW, "p": phone.lstrip("+")})
+    owner_session.execute(text(
+        "UPDATE customer_channels SET opt_out_at = :n WHERE phone_e164 = :p"),
+        {"n": NOW, "p": phone})
+    owner_session.commit()
+    before = len(wa.sent)
+    _handle_message(owner_session,
+                    _text_msg(f"wamid.{uuid.uuid4().hex}", phone,
+                              "حالة اشتراكي"),
+                    whatsapp_client=wa, admin_client=admin, now=NOW,
+                    onboarding=_worker_deps(wa))
+    owner_session.commit()
+    assert len(wa.sent) > before, "an opted-out customer lost their data rights"
+
+
+def _worker_deps(wa: Any) -> Any:
+    """Minimal Deps: the privacy commands need no model boundaries."""
+    import tempfile
+
+    from career.onboarding import orchestrator
+    from career.storage import FilesystemStorageAdapter
+
+    class _Scanner:
+        def scan(self, data: bytes) -> str | None:
+            return None
+
+    class _Extractor:
+        def extract(self, cv_text: str) -> Any:
+            raise AssertionError("not used by privacy commands")
+
+    return orchestrator.Deps(
+        whatsapp_client=wa, scanner=_Scanner(),
+        storage=FilesystemStorageAdapter(tempfile.mkdtemp()),
+        extractor=_Extractor(),
+    )

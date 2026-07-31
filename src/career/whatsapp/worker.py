@@ -45,6 +45,19 @@ logger = logging.getLogger("career.whatsapp")
 
 _UNRECOGNIZED = "أرسل رمز التفعيل من صفحة الشكر بعد الدفع للبدء."
 _STOP_CONFIRM = "تم إيقاف الرسائل. لن نرسل لك بعد الآن. لإعادة التفعيل أرسل: دعم"
+#: «دعم» is promised everywhere as the way to reach a human — so it must
+#: answer the customer, not just page the operator (closure audit).
+_SUPPORT_ACK = (
+    "وصلتنا رسالتك 🙏\n"
+    "أحد من الفريق بيتواصل معك بأقرب وقت — وأنت اكتب لنا أي وقت"
+)
+#: The last line of defence against silence for an ACTIVE customer.
+_ACTIVE_FALLBACK = (
+    "وصلتني رسالتك 👌\n"
+    "أنا معك يوميًا: كل صباح أرسل لك فرصك المختارة ومعها سيرتك جاهزة لها\n"
+    "وتقدر تكتب بأي وقت:\n"
+    "حالة اشتراكي · وقف مؤقت · تصدير بياناتي · دعم"
+)
 
 
 def _ten_code(session: Session, tenant_id: uuid.UUID) -> str:
@@ -224,6 +237,13 @@ def _handle_message(
             inbound_message_id=inbound.id, kind="support_request", status="open",
         ))
         admin_client.send_admin(admin_msg.support_request(_ten_code(session, channel.tenant_id)))
+        # closure audit: «دعم» is the escape hatch printed in every error
+        # message and on the store page — and it used to page the operator
+        # while answering the CUSTOMER with nothing at all.
+        try:
+            whatsapp_client.send_text(channel.phone_e164, _SUPPORT_ACK)
+        except Exception:  # noqa: BLE001 — the ticket is already recorded
+            logger.warning("support ack failed", exc_info=True)
         session.commit()
         return
 
@@ -232,10 +252,21 @@ def _handle_message(
     _record_inbound(session, tenant_id=channel.tenant_id, channel_id=channel.id,
                     wamid=wamid, message_type=message_type, text_body=text_body,
                     classification="other", payload=msg, now=now)
+    from career.funnel import flow as funnel_flow
+
     if opted_out:
+        # closure audit: opting out silenced the DATA RIGHTS too — export,
+        # delete, status and resume all died, though §12 and the privacy page
+        # promise them for life and PDPL does not let an opt-out revoke them.
+        # Opting out stops MARKETING, never the customer's own requests.
+        if onboarding is not None and text_body and \
+                orchestrator.handle_standing_command(
+                    session, channel_id=channel.id, text=text_body,
+                    deps=onboarding, now=now):
+            session.commit()
+            return
         session.commit()
         return
-    from career.funnel import flow as funnel_flow
 
     # AUDIT ك-7: standing privacy commands work for EVERY paying customer at
     # EVERY stage — funnel customers included (PDPL + the welcome message's
@@ -341,6 +372,15 @@ def _handle_message(
                     deps=onboarding, now=now):
             session.commit()
             return
+
+        # closure audit: an ACTIVE customer who typed anything else got NO
+        # reply at all — five realistic messages produced zero outbound. A
+        # paying customer must never wonder whether we are still here.
+        if text_body and landed is None:
+            try:
+                whatsapp_client.send_text(channel.phone_e164, _ACTIVE_FALLBACK)
+            except Exception:  # noqa: BLE001 — never crash the turn on an ack
+                logger.warning("active fallback reply failed", exc_info=True)
     session.commit()
 
 
