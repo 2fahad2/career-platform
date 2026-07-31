@@ -43,7 +43,11 @@ _ALLOWED: dict[str, frozenset[str]] = {
     ACTIVE: frozenset({PAUSED, GRACE, EXPIRED, CANCELED, REFUNDED, CHARGEBACK, SUSPENDED}),
     PAUSED: frozenset({ACTIVE, EXPIRED, CANCELED, REFUNDED, CHARGEBACK, SUSPENDED}),
     GRACE: frozenset({ACTIVE, EXPIRED, CANCELED, REFUNDED, CHARGEBACK, SUSPENDED}),
-    EXPIRED: frozenset({ACTIVE, CANCELED}),
+    # A refund/cancel/chargeback can arrive long after a period closed —
+    # renewals (§16) retire the superseded row to EXPIRED while its order
+    # stays refundable for weeks. Refusing the transition threw
+    # InvalidTransition out of the webhook worker and jammed the whole queue.
+    EXPIRED: frozenset({ACTIVE, CANCELED, REFUNDED, CHARGEBACK}),
     CANCELED: frozenset(),
     REFUNDED: frozenset(),
     CHARGEBACK: frozenset(),

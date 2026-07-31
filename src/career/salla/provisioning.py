@@ -177,6 +177,10 @@ def provision_order(
         )
         owner_session.add(renewed)
         owner_session.flush()
+        # a renewal on a different pass must actually change the service
+        renewals.resync_policy_limit(
+            owner_session, tenant_id=target.tenant_id, plan_code=plan_code,
+        )
         owner_session.add(
             SubscriptionEvent(
                 id=uuid.uuid4(),
@@ -335,7 +339,26 @@ def process_pending_webhooks(
                     whatsapp_client=whatsapp_client,
                 )
         elif ev.event_type in _LIFECYCLE_EVENTS:
-            _apply_lifecycle(owner_session, ev)
+            # AUDIT ك-19 again, on the refund path: this branch sat OUTSIDE
+            # the poison guard, so one unexpected transition stopped every
+            # later webhook — new paid orders included.
+            try:
+                _apply_lifecycle(owner_session, ev)
+            except Exception:  # noqa: BLE001
+                logger.error("lifecycle apply crashed for one event",
+                             exc_info=True)
+                owner_session.rollback()
+                _mark_webhook(owner_session, ev, "failed")
+                owner_session.commit()
+                if admin_client is not None:
+                    try:
+                        admin_client.send_admin(
+                            "🔴 حدث استرداد/إلغاء تعذّر تطبيقه وعُزل — راجع "
+                            "الطلب يدويًا"
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.warning("lifecycle poison alert failed",
+                                       exc_info=True)
         else:
             _mark_webhook(owner_session, ev, "ignored")
             owner_session.commit()
@@ -371,24 +394,52 @@ def _announce_renewal(
     period_end = sub.current_period_end
     until = period_end.date().isoformat() if period_end is not None else "—"
 
+    # A free-form text only lands inside the 24h window, and must never reach
+    # someone who opted out. Most renewals happen ON THE STOREFRONT, so the
+    # window is usually shut — tell the operator that plainly instead of
+    # pretending the customer was informed.
+    told = False
     if whatsapp_client is not None and sub.order_phone_e164:
+        from career.db.models import CustomerChannel
         from career.salla.renewal import RENEWED_CUSTOMER_AR, RENEWED_PAUSED_AR
+        from career.whatsapp.phones import phone_variants
+        from career.whatsapp.window import WindowState, window_state
 
+        channel = owner_session.execute(
+            select(CustomerChannel).where(
+                CustomerChannel.phone_e164.in_(
+                    phone_variants(sub.order_phone_e164)
+                ),
+                CustomerChannel.provider == "whatsapp",
+            ).order_by(CustomerChannel.created_at, CustomerChannel.id)
+        ).scalars().first()
+        state = window_state(
+            last_inbound_at=channel.last_inbound_at,
+            opt_out_at=channel.opt_out_at,
+            now=datetime.now(UTC),
+        ) if channel is not None else None
         head = (
             RENEWED_PAUSED_AR if sub.status == sub_states.PAUSED
             else RENEWED_CUSTOMER_AR
         )
-        try:
-            whatsapp_client.send_text(sub.order_phone_e164, f"{head}\n{until}")
-        except Exception:  # noqa: BLE001
-            logger.warning("renewal confirmation send failed", exc_info=True)
+        if state is WindowState.OPEN:
+            try:
+                whatsapp_client.send_text(
+                    sub.order_phone_e164, f"{head}\n{until}"
+                )
+                told = True
+            except Exception:  # noqa: BLE001
+                logger.warning("renewal confirmation send failed",
+                               exc_info=True)
 
     if admin_client is not None:
-        review = sub.status == sub_states.PAID_UNCLAIMED
+        review = sub.status == sub_states.SUSPENDED
         line = (
             f"⚠️ تجديد على حساب موقوف {code} — الاشتراك مربوط وينتظر مراجعتك "
             "قبل أي استئناف للخدمة"
         ) if review else f"↻ تجديد {code} — الفترة الجديدة تنتهي\n{until}"
+        if not review and not told:
+            line += "\nنافذة واتساب مقفلة — ما وصلت العميل رسالة تأكيد"
         try:
             admin_client.send_admin(line)
         except Exception:  # noqa: BLE001

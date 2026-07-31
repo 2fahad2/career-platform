@@ -67,6 +67,16 @@ def _is_funnel_only_tenant(owner_session: Session, tenant_id: uuid.UUID) -> bool
     return bool(plans) and all(p == "cv_analysis" for p in plans)
 
 
+def _is_funnel_purchase(
+    owner_session: Session, subscription_id: uuid.UUID | None
+) -> bool:
+    """True when the NEW order being activated is the one-shot analysis."""
+    if subscription_id is None:
+        return False
+    sub = owner_session.get(Subscription, subscription_id)
+    return sub is not None and sub.plan_code == "cv_analysis"
+
+
 def activate_by_order_phone(
     owner_session: Session,
     *,
@@ -153,6 +163,13 @@ def _activate_with_token(
     inherit = False
     if existing is not None and existing.tenant_id != tok.tenant_id:
         if _is_funnel_only_tenant(owner_session, existing.tenant_id):
+            inherit = True
+        elif _is_funnel_purchase(owner_session, tok.subscription_id):
+            # The mirror case (closure audit, 31 July): a PASS customer buys
+            # the 29-SAR analysis. It provisioned a shell tenant, so typing
+            # the token answered «هذا الرقم مرتبط بحساب آخر» — a customer
+            # blocked from a product they had just paid for. One human is one
+            # tenant in both directions; the analysis rides along on theirs.
             inherit = True
         else:
             whatsapp_client.send_text(from_phone, _CONFLICT)

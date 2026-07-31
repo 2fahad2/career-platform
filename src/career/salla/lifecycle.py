@@ -67,6 +67,17 @@ def _channel_phone(session: Session, tenant_id: uuid.UUID) -> str | None:
     return channel.phone_e164 if channel else None
 
 
+def _superseded_by_renewal(session: Session, sub: Subscription) -> bool:
+    """Was this row retired by a renewal (§16)?
+
+    The retired row keeps its old period_end, so without this check the sweep
+    would walk an ACTIVE paying customer through their PREVIOUS period all
+    over again: a «we miss you» recovery template plus a renew link, about
+    nine days after every single renewal, forever.
+    """
+    return _event_exists(session, sub.id, "renewed")
+
+
 def _send_template(
     whatsapp_client: Any, phone: str | None, template: Any
 ) -> bool:
@@ -162,6 +173,8 @@ def sweep_subscription_lifecycle(
     for sub in subs:
         period_end = sub.current_period_end
         if period_end is None:  # filtered above — belt and braces
+            continue
+        if _superseded_by_renewal(session, sub):
             continue
 
         if sub.status == sub_states.ACTIVE:

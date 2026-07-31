@@ -159,7 +159,9 @@ def test_a_disputed_account_waits_for_a_human(owner_session, clean_billing):
     assert result.tenant_id == str(tenant_id)
     current = renewal.current_subscription(owner_session, tenant_id)
     assert current is not None
-    assert current.status == sub_states.PAID_UNCLAIMED
+    # SUSPENDED, not PAID_UNCLAIMED: the claim sweep would have expired a
+    # paid renewal after 7 days with no alert
+    assert current.status == sub_states.SUSPENDED
     assert owner_session.execute(sql_text(
         "SELECT status FROM subscriptions WHERE id = :id"),
         {"id": str(sub_id)}).scalar_one() == "CHARGEBACK"  # untouched
@@ -251,6 +253,12 @@ def test_the_renewing_customer_is_told_and_the_operator_too(
     from career.salla.provisioning import process_pending_webhooks
 
     phone, _, _ = _customer(owner_session)
+    # they messaged us just now, so the 24h window is open and a free-form
+    # confirmation actually lands
+    owner_session.execute(sql_text(
+        "UPDATE customer_channels SET last_inbound_at = now() WHERE"
+        " phone_e164 = :p"), {"p": phone})
+    owner_session.commit()
     order_id = f"ORD-{uuid.uuid4()}"
     order = SallaOrder(order_id, "paid", "prod_pro", Decimal("279.00"), "SAR",
                        customer_phone=phone)
@@ -276,3 +284,188 @@ def test_the_renewing_customer_is_told_and_the_operator_too(
     assert not [m for m in wa.sent if m.kind == "template"]
     assert any("تجديد" in m for m in admin.messages)
     assert not any("رابط التفعيل" in m for m in admin.messages)
+
+
+# ── the adversarial review's findings, each pinned as a requirement ──────────
+
+
+def test_a_refund_on_a_superseded_order_never_jams_the_queue(
+    owner_session, clean_billing
+):
+    """The worst one: close_previous parks the old row in EXPIRED, and a
+    refund for THAT order used to raise InvalidTransition straight out of the
+    webhook worker — every later webhook, new paid orders included, stopped
+    being processed."""
+    from career.db.models import WebhookEvent
+    from career.salla.provisioning import process_pending_webhooks
+
+    phone, tenant_id, first_id = _customer(owner_session)
+    first_order = owner_session.execute(sql_text(
+        "SELECT salla_order_id FROM subscriptions WHERE id = :i"),
+        {"i": str(first_id)}).scalar_one()
+    _buy(owner_session, phone=phone)   # renewal retires the first row
+
+    order = SallaOrder(first_order, "refunded", "prod_pro",
+                       Decimal("279.00"), "SAR", customer_phone=phone)
+    owner_session.add(WebhookEvent(
+        id=uuid.uuid4(), provider="salla", event_type="order.refunded",
+        event_fingerprint=f"fp-ref-{first_order}", signature_valid=True,
+        salla_order_id=first_order, payload={"data": {"id": first_order}},
+        processing_status="received",
+    ))
+    owner_session.commit()
+
+    process_pending_webhooks(   # must not raise
+        owner_session, salla_client=FakeSallaClient({first_order: order}),
+        product_catalog=_CATALOG, expected_pricing=_PR,
+        admin_client=FakeTelegramAdminClient(), whatsapp_client=FakeWhatsAppClient(),
+        whatsapp_number_e164="+966500000000",
+    )
+
+    assert owner_session.execute(sql_text(
+        "SELECT status FROM subscriptions WHERE id = :i"),
+        {"i": str(first_id)}).scalar_one() == sub_states.REFUNDED
+    # the event is closed, not left poisoning the queue forever
+    assert owner_session.execute(sql_text(
+        "SELECT processing_status FROM webhook_events WHERE salla_order_id = :o"
+        " AND event_type = 'order.refunded'"),
+        {"o": first_order}).scalar_one() != "received"
+
+
+def test_a_disputed_renewal_is_not_swept_away_by_the_claim_deadline(
+    owner_session, clean_billing
+):
+    """It used to be written PAID_UNCLAIMED, so the claim sweep nagged an
+    already-activated customer at day 5 and silently EXPIRED their paid
+    renewal at day 7 — the operator's review window was secretly a week."""
+    from career.salla.lifecycle import sweep_subscription_lifecycle
+
+    phone, tenant_id, sub_id = _customer(owner_session)
+    owner_session.execute(sql_text(
+        "UPDATE subscriptions SET status = 'CHARGEBACK' WHERE id = :id"),
+        {"id": str(sub_id)})
+    owner_session.commit()
+    result, _ = _buy(owner_session, phone=phone)
+    renewed_id = uuid.UUID(str(result.subscription_id))
+
+    wa = FakeWhatsAppClient()
+    sweep_subscription_lifecycle(
+        owner_session, now=NOW + timedelta(days=9), whatsapp_client=wa,
+    )
+    owner_session.commit()
+
+    assert owner_session.execute(sql_text(
+        "SELECT status FROM subscriptions WHERE id = :i"),
+        {"i": str(renewed_id)}).scalar_one() == sub_states.SUSPENDED
+    assert not wa.sent
+
+
+def test_a_renewed_customer_is_never_told_we_miss_them(
+    owner_session, clean_billing
+):
+    """The retired row keeps its old period_end, so the sweep used to walk an
+    ACTIVE paying customer through their PREVIOUS period again — a «we miss
+    you» template plus a renew link, ~9 days after every renewal, forever."""
+    from career.salla.lifecycle import sweep_subscription_lifecycle
+
+    phone, tenant_id, _ = _customer(owner_session)   # period ends NOW+5
+    _buy(owner_session, phone=phone)
+
+    wa = FakeWhatsAppClient()
+    sweep_subscription_lifecycle(
+        owner_session, now=NOW + timedelta(days=16), whatsapp_client=wa,
+        store_url="https://store.example/renew",
+    )
+    owner_session.commit()
+
+    assert not wa.sent
+    current = renewal.current_subscription(owner_session, tenant_id)
+    assert current is not None and current.status == sub_states.ACTIVE
+
+
+def test_the_confirmation_is_not_shouted_into_a_closed_window(
+    owner_session, clean_billing
+):
+    """Most renewals happen on the storefront, so the 24h window is shut. A
+    free-form send would simply be rejected — the operator must be told that
+    the customer was NOT reached, not left assuming they were."""
+    from career.db.models import WebhookEvent
+    from career.salla.provisioning import process_pending_webhooks
+
+    phone, _, _ = _customer(owner_session)
+    owner_session.execute(sql_text(
+        "UPDATE customer_channels SET last_inbound_at = :t WHERE phone_e164 = :p"),
+        {"t": NOW - timedelta(days=3), "p": phone})
+    order_id = f"ORD-{uuid.uuid4()}"
+    order = SallaOrder(order_id, "paid", "prod_pro", Decimal("279.00"), "SAR",
+                       customer_phone=phone)
+    owner_session.add(WebhookEvent(
+        id=uuid.uuid4(), provider="salla", event_type="order.payment.updated",
+        event_fingerprint=f"fp-{order_id}", signature_valid=True,
+        salla_order_id=order_id, payload={"data": {"id": order_id}},
+        processing_status="received",
+    ))
+    owner_session.commit()
+
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    process_pending_webhooks(
+        owner_session, salla_client=FakeSallaClient({order_id: order}),
+        product_catalog=_CATALOG, expected_pricing=_PR,
+        admin_client=admin, whatsapp_client=wa,
+        whatsapp_number_e164="+966500000000",
+    )
+
+    assert not wa.sent
+    assert any("نافذة واتساب مقفلة" in m for m in admin.messages)
+
+
+def test_renewing_on_a_bigger_pass_actually_changes_the_service(
+    owner_session, clean_billing
+):
+    """Entitlements are snapshotted onto the search policy at onboarding and
+    never re-read — so an upgrade used to cost more and deliver exactly the
+    same number of jobs."""
+    phone, tenant_id, sub_id = _customer(owner_session, product="prod_basic")
+    owner_session.execute(sql_text(
+        "INSERT INTO search_policies (id, tenant_id, version, status,"
+        " approved_paths, cities, daily_job_limit)"
+        " VALUES (:i, :t, 1, 'active', '{}'::jsonb, '{}'::jsonb, 1)"),
+        {"i": str(uuid.uuid4()), "t": str(tenant_id)})
+    owner_session.commit()
+
+    _buy(owner_session, product="prod_pro", phone=phone)   # basic → professional
+
+    limit = owner_session.execute(sql_text(
+        "SELECT daily_job_limit FROM search_policies WHERE tenant_id = :t"
+        " AND status = 'active'"), {"t": str(tenant_id)}).scalar_one()
+    assert limit == 2   # the professional entitlement, not the old basic 1
+    owner_session.execute(sql_text(
+        "DELETE FROM search_policies WHERE tenant_id = :t"), {"t": str(tenant_id)})
+    owner_session.commit()
+
+
+def test_a_pass_customer_can_buy_the_analysis_without_hitting_a_wall(
+    owner_session, clean_billing
+):
+    """The mirror of the §04 upgrade: a paying pass customer buying the
+    29-riyal analysis was answered «هذا الرقم مرتبط بحساب آخر» — blocked from
+    a product they had just paid for."""
+    from career.whatsapp.activation_flow import ActivationStatus
+
+    phone, tenant_id, _ = _customer(owner_session)
+    result, _ = _buy(owner_session, product="prod_cv", phone=phone)
+
+    outcome = activate(
+        owner_session, token=result.activation_token, from_phone=phone,
+        display_name=None, now=NOW, whatsapp_client=FakeWhatsAppClient(),
+        admin_client=FakeTelegramAdminClient(),
+    )
+
+    assert outcome.status is not ActivationStatus.CONFLICT
+    assert outcome.tenant_id == str(tenant_id)   # rides along on their tenant
+    plans = sorted(p for _, p in [
+        (s, r) for s, r in owner_session.execute(sql_text(
+            "SELECT status, plan_code FROM subscriptions WHERE tenant_id = :t"),
+            {"t": str(tenant_id)}).all()
+    ])
+    assert "cv_analysis" in plans and "professional" in plans

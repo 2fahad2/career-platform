@@ -131,9 +131,16 @@ class RenewalTarget:
     @property
     def new_status(self) -> str:
         """A paused customer stays paused — they asked for quiet, and paying
-        does not revoke that. A disputed account waits for a human."""
+        does not revoke that. A disputed account waits for a human.
+
+        SUSPENDED, deliberately, for the review case: PAID_UNCLAIMED would
+        have been swept by the claim deadline — a welcome template at day 5
+        to an activated customer, and the paid renewal silently EXPIRED at
+        day 7 with no alert. SUSPENDED is untouched by every sweep and the
+        operator can move it straight to ACTIVE.
+        """
         if self.needs_review:
-            return sub_states.PAID_UNCLAIMED
+            return sub_states.SUSPENDED
         if self.previous_status == sub_states.PAUSED:
             return sub_states.PAUSED
         return sub_states.ACTIVE
@@ -152,11 +159,20 @@ def find_renewal(
     variants = phone_variants(order_phone)
     if not variants:
         return None
-    channel = session.execute(
-        select(CustomerChannel).where(CustomerChannel.phone_e164.in_(variants))
-    ).scalars().first()
-    if channel is None:
+    # Deterministic and provider-scoped. Two spellings of one number can
+    # legitimately coexist on different tenants (the unique index is on the
+    # exact string), and an arbitrary pick would extend the WRONG customer's
+    # service with this customer's money. Oldest channel wins — the first
+    # binding of that number is the one that was proven by token.
+    channels = session.execute(
+        select(CustomerChannel).where(
+            CustomerChannel.phone_e164.in_(variants),
+            CustomerChannel.provider == "whatsapp",
+        ).order_by(CustomerChannel.created_at, CustomerChannel.id)
+    ).scalars().all()
+    if not channels:
         return None
+    channel = channels[0]
 
     prior = [
         sub for sub in tenant_subscriptions(session, channel.tenant_id)
@@ -179,6 +195,38 @@ def find_renewal(
         period_end=start + timedelta(days=SUBSCRIPTION_DAYS),
         needs_review=live.status in _NEEDS_REVIEW,
     )
+
+
+def resync_policy_limit(
+    session: Session, *, tenant_id: uuid.UUID, plan_code: str
+) -> bool:
+    """Re-snapshot the active search policy's daily limit for a new plan.
+
+    Entitlements are snapshotted onto ``search_policies`` at onboarding and
+    never re-read, so a customer who renewed on a BIGGER pass kept the old
+    plan's daily limit — paying more for exactly the same service (and a
+    downgrade kept the richer one). Returns True when something changed.
+    """
+    from career.db.models import PlanEntitlement, SearchPolicy
+
+    limit = session.execute(
+        select(PlanEntitlement.daily_job_limit).where(
+            PlanEntitlement.plan_code == plan_code
+        )
+    ).scalars().first()
+    if limit is None:
+        return False
+    policy = session.execute(
+        select(SearchPolicy).where(
+            SearchPolicy.tenant_id == tenant_id,
+            SearchPolicy.status == "active",
+        )
+    ).scalars().first()
+    if policy is None or policy.daily_job_limit == limit:
+        return False
+    policy.daily_job_limit = limit
+    session.flush()
+    return True
 
 
 def close_previous(
@@ -212,8 +260,12 @@ RENEWED_CUSTOMER_AR = (
     "اشتراكك مستمر إلى"
 )
 
+#: §05 is explicit that a pause does NOT extend the period — the clock keeps
+#: running. Promising «أيامك محفوظة» would be a promise the system does not
+#: keep, so the paused renewal states the real end date and nudges them to
+#: resume.
 RENEWED_PAUSED_AR = (
     "تم تجديد اشتراكك ✅\n"
-    "اشتراكك لا يزال موقوفًا مؤقتًا بطلبك — أرسل: استئناف — أول ما تجهز\n"
-    "أيامك محفوظة إلى"
+    "لكنه لا يزال موقوفًا مؤقتًا بطلبك، والمدة تمشي وأنت موقوف\n"
+    "أرسل: استئناف — عشان تستفيد من أيامك، وهي تنتهي في"
 )
