@@ -60,9 +60,13 @@ class Seats:
 
 
 def founding_seats(session: Session, *, cap: int = FOUNDING_SEATS_CAP) -> Seats:
-    """The real count, from subscription rows. Runs as owner (spans tenants)."""
+    """The real count, from subscription rows. Runs as owner (spans tenants).
+
+    Counted per CUSTOMER, not per row: since renewals (§16) one person holds a
+    subscription row per order, and counting rows would have burned a second
+    founding seat every time somebody paid again."""
     taken = int(session.execute(
-        select(func.count()).select_from(Subscription).where(
+        select(func.count(func.distinct(Subscription.tenant_id))).where(
             Subscription.plan_code.in_(sorted(_SEAT_PLANS)),
             Subscription.status.in_(sorted(_HOLDING_STATES)),
         )

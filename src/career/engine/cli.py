@@ -121,6 +121,7 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
             sweep_subscription_lifecycle(
                 session, now=datetime.now(UTC),
                 whatsapp_client=lifecycle_wa,
+                store_url=settings.salla_store_url,
             )
             session.commit()
     except Exception:  # noqa: BLE001 — the sweep never blocks the run

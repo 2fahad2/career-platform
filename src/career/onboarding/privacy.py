@@ -299,9 +299,13 @@ def execute_deletion(
 
 
 def _subscription(session: Session, tenant_id: uuid.UUID) -> Subscription:
-    subscription = session.execute(
-        select(Subscription).where(Subscription.tenant_id == tenant_id)
-    ).scalars().first()
+    """THE live subscription. Since renewals (§16) a tenant holds one row per
+    order, so «whichever row came back first» would have shown a renewing
+    customer their old expired period — and pause/resume would have acted on
+    it. The order is explicit in career.salla.renewal."""
+    from career.salla.renewal import current_subscription
+
+    subscription = current_subscription(session, tenant_id)
     if subscription is None:
         raise RequestNotFound("subscription")
     return subscription
@@ -343,12 +347,34 @@ _STATUS_AR = {
 }
 
 
+#: A status reply that says «منتهي» and stops is a dead end — the customer has
+#: no way to come back from inside the conversation. §16: the store link is
+#: printed on its own line (Fahad's client scrambles mixed-direction lines).
+_RENEW_CTA_STATES: frozenset[str] = frozenset({"GRACE", "EXPIRED", "CANCELED"})
+_RENEW_CTA_DAYS = 3
+
+
+def _renew_cta(store_url: str | None) -> str:
+    url = (store_url or "").strip()
+    if not url:
+        return "\nللتجديد أرسل: دعم"
+    return "\nتقدر تجدد من هنا:\n" + url
+
+
 def subscription_status_summary(
-    session: Session, *, tenant_id: uuid.UUID, now: datetime
+    session: Session, *, tenant_id: uuid.UUID, now: datetime,
+    store_url: str | None = None,
 ) -> str:
     subscription = _subscription(session, tenant_id)
     label = _STATUS_AR.get(subscription.status, subscription.status)
     if subscription.current_period_end is not None:
         days_left = max(0, (subscription.current_period_end - now).days)
-        return f"اشتراكك: {label} — باقي {days_left} يومًا على نهاية الفترة الحالية."
-    return f"اشتراكك: {label}."
+        line = f"اشتراكك: {label} — باقي {days_left} يومًا على نهاية الفترة الحالية."
+        if (subscription.status in _RENEW_CTA_STATES
+                or days_left <= _RENEW_CTA_DAYS):
+            line += _renew_cta(store_url)
+        return line
+    line = f"اشتراكك: {label}."
+    if subscription.status in _RENEW_CTA_STATES:
+        line += _renew_cta(store_url)
+    return line

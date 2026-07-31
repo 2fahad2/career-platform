@@ -41,6 +41,7 @@ ACTIVATION_TOKEN_TTL_DAYS = 7
 
 class ProvisionStatus(StrEnum):
     PROVISIONED = "provisioned"
+    RENEWED = "renewed"
     ALREADY_PROVISIONED = "already_provisioned"
     NOT_PAID = "not_paid"
     UNKNOWN_PRODUCT = "unknown_product"
@@ -88,6 +89,7 @@ def provision_order(
     product_catalog: ProductCatalog,
     webhook_event: WebhookEvent | None = None,
     expected_pricing: ExpectedPricing | None = None,
+    now: datetime | None = None,
 ) -> ProvisionResult:
     if not order_id:
         _mark_webhook(owner_session, webhook_event, "ignored")
@@ -144,12 +146,65 @@ def provision_order(
         owner_session.commit()
         return ProvisionResult(ProvisionStatus.AMOUNT_MISMATCH)
 
+    from career.salla.activation_link import normalize_order_phone
+
+    order_phone = normalize_order_phone(order.customer_phone)
+
+    # CHANGELOG §16 — is this the same human paying again? Decided BEFORE
+    # anything is created: a renewal must not mint a second tenant, a second
+    # founding seat, or a token that dies unclaimed.
+    from career.salla import renewal as renewals
+
+    target = renewals.find_renewal(
+        owner_session, order_phone=order_phone, plan_code=plan_code,
+        now=now or datetime.now(UTC),
+    )
+    if target is not None:
+        renewals.close_previous(
+            owner_session, target, salla_order_id=order_id
+        )
+        renewed = Subscription(
+            id=uuid.uuid4(),
+            tenant_id=target.tenant_id,
+            plan_code=plan_code,
+            status=target.new_status,
+            salla_order_id=order_id,
+            amount_sar=order.amount,
+            currency=order.currency,
+            order_phone_e164=order_phone,
+            current_period_start=target.period_start,
+            current_period_end=target.period_end,
+        )
+        owner_session.add(renewed)
+        owner_session.flush()
+        owner_session.add(
+            SubscriptionEvent(
+                id=uuid.uuid4(),
+                tenant_id=target.tenant_id,
+                subscription_id=renewed.id,
+                event_type="renewal_provisioned",
+                from_status=None,
+                to_status=target.new_status,
+                salla_order_id=order_id,
+                details={
+                    "plan_code": plan_code,
+                    "previous_subscription_id": str(target.previous_id),
+                    "period_end": target.period_end.isoformat(),
+                },
+            )
+        )
+        _mark_webhook(owner_session, webhook_event, "processed")
+        owner_session.commit()
+        return ProvisionResult(
+            ProvisionStatus.RENEWED,
+            subscription_id=str(renewed.id),
+            tenant_id=str(target.tenant_id),
+        )
+
     # Provision: tenant → subscription(PAID_UNCLAIMED) → activation token.
     tenant = Tenant(id=uuid.uuid4(), code=_next_tenant_code(owner_session))
     owner_session.add(tenant)
     owner_session.flush()
-
-    from career.salla.activation_link import normalize_order_phone
 
     subscription = Subscription(
         id=uuid.uuid4(),
@@ -159,7 +214,7 @@ def provision_order(
         salla_order_id=order_id,
         amount_sar=order.amount,
         currency=order.currency,
-        order_phone_e164=normalize_order_phone(order.customer_phone),
+        order_phone_e164=order_phone,
     )
     owner_session.add(subscription)
     owner_session.flush()
@@ -273,12 +328,71 @@ def process_pending_webhooks(
                     whatsapp_number_e164=whatsapp_number_e164,
                     whatsapp_client=whatsapp_client,
                 )
+            elif result.status == ProvisionStatus.RENEWED:
+                _announce_renewal(
+                    owner_session, result,
+                    admin_client=admin_client,
+                    whatsapp_client=whatsapp_client,
+                )
         elif ev.event_type in _LIFECYCLE_EVENTS:
             _apply_lifecycle(owner_session, ev)
         else:
             _mark_webhook(owner_session, ev, "ignored")
             owner_session.commit()
     return results
+
+
+def _announce_renewal(
+    owner_session: Session,
+    result: ProvisionResult,
+    *,
+    admin_client: Any,
+    whatsapp_client: Any,
+) -> None:
+    """§16 — tell the renewing customer their days are safe, and tell the
+    operator which TEN code renewed. No activation token and no welcome
+    template: nothing about their account changed, and asking them to
+    activate again would be the dead end this feature removes.
+
+    Best-effort, exactly like the fresh-provision announcement: the money is
+    already recorded and committed, so a failed send never rolls it back.
+    Outside the 24h window the text simply will not land — the customer still
+    sees the renewal reflected in «حالة اشتراكي» whenever they write.
+    """
+    sub = owner_session.get(
+        Subscription, uuid.UUID(str(result.subscription_id))
+    ) if result.subscription_id else None
+    tenant = owner_session.get(
+        Tenant, uuid.UUID(str(result.tenant_id))
+    ) if result.tenant_id else None
+    if sub is None:
+        return
+    code = tenant.code if tenant else "?"
+    period_end = sub.current_period_end
+    until = period_end.date().isoformat() if period_end is not None else "—"
+
+    if whatsapp_client is not None and sub.order_phone_e164:
+        from career.salla.renewal import RENEWED_CUSTOMER_AR, RENEWED_PAUSED_AR
+
+        head = (
+            RENEWED_PAUSED_AR if sub.status == sub_states.PAUSED
+            else RENEWED_CUSTOMER_AR
+        )
+        try:
+            whatsapp_client.send_text(sub.order_phone_e164, f"{head}\n{until}")
+        except Exception:  # noqa: BLE001
+            logger.warning("renewal confirmation send failed", exc_info=True)
+
+    if admin_client is not None:
+        review = sub.status == sub_states.PAID_UNCLAIMED
+        line = (
+            f"⚠️ تجديد على حساب موقوف {code} — الاشتراك مربوط وينتظر مراجعتك "
+            "قبل أي استئناف للخدمة"
+        ) if review else f"↻ تجديد {code} — الفترة الجديدة تنتهي\n{until}"
+        try:
+            admin_client.send_admin(line)
+        except Exception:  # noqa: BLE001
+            logger.warning("renewal admin notice failed", exc_info=True)
 
 
 def _announce_provision(

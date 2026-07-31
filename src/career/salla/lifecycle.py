@@ -80,15 +80,38 @@ def _send_template(
         return False
 
 
+_RENEW_LINK_AR = "تقدر تجدد من هنا:"
+
+
+def _send_renew_link(
+    whatsapp_client: Any, phone: str | None, store_url: str | None
+) -> None:
+    """§16 — the approved templates carry a «تجديد الاشتراك» button but no
+    URL, so for ten days the reminder pointed nowhere. The link follows as a
+    plain text: it lands whenever the 24h window is open, and costs nothing
+    when it is not. The URL sits on its own line (mixed-direction lines
+    scramble in the customer's client)."""
+    url = (store_url or "").strip()
+    if whatsapp_client is None or not phone or not url:
+        return
+    try:
+        whatsapp_client.send_text(phone, f"{_RENEW_LINK_AR}\n{url}")
+    except Exception:  # noqa: BLE001 — messaging never blocks the lifecycle
+        logger.warning("renew link send failed", exc_info=True)
+
+
 def sweep_subscription_lifecycle(
     session: Session,
     *,
     now: datetime,
     whatsapp_client: Any = None,
     admin_client: Any = None,
+    store_url: str | None = None,
 ) -> dict[str, int]:
     """One idempotent pass over every timed subscription. Returns honest
-    counters for the admin summary."""
+    counters for the admin summary. ``store_url`` (§16) makes every renewal
+    nudge actionable — without it the customer is told to renew with nowhere
+    to go."""
     counts = {"reminded": 0, "graced": 0, "expired": 0, "recovered": 0,
               "unclaimed_reminded": 0, "unclaimed_expired": 0}
 
@@ -149,24 +172,27 @@ def sweep_subscription_lifecycle(
                     salla_order_id=sub.salla_order_id,
                 )
                 counts["graced"] += 1
+                grace_phone = _channel_phone(session, sub.tenant_id)
                 if _send_template(
-                    whatsapp_client, _channel_phone(session, sub.tenant_id),
-                    RENEWAL_REMINDER,
+                    whatsapp_client, grace_phone, RENEWAL_REMINDER,
                 ):
                     _mark(session, sub, "renewal_reminder_grace")
+                    _send_renew_link(whatsapp_client, grace_phone, store_url)
             else:
                 days_left = (period_end - now).days
                 for mark_day in REMINDER_DAYS_BEFORE:
                     if days_left < mark_day and not _event_exists(
                         session, sub.id, f"renewal_reminder_d{mark_day}"
                     ):
+                        due_phone = _channel_phone(session, sub.tenant_id)
                         if _send_template(
-                            whatsapp_client,
-                            _channel_phone(session, sub.tenant_id),
-                            RENEWAL_REMINDER,
+                            whatsapp_client, due_phone, RENEWAL_REMINDER,
                         ):
                             _mark(session, sub, f"renewal_reminder_d{mark_day}")
                             counts["reminded"] += 1
+                            _send_renew_link(
+                                whatsapp_client, due_phone, store_url
+                            )
                         break  # one reminder per sweep at most
 
         elif sub.status == sub_states.GRACE:
@@ -186,12 +212,11 @@ def sweep_subscription_lifecycle(
             if now >= recovery_at and not _event_exists(
                 session, sub.id, "recovery_sent"
             ):
-                if _send_template(
-                    whatsapp_client, _channel_phone(session, sub.tenant_id),
-                    RECOVERY,
-                ):
+                rec_phone = _channel_phone(session, sub.tenant_id)
+                if _send_template(whatsapp_client, rec_phone, RECOVERY):
                     _mark(session, sub, "recovery_sent")
                     counts["recovered"] += 1
+                    _send_renew_link(whatsapp_client, rec_phone, store_url)
 
     if admin_client is not None and any(counts.values()):
         try:

@@ -60,6 +60,10 @@ class Settings(BaseSettings):
     salla_product_pricing: str = Field(default="{}", alias="SALLA_PRODUCT_PRICING")
     # captured access-token expiry (ISO date) — manual until auto-refresh lands
     salla_token_expires_at: str = Field(default="", alias="SALLA_TOKEN_EXPIRES_AT")
+    # the storefront the customer renews from (§16). Empty until the store is
+    # published — every message that would carry it degrades to no link
+    # rather than printing a broken one.
+    salla_store_url: str = Field(default="", alias="SALLA_STORE_URL")
 
     # WhatsApp Cloud API (C4). Filled when the Meta app + WABA are set up.
     whatsapp_app_secret: str = Field(default="", alias="WHATSAPP_APP_SECRET")

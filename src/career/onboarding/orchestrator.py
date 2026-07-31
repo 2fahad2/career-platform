@@ -192,6 +192,18 @@ _PRIVACY_COMMANDS = {
 # ── plumbing ─────────────────────────────────────────────────────────────────
 
 
+def _store_url() -> str:
+    """The storefront to renew from (§16), or "" when it is not configured
+    yet — the copy degrades to «أرسل: دعم» rather than printing a broken
+    link. Read lazily so tests and offline paths need no settings."""
+    try:
+        from career.config import get_settings
+
+        return get_settings().salla_store_url
+    except Exception:  # noqa: BLE001 — a missing link must never break a reply
+        return ""
+
+
 def get_journey(session: Session, *, tenant_id: uuid.UUID) -> OnboardingSession:
     journey = session.execute(
         select(OnboardingSession).where(OnboardingSession.tenant_id == tenant_id)
@@ -1174,7 +1186,10 @@ def _handle_privacy_command(
     if command == "status":
         _send(
             session, deps, channel,
-            privacy.subscription_status_summary(session, tenant_id=tenant_id, now=now),
+            privacy.subscription_status_summary(
+                session, tenant_id=tenant_id, now=now,
+                store_url=_store_url(),
+            ),
             now=now,
         )
     elif command == "pause":
