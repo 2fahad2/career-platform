@@ -99,8 +99,13 @@ jobs:
           # paying customer receives, and the byte-determinism test passed or
           # failed on font-cache warmth rather than on our code.
           sudo apt-get install -y fonts-liberation fonts-dejavu-core \
-            fonts-noto-core fonts-noto-naskh-arabic >/dev/null 2>&1 || true
-          fc-cache -f >/dev/null 2>&1 || true
+            fonts-noto-core fonts-noto-naskh-arabic >/dev/null
+          fc-cache -f >/dev/null
+          # fail loudly rather than render in a fallback face: a masked
+          # install is how CI ended up validating a document the customer
+          # never receives
+          fc-list | grep -qi liberation || { echo "Liberation missing"; exit 1; }
+          fc-list | grep -qi naskh || { echo "Noto Naskh missing"; exit 1; }
           shellcheck ops/backup/*.sh scripts/*.sh
 
       - name: Dependency lockfile is present and parseable

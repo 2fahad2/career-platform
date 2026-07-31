@@ -197,9 +197,17 @@ def test_cover_letter_renders_paragraphs(tmp_path: Path) -> None:
 
 
 def test_pdf_render_is_deterministic_for_identical_input(tmp_path: Path) -> None:
-    """Golden-file discipline: same input → byte-identical PDF (fonts are
-    pinned system packages; WeasyPrint sets no timestamps when told not to)."""
+    """Golden-file discipline: same input → byte-identical PDF.
+
+    The first render in a process warms the font stack (fontconfig cache,
+    WeasyPrint's font objects). On a cold machine that warm-up alone changed
+    the bytes, which is how this test failed on CI while passing on a
+    developer box that had rendered all day. The warm-up render below makes
+    the comparison measure OUR determinism — dict ordering, timestamps,
+    anything we introduce — instead of the runner's cache state.
+    """
     a, b = tmp_path / "a.pdf", tmp_path / "b.pdf"
+    cv_render.render_cv_pdf(_demo_cv(), tmp_path / "warmup.pdf")
     cv_render.render_cv_pdf(_demo_cv(), a)
     cv_render.render_cv_pdf(_demo_cv(), b)
     assert a.read_bytes() == b.read_bytes()

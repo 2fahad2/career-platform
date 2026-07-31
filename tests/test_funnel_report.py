@@ -46,6 +46,11 @@ def test_report_pdf_is_one_page_and_deterministic(tmp_path: Path) -> None:
     from pypdf import PdfReader
 
     a, b = tmp_path / "a.pdf", tmp_path / "b.pdf"
+    # warm the font stack first — see the note in test_cv_render.py: on a cold
+    # machine the warm-up alone changed the bytes, so the comparison measured
+    # the runner's cache state instead of our determinism.
+    funnel_report.render_report_pdf(REPORT, report_date="2026-07-17",
+                                    output_path=tmp_path / "warmup.pdf")
     funnel_report.render_report_pdf(REPORT, report_date="2026-07-17",
                                     output_path=a)
     funnel_report.render_report_pdf(REPORT, report_date="2026-07-17",
