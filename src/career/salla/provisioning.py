@@ -14,6 +14,7 @@ only its hash stored).
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -26,7 +27,11 @@ from sqlalchemy.orm import Session
 
 from career.db.models import ActivationToken, Subscription, SubscriptionEvent, Tenant, WebhookEvent
 from career.salla import subscriptions as sub_states
-from career.salla.client import SallaClient
+from career.salla.client import (
+    SallaApiError,
+    SallaAuthError,
+    SallaClient,
+)
 from career.tokens import hash_token, new_activation_token
 
 # product_id -> plan_code (from the Salla store setup; injected).
@@ -43,6 +48,11 @@ class ProvisionStatus(StrEnum):
     PROVISIONED = "provisioned"
     RENEWED = "renewed"
     ALREADY_PROVISIONED = "already_provisioned"
+    #: an already-provisioned order came back canceled/refunded — service off
+    SERVICE_STOPPED = "service_stopped"
+    #: Salla could not be asked (dead token, 5xx, timeout). The event is left
+    #: 'received' and retried; NOTHING about it is final.
+    DEFERRED = "deferred"
     NOT_PAID = "not_paid"
     UNKNOWN_PRODUCT = "unknown_product"
     ORDER_NOT_FOUND = "order_not_found"
@@ -81,6 +91,67 @@ def _mark_webhook(session: Session, webhook_event: WebhookEvent | None, status: 
         webhook_event.attempt_count = webhook_event.attempt_count + 1
 
 
+#: Authoritative Salla status → the order lifecycle event it means. The client
+#: has always computed these two (client._CANCELED / _REFUNDED) and nothing
+#: had ever read them.
+_STATUS_TO_ORDER_EVENT: dict[str, str] = {
+    "canceled": "order.canceled",
+    "refunded": "order.refunded",
+}
+
+
+def _reconcile_existing(
+    owner_session: Session,
+    existing: Subscription,
+    order_id: str,
+    *,
+    salla_client: SallaClient,
+    webhook_event: WebhookEvent | None,
+) -> ProvisionResult:
+    """An event about an order we have already provisioned.
+
+    This used to be a one-line short circuit: mark ``skipped_duplicate`` and
+    return, without ever asking Salla anything. That made the money path
+    asymmetric — ``paid`` was re-verified against the authoritative API while
+    ``canceled``/``refunded`` was believed only if it arrived under its own
+    event name. The one order event this store has actually delivered is
+    ``order.status.updated``, and it is routed to provisioning; a cancellation
+    or a refund carried by it therefore stopped nothing. The customer kept
+    their founding seat, kept entering the nightly query families and kept
+    receiving paid deliveries — with their money already returned.
+
+    So the authoritative status is fetched for the duplicate too, and the same
+    state machine that serves ``order.refunded`` is applied. The idempotency
+    guarantee is untouched: no second subscription is created here under any
+    status, and a subscription already in a terminal state is left alone.
+    """
+    order = salla_client.get_order(order_id)
+    ids = {
+        "subscription_id": str(existing.id),
+        "tenant_id": str(existing.tenant_id),
+    }
+    if order is None:
+        # We cannot see the order that our own subscription claims to come
+        # from. Nothing to do safely, and nothing is destroyed by saying so.
+        logger.error("provisioned order is not visible in salla anymore")
+        _mark_webhook(owner_session, webhook_event, "failed")
+        owner_session.commit()
+        return ProvisionResult(ProvisionStatus.ORDER_NOT_FOUND, **ids)
+
+    event_type = _STATUS_TO_ORDER_EVENT.get(order.status)
+    if event_type is not None and existing.status not in sub_states.TERMINAL_STATES:
+        sub_states.apply_order_lifecycle(
+            owner_session, existing, event_type, salla_order_id=order_id,
+        )
+        _mark_webhook(owner_session, webhook_event, "processed")
+        owner_session.commit()
+        return ProvisionResult(ProvisionStatus.SERVICE_STOPPED, **ids)
+
+    _mark_webhook(owner_session, webhook_event, "skipped_duplicate")
+    owner_session.commit()
+    return ProvisionResult(ProvisionStatus.ALREADY_PROVISIONED, **ids)
+
+
 def provision_order(
     owner_session: Session,
     order_id: str | None,
@@ -101,12 +172,9 @@ def provision_order(
         select(Subscription).where(Subscription.salla_order_id == order_id)
     ).scalar_one_or_none()
     if existing is not None:
-        _mark_webhook(owner_session, webhook_event, "skipped_duplicate")
-        owner_session.commit()
-        return ProvisionResult(
-            ProvisionStatus.ALREADY_PROVISIONED,
-            subscription_id=str(existing.id),
-            tenant_id=str(existing.tenant_id),
+        return _reconcile_existing(
+            owner_session, existing, order_id,
+            salla_client=salla_client, webhook_event=webhook_event,
         )
 
     # Re-verify the order against Salla — authoritative source (never the webhook).
@@ -266,6 +334,136 @@ _PROVISION_EVENTS = frozenset(
 )
 _LIFECYCLE_EVENTS = frozenset(sub_states._ORDER_EVENT_TO_STATE)
 
+#: Salla's own token delivery. We do not consume it (storing a live credential
+#: from a webhook payload is a decision with its own security design), but it
+#: must never pass in silence: it is the ONLY moment a replacement credential
+#: is ever offered to us.
+_AUTHORIZE_EVENT = "app.store.authorize"
+
+#: After Salla refuses or fails us, stop hammering it. The worker loop polls
+#: every 3 seconds; without a pause a dead token means twenty pointless calls
+#: a minute and twenty operator alerts. One minute is short enough that a
+#: renewed token starts working almost immediately and long enough that the
+#: alert reads as one problem, not a flood.
+SALLA_BACKOFF_SECONDS = 60.0
+_NOTIFY_INTERVALS = {"salla_down": SALLA_BACKOFF_SECONDS,
+                     "token_expiring": 12 * 3600.0,
+                     "authorize": 12 * 3600.0}
+_last_notified: dict[str, float] = {}
+_backoff_until: float = 0.0
+
+
+def reset_salla_backoff() -> None:
+    """Clear the process-local backoff and alert timers (tests, and a manual
+    kick after the operator renews the token)."""
+    global _backoff_until
+    _backoff_until = 0.0
+    _last_notified.clear()
+
+
+def _due(key: str) -> bool:
+    """Rate-limit an operator alert without ever suppressing the first one."""
+    now = time.monotonic()
+    last = _last_notified.get(key)
+    if last is not None and now - last < _NOTIFY_INTERVALS[key]:
+        return False
+    _last_notified[key] = now
+    return True
+
+
+def _alert(admin_client: Any, text: str) -> None:
+    if admin_client is None:
+        return
+    try:
+        admin_client.send_admin(text)
+    except Exception:  # noqa: BLE001 — alerting never blocks the money path
+        logger.warning("salla operator alert failed", exc_info=True)
+
+
+def _token_expiry_line() -> str:
+    """The recorded expiry, if the operator wrote one down. Read lazily so
+    tests and offline paths need no settings."""
+    try:
+        from career.config import get_settings
+
+        recorded = (get_settings().salla_token_expires_at or "").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+    return f"\nانتهاء صلاحية التوكن المسجل:\n{recorded}" if recorded else ""
+
+
+#: How long before the recorded expiry the operator starts hearing about it.
+#: A token dies quietly — the first symptom is a paid order that provisions
+#: nothing — so the warning has to arrive while renewing it is still routine.
+TOKEN_EXPIRY_WARN_DAYS = 5
+
+
+def _warn_if_token_expiring(admin_client: Any) -> None:
+    """Say it BEFORE the money path breaks, not after.
+
+    The recorded expiry is a plain date the operator writes down; there is no
+    refresh flow yet (deferred by his own decision). If it is absent or
+    unparseable we say nothing — inventing an alarm from a blank field would
+    train him to ignore the channel. Rate-limited to twice a day by the
+    shared ``_due`` timer, and an expiry already in the past keeps warning,
+    because that is precisely when every new order is being deferred.
+    """
+    from datetime import date
+
+    try:
+        from career.config import get_settings
+
+        recorded = (get_settings().salla_token_expires_at or "").strip()
+        if not recorded:
+            return
+        expires = date.fromisoformat(recorded[:10])
+    except Exception:  # noqa: BLE001 — a malformed note is not an incident
+        return
+
+    days_left = (expires - date.today()).days
+    if days_left > TOKEN_EXPIRY_WARN_DAYS or not _due("token_expiring"):
+        return
+    if days_left < 0:
+        _alert(admin_client, (
+            "🔴 توكن سلة منتهي — الطلبات المدفوعة تنتظر ولا تُزوَّد\n"
+            "جدّده وبيمشي كل شي المحفوظ تلقائيًا"
+            f"{_token_expiry_line()}"
+        ))
+        return
+    _alert(admin_client, (
+        f"⚠️ توكن سلة يخلص خلال {days_left} يومًا — جدّده قبل ما يقف البيع"
+        f"{_token_expiry_line()}"
+    ))
+
+
+def _quarantine(session: Session, ev: WebhookEvent, admin_client: Any) -> None:
+    """Isolate ONE genuinely bad event so it cannot jam the queue (AUDIT ك-19).
+
+    The counterpart of :func:`_defer_webhook`, and the distinction between
+    them is the whole point of this module's error handling: ``failed`` is
+    terminal and nothing in this codebase undoes it, so it is reserved for an
+    event we could actually look at and could not process. A credential or a
+    network problem never lands here — that order is fine and waits.
+    """
+    session.rollback()
+    _mark_webhook(session, ev, "failed")
+    session.commit()
+    logger.error("provisioning crashed for one event", exc_info=True)
+    _alert(admin_client, "🔴 حدث سلة مسموم عُزل — راجع السجل")
+
+
+def _defer_webhook(session: Session, ev: WebhookEvent) -> None:
+    """Leave a paid order exactly where it is.
+
+    The whole point: ``processing_status`` stays 'received', which is the only
+    status ``process_pending_webhooks`` selects, so the event is picked up
+    again on the next pass and provisions itself the moment Salla answers.
+    Nothing here is terminal, nothing is marked processed, nothing is thrown
+    away — only the attempt counter moves, so the operator can see an order
+    that has been waiting.
+    """
+    ev.attempt_count = ev.attempt_count + 1
+
 
 def process_pending_webhooks(
     owner_session: Session,
@@ -283,7 +481,28 @@ def process_pending_webhooks(
     (bypasses RLS) since it spans tenants and creates new ones. On a fresh
     provision it emits the §09 activation deep link to the admin channel so
     the operator can hand it to the buyer (until Salla's thank-you page is
-    wired to build it directly)."""
+    wired to build it directly).
+
+    **A paid order is never destroyed by an infrastructure failure.** Renewing
+    the access token is the operator's job; the failure mode when it lapses is
+    ours, and it used to be the worst one available: get_order raised 401, the
+    blanket poison guard marked the webhook ``failed`` — the one status nothing
+    in this codebase can undo — and told the operator a *poisoned payload* had
+    been quarantined, pointing the investigation at the buyer's order instead
+    of at the credential. No tenant, no subscription, no activation, no welcome
+    message, and no way back short of hand-editing the database. Retryable
+    failures (401/403, 429, 5xx, timeouts) now leave the event untouched and
+    say plainly what is wrong; the orders sit there and provision themselves
+    when the token is renewed.
+    """
+    global _backoff_until
+
+    _warn_if_token_expiring(admin_client)
+    if time.monotonic() < _backoff_until:
+        # Salla just refused or failed us. Asking again this second helps
+        # nobody and buries the alert; the events are all still 'received'.
+        return []
+
     events = list(
         owner_session.execute(
             select(WebhookEvent)
@@ -301,20 +520,41 @@ def process_pending_webhooks(
                     salla_client=salla_client, product_catalog=product_catalog,
                     webhook_event=ev, expected_pricing=expected_pricing,
                 )
+            except SallaApiError as exc:
+                if not exc.retryable:
+                    _quarantine(owner_session, ev, admin_client)
+                    continue
+                # The order is fine. WE are broken. Touch nothing.
+                owner_session.rollback()
+                _defer_webhook(owner_session, ev)
+                owner_session.commit()
+                _backoff_until = time.monotonic() + SALLA_BACKOFF_SECONDS
+                results.append(ProvisionResult(ProvisionStatus.DEFERRED))
+                logger.error("salla unreachable — paid orders deferred, not "
+                             "failed", exc_info=True)
+                if _due("salla_down"):
+                    waiting = int(owner_session.execute(
+                        select(func.count(WebhookEvent.id)).where(
+                            WebhookEvent.processing_status == "received"
+                        )
+                    ).scalar_one())
+                    if isinstance(exc, SallaAuthError):
+                        _alert(admin_client,
+                               "🔴 سلة ترفض بيانات دخولنا — التوكن منتهٍ أو "
+                               "ملغى\nالطلبات المدفوعة محفوظة ولم يُفقد منها "
+                               "شيء، وتُعالج تلقائيًا بمجرد تجديد التوكن\n"
+                               f"أحداث تنتظر الآن: {waiting}"
+                               + _token_expiry_line())
+                    else:
+                        _alert(admin_client,
+                               "🟠 سلة لا تستجيب — الطلبات المدفوعة محفوظة "
+                               "وسنعيد المحاولة تلقائيًا\n"
+                               f"أحداث تنتظر الآن: {waiting}")
+                # every remaining event would hit the same wall
+                break
             except Exception:  # noqa: BLE001 — AUDIT ك-19: a poisoned event
                 # must not jam the whole queue in a 3-second retry loop
-                logger.error("provisioning crashed for one event",
-                             exc_info=True)
-                owner_session.rollback()
-                _mark_webhook(owner_session, ev, "failed")
-                owner_session.commit()
-                if admin_client is not None:
-                    try:
-                        admin_client.send_admin(
-                            "🔴 حدث سلة مسموم عُزل (failed) — راجع السجل"
-                        )
-                    except Exception:  # noqa: BLE001
-                        logger.warning("poison alert failed", exc_info=True)
+                _quarantine(owner_session, ev, admin_client)
                 continue
             if (result.status == ProvisionStatus.AMOUNT_MISMATCH
                     and admin_client is not None):

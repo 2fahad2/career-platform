@@ -44,6 +44,8 @@ from career.whatsapp.delivery import (
     DELIVERY_COMPLETED,
     DELIVERY_PARTIAL,
     DELIVERY_PENDING,
+    RESEND_OPTED_OUT,
+    RESEND_WINDOW_CLOSED,
     record_out,
     resend_pending_delivery,
 )
@@ -72,6 +74,24 @@ RESEND_FAILED_AR = (
     "🔴 حاولنا الإرسال ولم يصل شيء — الحزمة ما زالت محفوظة وتقبل محاولة أخرى"
     "\n{code}"
 )
+#: The exhaustion case. AUDIT: this used to answer with RESEND_PARTIAL_AR
+#: («وصل جزء من الحزمة») although the results list was EMPTY — the operator
+#: read that something reached the customer and stopped investigating while
+#: zero messages had landed. The status alone is not the truth; what landed is.
+RESEND_EXHAUSTED_AR = (
+    "🔴 أعدنا الإرسال ولم يصل شيء للعميل — واستنفدنا المحاولات المسموحة\n"
+    "أغلقنا يومه بحالة فشل واتساب\n{code}"
+)
+#: Refusing a doomed resend. A held bundle is held BECAUSE the window is
+#: shut, and واتساب rejects every free-form message outside it — so trying
+#: would spend one of three attempts to send nothing, and the third would
+#: make the bundle terminal and unclaimable for a customer who taps later.
+RESEND_CLOSED_AR = (
+    "🌙 نافذة الأربع والعشرين ساعة مقفولة — لا نستطيع إعادة الإرسال الآن\n"
+    "الحزمة محفوظة كما هي ولم نستهلك أي محاولة\n"
+    "تنزل تلقائيًا لحظة ما يراسلنا العميل\n{code}"
+)
+RESEND_OPTED_OUT_AR = "🚫 العميل أوقف الرسائل — لن نرسل له شيئًا\n{code}"
 RESEND_NOTHING_AR = "⚪ لا توجد حزمة معلّقة لإعادة إرسالها لهذا العميل\n{code}"
 
 #: The mutating actions the console may perform. pause/resume are pure-DB;
@@ -355,7 +375,7 @@ def _tenant_card(
         .where(CustomerChannel.tenant_id == tenant.id)
     ).first()
     delivery = session.execute(
-        select(Delivery.run_date, Delivery.status)
+        select(Delivery.run_date, Delivery.status, Delivery.bundle)
         .where(Delivery.tenant_id == tenant.id)
         .order_by(Delivery.created_at.desc()).limit(1)
     ).first()
@@ -383,7 +403,7 @@ def _tenant_card(
         )
     ).scalar_one()
     # «إعادة إرسال» is offered ONLY when it can do something: a still-held
-    # bundle, a channel that did not opt out, and a client to send with.
+    # bundle, an OPEN 24h window, and a client to send with.
     held_bundles = session.execute(
         select(func.count()).select_from(Delivery).where(
             Delivery.tenant_id == tenant.id,
@@ -401,10 +421,14 @@ def _tenant_card(
         "journey_state": journey,
         "window": window,
         "held_bundles": int(held_bundles),
+        # AUDIT: the window predicate is not cosmetic. A held bundle is held
+        # BECAUSE the window is shut, so without it the button was offered in
+        # the single most common state, every doomed tap burned one of three
+        # attempts, and the third made the bundle terminal and unclaimable.
         "can_resend": bool(
             whatsapp_client is not None
             and int(held_bundles) > 0
-            and window != "opted_out"
+            and window == "open"
         ),
         # «رد على العميل» is offered whenever there is someone to reply to and
         # a client to send with. A CLOSED window does NOT hide it — the card
@@ -417,8 +441,21 @@ def _tenant_card(
             and channel is not None
             and window != "opted_out"
         ),
+        # what LANDED, not only the status word: a PARTIAL whose delivered
+        # list is empty must never read as «وصل جزء منها» (§15.12).
         "last_delivery": (
-            {"run_date": delivery[0].isoformat(), "status": delivery[1]}
+            {
+                "run_date": delivery[0].isoformat(),
+                "status": delivery[1],
+                "delivered": len(
+                    ((delivery[2] or {}).get("results") or {}).get("delivered")
+                    or []
+                ),
+                "failed": len(
+                    ((delivery[2] or {}).get("results") or {}).get("failed")
+                    or []
+                ),
+            }
             if delivery else None
         ),
         "outcomes": outcomes,
@@ -638,20 +675,29 @@ def _run_action(
     elif action == "resend":
         if whatsapp_client is None:      # no client injected → nothing to do
             return None
-        delivery = resend_pending_delivery(
+        result = resend_pending_delivery(
             session, tenant_id=tenant.id,
             whatsapp_client=whatsapp_client, now=now,
         )
-        # read the status BEFORE the commit expires the instance
-        status = None if delivery is None else str(delivery.status)
+        # read status AND what actually landed BEFORE the commit expires the
+        # instance — the status alone cannot tell PARTIAL-with-something from
+        # PARTIAL-with-nothing, and only one of those is «وصل جزء».
+        status = result.status
+        delivered = result.delivered_groups
         session.commit()
-        if status == DELIVERY_COMPLETED:
+        if result.outcome == RESEND_WINDOW_CLOSED:
+            message = RESEND_CLOSED_AR
+        elif result.outcome == RESEND_OPTED_OUT:
+            message = RESEND_OPTED_OUT_AR
+        elif status == DELIVERY_COMPLETED:
             message = RESEND_DONE_AR
-        elif status == DELIVERY_PARTIAL:
+        elif status == DELIVERY_PARTIAL and delivered:
             message = RESEND_PARTIAL_AR
+        elif status == DELIVERY_PARTIAL:  # terminal, and nothing ever landed
+            message = RESEND_EXHAUSTED_AR
         elif status == DELIVERY_PENDING:
             message = RESEND_FAILED_AR
-        else:                            # nothing claimable (or opted out)
+        else:                            # nothing claimable at all
             message = RESEND_NOTHING_AR
         return code, message.format(code=code)
     session.commit()

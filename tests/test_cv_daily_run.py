@@ -306,6 +306,47 @@ def test_discovery_failed_day(owner_session: Session, clean_billing: None,
         _cleanup(owner_session, tid)
 
 
+class DeadSearchApi:
+    def search(self, params: dict[str, Any]) -> dict[str, Any]:
+        raise ConnectionError("dns is down")
+
+
+class DeadJobSpy:
+    def scrape(self, **kwargs: Any) -> list[dict[str, Any]]:
+        raise ConnectionError("dns is down")
+
+
+def test_a_total_discovery_failure_still_closes_every_tenants_day(
+    owner_session: Session, clean_billing: None, tmp_path: Any
+) -> None:
+    """AUDIT §15.12: DISCOVERY_FAILED was UNREACHABLE in production. The
+    engine returned that status with a hard-coded empty per_tenant map, and
+    the delivery phase — the only writer of day states — runs only when the
+    report carries tenants, so a night where every source died left every
+    paying customer with no row at all for that date. The state above was
+    proven only by a hand-built report shape run_nightly could never emit;
+    this one runs the REAL nightly path with both fetchers dead."""
+    tid, _ = _seed_active_tenant(owner_session)
+    try:
+        report = engine_run.run_nightly(
+            owner_session, searchapi=DeadSearchApi(), jobspy_client=DeadJobSpy(),
+            fetcher=NoFetch(), resolver=None, now=NOW, tenant_ids=[tid],
+        )
+        assert report.status == "discovery_failed"
+        # the report the engine ACTUALLY emits now names the tenants it owes
+        assert list(report.per_tenant) == [tid]
+        assert report.per_tenant[tid]["final"] == []
+
+        deps = _deps(tmp_path)
+        states = daily_run.run_daily_delivery(
+            owner_session, report=report, deps=deps, now=NOW,
+        )
+        assert states[tid].state == "DISCOVERY_FAILED"
+        assert deps.whatsapp_client.sent == []   # a failed night sends nothing
+    finally:
+        _cleanup(owner_session, tid)
+
+
 def test_cv_generation_failure_day(owner_session: Session, clean_billing: None,
                                    tmp_path: Any) -> None:
     class BrokenLlm:

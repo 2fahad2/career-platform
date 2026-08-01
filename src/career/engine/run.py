@@ -334,6 +334,31 @@ def _to_candidate(posting: JobPosting, verdict: GateVerdict) -> RankCandidate:
     )
 
 
+def _tenants_without_results(
+    owner_session: Session, families: list[QueryFamily]
+) -> dict[uuid.UUID, dict[str, Any]]:
+    """Every tenant of tonight's families that has an ACTIVE policy, carrying
+    an empty result. The delivery phase turns each into ONE honest day state;
+    the per-tenant loop below would have produced exactly this shape had
+    discovery returned zero rows instead of dying."""
+    tenant_union: set[uuid.UUID] = set()
+    for family in families:
+        tenant_union.update(family.tenant_ids)
+    if not tenant_union:
+        return {}
+    active = owner_session.execute(
+        select(SearchPolicy.tenant_id).where(
+            SearchPolicy.tenant_id.in_(list(tenant_union)),
+            SearchPolicy.status == "active",
+        )
+    ).scalars().all()
+    empty_counts = {"evaluated": 0, "passed": 0, "near_miss": 0, "suppressed": 0}
+    return {
+        tenant_id: {"final": [], "counts": dict(empty_counts)}
+        for tenant_id in sorted(set(active), key=str)
+    }
+
+
 def run_nightly(
     owner_session: Session,
     *,
@@ -380,7 +405,17 @@ def run_nightly(
     )
     failed_sources = sum(1 for s in sources.values() if s["status"] == "error")
     if failed_sources == len(sources):
-        return _finish("discovery_failed", {})
+        # §15.12 — a night where EVERY source died still owes each tenant its
+        # one honest state. This used to hand back an empty per_tenant map,
+        # and the delivery phase (engine/cli) only runs when the report
+        # carries tenants — so DISCOVERY_FAILED was structurally unreachable
+        # in production and a total-failure night left every paying customer
+        # with no row at all for that date (and skipped the stale-bundle
+        # sweep with it). The tenants are known here; hand them over empty
+        # and the close authority writes DISCOVERY_FAILED for each.
+        return _finish(
+            "discovery_failed", _tenants_without_results(owner_session, families)
+        )
 
     # 3) same-run dedupe (§8.1) + the cheap-retrieval cap.
     # Fairness (audit fix): interleave sources round-robin BEFORE the cap —

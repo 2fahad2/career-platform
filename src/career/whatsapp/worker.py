@@ -39,7 +39,12 @@ from career.whatsapp.activation_flow import (
 )
 from career.whatsapp.client import WhatsAppClient
 from career.whatsapp.delivery import descend_pending_delivery
-from career.whatsapp.inbound import InboundKind, classify_inbound
+from career.whatsapp.inbound import (
+    InboundKind,
+    classify_inbound,
+    has_readable_text,
+    media_ack,
+)
 
 logger = logging.getLogger("career.whatsapp")
 
@@ -67,12 +72,77 @@ _SUPPORT_ACK = (
     "وصلتنا رسالتك 🙏\n"
     "أحد من الفريق بيتواصل معك بأقرب وقت — وأنت اكتب لنا أي وقت"
 )
-#: The last line of defence against silence for an ACTIVE customer.
+#: The last line of defence against silence for a customer who is REALLY on
+#: the daily service — status ACTIVE on a renewable pass, the exact pair
+#: engine/families.py requires to put them in tonight's search. Promising the
+#: morning delivery to anyone else is a lie the system itself contradicts.
 _ACTIVE_FALLBACK = (
     "وصلتني رسالتك 👌\n"
     "أنا معك يوميًا: كل صباح أرسل لك فرصك المختارة ومعها سيرتك جاهزة لها\n"
     "وتقدر تكتب بأي وقت:\n"
     "حالة اشتراكي · وقف مؤقت · تصدير بياناتي · دعم"
+)
+#: A one-shot analysis customer (cv_analysis) is NOT on the daily service and
+#: never will be without buying it — daily_job_limit = 0 by design. Telling
+#: them «أنا معك يوميًا» right after their report reads as an enrolment
+#: confirmation and leaves them waiting every morning for nothing.
+_FUNNEL_FALLBACK = (
+    "وصلتني رسالتك 👌\n"
+    "خدمتك معنا هي تحليل السيرة الذاتية — وتقريرك وصلك\n"
+    "وما أنت مشترك في البحث اليومي، فما راح توصلك فرص كل صباح\n"
+    "وإذا تبي نشتغل عنك يوميًا ونجهّز لك سيرة مخصصة لكل فرصة، أرسل: دعم "
+    "ونرتبها لك\n"
+    "وتقدر تكتب بأي وقت: تصدير بياناتي · حذف بياناتي · دعم"
+)
+#: Paused: the service is off by their own hand, and the fallback used to
+#: offer «وقف مؤقت» a second time without ever naming the way back.
+_PAUSED_FALLBACK = (
+    "وصلتني رسالتك 👌\n"
+    "اشتراكك موقوف مؤقتًا الحين، فما راح توصلك فرص الصباح\n"
+    "وترجع لك من نفس النقطة إذا أرسلت: استئناف\n"
+    "وتقدر تكتب بأي وقت: حالة اشتراكي · تصدير بياناتي · دعم"
+)
+#: Expired / grace / canceled / suspended — service off, and «حالة اشتراكي»
+#: is the reply that already carries the renewal link (privacy §16).
+_INACTIVE_FALLBACK = (
+    "وصلتني رسالتك 👌\n"
+    "اشتراكك غير فعّال حاليًا، فما راح توصلك فرص الصباح\n"
+    "أرسل: حالة اشتراكي — تشوف حالتك وطريقة التجديد\n"
+    "وإذا تبي مساعدة أرسل: دعم"
+)
+#: No live subscription row we can speak for — say exactly that instead of
+#: guessing a service level.
+_UNKNOWN_PLAN_FALLBACK = (
+    "وصلتني رسالتك 👌\n"
+    "ما قدرت أتأكد من حالة اشتراكك من هنا\n"
+    "أرسل: حالة اشتراكي — وإذا ما ظهر شي أرسل: دعم وأحد من الفريق يتابع معك"
+)
+
+#: Media we cannot read. Every branch says the same two true things: your
+#: message arrived, and I cannot open it — then names the next step. §16: the
+#: two Latin format names each sit ALONE on their own line.
+_MEDIA_CONVERSATION = (
+    "\nبس ما أقدر أقرأ إلا النص المكتوب — الصوت والصور والملصقات ما تنفتح عندي\n"
+    "اكتب لي إجابتك نصًا وبنكمل من نفس النقطة 🙏"
+)
+_MEDIA_UPLOAD = (
+    "\nبس ما أقدر أقرأ سيرتك من صورة ولا من رسالة صوتية — أحتاجها ملفًا مرفقًا\n"
+    "أرسلها بإحدى الصيغتين:\n"
+    "PDF\n"
+    "DOCX"
+)
+_MEDIA_ACTIVE = (
+    "\nبس ما أقدر أقرأ إلا النص المكتوب — الصوت والصور والملصقات ما تنفتح عندي\n"
+    "اكتب لي سؤالك نصًا وأنا معك\n"
+    "وإذا تبي تكلم أحد من الفريق أرسل: دعم"
+)
+#: An ACTIVE customer sending a file is almost always sending an updated CV.
+#: We cannot merge it from here — and dropping it silently meant every later
+#: CV was built from the stale profile without anyone knowing.
+_DOCUMENT_ACTIVE = (
+    "وصلني الملف 👌\n"
+    "بس ما أقدر أحدّث ملفك المهني من هنا — ما دخل شي على بياناتك\n"
+    "إذا كان الملف سيرتك الجديدة أرسل: دعم — وأحد من الفريق يحدّثها لك"
 )
 
 
@@ -141,6 +211,49 @@ def _incomplete_journey(session: Session, tenant_id: uuid.UUID) -> OnboardingSes
     if journey is None or journey.state == "ACTIVE":
         return None
     return journey
+
+
+def _fallback_text(session: Session, tenant_id: uuid.UUID) -> str:
+    """The truth about what THIS customer will actually receive.
+
+    The daily service runs for exactly one pair — status ACTIVE on a
+    renewable plan (engine/families.py) — so that is the only pair allowed to
+    hear the daily promise. Everyone else hears their real situation and the
+    real next step.
+    """
+    from career.salla import subscriptions as sub_states
+    from career.salla.renewal import RENEWABLE_PLANS, current_subscription
+
+    try:
+        subscription = current_subscription(session, tenant_id)
+    except Exception:  # noqa: BLE001 — a lookup that fails must not mute us
+        logger.warning("fallback plan lookup failed", exc_info=True)
+        return _UNKNOWN_PLAN_FALLBACK
+    if subscription is None:
+        return _UNKNOWN_PLAN_FALLBACK
+    if subscription.plan_code not in RENEWABLE_PLANS:
+        return _FUNNEL_FALLBACK          # a one-shot analysis, never a service
+    if subscription.status == sub_states.ACTIVE:
+        return _ACTIVE_FALLBACK
+    if subscription.status == sub_states.PAUSED:
+        return _PAUSED_FALLBACK
+    if subscription.status in (sub_states.ONBOARDING, sub_states.PAID_UNCLAIMED,
+                               sub_states.PENDING_PAYMENT):
+        return _UNKNOWN_PLAN_FALLBACK    # setup never finished — don't promise
+    return _INACTIVE_FALLBACK
+
+
+def _media_reply(message_type: str, tail: str) -> str:
+    """Acknowledge what arrived, admit we cannot read it, name the next step."""
+    return media_ack(message_type) + tail
+
+
+def _reply(whatsapp_client: WhatsAppClient, phone: str, body: str) -> None:
+    """An ack must never crash the turn (the inbound is already recorded)."""
+    try:
+        whatsapp_client.send_text(phone, body)
+    except Exception:  # noqa: BLE001
+        logger.warning("customer reply failed", exc_info=True)
 
 
 def _handle_message(
@@ -327,39 +440,60 @@ def _handle_message(
         session.commit()
         return
 
+    # A voice note, a photo, a sticker, a location — the customer said
+    # something, but nothing WE can read. Routing it on as "" is not neutral:
+    # mid-confirmation it is committed as a blank CUSTOMER_CONFIRMED fact
+    # (§15.5 — nothing enters the achievement bank without an explicit human
+    # confirmation) and the question is never asked again. Documents keep
+    # their own real handler; everything else gets the truth.
+    readable = has_readable_text(text_body)
+    is_document = message_type == "document"
+
     funnel = (
         funnel_flow.incomplete_funnel(session, channel.tenant_id)
         if onboarding else None
     )
     if onboarding is not None and funnel is not None:
-        if message_type == "document":
+        if is_document:
             document = msg.get("document", {}) or {}
             funnel_flow.handle_funnel_document(
                 session, channel_id=channel.id,
                 media_id=str(document.get("id", "")),
                 filename=document.get("filename"), deps=onboarding, now=now,
             )
-        else:
+        elif readable and text_body is not None:
             funnel_flow.handle_funnel_text(
-                session, channel_id=channel.id, text=text_body or "",
+                session, channel_id=channel.id, text=text_body,
                 deps=onboarding, now=now,
             )
+        else:
+            _reply(whatsapp_client, channel.phone_e164, _media_reply(
+                message_type,
+                _MEDIA_UPLOAD if funnel.state == funnel_flow.STATE_UPLOAD
+                else _MEDIA_CONVERSATION,
+            ))
         session.commit()
         return
     journey = _incomplete_journey(session, channel.tenant_id) if onboarding else None
     if onboarding is not None and journey is not None:
-        if message_type == "document":
+        if is_document:
             document = msg.get("document", {}) or {}
             orchestrator.handle_document(
                 session, channel_id=channel.id,
                 media_id=str(document.get("id", "")),
                 filename=document.get("filename"), deps=onboarding, now=now,
             )
-        else:
+        elif readable and text_body is not None:
             orchestrator.handle_text(
-                session, channel_id=channel.id, text=text_body or "",
+                session, channel_id=channel.id, text=text_body,
                 deps=onboarding, now=now,
             )
+        else:
+            _reply(whatsapp_client, channel.phone_e164, _media_reply(
+                message_type,
+                _MEDIA_UPLOAD if journey.state == "CV_UPLOAD_PENDING"
+                else _MEDIA_CONVERSATION,
+            ))
     else:
         # audit fix: standing privacy commands must survive ACTIVE (§05/§12)
         if onboarding is not None and text_body and \
@@ -422,12 +556,32 @@ def _handle_message(
 
         # closure audit: an ACTIVE customer who typed anything else got NO
         # reply at all — five realistic messages produced zero outbound. A
-        # paying customer must never wonder whether we are still here.
-        if text_body and landed is None:
+        # paying customer must never wonder whether we are still here. The
+        # reply now tells THIS customer what they will actually receive:
+        # only a live pass hears the daily promise.
+        if landed is None and (readable or effective):
+            # `effective` covers a tap whose payload carried no title — an
+            # intent we could read, just not one we matched.
+            _reply(whatsapp_client, channel.phone_e164,
+                   _fallback_text(session, channel.tenant_id))
+        elif is_document:
+            # the file is not silence-worthy even when a held bundle landed:
+            # an updated CV dropped without a word meant every later CV was
+            # built from the stale profile and nobody knew.
+            _reply(whatsapp_client, channel.phone_e164, _DOCUMENT_ACTIVE)
             try:
-                whatsapp_client.send_text(channel.phone_e164, _ACTIVE_FALLBACK)
-            except Exception:  # noqa: BLE001 — never crash the turn on an ack
-                logger.warning("active fallback reply failed", exc_info=True)
+                admin_client.send_admin(
+                    f"📎 عميل أرسل ملفًا بعد التفعيل "
+                    f"{_ten_code(session, channel.tenant_id)} — "
+                    "قد تكون سيرة محدّثة، راجعه"
+                )
+            except Exception:  # noqa: BLE001 — alerting never blocks the reply
+                logger.warning("document notice failed", exc_info=True)
+        elif landed is None:
+            # a voice note / photo / sticker from a paying customer: the same
+            # silence, one type further out — answered, never pretended.
+            _reply(whatsapp_client, channel.phone_e164,
+                   _media_reply(message_type, _MEDIA_ACTIVE))
     session.commit()
 
 

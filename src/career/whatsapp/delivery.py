@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
 
@@ -20,7 +21,7 @@ from career.db.models import CustomerChannel, Delivery, DeliveryMessage
 from career.whatsapp.adaptive import DeliveryAction, plan_delivery
 from career.whatsapp.client import WhatsAppClient
 from career.whatsapp.templates import TemplateSpec
-from career.whatsapp.window import window_state
+from career.whatsapp.window import WindowState, window_state
 
 logger = logging.getLogger("career.whatsapp")
 
@@ -34,6 +35,38 @@ DELIVERY_PARTIAL = "PARTIAL"      # some job groups failed — honest, never hid
 #: and close it honestly. A customer who taps and gets nothing deserves the
 #: next message to try again — but not forever, and not on every keystroke.
 MAX_DISPATCH_ATTEMPTS = 3
+
+#: The honest outcomes of an operator «إعادة إرسال». A refusal is NOT a
+#: failed attempt: only :data:`RESEND_SENT` ever touches the attempt budget.
+RESEND_SENT = "sent"
+RESEND_NO_BUNDLE = "no_bundle"
+RESEND_OPTED_OUT = "opted_out"
+RESEND_WINDOW_CLOSED = "window_closed"
+
+
+@dataclass(frozen=True)
+class ResendResult:
+    """What the resend did — never just «a Delivery or None».
+
+    The caller has to tell the operator the truth, and «there is nothing to
+    resend» and «we refuse to try because the window is shut» are different
+    truths with different next steps. ``delivery`` is the bundle we looked at
+    (present even on a refusal, so the caller can report on it).
+    """
+
+    outcome: str
+    delivery: Delivery | None = None
+
+    @property
+    def status(self) -> str | None:
+        return None if self.delivery is None else str(self.delivery.status)
+
+    @property
+    def delivered_groups(self) -> list[str]:
+        if self.delivery is None:
+            return []
+        results = self.delivery.bundle.get("results") or {}
+        return [str(g) for g in (results.get("delivered") or [])]
 
 
 def record_out(
@@ -198,16 +231,60 @@ def _dispatch_bundle(
     delivery.completed_at = now
 
 
+def close_day_from_terminal_delivery(
+    session: Session, delivery: Delivery, *, now: datetime
+) -> None:
+    """§15.12 + §15.3: a delivery that reached a TERMINAL status closes its
+    tenant's day and writes the suppression for what actually landed.
+
+    AUDIT (constant 12): this used to live only at the two callers that
+    happened to remember it (the nightly orchestrator and the inbound descend
+    in whatsapp/worker). The operator's resend was a third caller and it
+    remembered nothing — so a resend that LANDED left ``tenant_day_states``
+    with no row for that run_date at all (permanently: the row is no longer
+    PENDING_WINDOW, so neither the descend query nor the stale sweep can ever
+    reach it again), wrote no suppression (the same posting passed the gate
+    again the next night and the identical cached PDF was re-sent), and
+    skipped the day's cost rollup. It now lives INSIDE the dispatch module,
+    next to the status it depends on, so no future caller can forget it.
+    """
+    if delivery.status not in (DELIVERY_COMPLETED, DELIVERY_PARTIAL):
+        return
+    # local imports: career.cv.daily_run imports this module at module scope
+    from career.cv import close as close_mod
+    from career.cv.daily_run import close_from_delivery
+
+    closed = close_from_delivery(session, delivery=delivery, now=now)
+    if closed is None:  # pragma: no cover — guarded by the status check above
+        return
+    try:
+        close_mod.rollup_costs(
+            session, tenant_id=delivery.tenant_id, day=closed.run_date
+        )
+    except Exception:  # noqa: BLE001 — accounting never blocks the close
+        logger.warning("resend cost rollup failed", exc_info=True)
+
+
 def resend_pending_delivery(
     session: Session, *, tenant_id: uuid.UUID,
     whatsapp_client: WhatsAppClient, now: datetime,
-) -> Delivery | None:
+) -> ResendResult:
     """The operator's «إعادة إرسال»: re-attempt today's held bundle.
 
     Until now a delivery that failed after the tap was terminal — there was
-    no retry path anywhere, for the customer OR the operator. This one is
-    deliberately blunt: it re-dispatches whatever is still claimable, and
-    returns None when there is nothing to resend.
+    no retry path anywhere, for the customer OR the operator.
+
+    Two audit fixes are load-bearing here:
+
+    * A held bundle is held precisely because the 24h window was CLOSED. A
+      free-form re-dispatch into a closed window is rejected by Meta for
+      EVERY job, yet the old code counted the attempt anyway — so three taps
+      on the most common held-bundle state (waiting for the morning tap) made
+      the bundle terminal and unclaimable, and a customer who tapped the
+      template later that day received nothing. The window is now checked
+      BEFORE the attempt counter moves, and a refusal costs nothing.
+    * A resend that lands is a delivery like any other: it closes the day and
+      writes suppression (:func:`close_day_from_terminal_delivery`).
     """
     delivery = session.execute(
         select(Delivery)
@@ -216,14 +293,25 @@ def resend_pending_delivery(
         .order_by(Delivery.created_at)
     ).scalars().first()
     if delivery is None:
-        return None
+        return ResendResult(RESEND_NO_BUNDLE)
     channel = session.get(CustomerChannel, delivery.channel_id)
-    if channel is None or channel.opt_out_at is not None:
-        return None
+    if channel is None:
+        return ResendResult(RESEND_NO_BUNDLE)
+    if channel.opt_out_at is not None:
+        return ResendResult(RESEND_OPTED_OUT, delivery)
+    window = window_state(
+        last_inbound_at=channel.last_inbound_at,
+        opt_out_at=channel.opt_out_at, now=now,
+    )
+    if window is not WindowState.OPEN:
+        # No send is possible, so no attempt is spent and nothing is stamped:
+        # the bundle stays exactly as claimable as it was.
+        return ResendResult(RESEND_WINDOW_CLOSED, delivery)
     delivery.opened_at = delivery.opened_at or now
     _dispatch_bundle(session, channel, delivery,
                      whatsapp_client=whatsapp_client, now=now, retry_ok=True)
-    return delivery
+    close_day_from_terminal_delivery(session, delivery, now=now)
+    return ResendResult(RESEND_SENT, delivery)
 
 
 def deliver_adaptive(

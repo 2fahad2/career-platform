@@ -194,17 +194,26 @@ def close_from_delivery(
         return None
     snapshot = delivery.bundle.get("close") or {}
     results = delivery.bundle.get("results") or {}
+    delivered = [str(g) for g in (results.get("delivered") or [])]
+    failed = [str(g) for g in (results.get("failed") or [])]
+    # A bundle carrying no counts snapshot (an older row, or one built outside
+    # this orchestrator) used to read gate_passes=0 — and the state authority
+    # answers NO_MATCHES for zero passes, so a day that actually DELIVERED
+    # jobs would have closed as «لا فرص مطابقة»: flattering and false. The
+    # groups in the bundle are the floor: each one is a gate pass whose CV was
+    # resolved, or it would never have been in the bundle at all (§15.12).
+    in_bundle = len(delivered) + len(failed)
     return close_mod.close_tenant_day(
         session,
         tenant_id=delivery.tenant_id,
         run_date=delivery.run_date,
         now=now,
         discovery_ok=True,
-        gate_passes=int(snapshot.get("gate_passes", 0)),
-        cv_resolved=int(snapshot.get("cv_resolved", 0)),
+        gate_passes=max(int(snapshot.get("gate_passes", 0)), in_bundle),
+        cv_resolved=max(int(snapshot.get("cv_resolved", 0)), in_bundle),
         cv_failed=int(snapshot.get("cv_failed", 0)),
-        delivered_groups=list(results.get("delivered", [])),
-        failed_groups=list(results.get("failed", [])),
+        delivered_groups=delivered,
+        failed_groups=failed,
         suppressor=suppressor,
     )
 
@@ -336,6 +345,11 @@ def _run_tenant(
                     jd_text=str(job["jd_text"]),
                     budget=monthly_budget,
                     forbidden_claims=forbidden,
+                    # §15.8: the bank can carry the customer's own words
+                    # verbatim (a free-text onboarding answer becomes an
+                    # experience title), so their name is stripped too — not
+                    # just the mechanical emails and phone numbers.
+                    known_name=profile.cv_full_name,
                 )
             return publish.publish_cv_pair(
                 deps.storage, tenant_id=str(tenant_id),

@@ -36,12 +36,29 @@ ALL_STATES = frozenset({
 # Service-off terminal states (a refund/cancel/chargeback lands here).
 TERMINAL_STATES = frozenset({CANCELED, REFUNDED, CHARGEBACK})
 
+# A rule, not a table of accidents: **a money reversal beats every internal
+# state.** Refund / cancel / chargeback are facts about the payment, and no
+# state of ours may refuse one — a subscription that cannot record «the money
+# went back» keeps serving a customer who was refunded, and the webhook that
+# said so lands in the poison quarantine. So every non-terminal state below
+# reaches CANCELED, REFUNDED and CHARGEBACK. (PENDING_PAYMENT and SUSPENDED
+# were the two that did not, and both are reachable with real money behind
+# them: a captured payment reversed before we ever saw it paid, and a disputed
+# account parked for review by the renewal path.)
 _ALLOWED: dict[str, frozenset[str]] = {
-    PENDING_PAYMENT: frozenset({PAID_UNCLAIMED, CANCELED, EXPIRED}),
+    PENDING_PAYMENT: frozenset({PAID_UNCLAIMED, CANCELED, REFUNDED, CHARGEBACK, EXPIRED}),
     PAID_UNCLAIMED: frozenset({ONBOARDING, CANCELED, REFUNDED, CHARGEBACK, SUSPENDED, EXPIRED}),
     ONBOARDING: frozenset({ACTIVE, PAUSED, CANCELED, REFUNDED, CHARGEBACK, SUSPENDED, EXPIRED}),
     ACTIVE: frozenset({PAUSED, GRACE, EXPIRED, CANCELED, REFUNDED, CHARGEBACK, SUSPENDED}),
-    PAUSED: frozenset({ACTIVE, EXPIRED, CANCELED, REFUNDED, CHARGEBACK, SUSPENDED}),
+    # PAUSED -> GRACE is legal, deliberately, not an accident of the sweep:
+    # §05 says a pause does NOT extend the period («الوقف المؤقت لا يمدد
+    # المدة»), so a paused period ENDS on exactly the same day an active one
+    # would. It therefore has to end the same way — grace, renewal reminder,
+    # expiry — otherwise PAUSED is terminal in practice: no clock ever left
+    # it, so a customer who paused once was never reminded, never expired,
+    # never billed again, and their PII outlived the published 90 days.
+    # Entering GRACE resumes no service (families.py enrols ACTIVE only).
+    PAUSED: frozenset({ACTIVE, GRACE, EXPIRED, CANCELED, REFUNDED, CHARGEBACK, SUSPENDED}),
     GRACE: frozenset({ACTIVE, EXPIRED, CANCELED, REFUNDED, CHARGEBACK, SUSPENDED}),
     # A refund/cancel/chargeback can arrive long after a period closed —
     # renewals (§16) retire the superseded row to EXPIRED while its order
@@ -51,7 +68,7 @@ _ALLOWED: dict[str, frozenset[str]] = {
     CANCELED: frozenset(),
     REFUNDED: frozenset(),
     CHARGEBACK: frozenset(),
-    SUSPENDED: frozenset({ACTIVE, CANCELED}),
+    SUSPENDED: frozenset({ACTIVE, CANCELED, REFUNDED, CHARGEBACK}),
 }
 
 # Salla order lifecycle event → the target service-off state.

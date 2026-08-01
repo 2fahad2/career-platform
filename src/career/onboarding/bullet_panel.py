@@ -202,6 +202,15 @@ class AnthropicBulletJudge(TokenCounter):  # pragma: no cover — live boundary
     ) -> dict[str, Any]:
         import json
 
+        from career.onboarding.extraction import assert_no_pii
+
+        # The caller (enrichment.handle_answer) strips before it ever gets
+        # here, so this is a CONTRACT CHECK, not a second strip: if the text
+        # arrives dirty, the promise on the store page is already broken and
+        # the right move is to refuse rather than to send it. Cheap, and it
+        # means the judge cannot be re-used from a future path that forgets.
+        assert_no_pii(arabic_answer, known_name=None)
+
         listing = "\n".join(f"[{i}] {c}" for i, c in enumerate(candidates))
         prompt = (
             f"What the job-seeker wrote (Arabic):\n{arabic_answer}\n\n"

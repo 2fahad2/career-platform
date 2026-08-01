@@ -273,3 +273,63 @@ def test_status_summary_names_state_and_days_left(two_tenants: tuple[str, str]) 
         summary = privacy.subscription_status_summary(s, tenant_id=tid, now=NOW)
     assert "نشط" in summary
     assert "21" in summary  # days remaining until period end
+
+
+def test_the_export_is_as_wide_as_the_deletion(owner_session, clean_billing):
+    """§12 grants «الحصول على نسخة منها» over everything personal we hold, and
+    the yardstick is our own deletion list: a table personal enough to DELETE
+    is personal enough to HAND OVER. Seven were missing — the customer got no
+    record of which jobs we sent, which CVs were generated in their name, what
+    they uploaded, or their own messages, while the request was still marked
+    fulfilled.
+
+    This guard is structural on purpose: adding a table to the deletion order
+    without exporting it fails here.
+    """
+    from career.onboarding import privacy as _p
+
+    #: deletion table -> the export section that carries it. A new personal
+    #: table must be given a home here (or an explicit, argued exemption).
+    covered = {
+        "forbidden_claims": "forbidden_claims",
+        "profile_facts": "facts",
+        "customer_profiles": "profile",
+        "career_path_assessments": "assessments",
+        "search_policies": "search_policies",
+        "cv_uploads": "cv_uploads",
+        "documents": "generated_cvs",
+        "funnel_sessions": "funnel_analyses",
+        "delivery_messages": "messages_we_sent",
+        "deliveries": "delivery_days",
+        "inbound_messages": "messages_you_sent",
+        "customer_channels": "channels",
+        # the journey row is process state (which question we were on), not
+        # data ABOUT the customer — its content is already exported as the
+        # profile and the facts it produced.
+        "onboarding_sessions": None,
+    }
+
+    deleted_tables = {m.__tablename__ for m in _p._PERSONAL_DELETION_ORDER}
+    assert deleted_tables <= set(covered), (
+        "a personal table is deleted but has no declared export home: "
+        f"{sorted(deleted_tables - set(covered))}"
+    )
+
+    tid = uuid.uuid4()
+    owner_session.execute(sql_text(
+        "INSERT INTO tenants (id, code) VALUES (:i, :c)"),
+        {"i": str(tid), "c": f"TEN-X{uuid.uuid4().int % 100_000:05d}"})
+    owner_session.commit()
+    try:
+        bundle = _p.export_bundle(owner_session, tenant_id=tid)
+        for table, section in covered.items():
+            if section is None:
+                continue
+            assert section in bundle, (
+                f"{table} is deleted on request but never exported ({section})"
+            )
+    finally:
+        owner_session.rollback()
+        owner_session.execute(sql_text("DELETE FROM tenants WHERE id = :t"),
+                              {"t": str(tid)})
+        owner_session.commit()

@@ -34,7 +34,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from career.db.models import CustomerChannel, Subscription
+from career.db.models import CustomerChannel, Subscription, SubscriptionEvent
 from career.salla import subscriptions as sub_states
 from career.whatsapp.phones import phone_variants
 
@@ -300,9 +300,15 @@ def close_previous(
 ) -> None:
     """Retire the superseded subscription so exactly one row is live.
 
-    Silent no-op when the previous row is already in a state that cannot or
-    need not move (EXPIRED, refunded, disputed) — the trail stays honest
-    either way, and a renewal must never fail because of bookkeeping.
+    The ``renewed`` event is written EVEN when there is no state change to
+    make. It is not decoration: it is the flag the lifecycle sweep reads to
+    know a row was retired by a renewal, and CHANGELOG §16 / D18 both promise
+    every retired row carries one. The old code wrote it only inside the
+    transition, so the commonest come-back shape — lapse to EXPIRED, pay again
+    a few days later — retired the row with no marker at all, and the sweep
+    then sent «نفتقدك» plus a buy link to a customer who had just paid. A
+    renewal must never fail because of bookkeeping, so a row that cannot
+    legally move is marked in place rather than forced.
     """
     if target.needs_review or target.prepaid:
         return
@@ -310,6 +316,17 @@ def close_previous(
     if previous is None:
         return
     if not sub_states.can_transition(previous.status, sub_states.EXPIRED):
+        session.add(SubscriptionEvent(
+            id=uuid.uuid4(),
+            tenant_id=previous.tenant_id,
+            subscription_id=previous.id,
+            event_type="renewed",
+            from_status=previous.status,
+            to_status=previous.status,
+            salla_order_id=salla_order_id,
+            details={"note": "already retired — superseded in place"},
+        ))
+        session.flush()
         return
     sub_states.transition(
         session, previous, sub_states.EXPIRED,

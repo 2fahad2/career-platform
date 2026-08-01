@@ -21,6 +21,7 @@ import json
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import Any
 
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
@@ -135,6 +136,19 @@ def export_bundle(session: Session, *, tenant_id: uuid.UUID) -> dict[str, object
     from career.salla.renewal import current_subscription
 
     subscription = current_subscription(session, tenant_id)
+
+    def _all(model: Any, order: Any) -> list[Any]:
+        return list(session.execute(
+            select(model).where(model.tenant_id == tenant_id).order_by(order)
+        ).scalars().all())
+
+    channels = _all(CustomerChannel, CustomerChannel.created_at)
+    uploads = _all(CvUpload, CvUpload.created_at)
+    documents = _all(Document, Document.created_at)
+    forbidden = _all(ForbiddenClaim, ForbiddenClaim.created_at)
+    deliveries = _all(Delivery, Delivery.run_date)
+    outbound = _all(DeliveryMessage, DeliveryMessage.created_at)
+    inbound = _all(InboundMessage, InboundMessage.received_at)
     funnels = session.execute(
         select(FunnelSession).where(FunnelSession.tenant_id == tenant_id)
         .order_by(FunnelSession.created_at)
@@ -172,8 +186,75 @@ def export_bundle(session: Session, *, tenant_id: uuid.UUID) -> dict[str, object
         ],
         "search_policies": [
             {"version": p.version, "status": p.status,
-             "approved_paths": p.approved_paths, "cities": p.cities}
+             "approved_paths": p.approved_paths, "cities": p.cities,
+             # the privacy page names these to the customer by name —
+             # «راتبك المستهدف» and «الشركات اللي ما تبي سيرتك توصلها»
+             "min_salary_sar": (
+                 str(p.min_salary_sar) if p.min_salary_sar is not None else None
+             ),
+             "unknown_salary_policy": p.unknown_salary_policy,
+             "remote_policy": p.remote_policy,
+             "sectors_preferred": p.sectors_preferred,
+             "sectors_avoided": p.sectors_avoided,
+             "banned_companies": p.banned_companies,
+             "daily_job_limit": p.daily_job_limit}
             for p in policies
+        ],
+        # §12 grants a copy of everything personal we hold, and the privacy
+        # page names «سجل تفاعلك مع الفرص المرسلة» explicitly. The yardstick
+        # is the deletion list: anything personal enough to DELETE is personal
+        # enough to HAND OVER, and seven of those tables were missing — the
+        # customer got no record of which jobs we sent, which they marked
+        # applied, which CVs were generated in their name, or what they
+        # uploaded, while the request was still marked fulfilled.
+        "channels": [
+            {"provider": c.provider, "phone_e164": c.phone_e164,
+             "display_name": c.display_name,
+             "opted_out_at": str(c.opt_out_at) if c.opt_out_at else None,
+             "last_inbound_at": (
+                 str(c.last_inbound_at) if c.last_inbound_at else None
+             ),
+             "created_at": str(c.created_at)}
+            for c in channels
+        ],
+        "cv_uploads": [
+            {"filename": u.original_filename, "status": u.status,
+             "mime_detected": u.mime_detected, "size_bytes": u.size_bytes,
+             "page_count": u.page_count, "scan_status": u.scan_status,
+             "created_at": str(u.created_at)}
+            for u in uploads
+        ],
+        "generated_cvs": [
+            {"storage_key": d.storage_key, "content_type": d.content_type,
+             "size_bytes": d.size_bytes, "status": d.status,
+             "created_at": str(d.created_at)}
+            for d in documents
+        ],
+        "forbidden_claims": [
+            {"claim": fc.claim, "source": fc.source,
+             "created_at": str(fc.created_at)}
+            for fc in forbidden
+        ],
+        "delivery_days": [
+            {"run_date": str(dv.run_date), "status": dv.status,
+             "window_at_start": dv.window_state_at_start,
+             "opened_at": str(dv.opened_at) if dv.opened_at else None,
+             "completed_at": (
+                 str(dv.completed_at) if dv.completed_at else None
+             ),
+             "results": (dv.bundle or {}).get("results")}
+            for dv in deliveries
+        ],
+        "messages_we_sent": [
+            {"kind": dm.kind, "template": dm.template_name,
+             "status": dm.status, "created_at": str(dm.created_at)}
+            for dm in outbound
+        ],
+        "messages_you_sent": [
+            {"classification": im.classification,
+             "message_type": im.message_type, "text": im.text_body,
+             "received_at": str(im.received_at)}
+            for im in inbound
         ],
         "assessments": [
             {"requested_path": x.requested_path, "fit_score": x.fit_score,

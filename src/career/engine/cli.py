@@ -219,6 +219,12 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
         logger.warning("searchapi credit check failed", exc_info=True)
 
     # ── the delivery phase (C7): engine result → CV → WhatsApp → close ──
+    # NOTE this phase is also the ONLY writer of tenant day states (§15.12),
+    # so it must run even on a night that discovered nothing: a
+    # discovery_failed report now carries every active tenant with an empty
+    # result list (engine.run._tenants_without_results), and each one closes
+    # DISCOVERY_FAILED here. No CV is generated and no message is sent on
+    # that path — the empty final list sees to that.
     delivery_phase_ran = bool(
         args.deliver and settings.whatsapp_access_token and report.per_tenant
     )

@@ -487,37 +487,56 @@ def _job(group: str) -> dict[str, Any]:
 
 def _seed_held_bundle(
     session: Session, tenant_id: str, *, jobs: list[dict[str, Any]],
-    opted_out: bool = False,
+    opted_out: bool = False, window_closed: bool = False,
+    attempts: int | None = None,
 ) -> None:
     """A PENDING_WINDOW delivery: the customer tapped nothing / the send
-    failed, so the bundle is still claimable."""
+    failed, so the bundle is still claimable. ``window_closed`` reproduces
+    the ordinary morning state (template sent, customer has not replied yet);
+    ``attempts`` pre-loads the retry counter."""
     import json
 
     channel_id = str(uuid.uuid4())
+    last_inbound = NOW - timedelta(hours=25) if window_closed else NOW
+    bundle: dict[str, Any] = {
+        "grouped": True, "header": "حزمة اليوم", "jobs": jobs,
+        "close": {"gate_passes": len(jobs), "cv_resolved": len(jobs),
+                  "cv_failed": 0},
+    }
+    if attempts is not None:
+        bundle["attempts"] = attempts
     session.execute(sql_text(
         "INSERT INTO customer_channels (id, tenant_id, provider, phone_e164,"
         " last_inbound_at, opt_out_at)"
         " VALUES (:i, :t, 'whatsapp', :p, :l, :o)"),
         {"i": channel_id, "t": tenant_id,
          "p": f"+96650{uuid.uuid4().int % 10**7:07d}",
-         "l": NOW, "o": NOW if opted_out else None})
+         "l": last_inbound, "o": NOW if opted_out else None})
     session.execute(sql_text(
         "INSERT INTO deliveries (id, tenant_id, channel_id, run_date, status,"
         " bundle) VALUES (:i, :t, :c, :d, 'PENDING_WINDOW', :b)"),
         {"i": str(uuid.uuid4()), "t": tenant_id, "c": channel_id,
-         "d": NOW.date().isoformat(),
-         "b": json.dumps({"grouped": True, "header": "حزمة اليوم",
-                          "jobs": jobs})})
+         "d": NOW.date().isoformat(), "b": json.dumps(bundle)})
     session.commit()
 
 
 def _clear_delivery(session: Session, tenant_id: str) -> None:
-    for table in ("delivery_messages", "deliveries", "customer_channels"):
+    for table in ("delivery_messages", "deliveries", "customer_channels",
+                  "tenant_day_states", "tenant_job_suppressions",
+                  "cost_allocations", "usage_events"):
         session.execute(
             sql_text(f"DELETE FROM {table} WHERE tenant_id = :t"),
             {"t": tenant_id},
         )
     session.commit()
+
+
+def _day_state(session: Session, tenant_id: str) -> str | None:
+    row = session.execute(
+        sql_text("SELECT state FROM tenant_day_states WHERE tenant_id = :t"),
+        {"t": tenant_id},
+    ).first()
+    return None if row is None else str(row[0])
 
 
 def _code_of(session: Session, tenant_id: str) -> str:
@@ -753,6 +772,8 @@ def test_resend_replies_and_confirm_card_are_direction_pure(
             template.format(code=code) for template in (
                 console.RESEND_DONE_AR, console.RESEND_PARTIAL_AR,
                 console.RESEND_FAILED_AR, console.RESEND_NOTHING_AR,
+                console.RESEND_EXHAUSTED_AR, console.RESEND_CLOSED_AR,
+                console.RESEND_OPTED_OUT_AR,
             )
         ]
         for text in texts:
@@ -1170,3 +1191,154 @@ def test_today_screen_lines_are_direction_pure_where_arabic() -> None:
     for line in text.splitlines():
         if arabic.search(line):
             assert not latin_or_digit.search(line), line
+
+
+# ── the delivery day must close with the truth, whoever closed it ────────────
+
+_JOB_URL = "https://careers.example.test/j/77"
+
+
+def test_resend_button_is_hidden_while_the_window_is_closed(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """AUDIT: a held bundle is held BECAUSE the window is shut, and واتساب
+    rejects every free-form message outside it — so the button used to be
+    offered in the one state it could never serve, and each doomed tap spent
+    one of three attempts. The card now says what is held and why it waits,
+    and the action is refused even if a stale callback arrives."""
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    _seed_held_bundle(owner_session, t1, jobs=[_job("g1")], window_closed=True)
+    try:
+        card = handle_update(
+            owner_session, _cbq(ADMIN, f"v1|tenant|{code}"),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+            whatsapp_client=_fake_wa(),
+        )
+        assert f"v1|act|{code}|resend" not in _buttons(card[1])
+        assert "حزمة محفوظة" in card[1].text        # the fact is not hidden
+        assert "النافذة مقفولة" in card[1].text     # …and the reason is given
+        refused = handle_update(
+            owner_session, _cbq(ADMIN, f"v1|act|{code}|resend"),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+            whatsapp_client=_fake_wa(),
+        )
+        assert [o.kind for o in refused] == ["ack"]
+    finally:
+        _clear_delivery(owner_session, t1)
+
+
+def test_a_window_that_closes_mid_confirm_refuses_and_costs_nothing(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """The window can shut between minting the confirm card and the tap —
+    re-checked at SEND time, refused out loud, and the attempt budget is
+    untouched so the bundle is still there when the customer replies."""
+    import career.telegram.console as console
+
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    _seed_held_bundle(owner_session, t1, jobs=[_job("g1")])
+    wa = _fake_wa()
+    try:
+        act = handle_update(
+            owner_session, _cbq(ADMIN, f"v1|act|{code}|resend"),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+            whatsapp_client=wa,
+        )
+        owner_session.execute(sql_text(
+            "UPDATE customer_channels SET last_inbound_at = :l"
+            " WHERE tenant_id = :t"),
+            {"l": NOW - timedelta(hours=25), "t": t1})
+        owner_session.commit()
+
+        done = handle_update(
+            owner_session, _cbq(ADMIN, act[1].keyboard[0][0][1]),
+            admin_chat_id=ADMIN, probes=FakeProbes(),
+            now=NOW + timedelta(minutes=1), whatsapp_client=wa,
+        )
+        assert console.RESEND_CLOSED_AR.format(code=code) in done[1].text
+        assert not wa.sent
+        row = owner_session.execute(sql_text(
+            "SELECT status, bundle FROM deliveries WHERE tenant_id = :t"),
+            {"t": t1}).one()
+        assert row[0] == "PENDING_WINDOW"
+        assert "attempts" not in row[1]           # no attempt was consumed
+    finally:
+        _clear_delivery(owner_session, t1)
+
+
+def test_a_landed_console_resend_closes_the_day_and_suppresses(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """AUDIT §15.12: the operator's resend used to deliver card+CV and leave
+    the run_date with no state row at all — permanently, since the delivery
+    is no longer PENDING_WINDOW — and wrote no suppression, so the same job
+    and the same cached PDF were sent again the next night."""
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    _seed_held_bundle(owner_session, t1, jobs=[_job(_JOB_URL)])
+    wa = _fake_wa()
+    try:
+        assert _day_state(owner_session, t1) is None
+        act = handle_update(
+            owner_session, _cbq(ADMIN, f"v1|act|{code}|resend"),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+            whatsapp_client=wa,
+        )
+        handle_update(
+            owner_session, _cbq(ADMIN, act[1].keyboard[0][0][1]),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+            whatsapp_client=wa,
+        )
+        assert _day_state(owner_session, t1) == "DELIVERED"
+        suppressed = owner_session.execute(sql_text(
+            "SELECT count(*) FROM tenant_job_suppressions WHERE tenant_id = :t"),
+            {"t": t1}).scalar_one()
+        assert suppressed == 1
+    finally:
+        _clear_delivery(owner_session, t1)
+
+
+def test_an_exhausted_resend_is_never_reported_as_partly_arrived(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """AUDIT: the third zero-delivery attempt stamps PARTIAL with an EMPTY
+    delivered list. The operator was told «وصل جزء من الحزمة» and stopped
+    investigating while nothing at all had landed — and the burned day got no
+    state. Now the reply reports the truth and the day closes WHATSAPP_FAILED.
+    """
+    import career.telegram.console as console
+
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    # two attempts already spent — this tap is the last one
+    _seed_held_bundle(owner_session, t1, jobs=[_job("g1")], attempts=2)
+    wa = _fake_wa()
+
+    def dead_text(to_phone: str, body: str) -> str:
+        raise RuntimeError("graph is down")
+
+    wa.send_text = dead_text                 # type: ignore[method-assign]
+    try:
+        act = handle_update(
+            owner_session, _cbq(ADMIN, f"v1|act|{code}|resend"),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+            whatsapp_client=wa,
+        )
+        done = handle_update(
+            owner_session, _cbq(ADMIN, act[1].keyboard[0][0][1]),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+            whatsapp_client=wa,
+        )
+        assert console.RESEND_EXHAUSTED_AR.format(code=code) in done[1].text
+        assert "وصل جزء" not in done[1].text
+        status = owner_session.execute(sql_text(
+            "SELECT status FROM deliveries WHERE tenant_id = :t"),
+            {"t": t1}).scalar_one()
+        assert status == "PARTIAL"
+        # the card beneath the reply must not contradict it either
+        assert "لم يصل منها شيء" in done[1].text
+        assert _day_state(owner_session, t1) == "WHATSAPP_FAILED"
+    finally:
+        _clear_delivery(owner_session, t1)

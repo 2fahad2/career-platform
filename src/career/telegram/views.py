@@ -176,6 +176,29 @@ _WINDOW_AR = {
     "opted_out": "🚫 أوقف الرسائل",
 }
 
+#: The delivery status word, said in Arabic. A raw Latin status inside an
+#: Arabic line is scrambled by the operator's client, and «PARTIAL» told them
+#: nothing about whether anything actually reached the customer.
+_DELIVERY_AR = {
+    "COMPLETED": "✅ وصلت كاملة",
+    "PARTIAL": "🟠 وصل جزء منها",
+    "PENDING_WINDOW": "⏳ محفوظة بانتظار فتح النافذة",
+    "OPENED": "⏳ قيد الإرسال",
+    "NO_SEND": "🚫 لم تُرسل — العميل أوقف الرسائل",
+    "EXPIRED_WINDOW": "⌛ انتهت مهلتها دون تسليم",
+}
+
+
+def _delivery_ar(last: dict[str, Any]) -> str:
+    """The honest one-liner for the last delivery. A PARTIAL that delivered
+    NOTHING is a failure, not a partial success — the operator must not read
+    «وصل جزء منها» when zero messages landed (§15.12)."""
+    status = str(last.get("status"))
+    delivered = last.get("delivered")
+    if status == "PARTIAL" and delivered is not None and int(delivered) == 0:
+        return "🔴 لم يصل منها شيء"
+    return _DELIVERY_AR.get(status, status)
+
 
 def _plan(code: str | None) -> str:
     return _PLAN_AR.get(str(code), str(code or "—"))
@@ -231,7 +254,10 @@ def render_tenant_card(card: dict[str, Any]) -> tuple[str, Keyboard]:
         lines.append("الواتساب: " + _WINDOW_AR.get(str(window), str(window)))
     last = card.get("last_delivery")
     if last:
-        lines.append(f"آخر تسليمة: {last['run_date']} · {last['status']}")
+        # date on its own line: a Latin digit inside an Arabic line scrambles
+        lines.append("آخر تسليمة")
+        lines.append(str(last["run_date"]))
+        lines.append(_delivery_ar(last))
     else:
         lines.append("آخر تسليمة: لا تسليمات بعد")
     outcomes = card.get("outcomes") or {}
@@ -247,8 +273,12 @@ def render_tenant_card(card: dict[str, Any]) -> tuple[str, Keyboard]:
             f"⏱ دقائق دعم: {support_min or 0}"
             f" · 👁 مراجعات بشرية: {review_count or 0}"
         )
-    if card.get("can_resend"):
+    # a held bundle is reported whether or not it can be re-attempted right
+    # now — and when it cannot, the card says why instead of hiding the fact
+    if card.get("held_bundles"):
         lines.append("📤 توجد حزمة محفوظة لم تُسلَّم بعد")
+        if str(card.get("window")) != "open":
+            lines.append("لا يمكن إعادة إرسالها والنافذة مقفولة — تنزل حين يراسلنا")
     # the mutating action depends on the subscription state (design doc §4)
     if str(card.get("sub_status")) == "PAUSED":
         action_button = ("▶️ استئناف الخدمة", f"v1|act|{code}|resume")

@@ -32,7 +32,7 @@ bad() {
 }
 section() { printf '\n▶ %s\n' "$1"; }
 
-section "1. secrets file present"
+section "1. secrets file present and locked down"
 if [[ -s "$ENV_FILE" ]]; then
   # Count key NAMES only — this script never reads or prints a value.
   keys=$(grep -cE '^[A-Za-z_][A-Za-z0-9_]*=' "$ENV_FILE")
@@ -40,6 +40,16 @@ if [[ -s "$ENV_FILE" ]]; then
     pass "$ENV_FILE has $keys keys"
   else
     bad "$ENV_FILE has only $keys keys — expected 30+, some are missing"
+  fi
+  # The rebuild procedure ends this file at 0600 (runbook step six). A live
+  # host that drifted looser than the rebuild is the asymmetry worth catching:
+  # every provider credential sits in here, and /root being 0700 is then the
+  # only thing between them and any non-root process.
+  mode=$(stat -c '%a' "$ENV_FILE" 2>/dev/null)
+  if [[ "$mode" == "600" ]]; then
+    pass "$ENV_FILE mode $mode (owner-only, as the runbook sets it)"
+  else
+    bad "$ENV_FILE mode $mode — expected 600 (run: chmod 600 $ENV_FILE)"
   fi
 else
   bad "$ENV_FILE missing or empty — nothing will start without it"
@@ -210,6 +220,26 @@ if [[ -s "$BACKUP_ENV" ]]; then
   fi
 else
   bad "$BACKUP_ENV missing — the new server is running with NO backups"
+fi
+
+section "9. document fonts installed on the host"
+# The delivery worker and the funnel both render on the HOST venv, not inside
+# the api container, so the host font set decides what a customer receives.
+# fontconfig never fails — it substitutes silently — so the only honest test
+# is whether it hands back the family we asked for. Without this a server
+# rebuilt from the runbook draws every CV and every Arabic report in a
+# fallback face, and every other check on this page still passes.
+if command -v fc-match >/dev/null 2>&1; then
+  for family in "Liberation Sans" "Noto Naskh Arabic" "DejaVu Sans"; do
+    got=$(fc-match -f '%{family}' "$family" 2>/dev/null)
+    if [[ ",${got}," == *",${family},"* || "$got" == "$family" ]]; then
+      pass "font '$family' resolves to itself"
+    else
+      bad "font '$family' MISSING — fontconfig substitutes '$got'; documents render in the wrong face (apt-get install -y fonts-liberation fonts-dejavu-core fonts-noto-core)"
+    fi
+  done
+else
+  bad "fc-match absent — fontconfig is not installed, so no document can be rendered"
 fi
 
 if [[ $fail -eq 0 ]]; then

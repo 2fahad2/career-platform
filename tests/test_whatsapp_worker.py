@@ -343,3 +343,290 @@ def test_resume_does_not_swallow_the_privacy_command(owner_session, clean_billin
 
     # …but NOT consumed by the resume branch when nothing was silenced
     assert len(wa.sent) > before
+
+
+# ── a non-text message is never silence, and never a fact ───────────────────
+# Theme: a paying customer must never be met with silence or with a lie.
+# A voice note is the most natural reply in Saudi WhatsApp; it used to be
+# routed into the conversation as "" — discarding the answer, committing a
+# BLANK «customer-confirmed» row into the achievement bank (§15.5) — or, once
+# ACTIVE, to produce no outbound at all.
+
+
+def _media_msg(phone: str, mtype: str, body: Any = None) -> dict[str, Any]:
+    """A realistic Meta media payload: the type carries no readable text."""
+    return {
+        "id": f"wamid.{uuid.uuid4().hex}", "from": phone, "type": mtype,
+        mtype: body if body is not None else {"id": f"media-{uuid.uuid4().hex}"},
+    }
+
+
+def _start_journey(owner_session: Session, wa: Any, deps: Any) -> str:
+    """Activate a real pass through the worker so the journey row exists."""
+    from career.whatsapp.worker import _handle_message
+
+    token = _provision_token(owner_session)
+    phone = _phone()
+    _handle_message(owner_session, _text_msg(f"wamid-{uuid.uuid4()}", phone,
+                                             f"تفعيل {token}"),
+                    whatsapp_client=wa, admin_client=FakeTelegramAdminClient(),
+                    now=NOW, onboarding=deps)
+    owner_session.commit()
+    return phone
+
+
+def _set_journey(owner_session: Session, phone: str, state: str,
+                 context: str = "{}") -> None:
+    owner_session.execute(text(
+        "UPDATE onboarding_sessions o SET state = :s, context = CAST(:c AS jsonb)"
+        " FROM customer_channels c WHERE c.tenant_id = o.tenant_id"
+        " AND c.phone_e164 = :p"),
+        {"s": state, "c": context, "p": phone})
+    owner_session.commit()
+
+
+def _set_subscription(owner_session: Session, phone: str, *,
+                      plan_code: str | None = None,
+                      status: str | None = None) -> None:
+    if plan_code is not None:
+        owner_session.execute(text(
+            "UPDATE subscriptions s SET plan_code = :v FROM customer_channels c"
+            " WHERE c.tenant_id = s.tenant_id AND c.phone_e164 = :p"),
+            {"v": plan_code, "p": phone})
+    if status is not None:
+        owner_session.execute(text(
+            "UPDATE subscriptions s SET status = :v FROM customer_channels c"
+            " WHERE c.tenant_id = s.tenant_id AND c.phone_e164 = :p"),
+            {"v": status, "p": phone})
+    owner_session.commit()
+
+
+def _fact_rows(owner_session: Session, phone: str) -> list[Any]:
+    return list(owner_session.execute(text(
+        "SELECT f.category, f.payload::text, f.status, f.source"
+        " FROM profile_facts f JOIN customer_channels c"
+        " ON c.tenant_id = f.tenant_id WHERE c.phone_e164 = :p"), {"p": phone}))
+
+
+def _deliver(owner_session: Session, phone: str, msg: dict[str, Any],
+             wa: Any, admin: Any, deps: Any = None) -> None:
+    from career.whatsapp.worker import _handle_message
+
+    _handle_message(owner_session, msg, whatsapp_client=wa,
+                    admin_client=admin, now=NOW, onboarding=deps)
+    owner_session.commit()
+
+
+def test_a_voice_note_never_becomes_a_confirmed_fact(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """§15.5: nothing enters the achievement bank without an explicit human
+    confirmation. Mid-confirmation the gap answer was taken from the message
+    BODY — and a voice note / sticker has none, so an empty
+    CUSTOMER_CONFIRMED experience was committed, the customer's real answer
+    was discarded, and the mandatory question was never asked again."""
+    wa = FakeWhatsAppClient()
+    deps = _worker_deps(wa)
+    admin = FakeTelegramAdminClient()
+    phone = _start_journey(owner_session, wa, deps)
+    _set_journey(owner_session, phone, "PROFILE_CONFIRMATION",
+                 '{"awaiting_gap": "experience"}')
+
+    before = len(wa.sent)
+    for mtype in ("audio", "sticker", "image"):
+        _deliver(owner_session, phone, _media_msg(phone, mtype), wa, admin, deps)
+
+    assert _fact_rows(owner_session, phone) == [], \
+        "a message with no words became a customer-confirmed fact"
+    still = owner_session.execute(text(
+        "SELECT o.context ->> 'awaiting_gap' FROM onboarding_sessions o"
+        " JOIN customer_channels c ON c.tenant_id = o.tenant_id"
+        " WHERE c.phone_e164 = :p"), {"p": phone}).scalar_one()
+    assert still == "experience", "the question was marked answered by silence"
+    replies = [m.body or "" for m in wa.sent[before:]]
+    assert len(replies) == 3, "the customer was met with silence"
+    assert all("ما أقدر أقرأ إلا النص المكتوب" in r for r in replies)
+    assert "وصلتني رسالتك الصوتية" in replies[0]      # grammatical per type
+    assert "وصلني الملصق" in replies[1]
+    assert "وصلتني الصورة" in replies[2]
+
+
+def test_a_photo_of_a_cv_is_answered_with_the_real_next_step(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """Photographing the CV is what people actually do. We cannot read it —
+    say so, and name the two formats we can."""
+    wa = FakeWhatsAppClient()
+    deps = _worker_deps(wa)
+    phone = _start_journey(owner_session, wa, deps)
+    _set_journey(owner_session, phone, "CV_UPLOAD_PENDING")
+
+    before = len(wa.sent)
+    _deliver(owner_session, phone, _media_msg(phone, "image"), wa,
+             FakeTelegramAdminClient(), deps)
+    reply = (wa.sent[-1].body or "")
+    assert len(wa.sent) > before
+    assert "أحتاجها ملفًا مرفقًا" in reply
+    assert "PDF" in reply and "DOCX" in reply
+
+
+def test_every_non_text_shape_from_an_active_customer_is_answered(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """The closure audit's fix covered TEXT only: image, voice, sticker,
+    location, video, contacts, reaction and Meta's `unsupported` all produced
+    zero outbound for a paying ACTIVE customer, indefinitely."""
+    wa = FakeWhatsAppClient()
+    deps = _worker_deps(wa)
+    phone = _start_journey(owner_session, wa, deps)
+    _set_journey(owner_session, phone, "ACTIVE")
+    _set_subscription(owner_session, phone, status="ACTIVE")
+
+    shapes = ["image", "audio", "sticker", "location", "video", "contacts",
+              "reaction", "unsupported"]
+    for mtype in shapes:
+        before = len(wa.sent)
+        _deliver(owner_session, phone, _media_msg(phone, mtype), wa,
+                 FakeTelegramAdminClient(), deps)
+        assert len(wa.sent) > before, f"{mtype} from a paying customer: silence"
+        body = wa.sent[-1].body or ""
+        assert "وصل" in body and "ما أقدر أقرأ إلا النص المكتوب" in body
+        assert "دعم" in body                     # the way to a human, always
+
+
+def test_a_document_from_an_active_customer_is_not_swallowed(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """An ACTIVE customer sending a file is sending an updated CV. It was
+    recorded as 'other' and dropped: every later CV kept being built from the
+    stale profile, and nobody — customer or operator — was told."""
+    wa = FakeWhatsAppClient()
+    deps = _worker_deps(wa)
+    admin = FakeTelegramAdminClient()
+    phone = _start_journey(owner_session, wa, deps)
+    _set_journey(owner_session, phone, "ACTIVE")
+    _set_subscription(owner_session, phone, status="ACTIVE")
+    admin.messages.clear()
+
+    before = len(wa.sent)
+    _deliver(owner_session, phone,
+             _media_msg(phone, "document",
+                        {"id": "media-1", "filename": "cv.pdf"}),
+             wa, admin, deps)
+    reply = wa.sent[-1].body or ""
+    assert len(wa.sent) > before
+    assert "ما دخل شي على بياناتك" in reply       # no invented capability
+    assert "دعم" in reply
+    assert len(admin.messages) == 1               # the operator hears the intent
+    assert "TEN-" in admin.messages[0]
+    assert phone.lstrip("+") not in admin.messages[0]   # §15.13 no PII
+
+
+# ── the fallback must tell each customer the truth ──────────────────────────
+
+_DAILY_PROMISE = "أنا معك يوميًا"
+
+
+def _fallback_for(owner_session: Session, phone: str, wa: Any, deps: Any) -> str:
+    before = len(wa.sent)
+    _deliver(owner_session, phone,
+             _text_msg(f"wamid-{uuid.uuid4()}", phone, "شكرًا، وش الخطوة الجاية؟"),
+             wa, FakeTelegramAdminClient(), deps)
+    assert len(wa.sent) > before, "no reply at all"
+    return wa.sent[-1].body or ""
+
+
+def test_the_daily_promise_survives_for_a_live_pass(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """Guard against over-correcting: a real ACTIVE pass IS on the daily
+    service (engine/families.py) and must keep hearing so."""
+    wa = FakeWhatsAppClient()
+    deps = _worker_deps(wa)
+    phone = _start_journey(owner_session, wa, deps)
+    _set_journey(owner_session, phone, "ACTIVE")
+    _set_subscription(owner_session, phone, status="ACTIVE")
+    assert _DAILY_PROMISE in _fallback_for(owner_session, phone, wa, deps)
+
+
+def test_the_fallback_never_promises_a_daily_service_to_a_funnel_customer(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """cv_analysis is a one-shot 29-riyal report — daily_job_limit = 0 by
+    design, excluded from tonight's families. «أنا معك يوميًا» right after
+    their report reads as an enrolment they never bought, and they wait every
+    morning for a delivery that can never come."""
+    wa = FakeWhatsAppClient()
+    deps = _worker_deps(wa)
+    phone = _start_journey(owner_session, wa, deps)
+    _set_journey(owner_session, phone, "ACTIVE")
+    _set_subscription(owner_session, phone, plan_code="cv_analysis",
+                      status="ONBOARDING")
+    reply = _fallback_for(owner_session, phone, wa, deps)
+    assert _DAILY_PROMISE not in reply
+    assert "ما راح توصلك فرص كل صباح" in reply
+    assert "تحليل السيرة الذاتية" in reply
+    assert "دعم" in reply
+
+
+def test_the_fallback_tells_a_paused_customer_they_are_paused(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """A paused customer was promised the morning delivery their own pause
+    stopped — and offered «وقف مؤقت» a second time, with no way back named."""
+    wa = FakeWhatsAppClient()
+    deps = _worker_deps(wa)
+    phone = _start_journey(owner_session, wa, deps)
+    _set_journey(owner_session, phone, "ACTIVE")
+    _set_subscription(owner_session, phone, status="PAUSED")
+    reply = _fallback_for(owner_session, phone, wa, deps)
+    assert _DAILY_PROMISE not in reply
+    assert "موقوف مؤقتًا" in reply
+    assert "استئناف" in reply                     # the way back, named
+    assert "وقف مؤقت" not in reply                # never offered twice
+
+
+def test_the_fallback_tells_an_expired_customer_to_renew(
+    owner_session: Session, clean_billing: None
+) -> None:
+    wa = FakeWhatsAppClient()
+    deps = _worker_deps(wa)
+    phone = _start_journey(owner_session, wa, deps)
+    _set_journey(owner_session, phone, "ACTIVE")
+    _set_subscription(owner_session, phone, status="EXPIRED")
+    reply = _fallback_for(owner_session, phone, wa, deps)
+    assert _DAILY_PROMISE not in reply
+    assert "غير فعّال حاليًا" in reply
+    assert "حالة اشتراكي" in reply                # carries the renewal link
+
+
+def test_every_customer_reply_is_direction_pure() -> None:
+    """§16 / Fahad's client: a line mixing Arabic with Latin letters, digits
+    or a URL is scrambled on delivery. Every reply the worker can send — and
+    every media acknowledgement — is checked line by line."""
+    import re
+
+    from career.whatsapp import inbound as wa_inbound
+    from career.whatsapp import worker as wa_worker
+
+    arabic = re.compile(r"[؀-ۿ]")
+    latin = re.compile(r"[A-Za-z0-9]")
+
+    bodies: list[tuple[str, str]] = []
+    for module in (wa_worker, wa_inbound):
+        for name, value in vars(module).items():
+            if name.startswith("__") or not name.isupper() and not name.startswith("_"):
+                continue
+            if isinstance(value, str):
+                bodies.append((name, value))
+            elif isinstance(value, dict):
+                bodies.extend(
+                    (name, v) for v in value.values() if isinstance(v, str)
+                )
+    assert bodies
+    for name, body in bodies:
+        for line in body.splitlines():
+            if arabic.search(line) and latin.search(line):
+                raise AssertionError(
+                    f"{name}: mixed-direction line would scramble: {line!r}"
+                )

@@ -36,6 +36,40 @@ class BudgetGuard(Protocol):
     def allow(self) -> tuple[bool, str | None]: ...
 
 
+class PiiGuardedLlm:
+    """§15.8 at the boundary, so no call site can forget it.
+
+    The tailoring chain had NO PII gate at all. It was designed on the
+    assumption that the achievement bank holds no personal data — true for
+    facts extracted from a CV (that extraction is itself stripped), but NOT
+    true for a fact built from a customer's free-text WhatsApp answer, which
+    is stored verbatim as an experience title and then JSON-dumped into the
+    ranking prompt. A customer who answers «أنا فهد وشتغلت مدير فرع» put
+    their own name on the wire.
+
+    Wrapping the client rather than patching three call sites is deliberate:
+    a future prompt added to this chain is gated by construction. A leak is
+    NOT sent — it raises, and every stage of the chain already degrades to
+    its deterministic rules, so the customer still gets a CV. Failing closed
+    costs us a model call; failing open costs us the promise printed on the
+    store page.
+    """
+
+    def __init__(self, inner: LlmClient, *, known_name: str | None = None) -> None:
+        self._inner = inner
+        self._known_name = known_name
+
+    def complete(self, prompt: str) -> str:
+        from career.onboarding.extraction import assert_no_pii, strip_pii
+
+        safe = strip_pii(prompt, known_name=self._known_name).text
+        assert_no_pii(safe, known_name=self._known_name)
+        return self._inner.complete(safe)
+
+    def __getattr__(self, name: str) -> Any:      # token counters, etc.
+        return getattr(self._inner, name)
+
+
 def _budget_allows(budget: BudgetGuard | None) -> bool:
     """Blocked ONLY by an explicit (False, reason) — a guard failure never
     blocks generation (LEGACY §10 client behavior)."""
@@ -450,6 +484,7 @@ def tailor_cv(
     jd_text: str,
     budget: BudgetGuard | None = None,
     forbidden_claims: Sequence[str] = (),
+    known_name: str | None = None,
 ) -> TailoredCV:
     """The §1.8 chain: analyze → rank → pace → skills → variant → humanize →
     enforce → the §1.6 gate → forbidden-claims + pre-render guards. Every LLM
@@ -458,6 +493,10 @@ def tailor_cv(
     from career.cv import enforce, normalize
     from career.cv.validate import validate_pre_render
     from career_core.sentences import validate_summary_quality
+
+    # §15.8: gate the client itself, once, so every prompt in this chain —
+    # including any added later — is stripped before it leaves the process.
+    llm = PiiGuardedLlm(llm, known_name=known_name)
 
     vocabulary = bank_vocabulary(bank)
     analysis = analyze_job(

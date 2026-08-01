@@ -6,6 +6,23 @@ daily template is provided in TWO wordings so its Utility-vs-Marketing
 classification can be tested and the economics built on the approved one.
 
 Free-form service messages inside an open window need no template.
+
+**A button label is a routing decision, not decoration.** A tap arrives as an
+ordinary inbound whose text is the LABEL (worker._text_of reads
+``button.text``), so a label nobody routes is a dead end with a nice name:
+«تجديد الاشتراك» and «العودة» matched no standing command and no outcome
+button, and the customer who tapped the renewal reminder on day 27 was
+answered with the generic «أنا معك يوميًا» — no link, no price, no
+instruction. The two lifecycle templates now carry a label the router already
+understands, so the tap lands on the subscription-status reply, which states
+the days left and prints the renewal route (the store link, or «دعم» while no
+storefront is configured).
+
+That is the fix that works with no other change; the fuller one is to accept
+the natural labels as aliases in ``orchestrator._PRIVACY_COMMANDS`` and give
+the buttons back their marketing wording. Templates are submitted to Meta by
+hand, so any label change here is only real once resubmitted — which is free
+today, since these two are not approved yet.
 """
 
 from __future__ import annotations
@@ -57,19 +74,25 @@ ONBOARDING_REMINDER = TemplateSpec(
     category=TemplateCategory.UTILITY,
     body="لم تكمل إعداد خدمتك بعد. أكمله الآن لنبدأ البحث لك يوميًا.",
 )
+#: The one label the inbound router resolves to a real answer about billing
+#: (orchestrator._PRIVACY_COMMANDS → subscription_status_summary, which prints
+#: the days left AND the way to renew). Every lifecycle template's button uses
+#: it, so no nudge can end in the generic fallback again.
+RENEW_BUTTON_AR = "حالة اشتراكي"
+
 RENEWAL_REMINDER = TemplateSpec(
     name="renewal_reminder",
     language="ar",
     category=TemplateCategory.UTILITY,
     body="اشتراكك ينتهي قريبًا. جدّد الآن لمواصلة استقبال الفرص اليومية.",
-    buttons=("تجديد الاشتراك",),
+    buttons=(RENEW_BUTTON_AR,),
 )
 RECOVERY = TemplateSpec(
     name="recovery",
     language="ar",
     category=TemplateCategory.MARKETING,  # marketing → opt-in list only
     body="نفتقدك! عد إلى مساعد التوظيف وواصل رحلتك نحو الفرصة المناسبة.",
-    buttons=("العودة",),
+    buttons=(RENEW_BUTTON_AR,),
 )
 ZERO_DAY_REPORT = TemplateSpec(
     name="zero_day_report",

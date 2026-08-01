@@ -118,8 +118,12 @@ def test_cv_analysis_one_shot_is_untouched(
     owner_session.commit()
     counts = sweep_subscription_lifecycle(owner_session, now=NOW)
     owner_session.commit()
-    assert counts == {"reminded": 0, "graced": 0, "expired": 0, "recovered": 0,
-                      "unclaimed_reminded": 0, "unclaimed_expired": 0}
+    # the one-shot analysis product has no period to sweep, so EVERY counter
+    # the sweep reports must be zero — asserted over whatever the sweep
+    # currently counts, so a new counter cannot quietly start firing here
+    assert set(counts) >= {"reminded", "graced", "expired", "recovered",
+                           "unclaimed_reminded", "unclaimed_expired"}
+    assert all(v == 0 for v in counts.values()), counts
 
 
 def test_amount_or_currency_mismatch_never_provisions(

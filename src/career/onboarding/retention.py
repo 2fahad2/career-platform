@@ -44,6 +44,14 @@ logger = logging.getLogger("career.retention")
 RETENTION_DAYS_AFTER_END = 90
 
 #: A tenant holding any of these is still our customer — never swept.
+#:
+#: PAUSED is the one that needed re-justifying. It belongs here ONLY because a
+#: paused row is now temporary: the §05 clock runs while a customer is quiet,
+#: and the lifecycle sweep retires a paused row at its period end exactly like
+#: an active one. Before that fix nothing ever left PAUSED, so «still our
+#: customer» silently meant «forever», and the 90-day deletion the customer
+#: ticked before paying could never fire for them. The label is honest again
+#: because the state it names now expires.
 _LIVE_STATES: frozenset[str] = frozenset({
     sub_states.PENDING_PAYMENT, sub_states.PAID_UNCLAIMED,
     sub_states.ONBOARDING, sub_states.ACTIVE, sub_states.PAUSED,
@@ -52,6 +60,27 @@ _LIVE_STATES: frozenset[str] = frozenset({
 
 #: The marker written on the request so a swept tenant is never swept twice.
 SWEEP_MARKER = "retention_sweep_90d"
+
+
+def stale_live_tenants(session: Session, *, now: datetime) -> list[uuid.UUID]:
+    """Tenants excluded by a live LABEL whose paid period ended long ago.
+
+    Deliberately a report, never a deletion. If the lifecycle sweep stops
+    running, or a row is parked SUSPENDED by an operator and forgotten, this
+    tenant is exempt from the 90-day promise for as long as the label sticks —
+    the exact shape of the defect that made PAUSED permanent. Deleting on the
+    strength of a stale label would be the worse mistake (irreversible, and
+    triggered by our own job being down), so the sweep keeps the data and says
+    so out loud instead of keeping it silently.
+    """
+    cutoff = now - timedelta(days=RETENTION_DAYS_AFTER_END)
+    rows = session.execute(
+        select(Subscription.tenant_id)
+        .where(Subscription.status.in_(sorted(_LIVE_STATES)))
+        .group_by(Subscription.tenant_id)
+        .having(func.max(Subscription.current_period_end) < cutoff)
+    ).scalars().all()
+    return list(rows)
 
 
 def due_tenants(session: Session, *, now: datetime) -> list[uuid.UUID]:
@@ -90,7 +119,11 @@ def sweep_retention(
     admin_client: object | None = None,
 ) -> dict[str, int]:
     """One idempotent pass. Returns honest counters for the admin summary."""
-    counts = {"swept": 0, "skipped_empty": 0, "storage_keys": 0}
+    counts = {"swept": 0, "skipped_empty": 0, "storage_keys": 0,
+              # kept past 90 days because a live label outlived its period
+              "stale_live": 0}
+    stale = stale_live_tenants(session, now=now)
+    counts["stale_live"] = len(stale)
 
     for tenant_id in due_tenants(session, now=now):
         # Nothing personal left (an earlier customer-initiated deletion, or a
@@ -129,14 +162,23 @@ def sweep_retention(
         # TEN codes only in the admin channel (§15.13) — and not even that per
         # tenant: a per-customer deletion notice is noise, the total is signal.
 
-    if admin_client is not None and counts["swept"]:
-        try:
-            admin_client.send_admin(  # type: ignore[attr-defined]
+    if admin_client is not None and (counts["swept"] or counts["stale_live"]):
+        lines = []
+        if counts["swept"]:
+            lines.append(
                 "🧹 كنس الاحتفاظ: حُذفت بيانات "
                 f"{counts['swept']} عميل انتهى اشتراكهم قبل أكثر من "
                 f"{RETENTION_DAYS_AFTER_END} يومًا "
                 "(السجلات المالية وسجل الموافقات محفوظة نظاميًا)"
             )
+        if counts["stale_live"]:
+            lines.append(
+                f"⚠️ {counts['stale_live']} حساب ما زال محسوبًا «قائمًا» "
+                "وفترته المدفوعة انتهت من زمان — بياناته محفوظة خارج المهلة "
+                "المعلنة، راجع حالته"
+            )
+        try:
+            admin_client.send_admin("\n".join(lines))  # type: ignore[attr-defined]
         except Exception:  # noqa: BLE001 — notifying never blocks the promise
             logger.warning("retention sweep notice failed", exc_info=True)
     return counts

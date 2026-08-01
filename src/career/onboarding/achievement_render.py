@@ -399,6 +399,16 @@ class AnthropicExamplesWriter(TokenCounter):  # pragma: no cover — live
     def write(self, role_title: str, role_description: str) -> list[str]:
         import json
 
+        from career.onboarding.extraction import assert_no_pii, strip_pii
+
+        # These two strings come straight off a ProfileFact payload, and a
+        # fact built from a customer's free-text answer is stored verbatim —
+        # so «أنا فهد وشتغلت مدير فرع» would have gone to the model as-is.
+        role_title = strip_pii(role_title or "", known_name=None).text
+        role_description = strip_pii(role_description or "", known_name=None).text
+        assert_no_pii(role_title, known_name=None)
+        assert_no_pii(role_description, known_name=None)
+
         prompt = f"الدور: {role_title}\nالوصف: {role_description or '—'}"
         response = self._client.messages.create(
             model=self._model, max_tokens=1024,

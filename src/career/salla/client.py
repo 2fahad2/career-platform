@@ -48,6 +48,40 @@ def _map_status(slug: str, payment_method: str) -> str:
     return "pending"
 
 
+class SallaApiError(Exception):
+    """A call to Salla did not answer usefully.
+
+    ``retryable`` is the load-bearing field: it separates «this order is bad»
+    from «we could not ask». Everything that reached the worker before was one
+    undifferentiated Exception, so a dead access token — a credential problem,
+    fixed in ninety seconds by a human — looked exactly like a poisoned
+    payload and got the same treatment: the paid order's webhook marked
+    ``failed`` forever, no tenant, no subscription, no activation, and an
+    alert pointing the operator at the payload instead of the credential.
+    """
+
+    def __init__(self, message: str, *, retryable: bool) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
+class SallaAuthError(SallaApiError):
+    """401/403 — the token is rejected. Retryable BY DEFINITION: the order is
+    perfectly valid and must wait, untouched, until the credential is
+    renewed."""
+
+    def __init__(self, message: str = "salla rejected our credentials") -> None:
+        super().__init__(message, retryable=True)
+
+
+class SallaUnavailable(SallaApiError):
+    """Rate limit, 5xx, timeout, connection failure — Salla's side or the
+    network. The order is fine; ask again later."""
+
+    def __init__(self, message: str = "salla unavailable") -> None:
+        super().__init__(message, retryable=True)
+
+
 @dataclass(frozen=True)
 class SallaOrder:
     order_id: str
@@ -100,8 +134,31 @@ class HttpSallaClient:
             transport=transport,
         )
 
+    def _get(self, url: str, **kwargs: object) -> httpx.Response:
+        """One place where an HTTP outcome becomes a typed failure.
+
+        404 stays soft (handled by the caller as «no such order»). Everything
+        else that is not our fault — credentials, throttling, Salla's own 5xx,
+        a timeout, a dropped connection — raises a RETRYABLE error, because
+        the money already changed hands and the order must survive to be
+        provisioned once we can ask again.
+        """
+        try:
+            resp = self._client.get(url, **kwargs)  # type: ignore[arg-type]
+        except httpx.TimeoutException as exc:
+            raise SallaUnavailable(f"timeout calling salla: {url}") from exc
+        except httpx.TransportError as exc:
+            raise SallaUnavailable(f"transport error calling salla: {url}") from exc
+        if resp.status_code in (401, 403):
+            raise SallaAuthError(
+                f"salla rejected our credentials ({resp.status_code})"
+            )
+        if resp.status_code == 429 or resp.status_code >= 500:
+            raise SallaUnavailable(f"salla returned {resp.status_code}")
+        return resp
+
     def get_order(self, order_id: str) -> SallaOrder | None:
-        resp = self._client.get(f"/orders/{order_id}")
+        resp = self._get(f"/orders/{order_id}")
         if resp.status_code == 404:
             return None
         resp.raise_for_status()
@@ -114,7 +171,7 @@ class HttpSallaClient:
         currency = str(total.get("currency") or data.get("currency") or "SAR")
         phone = (data.get("customer") or {}).get("mobile")
 
-        items_resp = self._client.get("/orders/items", params={"order_id": order_id})
+        items_resp = self._get("/orders/items", params={"order_id": order_id})
         items_resp.raise_for_status()
         items = items_resp.json().get("data") or []
         first = items[0] if items else {}
