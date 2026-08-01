@@ -58,6 +58,12 @@ _NEEDS_REVIEW: frozenset[str] = frozenset({
     sub_states.CHARGEBACK, sub_states.SUSPENDED,
 })
 
+#: Paying again before the service has actually STARTED. Neither row is
+#: retired; the days are merged into the period stamped at activation.
+_PREPAID_STATES: frozenset[str] = frozenset({
+    sub_states.PAID_UNCLAIMED, sub_states.ONBOARDING,
+})
+
 #: The paid period, mirroring policy._SUBSCRIPTION_DAYS.
 SUBSCRIPTION_DAYS = 30
 
@@ -201,10 +207,19 @@ def find_renewal(
     if not prior:
         return None
     live = prior[0]
-    if live.status == sub_states.PAID_UNCLAIMED:
+    if live.status in _PREPAID_STATES:
         # A prepayment, not a renewal of running service: it keeps the
         # unclaimed status (the first token still activates them) and its
         # days are merged in at activation by merge_prepaid_orders.
+        #
+        # ONBOARDING belongs here for a sharper reason. Retiring a row a
+        # JOURNEY is still using produced two live subscriptions: the renewal
+        # closed the onboarding row EXPIRED, and then «تأكيد وبدء البحث»
+        # revived that same row through policy.activate — so the customer
+        # ended with two ACTIVE rows, and the revived one carried a «renewed»
+        # event, which makes the lifecycle sweep skip it forever: it never
+        # graces, never expires, never reminds. Nothing may retire a
+        # subscription whose onboarding has not finished.
         return RenewalTarget(
             tenant_id=tenant_id, previous_id=live.id,
             previous_status=live.status, period_start=now,

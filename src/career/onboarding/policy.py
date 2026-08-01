@@ -66,6 +66,24 @@ def _one_or_missing(session: Session, model: type[T], tenant_id: uuid.UUID, what
     return row
 
 
+def _superseded(session: Session, subscription: Subscription) -> bool:
+    """Was this row retired by a renewal (§16)?
+
+    Belt to the braces of the renewal fix: reviving a retired row here is what
+    produced two ACTIVE subscriptions for one customer, and the revived one is
+    invisible to the lifecycle sweep forever. Even if some future path retires
+    a journey's row again, activation will not resurrect it.
+    """
+    from career.db.models import SubscriptionEvent
+
+    return session.execute(
+        select(SubscriptionEvent.id).where(
+            SubscriptionEvent.subscription_id == subscription.id,
+            SubscriptionEvent.event_type == "renewed",
+        )
+    ).first() is not None
+
+
 def _subscription_of(session: Session, tenant_id: uuid.UUID) -> Subscription:
     """THE subscription this tenant is being served under.
 
@@ -87,7 +105,8 @@ def _subscription_of(session: Session, tenant_id: uuid.UUID) -> Subscription:
     ).scalars().first()
     if journey is not None and journey.subscription_id is not None:
         by_journey = session.get(Subscription, journey.subscription_id)
-        if by_journey is not None and by_journey.tenant_id == tenant_id:
+        if (by_journey is not None and by_journey.tenant_id == tenant_id
+                and not _superseded(session, by_journey)):
             return by_journey
     subscription = current_subscription(session, tenant_id)
     if subscription is None:

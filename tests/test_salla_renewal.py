@@ -527,3 +527,52 @@ def test_paying_twice_before_activating_costs_neither_a_tenant_nor_a_day(
         "SELECT count(*) FROM subscription_events WHERE subscription_id = :i"
         " AND event_type = 'merged_into_activation'"),
         {"i": str(second.subscription_id)}).scalar_one() == 1
+
+
+def test_renewing_mid_onboarding_never_makes_two_live_subscriptions(
+    owner_session, clean_billing
+):
+    """The audit's sharpest state defect. A customer who stalls in onboarding
+    and buys again used to have their ONBOARDING row retired EXPIRED by the
+    renewal — and then «تأكيد وبدء البحث» revived that same row. Two ACTIVE
+    subscriptions on one tenant, and the revived one carries a «renewed»
+    event, so the lifecycle sweep skips it forever: it never graces, never
+    expires, never reminds.
+    """
+    from career.db.models import Subscription
+
+    phone, tenant_id, first_id = _customer(owner_session)
+    owner_session.execute(sql_text(
+        "UPDATE subscriptions SET status = 'ONBOARDING',"
+        " current_period_end = NULL WHERE id = :i"), {"i": str(first_id)})
+    owner_session.commit()
+
+    result, _ = _buy(owner_session, phone=phone)      # they pay again
+    owner_session.commit()
+
+    assert result.status is ProvisionStatus.RENEWED
+    # the row their journey is standing on is NOT retired
+    assert owner_session.execute(sql_text(
+        "SELECT status FROM subscriptions WHERE id = :i"),
+        {"i": str(first_id)}).scalar_one() == sub_states.ONBOARDING
+    assert owner_session.execute(sql_text(
+        "SELECT count(*) FROM subscription_events WHERE subscription_id = :i"
+        " AND event_type = 'renewed'"), {"i": str(first_id)}).scalar_one() == 0
+
+    # and finishing onboarding leaves exactly ONE live row, with both
+    # payments' days on it
+    activated = owner_session.get(Subscription, first_id)
+    assert activated is not None
+    activated.status = sub_states.ACTIVE
+    activated.current_period_start = NOW
+    activated.current_period_end = NOW + timedelta(days=30)
+    merged = renewal.merge_prepaid_orders(
+        owner_session, tenant_id=tenant_id, activated=activated, now=NOW)
+    owner_session.commit()
+
+    assert merged == 1
+    assert activated.current_period_end == NOW + timedelta(days=60)
+    live = owner_session.execute(sql_text(
+        "SELECT count(*) FROM subscriptions WHERE tenant_id = :t"
+        " AND status = 'ACTIVE'"), {"t": str(tenant_id)}).scalar_one()
+    assert live == 1, "exactly one live subscription — D18's actual claim"
