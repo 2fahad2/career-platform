@@ -23,11 +23,11 @@ SQLAlchemy + Alembic · Docker Compose · pytest · Anthropic API only for LLM.
 
 | | |
 |---|---|
-| 🧪 Test suite | **849 passing** (fresh-run gated commits, disposable `career_test` DB only — enforced by a hard guard) |
-| 🗄️ Schema | migration `0018`, live-verified drift-free (host **and** deployed container) |
+| 🧪 Test suite | **938 passing** (fresh-run gated commits, disposable `career_test` DB only — enforced by a hard guard) |
+| 🗄️ Schema | migration `0019` (36 tables, 30 with RLS enabled), live-verified drift-free (host **and** deployed container) |
 | 🔍 Last full audit | 2026-07-23, 42-agent adversarial sweep — all 5 critical + 20/23 major findings **fixed** (see `docs/AUDIT-2026-07-23.md`) |
 | 🚀 Live | worker loop, admin watchtower bot, nightly engine timer (04:30 Riyadh) — real customer journey completed end-to-end incl. first real CV delivery |
-| 🏗️ Phases | C1–C8 complete · C9 (production env + launch waves) gated on the Salla store go-live |
+| 🏗️ Phases | C1–C8 **code**-complete · C3 and C4 exit conditions are NOT met (no real riyal purchase yet; two templates the code sends do not exist at Meta) · C9 gated on the store go-live |
 
 ## System overview
 
@@ -287,6 +287,7 @@ absent from the raw Arabic → the customer confirms (English + Arabic gloss)
 | `0016` | `subscriptions.order_phone_e164` — zero-touch activation. |
 | `0017` | 🆕 `role_enrichments` — the F-ENRICH once-ever ledger. |
 | `0018` | `outbox_events` FORCE RLS (caught by the RLS meta-test). |
+| `0019` | `usage_events` prompt-cache token columns (§14 cost coverage). |
 
 ### `scripts/` — live runners
 
@@ -316,7 +317,7 @@ absent from the raw Arabic → the customer confirms (English + Arabic gloss)
 |------|---------|
 | `WHITEPAPER.html` | Product constitution: phases + exit conditions, the 15 invariants, pricing. |
 | `CHANGELOG-v1.1.md` | Approved post-v1.0 decisions (override conflicting v1.0 text). |
-| `DEVIATIONS.md` | Approved deviations D1–D13 with rationale. |
+| `DEVIATIONS.md` | Approved deviations D1–D19 with rationale. |
 | `PLAN.md` | Full execution plan. |
 | `PROGRESS.md` | Session-by-session state + exit gates + pending decisions. |
 | `ADMIN_BOT_DESIGN.md` | Watchtower design + external-proposal evaluation. |
@@ -384,7 +385,7 @@ WHATSAPP_APP_SECRET=wa_app_secret_123 WHATSAPP_VERIFY_TOKEN=wa_verify_123 \
 CI_REQUIRE_DB=1 python -m pytest tests/ -q
 ```
 
-**849 tests**, zero skips with a full environment: adversarial RLS (plus a
+**938 tests**, zero skips with a full environment: adversarial RLS (plus a
 catalog **meta-test** enforcing ENABLE+FORCE+policy on every tenant table),
 webhook
 idempotency, upload attack files, CV binding/quarantine, the seven-state
