@@ -46,6 +46,26 @@ class TemplateSpec:
     variables: tuple[str, ...] = field(default_factory=tuple)
 
 
+#: The daily template Meta actually classified as UTILITY (2 August).
+#:
+#: `daily_opportunities_utility` was approved but classified MARKETING despite
+#: its name, and Meta refuses to re-categorise an APPROVED template — the API
+#: answers «You cannot update an approved template category». Category is
+#: decided from CONTENT, so this one is written as what it truly is: a status
+#: update on a service the customer is PAYING for, with no offer, no
+#: enticement and no promotional punctuation. Meta accepted it as UTILITY on
+#: submission, which is roughly a third of the marketing price per message —
+#: and marketing templates are also subject to per-user marketing limits, so
+#: a paying customer could have missed their own delivery.
+DAILY_SERVICE_UPDATE = TemplateSpec(
+    name="daily_service_update",
+    language="ar",
+    category=TemplateCategory.UTILITY,
+    body=("تحديث خدمتك اليومي: اكتمل بحث اليوم على اشتراكك، وجهّزنا سيرتك "
+          "الذاتية للفرص المختارة. اضغط للاطلاع على التفاصيل."),
+    buttons=("عرض التفاصيل",),
+)
+
 # Daily opportunity template — two wordings for the classification test (§08).
 DAILY_UTILITY = TemplateSpec(
     name="daily_opportunities_utility",
@@ -105,7 +125,34 @@ ZERO_DAY_REPORT = TemplateSpec(
 REGISTRY: dict[str, TemplateSpec] = {
     t.name: t
     for t in (
-        DAILY_UTILITY, DAILY_MARKETING, WELCOME_ACTIVATION, ONBOARDING_REMINDER,
+        DAILY_SERVICE_UPDATE, DAILY_UTILITY, DAILY_MARKETING,
+        WELCOME_ACTIVATION, ONBOARDING_REMINDER,
         RENEWAL_REMINDER, RECOVERY, ZERO_DAY_REPORT,
     )
 }
+
+#: The daily template the delivery run should use, best first. The UTILITY one
+#: costs roughly a third of the marketing rate and is not subject to Meta's
+#: per-user marketing limits — a paying customer must never miss their own
+#: delivery because a promotional cap was hit. Falling back is deliberate: a
+#: template awaiting Meta's review would otherwise stop the day entirely.
+DAILY_PREFERENCE: tuple[TemplateSpec, ...] = (
+    DAILY_SERVICE_UPDATE, DAILY_UTILITY, DAILY_MARKETING,
+)
+
+
+def preferred_daily_template(
+    approved_names: set[str] | None,
+) -> TemplateSpec:
+    """The cheapest daily template Meta has actually approved.
+
+    ``approved_names`` is what the live account reports; None means we could
+    not ask (no credentials, or Meta unreachable), and then we keep using the
+    long-standing one rather than gambling the day on an unverified name.
+    """
+    if approved_names is None:
+        return DAILY_UTILITY
+    for spec in DAILY_PREFERENCE:
+        if spec.name in approved_names:
+            return spec
+    return DAILY_UTILITY

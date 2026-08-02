@@ -74,6 +74,42 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _preferred_daily(settings: Any) -> Any:
+    """The cheapest APPROVED daily template, asked at run time.
+
+    Never blocks or fails the run: if the account cannot be reached we keep
+    the long-standing template rather than gamble the day on a name Meta may
+    not have approved yet.
+    """
+    from career.whatsapp.templates import preferred_daily_template
+
+    if not (settings.whatsapp_access_token and settings.whatsapp_waba_id):
+        return preferred_daily_template(None)
+    try:
+        import httpx
+
+        response = httpx.get(
+            f"https://graph.facebook.com/v21.0/{settings.whatsapp_waba_id}"
+            "/message_templates",
+            params={"fields": "name,status", "limit": 100},
+            headers={"Authorization": f"Bearer {settings.whatsapp_access_token}"},
+            timeout=20.0,
+        )
+        if response.status_code != 200:
+            return preferred_daily_template(None)
+        approved = {
+            row.get("name") for row in response.json().get("data", [])
+            if row.get("status") == "APPROVED"
+        }
+    except Exception:  # noqa: BLE001 — a template probe never stops delivery
+        logger.warning("could not ask Meta which templates are approved",
+                       exc_info=True)
+        return preferred_daily_template(None)
+    chosen = preferred_daily_template(approved)
+    logger.info("daily template: %s (%s)", chosen.name, chosen.category)
+    return chosen
+
+
 def summarize(
     report: RunReport, tenant_codes: dict[uuid.UUID, str]
 ) -> dict[str, Any]:
@@ -260,6 +296,13 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
             examples_writer=AnthropicExamplesWriter(
                 api_key=settings.anthropic_api_key
             ),
+            # Ask the live account which daily template is approved and take
+            # the cheapest one. `daily_opportunities_utility` was approved
+            # under the MARKETING category despite its name, and Meta refuses
+            # to re-categorise an approved template — so a UTILITY-shaped
+            # replacement was submitted, and the run adopts it the moment
+            # Meta approves it, with no deploy and no human step.
+            daily_template=_preferred_daily(settings),
         )
         engine2 = create_engine(settings.owner_database_url, future=True)
         try:
