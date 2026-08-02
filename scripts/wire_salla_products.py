@@ -25,7 +25,6 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
-import sys
 import uuid
 from decimal import Decimal
 
