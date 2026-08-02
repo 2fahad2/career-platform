@@ -23,7 +23,7 @@ SQLAlchemy + Alembic · Docker Compose · pytest · Anthropic API only for LLM.
 
 | | |
 |---|---|
-| 🧪 Test suite | **938 passing** (fresh-run gated commits, disposable `career_test` DB only — enforced by a hard guard) |
+| 🧪 Test suite | **944 passing** (fresh-run gated commits, disposable `career_test` DB only — enforced by a hard guard) |
 | 🗄️ Schema | migration `0019` (36 tables, 30 with RLS enabled), live-verified drift-free (host **and** deployed container) |
 | 🔍 Last full audit | 2026-07-23, 42-agent adversarial sweep — all 5 critical + 20/23 major findings **fixed** (see `docs/AUDIT-2026-07-23.md`) |
 | 🚀 Live | worker loop, admin watchtower bot, nightly engine timer (04:30 Riyadh) — real customer journey completed end-to-end incl. first real CV delivery |
@@ -377,15 +377,28 @@ and proactive alerts.
 ## Testing
 
 ```bash
-# disposable DB — NEVER run pytest against staging
-DB_HOST=127.0.0.1 DB_PORT=5433 DB_NAME=career_test \
-REDIS_HOST=127.0.0.1 REDIS_PORT=6380 \
-SALLA_WEBHOOK_SECRET=test_secret_123 \
-WHATSAPP_APP_SECRET=wa_app_secret_123 WHATSAPP_VERIFY_TOKEN=wa_verify_123 \
-CI_REQUIRE_DB=1 python -m pytest tests/ -q
+# disposable DB — NEVER run pytest against staging (a hard guard in
+# tests/conftest.py refuses any DB whose name does not end in _test).
+#
+# The three passwords are NOT optional: without them every DB-backed test
+# errors on connect. Read them out of the untracked .env.staging rather than
+# retyping secrets — and read only those keys: `source`-ing the whole file
+# hands its JSON values to bash as commands.
+for k in DB_OWNER_PASSWORD DB_PASSWORD REDIS_PASSWORD; do
+  export "$k=$(grep -m1 "^$k=" .env.staging | cut -d= -f2-)"
+done
+export DB_HOST=127.0.0.1 DB_PORT=5433 DB_NAME=career_test
+export REDIS_HOST=127.0.0.1 REDIS_PORT=6380
+export SALLA_WEBHOOK_SECRET=test_secret_123
+export WHATSAPP_APP_SECRET=wa_app_secret_123 WHATSAPP_VERIFY_TOKEN=wa_verify_123
+export CI_REQUIRE_DB=1
+.venv/bin/python -m pytest tests/ -q
+
+# or simply, which runs CI's exact sequence including lint, types and drift:
+./scripts/gate.sh
 ```
 
-**938 tests**, zero skips with a full environment: adversarial RLS (plus a
+**944 tests**, zero skips with a full environment: adversarial RLS (plus a
 catalog **meta-test** enforcing ENABLE+FORCE+policy on every tenant table),
 webhook
 idempotency, upload attack files, CV binding/quarantine, the seven-state
