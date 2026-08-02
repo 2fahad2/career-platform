@@ -1,0 +1,12 @@
+[Unit]
+Description=Report to the operator that the server came back
+After=network-online.target docker.service caddy.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/root/career/scripts/post_boot_report.sh
+TimeoutStartSec=400
+
+[Install]
+WantedBy=multi-user.target
