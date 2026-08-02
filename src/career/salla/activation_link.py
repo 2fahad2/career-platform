@@ -38,6 +38,12 @@ def normalize_order_phone(raw: str | None) -> str | None:
         digits = digits[2:]
     if digits.startswith("05") and len(digits) == 10:   # Saudi local mobile
         digits = "966" + digits[1:]
+    elif digits.startswith("5") and len(digits) == 9:
+        # A bare Saudi mobile with neither the country code nor the leading
+        # zero — the shape Salla's `mobile` field carries when its country
+        # code sits in `mobile_code`. Safe to assume Saudi here: this product
+        # sells only in Saudi Arabia and every plan is priced in riyals.
+        digits = "966" + digits
     if len(digits) < 11 or len(digits) > 15:
         return None
     return f"+{digits}"

@@ -161,6 +161,7 @@ def provision_order(
     webhook_event: WebhookEvent | None = None,
     expected_pricing: ExpectedPricing | None = None,
     now: datetime | None = None,
+    admin_client_hint: Any = None,
 ) -> ProvisionResult:
     if not order_id:
         _mark_webhook(owner_session, webhook_event, "ignored")
@@ -190,6 +191,18 @@ def provision_order(
 
     plan_code = product_catalog.get(order.product_id)
     if plan_code is None:
+        # A PAID order for a product id we do not recognise. The old branch
+        # dropped it in total silence — no tenant, no message, no alert — so a
+        # mistyped id in the catalog meant the operator learned about it from
+        # the customer complaining, and the event was already 'ignored' and
+        # unretryable by then. A cataloged product with missing PRICING fails
+        # loudly; this branch was the asymmetric one.
+        logger.error("paid order for an uncataloged product — nothing served")
+        _alert(admin_client_hint, (
+            "🔴 طلب مدفوع لمنتج غير معروف في الكتالوج — ما تم تزويد شيء\n"
+            f"معرّف المنتج:\n{order.product_id}\n"
+            "راجع كتالوج المنتجات ثم أعد تشغيل الطلب يدويًا"
+        ))
         _mark_webhook(owner_session, webhook_event, "ignored")
         owner_session.commit()
         return ProvisionResult(ProvisionStatus.UNKNOWN_PRODUCT)
@@ -217,6 +230,18 @@ def provision_order(
     from career.salla.activation_link import normalize_order_phone
 
     order_phone = normalize_order_phone(order.customer_phone)
+    if order_phone is None:
+        # Zero-touch activation, the welcome template and the renewal match
+        # ALL key on this column. Provisioning still proceeds — the money is
+        # real and the typed-token path still works — but the operator has to
+        # know, because the buyer will otherwise sit waiting for a message
+        # that is never coming.
+        logger.error("paid order carries no usable phone — zero-touch is off "
+                     "for this buyer")
+        _alert(admin_client_hint, (
+            "⚠️ طلب مدفوع بلا رقم جوال صالح — التفعيل التلقائي معطّل لهذا "
+            "المشتري\nأرسل له رابط التفعيل يدويًا من القناة"
+        ))
 
     # CHANGELOG §16 — is this the same human paying again? Decided BEFORE
     # anything is created: a renewal must not mint a second tenant, a second
@@ -519,6 +544,7 @@ def process_pending_webhooks(
                     owner_session, ev.salla_order_id,
                     salla_client=salla_client, product_catalog=product_catalog,
                     webhook_event=ev, expected_pricing=expected_pricing,
+                    admin_client_hint=admin_client,
                 )
             except SallaApiError as exc:
                 if not exc.retryable:

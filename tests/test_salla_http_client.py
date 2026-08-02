@@ -54,7 +54,13 @@ def test_online_under_review_is_paid_and_fields_mapped() -> None:
     assert order.product_id == "786318419"
     assert order.amount == Decimal("1")
     assert order.currency == "SAR"
-    assert order.customer_phone == "555000111"
+    # This assertion used to read "555000111" — the LOCAL part alone — and in
+    # doing so it enshrined the defect: normalize_order_phone rightly refuses
+    # nine digits, so order_phone_e164 was stored NULL, no welcome template was
+    # sent, and the buyer's reply could not claim the order they had paid for.
+    # Salla carries the country code beside it in `mobile_code`; the client
+    # joins them now, so the captured live shape yields a usable number.
+    assert order.customer_phone == "+966555000111"
 
 
 def test_bank_transfer_under_review_is_not_paid() -> None:

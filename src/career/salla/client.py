@@ -169,7 +169,18 @@ class HttpSallaClient:
         total = (data.get("amounts") or {}).get("total") or {}
         amount = Decimal(str(total.get("amount") or "0"))
         currency = str(total.get("currency") or data.get("currency") or "SAR")
-        phone = (data.get("customer") or {}).get("mobile")
+        # Salla splits the buyer's number: `mobile` is the LOCAL part and the
+        # country code lives beside it in `mobile_code`. The repo's own
+        # captured live response is {"mobile": "555000111", "mobile_code":
+        # "+966"} — reading `mobile` alone produced a nine-digit string that
+        # normalize_order_phone rightly refused, so order_phone_e164 was NULL:
+        # no welcome template, and the buyer's reply could not claim their own
+        # paid order. Join them when the code is there.
+        customer = data.get("customer") or {}
+        phone = customer.get("mobile")
+        code = str(customer.get("mobile_code") or "").strip()
+        if phone and code:
+            phone = f"{code}{str(phone).lstrip('0')}"
 
         items_resp = self._get("/orders/items", params={"order_id": order_id})
         items_resp.raise_for_status()

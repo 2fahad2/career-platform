@@ -48,6 +48,7 @@ from career.db.models import (
     ProfileFact,
 )
 from career.onboarding import collection, confirmation, consents, fsm, paths, policy, privacy
+from career.onboarding.achievement_render import normalize_ar
 from career.onboarding.consents import ConsentMissing
 from career.onboarding.extraction import (
     ExtractionFailed,
@@ -177,6 +178,12 @@ _VERDICT_IDS = {
 _GREETINGS = frozenset(
     {"مرحبا", "مرحبًا", "هلا", "اهلا", "أهلا", "السلام عليكم", "سلام",
      "نكمل", "كمل", "وين وقفنا", "hi", "hello", "hey"}
+)
+
+#: Matched after Arabic normalisation (hamza/taa-marbuta/diacritics folded)
+#: so «مرحبًا» and «مرحبا» are the same greeting, which the raw set was not.
+_GREETINGS_NORMALIZED: frozenset[str] = frozenset(
+    normalize_ar(g) for g in _GREETINGS
 )
 
 _PRIVACY_COMMANDS = {
@@ -1006,6 +1013,17 @@ def _handle_verdict(
     if context.get("awaiting_gap"):
         # the gap answer arrives while still in PROFILE_CONFIRMATION
         gap = context["awaiting_gap"]
+        # A greeting is not an answer. The guard existed for the fourteen
+        # questions and NOT here, so «السلام عليكم» was written straight into
+        # the achievement bank as a CUSTOMER_CONFIRMED job title, the gap was
+        # marked satisfied, and the real question was never asked again — and
+        # that title then fed every CV we generate (constant 5). Re-ask
+        # instead: the customer is greeting us, not answering.
+        if normalize_ar(body) in _GREETINGS_NORMALIZED:
+            _send(session, deps, channel,
+                  _GAP_EXPERIENCE if gap == "experience" else _GAP_SKILL,
+                  now=now)
+            return
         payload = (
             {"title": body, "employer": None} if gap == "experience" else {"name": body}
         )
