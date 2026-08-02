@@ -38,7 +38,9 @@ PLANS: dict[str, tuple[str, Decimal]] = {
 ENV_FILE = pathlib.Path("/root/career/.env.staging")
 
 
-def _rehearse(catalog: dict[str, str], pricing: dict[str, list]) -> list[str]:
+def _rehearse(
+    catalog: dict[str, str], pricing: dict[str, list[object]]
+) -> list[str]:
     """Provision one order per product on the TEST database. Returns failures.
 
     Two halves, and the second one matters. The first version built the test
@@ -140,7 +142,7 @@ def main() -> int:
     args = parser.parse_args()
 
     catalog: dict[str, str] = {}
-    pricing: dict[str, list] = {}
+    pricing: dict[str, list[object]] = {}
     for key, (plan, price) in PLANS.items():
         pid = str(getattr(args, key)).strip()
         if not pid or pid in catalog:
