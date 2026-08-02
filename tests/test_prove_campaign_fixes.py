@@ -10,6 +10,8 @@ from __future__ import annotations
 import uuid
 from decimal import Decimal
 
+from sqlalchemy import text as sql_text
+
 from career.salla.activation_link import normalize_order_phone
 
 
@@ -146,3 +148,87 @@ def test_a_disputed_account_is_not_promised_a_service_it_will_not_get() -> None:
     assert "بنكمل عادي" not in RENEWED_UNDER_REVIEW_AR
     assert "مراجعة" in RENEWED_UNDER_REVIEW_AR
     assert "دعم" in RENEWED_UNDER_REVIEW_AR
+
+
+def test_a_tenant_code_collision_is_retried_not_fatal(owner_session, clean_billing):
+    """max(code)+1 is a read-then-write. Two overlapping provisioning passes
+    read the same maximum and try the same code; the loser used to raise
+    UniqueViolation into the poison guard, which marked the paid webhook
+    'failed' FOREVER — the buyer paid and got nothing recoverable.
+
+    Simulated by handing the allocator a code that is already taken on its
+    first attempt, exactly as the losing pass would have computed it."""
+    import career.salla.provisioning as prov
+
+    taken = f"TEN-Z{uuid.uuid4().int % 10_000:04d}"
+    owner_session.execute(sql_text(
+        "INSERT INTO tenants (id, code) VALUES (:i, :c)"),
+        {"i": str(uuid.uuid4()), "c": taken})
+    owner_session.commit()
+
+    calls = {"n": 0}
+    real = prov._next_tenant_code
+
+    def _collide_once(session):  # noqa: ANN001
+        calls["n"] += 1
+        return taken if calls["n"] == 1 else real(session)
+
+    prov._next_tenant_code = _collide_once
+    try:
+        tenant = prov._create_tenant(owner_session)
+        owner_session.commit()
+    finally:
+        prov._next_tenant_code = real
+
+    assert calls["n"] >= 2, "the collision must trigger a retry"
+    assert tenant.code != taken
+    # and the session is still usable — the failed INSERT rolled back alone
+    assert owner_session.execute(sql_text(
+        "SELECT count(*) FROM tenants WHERE code = :c"),
+        {"c": tenant.code}).scalar_one() == 1
+
+    owner_session.execute(sql_text("DELETE FROM tenants WHERE code IN (:a, :b)"),
+                          {"a": taken, "b": tenant.code})
+    owner_session.commit()
+
+
+def test_stray_chatter_at_the_cards_leaves_no_orphan_rows(
+    owner_session, clean_billing, tmp_path
+):
+    """Every unmatched message at the path/policy card used to insert a fresh
+    assessment and a fresh policy draft — a chatty customer left one orphan
+    per message, forever, each with a bumped version number."""
+    from career.db.models import SearchPolicy
+    from career.onboarding import orchestrator as orch
+
+    tid = uuid.uuid4()
+    owner_session.execute(sql_text(
+        "INSERT INTO tenants (id, code) VALUES (:i, :c)"),
+        {"i": str(tid), "c": f"TEN-S{uuid.uuid4().int % 100_000:05d}"})
+    owner_session.execute(sql_text(
+        "INSERT INTO search_policies (id, tenant_id, version, status,"
+        " approved_paths, cities) VALUES (:i, :t, 1, 'draft',"
+        " '{}'::jsonb, '{}'::jsonb)"),
+        {"i": str(uuid.uuid4()), "t": str(tid)})
+    owner_session.commit()
+    policy_id = owner_session.execute(sql_text(
+        "SELECT id FROM search_policies WHERE tenant_id = :t"),
+        {"t": str(tid)}).scalar_one()
+    try:
+        # the journey is already showing THIS draft
+        found = orch._existing(owner_session, SearchPolicy, str(policy_id), tid)
+        assert found is not None, "the card in front of the customer is reused"
+
+        # a row belonging to someone else never resolves through context
+        assert orch._existing(
+            owner_session, SearchPolicy, str(policy_id), uuid.uuid4()) is None
+        # and garbage in the context is simply ignored
+        assert orch._existing(
+            owner_session, SearchPolicy, "not-a-uuid", tid) is None
+    finally:
+        owner_session.rollback()
+        owner_session.execute(sql_text(
+            "DELETE FROM search_policies WHERE tenant_id = :t"), {"t": str(tid)})
+        owner_session.execute(sql_text("DELETE FROM tenants WHERE id = :t"),
+                              {"t": str(tid)})
+        owner_session.commit()

@@ -7,7 +7,12 @@ them must render as text, never execute. The template itself is unchanged
 
 Determinism: WeasyPrint stamps no wall-clock into the PDF when the input HTML
 is identical and fonts are pinned (Liberation/DejaVu system packages) — the
-golden-file test holds same-input → byte-identical output.
+golden-file test holds same-input → same DOCUMENT (page count and extracted
+text). NOT byte-identical: PDF bytes depend on the font stack and on
+fontconfig's cache state, neither of which we control — it held on a warm
+developer machine and did not on a cold CI runner. Nothing may key on a PDF's
+sha256 for identity or de-duplication; publishing hashes whatever bytes it
+produced, which is the only place that hash is meaningful.
 """
 
 from __future__ import annotations

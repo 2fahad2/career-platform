@@ -84,6 +84,43 @@ def _next_tenant_code(session: Session) -> str:
     return f"TEN-{max(top, 1) + 1:04d}"
 
 
+#: How many times to re-read max(code) and try again after a collision.
+_TENANT_CODE_ATTEMPTS = 5
+
+
+def _create_tenant(session: Session) -> Tenant:
+    """Allocate the next TEN code and insert, surviving a collision.
+
+    max(code) + 1 is a read-then-write, so two provisioning passes that
+    overlap — a manual catch-up run beside the live loop, a restart overlap,
+    a second host after scale-out — both read the same maximum and both try
+    the same code. One INSERT wins; the other raised UniqueViolation, which
+    the poison guard turned into a webhook marked 'failed' FOREVER: the losing
+    buyer paid and got no tenant, no subscription and no way back short of
+    hand-editing the database.
+
+    A collision is not a poisoned payload, it is a race — so it is retried.
+    Each attempt re-reads the maximum inside a SAVEPOINT, so a failed INSERT
+    rolls back only itself and leaves the surrounding transaction usable.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    last: Exception | None = None
+    for _ in range(_TENANT_CODE_ATTEMPTS):
+        try:
+            with session.begin_nested():
+                tenant = Tenant(
+                    id=uuid.uuid4(), code=_next_tenant_code(session)
+                )
+                session.add(tenant)
+                session.flush()
+            return tenant
+        except IntegrityError as exc:   # another pass took this code
+            last = exc
+            logger.warning("tenant code collided — retrying with a fresh max")
+    raise last if last is not None else RuntimeError("tenant code exhausted")
+
+
 def _mark_webhook(session: Session, webhook_event: WebhookEvent | None, status: str) -> None:
     if webhook_event is not None:
         webhook_event.processing_status = status
@@ -299,9 +336,7 @@ def provision_order(
         )
 
     # Provision: tenant → subscription(PAID_UNCLAIMED) → activation token.
-    tenant = Tenant(id=uuid.uuid4(), code=_next_tenant_code(owner_session))
-    owner_session.add(tenant)
-    owner_session.flush()
+    tenant = _create_tenant(owner_session)
 
     subscription = Subscription(
         id=uuid.uuid4(),

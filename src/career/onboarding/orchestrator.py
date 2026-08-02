@@ -46,6 +46,7 @@ from career.db.models import (
     CustomerProfile,
     OnboardingSession,
     ProfileFact,
+    SearchPolicy,
 )
 from career.onboarding import collection, confirmation, consents, fsm, paths, policy, privacy
 from career.onboarding.achievement_render import normalize_ar
@@ -1094,6 +1095,24 @@ def _after_confirmation(
 # ── path review ──────────────────────────────────────────────────────────────
 
 
+def _existing(
+    session: Session, model: Any, row_id: Any, tenant_id: uuid.UUID
+) -> Any:
+    """The row this journey already put in front of the customer, or None.
+
+    Scoped to the tenant on purpose: a context value is not a capability, and
+    an id that belongs to somebody else must never resolve here.
+    """
+    if not row_id:
+        return None
+    try:
+        parsed = uuid.UUID(str(row_id))
+    except (ValueError, AttributeError, TypeError):
+        return None
+    row = session.get(model, parsed)
+    return row if row is not None and row.tenant_id == tenant_id else None
+
+
 def _present_assessment(
     session: Session, journey: OnboardingSession, channel: CustomerChannel,
     deps: Deps, *, now: datetime,
@@ -1103,8 +1122,18 @@ def _present_assessment(
         select(CustomerProfile).where(CustomerProfile.tenant_id == tenant_id)
     ).scalar_one_or_none()
     requested = (profile.requested_path if profile else None) or "غير محدد"
-    assessment = paths.assess(session, tenant_id=tenant_id, requested_path=requested)
-    journey.context = {**(journey.context or {}), "assessment_id": str(assessment.id)}
+    # Re-SHOW the card the customer is already looking at; do not build a new
+    # one. Every unmatched message at this state used to insert a fresh
+    # assessment row — a chatty customer («ايش الوضع», «شكرا», «هلا») left one
+    # orphan per message, forever, each with a bumped version.
+    assessment = _existing(session, CareerPathAssessment,
+                           (journey.context or {}).get("assessment_id"),
+                           tenant_id)
+    if assessment is None:
+        assessment = paths.assess(
+            session, tenant_id=tenant_id, requested_path=requested)
+        journey.context = {
+            **(journey.context or {}), "assessment_id": str(assessment.id)}
 
     requested_info = (assessment.suggested or {}).get("requested", {})
     closest = (assessment.suggested or {}).get("closest", [])
@@ -1184,8 +1213,15 @@ def _present_policy(
     session: Session, journey: OnboardingSession, channel: CustomerChannel,
     deps: Deps, *, now: datetime,
 ) -> None:
-    draft = policy.build_draft_policy(session, tenant_id=journey.tenant_id)
-    journey.context = {**(journey.context or {}), "policy_id": str(draft.id)}
+    # Same rule as the assessment card: re-show, never re-build. A stray
+    # message here used to insert an orphan search-policy draft per message.
+    draft = _existing(session, SearchPolicy,
+                      (journey.context or {}).get("policy_id"),
+                      journey.tenant_id)
+    if draft is None:
+        draft = policy.build_draft_policy(session, tenant_id=journey.tenant_id)
+        journey.context = {
+            **(journey.context or {}), "policy_id": str(draft.id)}
     card = policy.render_summary_card(draft)
     _send(session, deps, channel, card.text_ar, buttons=(card.confirm_button_ar,), now=now)
 
