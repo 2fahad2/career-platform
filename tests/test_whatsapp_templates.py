@@ -52,3 +52,23 @@ def test_the_daily_service_update_reads_as_a_transaction_not_an_offer() -> None:
     assert "اشتراكك" in body                    # tied to what they paid for
     for promo in ("!", "🎯", "الآن!", "عرض خاص", "مجانًا"):
         assert promo not in body
+
+
+def test_the_body_that_survived_review_never_mentions_opportunities() -> None:
+    """The empirical lesson from two submissions on the same day: Meta accepted
+    `daily_service_update` as UTILITY and its reviewer moved it to MARKETING
+    while pending, while `subscription_daily_report` held UTILITY. The only
+    difference is that the surviving one never announces «الفرص» — their
+    classifier reads that as promotion regardless of what the customer paid
+    for. Pin it, so a future edit does not casually re-add the word and
+    silently triple the per-message cost."""
+    from career.whatsapp.templates import (
+        DAILY_PREFERENCE,
+        SUBSCRIPTION_DAILY_REPORT,
+        TemplateCategory,
+    )
+
+    assert DAILY_PREFERENCE[0] is SUBSCRIPTION_DAILY_REPORT
+    assert SUBSCRIPTION_DAILY_REPORT.category is TemplateCategory.UTILITY
+    assert "فرص" not in SUBSCRIPTION_DAILY_REPORT.body
+    assert "اشتراكك" in SUBSCRIPTION_DAILY_REPORT.body

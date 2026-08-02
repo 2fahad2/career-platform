@@ -46,6 +46,22 @@ class TemplateSpec:
     variables: tuple[str, ...] = field(default_factory=tuple)
 
 
+#: Strictly transactional wording — and the ONE that held UTILITY through
+#: review. `daily_service_update` was accepted as UTILITY on submission and
+#: Meta's reviewer moved it to MARKETING while pending; the difference between
+#: the two bodies is that this one never mentions «الفرص». Their classifier
+#: reads a message that announces opportunities as promotion, no matter what
+#: the customer paid for. So this says only what is transactionally true: the
+#: report you subscribe to is ready, and your files are with it.
+SUBSCRIPTION_DAILY_REPORT = TemplateSpec(
+    name="subscription_daily_report",
+    language="ar",
+    category=TemplateCategory.UTILITY,
+    body=("تحديث اشتراكك: تقريرك اليومي جاهز، ومعه ملفاتك بصيغة PDF. "
+          "اضغط لاستلامه."),
+    buttons=("استلام",),
+)
+
 #: The daily template Meta actually classified as UTILITY (2 August).
 #:
 #: `daily_opportunities_utility` was approved but classified MARKETING despite
@@ -125,8 +141,8 @@ ZERO_DAY_REPORT = TemplateSpec(
 REGISTRY: dict[str, TemplateSpec] = {
     t.name: t
     for t in (
-        DAILY_SERVICE_UPDATE, DAILY_UTILITY, DAILY_MARKETING,
-        WELCOME_ACTIVATION, ONBOARDING_REMINDER,
+        SUBSCRIPTION_DAILY_REPORT, DAILY_SERVICE_UPDATE, DAILY_UTILITY,
+        DAILY_MARKETING, WELCOME_ACTIVATION, ONBOARDING_REMINDER,
         RENEWAL_REMINDER, RECOVERY, ZERO_DAY_REPORT,
     )
 }
@@ -137,7 +153,8 @@ REGISTRY: dict[str, TemplateSpec] = {
 #: delivery because a promotional cap was hit. Falling back is deliberate: a
 #: template awaiting Meta's review would otherwise stop the day entirely.
 DAILY_PREFERENCE: tuple[TemplateSpec, ...] = (
-    DAILY_SERVICE_UPDATE, DAILY_UTILITY, DAILY_MARKETING,
+    SUBSCRIPTION_DAILY_REPORT, DAILY_SERVICE_UPDATE, DAILY_UTILITY,
+    DAILY_MARKETING,
 )
 
 
