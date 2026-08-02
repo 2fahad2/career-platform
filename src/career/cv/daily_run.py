@@ -18,7 +18,7 @@ import logging
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -178,6 +178,19 @@ class MonthlyCapBudget:
         if used >= self._cap:
             return False, f"monthly_cv_safety_cap reached ({used}/{self._cap})"
         return True, None
+
+
+def _already_delivered_today(
+    session: Session, *, tenant_id: uuid.UUID, run_date: date,
+) -> bool:
+    """Has this tenant's day already ended in something they RECEIVED?"""
+    state = session.execute(
+        select(TenantDayState.state).where(
+            TenantDayState.tenant_id == tenant_id,
+            TenantDayState.run_date == run_date,
+        )
+    ).scalars().first()
+    return state in ("DELIVERED", "PARTIAL_DELIVERY")
 
 
 def close_from_delivery(
@@ -574,9 +587,22 @@ def run_daily_delivery(
     canary_present = canary_tenant_id in report.per_tenant
 
     states: dict[uuid.UUID, TenantDayState] = {}
+    today = now.astimezone(_RIYADH).date()   # the same Riyadh day _run_tenant uses
     for index, (tenant_id, payload) in enumerate(ordered):
         if (index == 1 and canary_present and canary_delay_seconds > 0):
             (sleeper or __import__("time").sleep)(canary_delay_seconds)
+        if _already_delivered_today(session, tenant_id=tenant_id,
+                                    run_date=today):
+            # Re-running the nightly the same Riyadh day is a normal recovery
+            # action after a partial failure, and it used to be destructive:
+            # a second pass that found nothing rewrote a DELIVERED day as
+            # NO_MATCHES and told a customer who HAD received his jobs that we
+            # found none; a pass that found something new paid for the CV and
+            # then crashed on the one-delivery-per-day constraint, rewriting
+            # the day CV_GENERATION_FAILED. A customer is served once a day —
+            # skip them, do not re-serve and do not overwrite.
+            logger.info("tenant already delivered today — skipping re-run")
+            continue
         try:
             state = _run_tenant(
                 session, tenant_id=tenant_id, payload=payload, report=report,

@@ -667,7 +667,11 @@ def _announce_renewal(
     told = False
     if whatsapp_client is not None and sub.order_phone_e164:
         from career.db.models import CustomerChannel
-        from career.salla.renewal import RENEWED_CUSTOMER_AR, RENEWED_PAUSED_AR
+        from career.salla.renewal import (
+            RENEWED_CUSTOMER_AR,
+            RENEWED_PAUSED_AR,
+            RENEWED_UNDER_REVIEW_AR,
+        )
         from career.whatsapp.phones import phone_variants
         from career.whatsapp.window import WindowState, window_state
 
@@ -684,10 +688,16 @@ def _announce_renewal(
             opt_out_at=channel.opt_out_at,
             now=datetime.now(UTC),
         ) if channel is not None else None
-        head = (
-            RENEWED_PAUSED_AR if sub.status == sub_states.PAUSED
-            else RENEWED_CUSTOMER_AR
-        )
+        # A disputed account renews into SUSPENDED and waits for a human, so
+        # «وبنكمل عادي» would be a promise of a daily service that is not
+        # going to arrive. Tell them the truth: the payment landed, and
+        # someone is looking at it.
+        if sub.status == sub_states.SUSPENDED:
+            head = RENEWED_UNDER_REVIEW_AR
+        elif sub.status == sub_states.PAUSED:
+            head = RENEWED_PAUSED_AR
+        else:
+            head = RENEWED_CUSTOMER_AR
         if state is WindowState.OPEN:
             try:
                 whatsapp_client.send_text(

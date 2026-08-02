@@ -362,6 +362,16 @@ RENEWED_CUSTOMER_AR = (
 #: running. Promising «أيامك محفوظة» would be a promise the system does not
 #: keep, so the paused renewal states the real end date and nudges them to
 #: resume.
+#: A chargeback or suspended account renews into SUSPENDED and waits for the
+#: operator. Telling them «وبنكمل عادي» would promise a daily service that is
+#: not coming, and they would sit waiting instead of contacting us.
+RENEWED_UNDER_REVIEW_AR = (
+    "وصلنا دفعك ✅\n"
+    "بس حسابك عندنا تحت مراجعة من فريقنا قبل ما نكمل — عشان في ملاحظة على "
+    "عملية دفع سابقة\n"
+    "نتواصل معك بأقرب وقت، وتقدر تستعجلنا بكلمة: دعم"
+)
+
 RENEWED_PAUSED_AR = (
     "تم تجديد اشتراكك ✅\n"
     "لكنه لا يزال موقوفًا مؤقتًا بطلبك، والمدة تمشي وأنت موقوف\n"

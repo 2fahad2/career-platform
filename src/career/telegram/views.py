@@ -238,10 +238,14 @@ def render_tenant_card(card: dict[str, Any]) -> tuple[str, Keyboard]:
     """One customer, zero PII: TEN code + plan + states + counters only."""
     code = str(card.get("code"))
     lines = [f"👤 {code}"]
-    lines.append(
-        f"الخطة: {_plan(card.get('plan_code'))}"
-        f" · الحالة: {card.get('sub_status') or '—'}"
-    )
+    # Two lines, not one. The subscription status is a Latin token
+    # (ACTIVE / PAUSED / EXPIRED …) and the rest of this file goes out of its
+    # way to keep TEN codes and dates on their own lines for exactly this
+    # reason — a mixed run re-orders in a right-to-left client and the
+    # operator reads a scrambled plan and status.
+    lines.append(f"الخطة: {_plan(card.get('plan_code'))}")
+    lines.append("الحالة:")
+    lines.append(str(card.get("sub_status") or "—"))
     age = card.get("sub_age_days")
     if age is not None:
         lines.append(f"عمر الاشتراك: {age} يوم")

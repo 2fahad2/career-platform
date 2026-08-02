@@ -3,6 +3,8 @@ Description=Report to the operator that the server came back
 After=network-online.target docker.service caddy.service
 Wants=network-online.target
 
+OnFailure=career-alert@%n.service
+
 [Service]
 Type=oneshot
 ExecStart=/root/career/scripts/post_boot_report.sh

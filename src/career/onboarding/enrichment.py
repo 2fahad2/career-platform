@@ -181,7 +181,13 @@ def final_offer_prompt(english: str, arabic_gloss: str) -> str:
         "ولو ما ناسبتك اضغط «تخطّي هذا الدور» ونكمل ولا يهمك 👌"
     )
 
-_ACK_THANKS = "تسلم يا [name] 🙏 هالمعلومة فرقت مرة وبتقوّي سيرتك فعلاً."
+#: The name sits on ITS OWN LINE — most customers' names are Latin in our
+#: records (they come off the CV header), and a mixed line scrambles in the
+#: customer's client. And with no name at all the old text read «تسلم يا 🙏»,
+#: a broken sentence delivered at the one moment we are thanking them; the
+#: nameless form is now a complete sentence in its own right.
+_ACK_THANKS_NAMED = "تسلم يا\n[name]\n🙏 هالمعلومة فرقت مرة وبتقوّي سيرتك فعلاً."
+_ACK_THANKS_PLAIN = "تسلم 🙏 هالمعلومة فرقت مرة وبتقوّي سيرتك فعلاً."
 _ACK_SKIP = "تمام، عدّينا هالجزء وسيرتك زينة 👍"
 _ACK_DONE = "خلّصنا، مشكور على وقتك 🌟"
 
@@ -619,7 +625,9 @@ def personalize(text: str, name: str | None) -> str:
 
 
 def ack_thanks(name: str | None) -> str:
-    return personalize(_ACK_THANKS, name)
+    if not (name or "").strip():
+        return _ACK_THANKS_PLAIN
+    return personalize(_ACK_THANKS_NAMED, name)
 
 
 

@@ -127,12 +127,45 @@ def close_tenant_day(
             state=state_value, counts=counts, recorded_at=now,
         )
         session.add(row)
-    else:
+    elif _outranks(state_value, row.state):
         row.state = state_value
         row.counts = counts
         row.recorded_at = now
     session.flush()
     return row
+
+
+#: A day that ALREADY delivered cannot be un-delivered by a later pass.
+#:
+#: Re-running the nightly on the same Riyadh day is a normal recovery action,
+#: and it used to destroy the truth: a DELIVERED day whose second pass found
+#: nothing new was rewritten NO_MATCHES, and the customer who had already
+#: received his jobs was told «بحثنا اليوم ولم نجد فرصًا». Worse, a second pass
+#: that DID find something crashed on the one-delivery-per-day constraint and
+#: rewrote the day as CV_GENERATION_FAILED — after paying for the CV.
+#:
+#: So the ledger only ever moves UP. Rank is «how much did the customer
+#: actually receive», not «what happened last».
+_STATE_RANK: dict[str, int] = {
+    "DELIVERED": 100,
+    "PARTIAL_DELIVERY": 90,
+    "SKIPPED_OPTED_OUT": 50,
+    "NO_MATCHES": 40,
+    "WHATSAPP_FAILED": 30,
+    "CV_GENERATION_FAILED": 20,
+    "DISCOVERY_FAILED": 10,
+    "LEDGER_FAILED": 5,
+}
+
+
+def _outranks(new_state: str, existing: str) -> bool:
+    """True when the new state may replace the recorded one.
+
+    Equal ranks still replace: a second DELIVERED pass legitimately refreshes
+    its counts. Only a DEMOTION is refused, because nothing that happens after
+    a delivery can make that delivery not have happened.
+    """
+    return _STATE_RANK.get(new_state, 0) >= _STATE_RANK.get(existing, 0)
 
 
 def close_skipped_opted_out(

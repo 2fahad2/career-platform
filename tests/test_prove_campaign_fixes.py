@@ -99,3 +99,50 @@ def test_a_greeting_is_never_written_into_the_achievement_bank(
     # a real answer is still an answer
     assert normalize_ar("محلل أعمال") not in _GREETINGS_NORMALIZED
     assert normalize_ar("مهندس برمجيات") not in _GREETINGS_NORMALIZED
+
+
+def test_a_delivered_day_can_never_be_undelivered() -> None:
+    """Re-running the nightly the same Riyadh day is a normal recovery action
+    and it used to be destructive: a second pass that found nothing rewrote a
+    DELIVERED day as NO_MATCHES and told a customer who HAD received his jobs
+    that we found none. The ledger only moves up now."""
+    from career.cv.close import _outranks
+
+    assert not _outranks("NO_MATCHES", "DELIVERED")
+    assert not _outranks("CV_GENERATION_FAILED", "DELIVERED")
+    assert not _outranks("WHATSAPP_FAILED", "PARTIAL_DELIVERY")
+    # an equal or better outcome still refreshes
+    assert _outranks("DELIVERED", "DELIVERED")
+    assert _outranks("DELIVERED", "NO_MATCHES")
+    assert _outranks("PARTIAL_DELIVERY", "WHATSAPP_FAILED")
+
+
+def test_the_thank_you_never_mixes_directions_and_never_breaks() -> None:
+    """Names come off the CV header and are usually Latin; a mixed line
+    scrambles in the customer's client. And with no name the old text read
+    «تسلم يا 🙏» — a broken sentence at the one moment we thank them."""
+    from career.onboarding.enrichment import ack_thanks
+
+    named = ack_thanks("Fahad Almulhim")
+    assert "Fahad Almulhim" in named
+    for line in named.splitlines():
+        has_arabic = any("؀" <= ch <= "ۿ" for ch in line)
+        has_latin = any(ch.isascii() and ch.isalpha() for ch in line)
+        assert not (has_arabic and has_latin), line
+
+    for empty in (None, "", "   "):
+        plain = ack_thanks(empty)
+        assert "يا" not in plain.split("\n")[0]
+        assert plain.startswith("تسلم")
+
+
+def test_a_disputed_account_is_not_promised_a_service_it_will_not_get() -> None:
+    from career.salla.renewal import (
+        RENEWED_CUSTOMER_AR,
+        RENEWED_UNDER_REVIEW_AR,
+    )
+
+    assert "بنكمل عادي" in RENEWED_CUSTOMER_AR
+    assert "بنكمل عادي" not in RENEWED_UNDER_REVIEW_AR
+    assert "مراجعة" in RENEWED_UNDER_REVIEW_AR
+    assert "دعم" in RENEWED_UNDER_REVIEW_AR
