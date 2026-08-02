@@ -1386,3 +1386,44 @@ def test_a_resend_that_lands_closes_the_day_and_suppresses(
         "SELECT state FROM tenant_day_states WHERE tenant_id = :t"
         " ORDER BY run_date DESC LIMIT 1"), {"t": str(t1)}).scalar_one()
     assert state in ("DELIVERED", "PARTIAL_DELIVERY"), state
+
+
+def test_the_business_screen_shows_the_search_allowance(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """The ceiling the operator could not see. Money was on the screen and the
+    SEARCH allowance was not — and it is the allowance that stops discovery
+    for every customer at once. It is consumed by career PATHS, not by
+    customers, so spend rising tells you nothing about how close it is.
+
+    The arithmetic matters: a family's credit count is written onto every
+    tenant that family serves (the cost is split, the count is not), so a
+    naive sum multiplies by the audience."""
+    import uuid as _uuid
+
+    from sqlalchemy import text as _sql
+
+    import career.telegram.console as console
+
+    t1, t2 = two_tenants
+    run = _uuid.uuid4()
+    for tid in (t1, t2):                      # ONE family, TWO tenants
+        owner_session.execute(_sql(
+            "INSERT INTO usage_events (id, tenant_id, kind, run_id,"
+            " input_tokens, cost_usd, occurred_at)"
+            " VALUES (:i, :t, 'search_api', :r, 8, 0.016, now())"),
+            {"i": str(_uuid.uuid4()), "t": str(tid), "r": str(run)})
+    owner_session.commit()
+    try:
+        data = console._business_data(owner_session, "30", now=NOW)
+        assert data["searches_this_month"] == 8, (
+            "eight credits were billed once, not once per tenant"
+        )
+        text, _ = views.render_business("30", data)
+        assert "بحثات هذا الشهر" in text
+        assert "8 من 10000" in text
+    finally:
+        owner_session.rollback()
+        owner_session.execute(_sql(
+            "DELETE FROM usage_events WHERE run_id = :r"), {"r": str(run)})
+        owner_session.commit()

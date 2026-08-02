@@ -485,6 +485,31 @@ def week_day_states(session: Session, *, now: datetime) -> dict[str, int]:
     return {str(s): int(n) for s, n in rows}
 
 
+def _searches_this_month(session: Session, *, now: datetime) -> int:
+    """Search credits billed since the first of this Riyadh month."""
+    from career.cv.close import SEARCH_KINDS
+
+    local = now.astimezone(_RIYADH)
+    month_start = local.replace(day=1, hour=0, minute=0, second=0,
+                                microsecond=0).astimezone(now.tzinfo)
+    # Careful with the arithmetic: a family's credit count is written onto
+    # EVERY tenant that family serves (the cost is split, the count is not),
+    # so summing input_tokens would multiply by the audience. The provider
+    # bills the family ONCE, so the honest figure is the count per (run,
+    # family) taken once — approximated here by the max within each run, then
+    # summed across runs.
+    per_run = select(
+        UsageEvent.run_id.label("run_id"),
+        func.max(UsageEvent.input_tokens).label("credits"),
+    ).where(
+        UsageEvent.kind.in_(SEARCH_KINDS),
+        UsageEvent.occurred_at >= month_start,
+    ).group_by(UsageEvent.run_id).subquery()
+    return int(session.execute(
+        select(func.coalesce(func.sum(per_run.c.credits), 0))
+    ).scalar_one() or 0)
+
+
 def _business_data(
     session: Session, range_key: str, *, now: datetime
 ) -> dict[str, Any]:
@@ -625,6 +650,14 @@ def _business_data(
         "outcomes": outcomes,
         "llm_generations": llm_calls,
         "llm_cost_usd": llm_cost,
+        # The real ceiling is not money, it is the monthly SEARCH allowance:
+        # the provider sells a fixed block of searches, and it is the number
+        # of CAREER PATHS that consumes it, not the number of customers. A
+        # hundred customers across five paths use what twenty across the same
+        # five use. Without this line the operator watches spend rise and has
+        # no idea how close the allowance is to running out — the one limit
+        # that stops discovery for EVERY customer at once.
+        "searches_this_month": _searches_this_month(session, now=now),
         "spend_by_category": {k: (v[0], v[1]) for k, v in sorted(spend.items())},
         "total_cost_usd": total_cost,
         "cost_tenants": cost_tenants,
