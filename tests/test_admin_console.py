@@ -1342,3 +1342,47 @@ def test_an_exhausted_resend_is_never_reported_as_partly_arrived(
         assert _day_state(owner_session, t1) == "WHATSAPP_FAILED"
     finally:
         _clear_delivery(owner_session, t1)
+
+
+def test_a_resend_that_lands_closes_the_day_and_suppresses(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """The operator's resend went through the same delivery machinery as the
+    customer's tap but skipped everything that HAPPENS after it: the day was
+    never closed (§15.12 — a tenant with no honest state) and no suppression
+    was written, so the very same jobs stayed eligible and would be sent
+    again the next day. The operator fixed a delivery and silently created a
+    duplicate."""
+    from sqlalchemy import text as _sql
+
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    _seed_held_bundle(owner_session, t1, jobs=[_job("g1")])
+    wa = _fake_wa()
+
+    before = owner_session.execute(_sql(
+        "SELECT count(*) FROM tenant_day_states WHERE tenant_id = :t"),
+        {"t": str(t1)}).scalar_one()
+
+    handle_update(owner_session, _cbq(ADMIN, f"v1|act|{code}|resend"),
+                  admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+                  whatsapp_client=wa)
+    nonce_btn = handle_update(
+        owner_session, _cbq(ADMIN, f"v1|act|{code}|resend"),
+        admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+        whatsapp_client=wa,
+    )[1].keyboard[0][0][1]
+    handle_update(owner_session, _cbq(ADMIN, nonce_btn),
+                  admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+                  whatsapp_client=wa)
+    owner_session.commit()
+
+    after = owner_session.execute(_sql(
+        "SELECT count(*) FROM tenant_day_states WHERE tenant_id = :t"),
+        {"t": str(t1)}).scalar_one()
+    assert after == before + 1, "a landed resend must close the tenant's day"
+
+    state = owner_session.execute(_sql(
+        "SELECT state FROM tenant_day_states WHERE tenant_id = :t"
+        " ORDER BY run_date DESC LIMIT 1"), {"t": str(t1)}).scalar_one()
+    assert state in ("DELIVERED", "PARTIAL_DELIVERY"), state

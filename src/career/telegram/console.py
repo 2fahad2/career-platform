@@ -24,6 +24,8 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from career.cv.close import rollup_costs
+from career.cv.daily_run import close_from_delivery
 from career.db.models import (
     CustomerChannel,
     Delivery,
@@ -684,6 +686,22 @@ def _run_action(
         # PARTIAL-with-nothing, and only one of those is «وصل جزء».
         status = result.status
         delivered = result.delivered_groups
+        # Close the DAY, exactly as the customer-tap path does. Without this a
+        # resend that actually landed left the tenant with no honest day state
+        # (§15.12) and — worse — wrote no suppression, so the very same jobs
+        # were eligible to be sent again tomorrow. The operator fixed the
+        # delivery and silently created a duplicate.
+        if result.delivery is not None:
+            closed = close_from_delivery(
+                session, delivery=result.delivery, now=now,
+            )
+            if closed is not None:
+                try:
+                    rollup_costs(
+                        session, tenant_id=tenant.id, day=closed.run_date,
+                    )
+                except Exception:  # noqa: BLE001 — accounting never blocks
+                    logger.warning("resend cost rollup failed", exc_info=True)
         session.commit()
         if result.outcome == RESEND_WINDOW_CLOSED:
             message = RESEND_CLOSED_AR
