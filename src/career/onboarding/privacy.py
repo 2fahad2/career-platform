@@ -394,9 +394,25 @@ def _subscription(session: Session, tenant_id: uuid.UUID) -> Subscription:
     return subscription
 
 
+#: Pausing is meaningful only from a state that is actually running.
+_PAUSABLE: frozenset[str] = frozenset({
+    sub_states.ACTIVE, sub_states.ONBOARDING, sub_states.GRACE,
+})
+
+
 def pause_subscription(session: Session, *, tenant_id: uuid.UUID) -> Subscription:
-    """Suspend delivery WITHOUT touching the period end (§05: لا يمدد)."""
+    """Suspend delivery WITHOUT touching the period end (§05: لا يمدد).
+
+    Idempotent, and never an exception. The unguarded transition raised
+    InvalidTransition straight into the WhatsApp worker for anyone already
+    paused, expired or cancelled — a customer typing «وقف مؤقت» a second time,
+    or after their period ended, crashed their own turn and was answered with
+    nothing at all. Sending a command twice is not an error, and a customer
+    must never be able to break the conversation by repeating themselves.
+    """
     subscription = _subscription(session, tenant_id)
+    if subscription.status not in _PAUSABLE:
+        return subscription
     return transition(
         session, subscription, sub_states.PAUSED, event_type="customer_pause"
     )

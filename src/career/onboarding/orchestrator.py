@@ -181,6 +181,16 @@ _GREETINGS = frozenset(
 
 _PRIVACY_COMMANDS = {
     "حالة اشتراكي": "status",
+    # What Meta's ALREADY-APPROVED renewal and recovery templates actually
+    # send when the customer taps their button. A quick-reply button arrives
+    # as its own label, and the label on those two is «تجديد الاشتراك» — a
+    # template's buttons cannot be changed once approved, so the code has to
+    # accept what the wire really carries. Without this the customer taps
+    # «renew» at the exact moment they intend to PAY and lands on the generic
+    # fallback. It routes to the status reply, which is where the store link
+    # and the remaining days are (§16).
+    "تجديد الاشتراك": "status",
+    "تجديد اشتراكي": "status",
     "وقف مؤقت": "pause",
     "استئناف": "resume",
     "تصدير بياناتي": "export",

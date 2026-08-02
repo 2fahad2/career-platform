@@ -333,3 +333,56 @@ def test_the_export_is_as_wide_as_the_deletion(owner_session, clean_billing):
         owner_session.execute(sql_text("DELETE FROM tenants WHERE id = :t"),
                               {"t": str(tid)})
         owner_session.commit()
+
+
+def test_pausing_twice_never_breaks_the_conversation(owner_session, clean_billing):
+    """The unguarded transition raised InvalidTransition into the WhatsApp
+    worker for anyone already paused, expired or cancelled — a customer who
+    typed «وقف مؤقت» a second time crashed their own turn and was answered
+    with nothing. Repeating a command is not an error."""
+    from career.onboarding import privacy as _p
+    from career.salla import subscriptions as _st
+
+    tid = uuid.uuid4()
+    sid = uuid.uuid4()
+    owner_session.execute(sql_text(
+        "INSERT INTO tenants (id, code) VALUES (:i, :c)"),
+        {"i": str(tid), "c": f"TEN-P{uuid.uuid4().int % 100_000:05d}"})
+    owner_session.execute(sql_text(
+        "INSERT INTO subscriptions (id, tenant_id, plan_code, status,"
+        " salla_order_id, amount_sar, currency)"
+        " VALUES (:i, :t, 'professional', 'ACTIVE', :o, 279, 'SAR')"),
+        {"i": str(sid), "t": str(tid), "o": f"ORD-{uuid.uuid4()}"})
+    owner_session.commit()
+    try:
+        first = _p.pause_subscription(owner_session, tenant_id=tid)
+        assert first.status == _st.PAUSED
+
+        again = _p.pause_subscription(owner_session, tenant_id=tid)   # no raise
+        assert again.status == _st.PAUSED
+
+        # and from a state where pausing means nothing at all
+        owner_session.execute(sql_text(
+            "UPDATE subscriptions SET status = 'EXPIRED' WHERE id = :i"),
+            {"i": str(sid)})
+        owner_session.commit()
+        expired = _p.pause_subscription(owner_session, tenant_id=tid)
+        assert expired.status == "EXPIRED"        # untouched, not crashed
+    finally:
+        owner_session.rollback()
+        for table in ("subscription_events", "privacy_requests", "subscriptions"):
+            owner_session.execute(sql_text(
+                f"DELETE FROM {table} WHERE tenant_id = :t"), {"t": str(tid)})  # noqa: S608
+        owner_session.execute(sql_text("DELETE FROM tenants WHERE id = :t"),
+                              {"t": str(tid)})
+        owner_session.commit()
+
+
+def test_the_renewal_button_meta_really_sends_is_understood() -> None:
+    """Meta's APPROVED renewal and recovery templates carry the button label
+    «تجديد الاشتراك», and a template's buttons cannot be changed once
+    approved. The customer taps it at the exact moment they intend to pay."""
+    from career.onboarding.orchestrator import _PRIVACY_COMMANDS
+
+    assert _PRIVACY_COMMANDS["تجديد الاشتراك"] == "status"
+    assert _PRIVACY_COMMANDS["حالة اشتراكي"] == "status"
