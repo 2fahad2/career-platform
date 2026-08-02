@@ -205,7 +205,7 @@ def main() -> None:  # pragma: no cover — the C7.8 live runner
                 if any(enr_counts.values()):
                     logger.info("enrichment sweep: %s", enr_counts)
                 # canary evening nudge: keep the operator's own 24h window
-                # open for tomorrow's dawn delivery (template-independence)
+                # open for tomorrow's 11:00 delivery (template-independence)
                 today = now.astimezone(_RIYADH).date()
                 if settings.canary_test_phone and last_window_nudge != today:
                     with Session(engine) as session:
@@ -227,8 +227,8 @@ def main() -> None:  # pragma: no cover — the C7.8 live runner
                         last_window_nudge = today
                         admin.send_admin(
                             "🔔 نافذة واتساب حقتك بتكون مقفولة وقت تسليم "
-                            "بكرة الفجر — أرسل أي رسالة لرقم الخدمة الآن "
-                            "عشان توصلك الفرص مباشرة"
+                            "بكرة — أرسل أي رسالة لرقم الخدمة الآن عشان "
+                            "توصلك الفرص مباشرة"
                         )
                 # weekly report — Sunday morning (Riyadh), once per week
                 riyadh_now = now.astimezone(_RIYADH)

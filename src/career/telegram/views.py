@@ -112,8 +112,8 @@ def render_health(h: dict[str, Any]) -> tuple[str, Keyboard]:
     lines.append("عامل المحادثة: " + _light(h.get("worker_active"), "يعمل", "متوقف"))
     timer_next = h.get("timer_next")
     lines.append(
-        f"مؤقت الفجر: 🟢 التالي {timer_next}" if timer_next
-        else "مؤقت الفجر: ⚪ غير معروف"
+        f"مؤقت التسليم: 🟢 التالي {timer_next}" if timer_next
+        else "مؤقت التسليم: ⚪ غير معروف"
     )
     lines.append("توكن ميتا: " + _light(h.get("meta_token_ok"), "دائم ويعمل", "لا يستجيب"))
     days = h.get("salla_days_left")

@@ -1,10 +1,18 @@
-# 04:30 Riyadh: after the 03:30 backup, before the Saudi morning (C7 delivery
-# will read this run's results).
+# 11:00 Riyadh (Fahad's decision, 2 August). Dawn was chosen so the jobs
+# would be waiting when the customer woke up; in practice it cost twice.
+#
+# Every customer's 24h WhatsApp window is shut at 04:30 — nobody messages us
+# at four in the morning — so EVERY delivery needed a paid, Meta-approved
+# template, and any template failure lost the whole day. At 11:00 a customer
+# who wrote to us yesterday evening is still INSIDE their window, so the
+# bundle goes out as a direct free-form message: no template, no cost, no
+# Meta dependency. And a message that lands at eleven is read and acted on;
+# one that lands at four thirty is buried under the morning's notifications.
 [Unit]
-Description=Nightly career engine run at 04:30 Riyadh
+Description=Daily career engine run at 11:00 Riyadh
 
 [Timer]
-OnCalendar=*-*-* 04:30:00 Asia/Riyadh
+OnCalendar=*-*-* 11:00:00 Asia/Riyadh
 Persistent=true
 
 [Install]

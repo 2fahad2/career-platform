@@ -284,7 +284,12 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
                     now=datetime.now(UTC),
                     include_weekend=args.include_weekend,
                     canary_tenant_id=canary_tid,
-                    canary_delay_seconds=3600.0,
+                    # Fahad, 2 August: «كل شي الساعة ١١». The canary hour
+                    # belonged to the review phase — it pushed every other
+                    # customer's delivery to noon. Ordering is kept (his
+                    # lands first, so a bad CV is still seen first) but the
+                    # wait is gone: everyone is served at eleven.
+                    canary_delay_seconds=0.0,
                 )
                 # read INSIDE the session — the rows expire on close
                 # AUDIT ك-17: TEN codes in the journal, never raw uuids

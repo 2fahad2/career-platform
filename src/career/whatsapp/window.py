@@ -39,9 +39,14 @@ def window_state(
 # ── the canary evening reminder (admin channel, template-independence) ───────
 
 _RIYADH = ZoneInfo("Asia/Riyadh")
-_DELIVERY_HOUR = 4          # the nightly timer fires 04:30 Riyadh
+#: The delivery run's hour, Riyadh. Moved from 04:30 to 11:00 (Fahad, 2
+#: August): at dawn EVERY customer's window is shut, so every delivery needed
+#: a paid template; at eleven, anyone who wrote to us the previous evening is
+#: still inside their 24h window and the bundle goes out free-form.
+_DELIVERY_HOUR = 11
+_DELIVERY_MINUTE = 0
 _REMINDER_HOURS = (19, 20, 21, 22)   # evening nudge window (Riyadh)
-_SAUDI_WEEKEND = (4, 5)     # Fri/Sat — no delivery next dawn on Thu/Fri eve
+_SAUDI_WEEKEND = (4, 5)     # Fri/Sat — no delivery on Thu/Fri evening
 
 
 def window_reminder_due(
@@ -50,10 +55,14 @@ def window_reminder_due(
     opt_out_at: datetime | None,
     now: datetime,
 ) -> bool:
-    """True when the operator should be nudged TONIGHT: tomorrow's dawn run
-    is a delivery day and the 24h window will already be CLOSED at 04:30 —
-    so without an approved template nothing free-form can go out. Pure;
-    the caller de-duplicates per evening."""
+    """True when the operator should be nudged TONIGHT: tomorrow IS a delivery
+    day and their 24h window will STILL be closed when the run fires — so
+    without an approved template nothing free-form can go out. Pure; the
+    caller de-duplicates per evening.
+
+    Note the eleven o'clock move makes this fire far less often: a message
+    sent at nine in the evening leaves the window open until nine the next
+    evening, which now covers the run instead of missing it by seven hours."""
     if opt_out_at is not None:
         return False
     local = now.astimezone(_RIYADH)
@@ -62,9 +71,11 @@ def window_reminder_due(
     tomorrow = local.date() + timedelta(days=1)
     if tomorrow.weekday() in _SAUDI_WEEKEND:
         return False
-    dawn = datetime.combine(
-        tomorrow, time(hour=_DELIVERY_HOUR, minute=30), tzinfo=_RIYADH
+    delivery_at = datetime.combine(
+        tomorrow, time(hour=_DELIVERY_HOUR, minute=_DELIVERY_MINUTE),
+        tzinfo=_RIYADH,
     )
     return window_state(
-        last_inbound_at=last_inbound_at, opt_out_at=opt_out_at, now=dawn
+        last_inbound_at=last_inbound_at, opt_out_at=opt_out_at,
+        now=delivery_at,
     ) is WindowState.CLOSED
