@@ -520,6 +520,12 @@ def _handle_message(
 
         answer = followup.parse_answer(effective)
         if answer is not None:
+            # CONSUMES the tap either way. Falling through when nothing was
+            # pending sent «oc_interview» into the enrichment branch, whose
+            # final else treats unmatched text as the customer's achievement
+            # — so a double tap, or a tap on an old card (WhatsApp keeps them
+            # tappable forever), wrote a button id into the achievement bank
+            # and paid for an LLM call to render it. Constant 5.
             pending = followup.pending_job_ref(
                 session, tenant_id=channel.tenant_id)
             if pending is not None:
@@ -527,9 +533,11 @@ def _handle_message(
                     session, tenant_id=channel.tenant_id, job_ref=pending,
                     outcome=answer, now=now,
                 )
-                whatsapp_client.send_text(channel.phone_e164, thanks)
-                session.commit()
-                return
+            else:
+                thanks = followup.ALREADY_ANSWERED_AR
+            whatsapp_client.send_text(channel.phone_e164, thanks)
+            session.commit()
+            return
 
         outcome = cv_deliver.parse_outcome_button(effective)
         if outcome is not None:

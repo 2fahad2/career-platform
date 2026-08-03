@@ -135,7 +135,8 @@ def close_tenant_day(
     return row
 
 
-#: A day that ALREADY delivered cannot be un-delivered by a later pass.
+#: Only a DELIVERY is protected. A day that already delivered cannot be
+#: un-delivered by a later pass — but nothing else outranks anything.
 #:
 #: Re-running the nightly on the same Riyadh day is a normal recovery action,
 #: and it used to destroy the truth: a DELIVERED day whose second pass found
@@ -146,26 +147,30 @@ def close_tenant_day(
 #:
 #: So the ledger only ever moves UP. Rank is «how much did the customer
 #: actually receive», not «what happened last».
-_STATE_RANK: dict[str, int] = {
-    "DELIVERED": 100,
-    "PARTIAL_DELIVERY": 90,
-    "SKIPPED_OPTED_OUT": 50,
-    "NO_MATCHES": 40,
-    "WHATSAPP_FAILED": 30,
-    "CV_GENERATION_FAILED": 20,
-    "DISCOVERY_FAILED": 10,
-    "LEDGER_FAILED": 5,
-}
+#: The ONLY states that may not be overwritten by a later pass, because the
+#: customer really did receive something and no later event can undo that.
+_PROTECTED: frozenset[str] = frozenset({"DELIVERED", "PARTIAL_DELIVERY"})
 
 
 def _outranks(new_state: str, existing: str) -> bool:
-    """True when the new state may replace the recorded one.
+    """May the new state replace the recorded one?
 
-    Equal ranks still replace: a second DELIVERED pass legitimately refreshes
-    its counts. Only a DEMOTION is refused, because nothing that happens after
-    a delivery can make that delivery not have happened.
+    The first version of this ranked ALL eight states, and that was wrong in
+    a way that broke the very constant it was meant to serve. NO_MATCHES
+    outranked every failure, so a morning that found nothing and an afternoon
+    re-run whose CV generation then failed was still recorded «no matching
+    opportunities» — money spent on Claude, an honest failure discarded, and
+    the operator shown a clean day. LEDGER_FAILED, ranked lowest of all, could
+    never be recorded at all, though §15.3 and §15.12 both lean on it.
+
+    So only a real DELIVERY is protected. Everything else is the latest truth,
+    which is what an honest ledger is for. A promotion into a delivered state
+    is always allowed — a re-run that finally lands is exactly the recovery
+    the operator is trying to perform.
     """
-    return _STATE_RANK.get(new_state, 0) >= _STATE_RANK.get(existing, 0)
+    if existing not in _PROTECTED:
+        return True
+    return new_state in _PROTECTED
 
 
 def close_skipped_opted_out(

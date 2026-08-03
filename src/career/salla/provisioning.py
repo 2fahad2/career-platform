@@ -199,12 +199,15 @@ def _reconcile_existing(
         # gets wrong — a customer who got 50 riyals back as an apology and
         # lost their whole subscription — is invisible otherwise and only the
         # operator can put it right.
+        refunded = event_type == "order.refunded"
         _alert(admin_client_hint, (
-            f"🔻 أُوقفت الخدمة لـ{_code_of(owner_session, existing.tenant_id)}\n"
+            "🔻 أُوقفت الخدمة للعميل\n"
+            f"{_code_of(owner_session, existing.tenant_id)}\n"
             f"السبب:\n{event_type}\n"
             f"المبلغ المدفوع أصلًا:\n{charged if charged is not None else '؟'}\n"
             f"مبلغ الطلب الآن:\n{order.amount}\n"
-            "إن كان الاسترداد جزئيًا فالإيقاف غير مقصود — أعِد تفعيله يدويًا"
+            + ("إن كان الاسترداد جزئيًا فالإيقاف غير مقصود — أعِد تفعيله يدويًا"
+               if refunded else "إلغاء من المتجر — راجعه إن لم يكن بطلب العميل")
         ))
         return ProvisionResult(ProvisionStatus.SERVICE_STOPPED, **ids)
 
@@ -284,7 +287,20 @@ def provision_order(
     exp_amount, exp_currency = expected
     if (order.amount != exp_amount
             or (order.currency or "").upper() != exp_currency.upper()):
-        logger.warning("order amount/currency mismatch — not provisioning")
+        logger.error("order amount/currency mismatch — not provisioning")
+        # The single highest-cost failure in the system — the buyer paid and
+        # will be refused — was the ONE branch with no alert, while the
+        # uncataloged-product and unusable-phone branches beside it both
+        # shout. The most likely trigger is our own configuration: the store
+        # sells at a price the environment does not expect.
+        _alert(admin_client_hint, (
+            "🔴 طلب مدفوع بمبلغ أو عملة لا تطابق المتوقع — لم يُزوَّد\n"
+            f"معرّف المنتج:\n{order.product_id}\n"
+            f"المبلغ الوارد:\n{order.amount} {order.currency}\n"
+            f"المتوقع:\n{exp_amount} {exp_currency}\n"
+            "الأغلب أن سعر المتجر لا يطابق التسعيرة في الإعدادات — صحّحها "
+            "ثم أعد تشغيل الطلب"
+        ))
         _mark_webhook(owner_session, webhook_event, "failed")
         owner_session.commit()
         return ProvisionResult(ProvisionStatus.AMOUNT_MISMATCH)

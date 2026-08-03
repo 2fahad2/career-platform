@@ -180,7 +180,17 @@ class HttpSallaClient:
         phone = customer.get("mobile")
         code = str(customer.get("mobile_code") or "").strip()
         if phone and code:
-            phone = f"{code}{str(phone).lstrip('0')}"
+            local = str(phone).strip()
+            digits_code = code.lstrip("+")
+            # Some payloads carry the country code in BOTH fields. Blindly
+            # concatenating produced «+966966555000111» — fifteen digits, which
+            # passes the length check and is stored as a real number, so the
+            # buyer gets no welcome template AND the «no usable phone» alert
+            # never fires. Silent is worse than absent.
+            if not local.lstrip("+").startswith(digits_code):
+                phone = f"{code}{local.lstrip('0')}"
+            else:
+                phone = f"+{local.lstrip('+')}"
 
         items_resp = self._get("/orders/items", params={"order_id": order_id})
         items_resp.raise_for_status()

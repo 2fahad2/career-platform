@@ -187,6 +187,34 @@ _GREETINGS_NORMALIZED: frozenset[str] = frozenset(
     normalize_ar(g) for g in _GREETINGS
 )
 
+#: Every word that can appear in a pure courtesy message. Exact membership on
+#: whole phrases caught «السلام عليكم» and missed «السلام عليكم ورحمة الله
+#: وبركاته», «صباح الخير», «هلا والله», «شكرا», «وعليكم السلام» — all of which
+#: were then written into the achievement bank as a job title and fed into
+#: every CV we generate. A greeting is not a set of phrases to enumerate; it
+#: is a message made ENTIRELY of courtesy words and nothing else.
+_COURTESY_WORDS: frozenset[str] = frozenset(normalize_ar(w) for w in (
+    "السلام", "عليكم", "وعليكم", "ورحمه", "الله", "وبركاته", "وبركاة",
+    "مرحبا", "مرحب", "اهلا", "اهلين", "هلا", "والله", "يا", "حياك",
+    "صباح", "مساء", "الخير", "النور", "كيف", "الحال", "حالك", "شلونك",
+    "شكرا", "مشكور", "تسلم", "يعطيك", "العافيه", "طيب", "تمام", "اوك",
+    "نكمل", "كمل", "وين", "وقفنا", "سلام",
+    "hi", "hello", "hey", "thanks", "ok", "okay",
+))
+
+
+def _is_courtesy_only(body: str) -> bool:
+    """True when the message carries nothing but politeness.
+
+    Deliberately conservative: ANY word outside the courtesy vocabulary makes
+    it a real answer, so «هلا، شتغلت مدير فرع» is treated as the answer it is
+    and never bounced back at the customer.
+    """
+    words = [w for w in normalize_ar(body or "").split() if w]
+    if not words or len(words) > 6:
+        return False
+    return all(w.strip("،.!?؟") in _COURTESY_WORDS for w in words)
+
 _PRIVACY_COMMANDS = {
     "حالة اشتراكي": "status",
     # What Meta's ALREADY-APPROVED renewal and recovery templates actually
@@ -898,7 +926,9 @@ def _handle_consent_or_question(
     if question is None:  # shouldn't happen — prompt advances the state
         _prompt_current_step(session, journey, channel, deps, now=now)
         return
-    if body.strip(" ؟?!.").lower() in _GREETINGS:
+    # Same authority as the gap question. This one compared RAW text, so
+    # «مرحبًا» with its diacritic slipped past the very guard named after it.
+    if _is_courtesy_only(body):
         # a greeting/resume nudge is never an answer — re-ask where we left off
         _prompt_current_step(session, journey, channel, deps, now=now)
         return
@@ -1020,7 +1050,7 @@ def _handle_verdict(
         # marked satisfied, and the real question was never asked again — and
         # that title then fed every CV we generate (constant 5). Re-ask
         # instead: the customer is greeting us, not answering.
-        if normalize_ar(body) in _GREETINGS_NORMALIZED:
+        if normalize_ar(body) in _GREETINGS_NORMALIZED or _is_courtesy_only(body):
             _send(session, deps, channel,
                   _GAP_EXPERIENCE if gap == "experience" else _GAP_SKILL,
                   now=now)

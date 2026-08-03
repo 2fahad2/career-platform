@@ -190,7 +190,12 @@ def _already_delivered_today(
             TenantDayState.run_date == run_date,
         )
     ).scalars().first()
-    return state in ("DELIVERED", "PARTIAL_DELIVERY")
+    # DELIVERED only. A PARTIAL day is precisely the one the operator re-runs
+    # to finish: a customer who paid for two jobs and received one must not be
+    # skipped for the rest of the day, which is what treating PARTIAL as
+    # «already received» did — it removed the recovery it was written to
+    # protect and dropped the tenant from the run report entirely.
+    return state == "DELIVERED"
 
 
 def close_from_delivery(

@@ -262,3 +262,45 @@ def test_no_test_order_describes_a_shape_salla_never_sends() -> None:
         "these test orders carry no buyer mobile, a shape Salla never sends: "
         + ", ".join(offenders)
     )
+
+
+def test_courtesy_is_recognised_by_shape_not_by_a_list() -> None:
+    """The first guard was exact membership on thirteen phrases, so it caught
+    «السلام عليكم» and missed «السلام عليكم ورحمة الله وبركاته», «صباح الخير»,
+    «هلا والله», «شكرا» and «وعليكم السلام» — every one of which was then
+    written into the achievement bank as a job title and fed into every CV.
+
+    A greeting is not a list to enumerate; it is a message made ENTIRELY of
+    courtesy words. And the rule must stay conservative in the other
+    direction: any real content makes it an answer."""
+    from career.onboarding.orchestrator import _is_courtesy_only as courtesy
+
+    for greeting in ("السلام عليكم ورحمة الله وبركاته", "صباح الخير",
+                     "مساء الخير", "هلا والله", "كيف الحال", "شكرا",
+                     "وعليكم السلام", "مرحبًا", "نكمل", "hi", "تمام"):
+        assert courtesy(greeting), greeting
+
+    for answer in ("محلل أعمال", "مدير فرع في بنك الرياض", "مهندس برمجيات",
+                   "هلا، شتغلت مدير فرع", "شكرا اشتغلت محاسب"):
+        assert not courtesy(answer), answer
+
+
+def test_only_a_real_delivery_is_protected_from_being_overwritten() -> None:
+    """The first monotonic ledger ranked all eight states and broke the very
+    constant it served: NO_MATCHES outranked every failure, so a re-run whose
+    CV generation failed still read «no opportunities today» — money spent,
+    failure discarded. LEDGER_FAILED, ranked lowest, could never be recorded
+    at all, though §15.3 and §15.12 both lean on it."""
+    from career.cv.close import _outranks
+
+    # a delivery cannot be undone
+    assert not _outranks("NO_MATCHES", "DELIVERED")
+    assert not _outranks("CV_GENERATION_FAILED", "PARTIAL_DELIVERY")
+    # but every honest failure can still be recorded over a non-delivery
+    assert _outranks("CV_GENERATION_FAILED", "NO_MATCHES")
+    assert _outranks("LEDGER_FAILED", "DELIVERED") is False
+    assert _outranks("LEDGER_FAILED", "NO_MATCHES")
+    assert _outranks("WHATSAPP_FAILED", "DISCOVERY_FAILED")
+    # and a recovery run that finally lands is always allowed
+    assert _outranks("DELIVERED", "WHATSAPP_FAILED")
+    assert _outranks("PARTIAL_DELIVERY", "DELIVERED")

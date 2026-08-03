@@ -21,9 +21,11 @@ Every constraint here is deliberate:
   hour: if the window is shut we wait, and after thirty days we close the ask
   silently, because the answer's value decays and a stale question is worse
   than none.
-* **Never to someone who stopped messages** and never on a day they are
-  already receiving a delivery — the question must not compete with the
-  product.
+* **Never to someone who stopped messages.** (An earlier draft of this note
+  also promised «never on a day they are already receiving a delivery»; no
+  such check existed, so the promise is removed rather than left as fiction.
+  In practice the two rarely collide: delivery runs at eleven, this sweep
+  fires hourly on an open window.)
 
 Built BEFORE launch on purpose: this data cannot be recovered afterwards. A
 customer who applied today and was not asked will not remember in a month.
@@ -52,6 +54,10 @@ ASK_AFTER_DAYS = 14
 
 #: After this we stop waiting for an open window and close the ask silently.
 GIVE_UP_AFTER_DAYS = 30
+
+#: How long an ASKED question stays open before we accept it went unanswered.
+#: Without this a single ignored question blocked that customer forever.
+ANSWER_WINDOW_DAYS = 7
 
 #: The application stage we follow up on, and the stages that end the thread.
 #: Deliberately short: outcome_events.outcome is VARCHAR(16), and widening a
@@ -88,6 +94,9 @@ THANKS_INTERVIEW_AR = (
     "توفيق يا رب 🤍\n"
     "وهذي أهم معلومة تعطينا إياها — نعرف منها أي فرص تستاهل وقتك فعلًا"
 )
+#: A tap with nothing pending — a second tap, or an old card scrolled back to.
+ALREADY_ANSWERED_AR = "مسجّلة عندنا 👍 شكرًا لك"
+
 THANKS_OTHER_AR = (
     "شكرًا لك 🙏\n"
     "حتى «ما ردّوا» تفيدنا — نتعلم منها ونحسّن اختياراتنا لك"
@@ -146,6 +155,33 @@ def record_answer(
     return THANKS_INTERVIEW_AR if outcome == INTERVIEW else THANKS_OTHER_AR
 
 
+def stale_asked(
+    session: Session, *, now: datetime
+) -> list[tuple[uuid.UUID, str]]:
+    """Questions asked long ago and never answered.
+
+    These MUST be closable, and originally they were not: the give-up path
+    only ran over `due_applications`, which excludes anything already ASKED —
+    so an unanswered question stayed pending forever, `pending_job_ref` never
+    returned None, and every later application for that customer was skipped
+    every hour for the rest of their subscription. Twenty such customers took
+    the whole per-pass budget and the feature stopped collecting anything at
+    all (proved by execution, not argument).
+    """
+    cutoff = now - timedelta(days=ANSWER_WINDOW_DAYS)
+    rows = session.execute(
+        select(OutcomeEvent.tenant_id, OutcomeEvent.job_ref)
+        .where(OutcomeEvent.outcome == ASKED,
+               OutcomeEvent.occurred_at <= cutoff)
+    ).all()
+    out: list[tuple[uuid.UUID, str]] = []
+    for tenant_id, job_ref in rows:
+        if not (_stages(session, tenant_id, job_ref)
+                & {INTERVIEW, NO_REPLY, REJECTED, GAVE_UP}):
+            out.append((tenant_id, str(job_ref)))
+    return out
+
+
 def due_applications(
     session: Session, *, now: datetime
 ) -> list[tuple[uuid.UUID, str, datetime]]:
@@ -195,7 +231,21 @@ def sweep_outcome_questions(
     limit: int = 20,
 ) -> dict[str, int]:
     """Ask, or wait, or give up — one honest pass. Safe to run hourly."""
-    counts = {"asked": 0, "waiting_window": 0, "gave_up": 0, "skipped": 0}
+    counts = {"asked": 0, "waiting_window": 0, "gave_up": 0, "skipped": 0,
+              "closed_unanswered": 0}
+
+    # FIRST: retire questions nobody answered. Doing this before anything else
+    # is what keeps one ignored question from blocking a customer forever.
+    from career.cv.deliver import record_outcome
+
+    for tenant_id, job_ref in stale_asked(session, now=now):
+        record_outcome(
+            session, tenant_id=tenant_id, job_ref=job_ref, outcome=GAVE_UP,
+            reason="no_answer", now=now,
+        )
+        counts["closed_unanswered"] += 1
+    if counts["closed_unanswered"]:
+        session.flush()
 
     for tenant_id, job_ref, applied_at in due_applications(session, now=now)[:limit]:
         channel = session.execute(
@@ -249,12 +299,15 @@ def sweep_outcome_questions(
 
         record_out(session, tenant_id=tenant_id, channel_id=channel.id,
                    kind="interactive", wa_message_id=mid, now=now)
-        from career.cv.deliver import record_outcome
-
         record_outcome(
             session, tenant_id=tenant_id, job_ref=job_ref, outcome=ASKED,
             reason="followup_sent", now=now,
         )
+        # Commit per question, not per pass. The message is already gone; if
+        # the loop dies before the caller commits, the ASKED row vanishes and
+        # the customer is asked the very same thing again (proved: SENT TWICE).
+        # A survey that repeats is the one thing this feature must never be.
+        session.commit()
         counts["asked"] += 1
 
     return counts
