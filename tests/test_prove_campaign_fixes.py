@@ -232,3 +232,33 @@ def test_stray_chatter_at_the_cards_leaves_no_orphan_rows(
         owner_session.execute(sql_text("DELETE FROM tenants WHERE id = :t"),
                               {"t": str(tid)})
         owner_session.commit()
+
+
+def test_no_test_order_describes_a_shape_salla_never_sends() -> None:
+    """The structural guard behind the phone defect.
+
+    A real Salla order ALWAYS carries the buyer's mobile — zero-touch
+    activation, the welcome template and renewal matching all key on it. Test
+    orders that omitted it were describing a shape the world never sends, and
+    that unrealism is precisely how the defect survived for weeks: the suite
+    was green while no real customer could have been activated.
+
+    A new test order without a phone fails here rather than in production.
+    """
+    import pathlib
+    import re
+
+    offenders: list[str] = []
+    for path in sorted(pathlib.Path("tests").glob("test_*.py")):
+        text = path.read_text(encoding="utf-8")
+        for match in re.finditer(r"SallaOrder\(", text):
+            # look at the call and the two lines that follow it
+            window = text[match.start(): match.start() + 400]
+            call = window.split("\n\n")[0]
+            if "customer_phone" not in call:
+                line = text[: match.start()].count("\n") + 1
+                offenders.append(f"{path}:{line}")
+    assert offenders == [], (
+        "these test orders carry no buyer mobile, a shape Salla never sends: "
+        + ", ".join(offenders)
+    )

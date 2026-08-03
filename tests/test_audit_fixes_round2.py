@@ -24,11 +24,21 @@ _PR = {"prod_pro": (Decimal("279.00"), "SAR"), "prod_basic": (Decimal("149"), "S
 NOW = datetime(2026, 7, 15, 9, 0, tzinfo=UTC)
 
 
+def _probe_phone() -> str:
+    """A real Salla order ALWAYS carries the buyer's mobile — the whole
+    zero-touch activation path keys on it. Test orders that omitted it were
+    describing a shape the world never sends, and that unrealism is exactly
+    how the phone defect survived: the suite was green while no real customer
+    could have been activated."""
+    return f"+96650{uuid.uuid4().int % 10_000_000:07d}"
+
+
 def _tenant_with_channel(owner_session: Session):
     order_id = f"ORD-{uuid.uuid4()}"
     client = FakeSallaClient({
         order_id: SallaOrder(order_id, "paid", "prod_pro",
-                             Decimal("279.00"), "SAR")
+                             Decimal("279.00"), "SAR",
+                       customer_phone=_probe_phone())
     })
     token = provision_order(owner_session, order_id, salla_client=client,
                             product_catalog={"prod_pro": "professional"},

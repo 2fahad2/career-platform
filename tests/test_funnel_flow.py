@@ -46,6 +46,15 @@ class FakeExtractor:
         return FACTS
 
 
+def _probe_phone() -> str:
+    """A real Salla order ALWAYS carries the buyer's mobile — the whole
+    zero-touch activation path keys on it. Test orders that omitted it were
+    describing a shape the world never sends, and that unrealism is exactly
+    how the phone defect survived: the suite was green while no real customer
+    could have been activated."""
+    return f"+96650{uuid.uuid4().int % 10_000_000:07d}"
+
+
 def _deps(tmp_path) -> orchestrator.Deps:
     client = FakeWhatsAppClient()
     client.media["media-9"] = (
@@ -62,7 +71,8 @@ def _deps(tmp_path) -> orchestrator.Deps:
 def _provision_funnel(owner: Session) -> str:
     order_id = f"ORD-{uuid.uuid4()}"
     client = FakeSallaClient({
-        order_id: SallaOrder(order_id, "paid", "prod_cv", Decimal("29"), "SAR")
+        order_id: SallaOrder(order_id, "paid", "prod_cv", Decimal("29"), "SAR",
+                       customer_phone=_probe_phone())
     })
     result = provision_order(
         owner, order_id, salla_client=client,
@@ -191,7 +201,8 @@ def test_upgrade_relinks_and_opens_half_ready_onboarding(
         order_id = f"ORD-{uuid.uuid4()}"
         client = FakeSallaClient({
             order_id: SallaOrder(order_id, "paid", "prod_basic",
-                                 Decimal("149"), "SAR")
+                                 Decimal("149"), "SAR",
+                       customer_phone=_probe_phone())
         })
         upgrade = provision_order(
             owner_session, order_id, salla_client=client,
@@ -261,7 +272,8 @@ def test_expired_upgrade_token_never_relinks(
         order_id = f"ORD-{uuid.uuid4()}"
         client = FakeSallaClient({
             order_id: SallaOrder(order_id, "paid", "prod_basic",
-                                 Decimal("149"), "SAR")
+                                 Decimal("149"), "SAR",
+                       customer_phone=_probe_phone())
         })
         upgrade = provision_order(
             owner_session, order_id, salla_client=client,
@@ -333,7 +345,8 @@ def test_second_analysis_purchase_restarts_the_funnel(
         order_id = f"ORD-{uuid.uuid4()}"
         client = FakeSallaClient({
             order_id: SallaOrder(order_id, "paid", "prod_cv",
-                                 Decimal("29"), "SAR")
+                                 Decimal("29"), "SAR",
+                       customer_phone=_probe_phone())
         })
         second = provision_order(
             owner_session, order_id, salla_client=client,

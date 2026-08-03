@@ -23,11 +23,21 @@ _PR = {"prod_pro": (Decimal("279.00"), "SAR"), "prod_basic": (Decimal("149"), "S
 NOW = datetime(2026, 7, 15, 9, 0, tzinfo=UTC)
 
 
+def _probe_phone() -> str:
+    """A real Salla order ALWAYS carries the buyer's mobile — the whole
+    zero-touch activation path keys on it. Test orders that omitted it were
+    describing a shape the world never sends, and that unrealism is exactly
+    how the phone defect survived: the suite was green while no real customer
+    could have been activated."""
+    return f"+96650{uuid.uuid4().int % 10_000_000:07d}"
+
+
 def _active_sub(owner_session: Session, *, period_end: datetime) -> uuid.UUID:
     order_id = f"ORD-{uuid.uuid4()}"
     client = FakeSallaClient({
         order_id: SallaOrder(order_id, "paid", "prod_pro",
-                             Decimal("279.00"), "SAR")
+                             Decimal("279.00"), "SAR",
+                       customer_phone=_probe_phone())
     })
     result = provision_order(owner_session, order_id, salla_client=client,
                              product_catalog={"prod_pro": "professional"},
@@ -106,7 +116,8 @@ def test_cv_analysis_one_shot_is_untouched(
 ) -> None:
     order_id = f"ORD-{uuid.uuid4()}"
     client = FakeSallaClient({
-        order_id: SallaOrder(order_id, "paid", "prod_cv", Decimal("29.00"), "SAR")
+        order_id: SallaOrder(order_id, "paid", "prod_cv", Decimal("29.00"), "SAR",
+                       customer_phone=_probe_phone())
     })
     result = provision_order(owner_session, order_id, salla_client=client,
                              product_catalog={"prod_cv": "cv_analysis"},
@@ -133,7 +144,8 @@ def test_amount_or_currency_mismatch_never_provisions(
     order_id = f"ORD-{uuid.uuid4()}"
     client = FakeSallaClient({
         order_id: SallaOrder(order_id, "paid", "prod_pro",
-                             Decimal("10.00"), "SAR")   # should be 279.00
+                             Decimal("10.00"), "SAR",
+                       customer_phone=_probe_phone())   # should be 279.00
     })
     result = provision_order(
         owner_session, order_id, salla_client=client,
@@ -150,7 +162,8 @@ def test_amount_or_currency_mismatch_never_provisions(
     order2 = f"ORD-{uuid.uuid4()}"
     client2 = FakeSallaClient({
         order2: SallaOrder(order2, "paid", "prod_pro",
-                           Decimal("279.00"), "SAR")
+                           Decimal("279.00"), "SAR",
+                       customer_phone=_probe_phone())
     })
     ok = provision_order(
         owner_session, order2, salla_client=client2,
@@ -167,7 +180,8 @@ def test_unclaimed_subscription_expires_after_claim_deadline(
     order_id = f"ORD-{uuid.uuid4()}"
     client = FakeSallaClient({
         order_id: SallaOrder(order_id, "paid", "prod_pro",
-                             Decimal("279.00"), "SAR")
+                             Decimal("279.00"), "SAR",
+                       customer_phone=_probe_phone())
     })
     result = provision_order(owner_session, order_id, salla_client=client,
                              product_catalog={"prod_pro": "professional"},

@@ -31,6 +31,14 @@ NOW = datetime(2026, 7, 15, 10, 0, tzinfo=UTC)
 CATALOG = {"prod_pro": "professional"}
 
 
+def _probe_phone() -> str:
+    """A real Salla order ALWAYS carries the buyer's mobile — the whole
+    zero-touch activation path keys on it. A test order without one describes
+    a shape the world never sends, and that unrealism is how the phone defect
+    survived: the suite was green while no real customer could be activated."""
+    return f"+96650{uuid.uuid4().int % 10_000_000:07d}"
+
+
 def _payload(messages: list[dict[str, Any]] | None = None,
              statuses: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     return {"entry": [{"changes": [{"value": {
@@ -55,7 +63,8 @@ def _insert_event(owner_session: Session, payload: dict[str, Any]) -> None:
 def _provision_token(owner_session: Session) -> str:
     order_id = f"ORD-{uuid.uuid4()}"
     client = FakeSallaClient({
-        order_id: SallaOrder(order_id, "paid", "prod_pro", Decimal("279.00"), "SAR")
+        order_id: SallaOrder(order_id, "paid", "prod_pro", Decimal("279.00"),
+                             "SAR", customer_phone=_probe_phone())
     })
     pricing = {k: (Decimal("279.00"), "SAR") for k in CATALOG}
     tok = provision_order(owner_session, order_id, salla_client=client,

@@ -33,10 +33,19 @@ PRICING = {"prod_pro": (Decimal("279.00"), "SAR"),
            "prod_riyal": (Decimal("1.00"), "SAR")}
 
 
+def _probe_phone() -> str:
+    """A real Salla order ALWAYS carries the buyer's mobile — the whole
+    zero-touch activation path keys on it. A test order without one describes
+    a shape the world never sends, and that unrealism is how the phone defect
+    survived: the suite was green while no real customer could be activated."""
+    return f"+96650{uuid.uuid4().int % 10_000_000:07d}"
+
+
 def _order(order_id: str, *, status: str = "paid", product: str = "prod_pro",
            amount: str = "279.00", currency: str = "SAR") -> SallaOrder:
     return SallaOrder(order_id=order_id, status=status, product_id=product,
-                      amount=Decimal(amount), currency=currency)
+                      amount=Decimal(amount), currency=currency,
+                      customer_phone=_probe_phone())
 
 
 def _sub_count(owner_engine: Engine, order_id: str) -> int:

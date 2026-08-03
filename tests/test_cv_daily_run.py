@@ -83,10 +83,20 @@ class ThreeStageLlm:
         )
 
 
+def _probe_phone() -> str:
+    """A real Salla order ALWAYS carries the buyer's mobile — the whole
+    zero-touch activation path keys on it. Test orders that omitted it were
+    describing a shape the world never sends, and that unrealism is exactly
+    how the phone defect survived: the suite was green while no real customer
+    could have been activated."""
+    return f"+96650{uuid.uuid4().int % 10_000_000:07d}"
+
+
 def _seed_active_tenant(owner: Session) -> tuple[uuid.UUID, CustomerChannel]:
     order_id = f"ORD-{uuid.uuid4()}"
     client = FakeSallaClient({
-        order_id: SallaOrder(order_id, "paid", "prod_basic", Decimal("149"), "SAR")
+        order_id: SallaOrder(order_id, "paid", "prod_basic", Decimal("149"), "SAR",
+                       customer_phone=_probe_phone())
     })
     result = provision_order(
         owner, order_id, salla_client=client,
