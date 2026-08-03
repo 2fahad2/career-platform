@@ -137,6 +137,12 @@ _STATUS_TO_ORDER_EVENT: dict[str, str] = {
 }
 
 
+def _code_of(session: Session, tenant_id: uuid.UUID) -> str:
+    """TEN code for the admin channel (§15.13 — never a phone, never a name)."""
+    tenant = session.get(Tenant, tenant_id)
+    return tenant.code if tenant is not None else "?"
+
+
 def _reconcile_existing(
     owner_session: Session,
     existing: Subscription,
@@ -144,6 +150,7 @@ def _reconcile_existing(
     *,
     salla_client: SallaClient,
     webhook_event: WebhookEvent | None,
+    admin_client_hint: Any = None,
 ) -> ProvisionResult:
     """An event about an order we have already provisioned.
 
@@ -177,11 +184,28 @@ def _reconcile_existing(
 
     event_type = _STATUS_TO_ORDER_EVENT.get(order.status)
     if event_type is not None and existing.status not in sub_states.TERMINAL_STATES:
+        charged = existing.amount_sar
         sub_states.apply_order_lifecycle(
             owner_session, existing, event_type, salla_order_id=order_id,
         )
         _mark_webhook(owner_session, webhook_event, "processed")
         owner_session.commit()
+        # Stopping service on ANY refund is the safe default — we must never
+        # keep serving somebody whose money went back. But a PARTIAL refund
+        # (a goodwill gesture, a prorated adjustment) is indistinguishable
+        # from a full one here: the reconciler reads the order STATUS only,
+        # and nothing in the payload tells us how much came back. So we stop,
+        # and we say so loudly with both amounts, because the one case this
+        # gets wrong — a customer who got 50 riyals back as an apology and
+        # lost their whole subscription — is invisible otherwise and only the
+        # operator can put it right.
+        _alert(admin_client_hint, (
+            f"🔻 أُوقفت الخدمة لـ{_code_of(owner_session, existing.tenant_id)}\n"
+            f"السبب:\n{event_type}\n"
+            f"المبلغ المدفوع أصلًا:\n{charged if charged is not None else '؟'}\n"
+            f"مبلغ الطلب الآن:\n{order.amount}\n"
+            "إن كان الاسترداد جزئيًا فالإيقاف غير مقصود — أعِد تفعيله يدويًا"
+        ))
         return ProvisionResult(ProvisionStatus.SERVICE_STOPPED, **ids)
 
     _mark_webhook(owner_session, webhook_event, "skipped_duplicate")
@@ -213,6 +237,7 @@ def provision_order(
         return _reconcile_existing(
             owner_session, existing, order_id,
             salla_client=salla_client, webhook_event=webhook_event,
+            admin_client_hint=admin_client_hint,
         )
 
     # Re-verify the order against Salla — authoritative source (never the webhook).
