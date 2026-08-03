@@ -511,6 +511,26 @@ def _handle_message(
         # open enrichment session eats «قدمت» taps (outcome never recorded)
         # and blocks a held delivery from landing for up to 72h.
         effective = _button_id_of(msg) or text_body
+
+        # §20: the answer to the outcome question. Checked BEFORE the delivery
+        # buttons and before enrichment for the same reason those two beat
+        # enrichment — a reply we asked for must never be eaten by another
+        # open conversation, or the datum is lost and cannot be re-collected.
+        from career.cv import outcome_followup as followup
+
+        answer = followup.parse_answer(effective)
+        if answer is not None:
+            pending = followup.pending_job_ref(
+                session, tenant_id=channel.tenant_id)
+            if pending is not None:
+                thanks = followup.record_answer(
+                    session, tenant_id=channel.tenant_id, job_ref=pending,
+                    outcome=answer, now=now,
+                )
+                whatsapp_client.send_text(channel.phone_e164, thanks)
+                session.commit()
+                return
+
         outcome = cv_deliver.parse_outcome_button(effective)
         if outcome is not None:
             outcome_kind, job_ref = outcome

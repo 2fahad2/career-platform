@@ -204,6 +204,17 @@ def main() -> None:  # pragma: no cover — the C7.8 live runner
                     session.commit()
                 if any(enr_counts.values()):
                     logger.info("enrichment sweep: %s", enr_counts)
+                # §20: ask what happened to applications made two weeks ago.
+                # Hourly is right — it only ever fires inside an open window,
+                # so it has to be looking whenever the customer writes to us.
+                from career.cv.outcome_followup import sweep_outcome_questions
+                with Session(engine) as session:
+                    oc_counts = sweep_outcome_questions(
+                        session, whatsapp_client=whatsapp, now=now,
+                    )
+                    session.commit()
+                if any(oc_counts.values()):
+                    logger.info("outcome questions: %s", oc_counts)
                 # canary evening nudge: keep the operator's own 24h window
                 # open for tomorrow's 11:00 delivery (template-independence)
                 today = now.astimezone(_RIYADH).date()
