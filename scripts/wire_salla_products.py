@@ -186,8 +186,31 @@ def main() -> int:
     for key, value in wanted.items():
         if key not in seen:
             out.append(f"{key}={value}")
-    ENV_FILE.write_text("\n".join(out) + "\n")
+    # Constant 7's atomic discipline, applied to the one file that has no
+    # copy anywhere: .env.staging is gitignored AND deliberately excluded from
+    # the backup, and it is the EnvironmentFile for all three units. A crash
+    # midway through a plain truncating write would take every secret on the
+    # server with it. Backup first, then temp → fsync → atomic replace.
+    import os
+    import tempfile
+
+    backup = ENV_FILE.with_suffix(ENV_FILE.suffix + ".bak")
+    backup.write_text(ENV_FILE.read_text())
+    os.chmod(backup, 0o600)
+    body = "\n".join(out) + "\n"
+    fd, tmp = tempfile.mkstemp(dir=str(ENV_FILE.parent), prefix=".env.tmp")
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, ENV_FILE)      # atomic within the filesystem
+    except BaseException:
+        pathlib.Path(tmp).unlink(missing_ok=True)
+        raise
     print(f"\n✓ كُتب في {ENV_FILE}")
+    print(f"  نسخة الأمان:\n  {backup}")
     print("أعد تشغيل الخدمات:")
     print("  systemctl restart career-worker career-admin-bot")
     return 0

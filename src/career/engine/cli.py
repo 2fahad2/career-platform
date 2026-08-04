@@ -77,34 +77,60 @@ def build_parser() -> argparse.ArgumentParser:
 def _preferred_daily(settings: Any) -> Any:
     """The cheapest APPROVED daily template, asked at run time.
 
-    Never blocks or fails the run: if the account cannot be reached we keep
-    the long-standing template rather than gamble the day on a name Meta may
-    not have approved yet.
+    Never blocks or fails the run — but the FALLBACK is the expensive part, so
+    it is chosen deliberately rather than by accident. When Meta cannot be
+    reached we cannot know what is approved, and the long-standing name Meta
+    classified MARKETING is the only one we have ever seen it accept. A slow
+    Meta at eleven in the morning therefore bills the whole day at roughly
+    three times the utility rate AND exposes it to per-user marketing caps, so
+    the fallback is announced loudly instead of taken in silence.
+
+    The listing is PAGINATED. Reading only the first page silently drops
+    templates once the account grows past a page — including, eventually, the
+    utility one this function exists to find.
     """
     from career.whatsapp.templates import preferred_daily_template
 
     if not (settings.whatsapp_access_token and settings.whatsapp_waba_id):
         return preferred_daily_template(None)
+
+    def _fallback(why: str) -> Any:
+        chosen = preferred_daily_template(None)
+        logger.error(
+            "could not confirm approved templates (%s) — falling back to %s "
+            "(%s), which bills at the marketing rate", why, chosen.name,
+            chosen.category,
+        )
+        return chosen
+
     try:
         import httpx
 
-        response = httpx.get(
+        approved: set[str] = set()
+        url: str | None = (
             f"https://graph.facebook.com/v21.0/{settings.whatsapp_waba_id}"
-            "/message_templates",
-            params={"fields": "name,status", "limit": 100},
-            headers={"Authorization": f"Bearer {settings.whatsapp_access_token}"},
-            timeout=20.0,
+            "/message_templates"
         )
-        if response.status_code != 200:
-            return preferred_daily_template(None)
-        approved = {
-            row.get("name") for row in response.json().get("data", [])
-            if row.get("status") == "APPROVED"
-        }
+        params: dict[str, Any] | None = {"fields": "name,status", "limit": 100}
+        headers = {"Authorization": f"Bearer {settings.whatsapp_access_token}"}
+        for _ in range(10):          # a page cap, not a trust boundary
+            if url is None:
+                break
+            response = httpx.get(url, params=params, headers=headers,
+                                 timeout=20.0)
+            if response.status_code != 200:
+                return _fallback(f"HTTP {response.status_code}")
+            body = response.json()
+            approved |= {
+                row.get("name") for row in body.get("data", [])
+                if row.get("status") == "APPROVED"
+            }
+            url = ((body.get("paging") or {}).get("next"))
+            params = None            # the `next` URL already carries them
     except Exception:  # noqa: BLE001 — a template probe never stops delivery
-        logger.warning("could not ask Meta which templates are approved",
-                       exc_info=True)
-        return preferred_daily_template(None)
+        logger.warning("template probe failed", exc_info=True)
+        return _fallback("probe raised")
+
     chosen = preferred_daily_template(approved)
     logger.info("daily template: %s (%s)", chosen.name, chosen.category)
     return chosen

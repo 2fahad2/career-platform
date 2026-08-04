@@ -1407,21 +1407,35 @@ def test_the_business_screen_shows_the_search_allowance(
 
     t1, t2 = two_tenants
     run = _uuid.uuid4()
-    for tid in (t1, t2):                      # ONE family, TWO tenants
+    # ONE family of 8 credits serving TWO tenants: the count is written on
+    # each row, the COST is split between them.
+    for tid in (t1, t2):
         owner_session.execute(_sql(
             "INSERT INTO usage_events (id, tenant_id, kind, run_id,"
             " input_tokens, cost_usd, occurred_at)"
             " VALUES (:i, :t, 'search_api', :r, 8, 0.016, now())"),
             {"i": str(_uuid.uuid4()), "t": str(tid), "r": str(run)})
+    # …and TWO more families in the SAME run, 3 and 2 credits, one tenant
+    # each. Taking the max per run reported 8 of a real 13 — only the biggest
+    # family — which is how the operator saw roughly half the consumption of
+    # the one limit that halts discovery for everybody at once.
+    for credits in (3, 2):
+        owner_session.execute(_sql(
+            "INSERT INTO usage_events (id, tenant_id, kind, run_id,"
+            " input_tokens, cost_usd, occurred_at)"
+            " VALUES (:i, :t, 'search_api', :r, :c, :u, now())"),
+            {"i": str(_uuid.uuid4()), "t": str(t1), "r": str(run),
+             "c": credits, "u": credits * 0.004})
     owner_session.commit()
     try:
         data = console._business_data(owner_session, "30", now=NOW)
-        assert data["searches_this_month"] == 8, (
-            "eight credits were billed once, not once per tenant"
+        assert data["searches_this_month"] == 13, (
+            "8 + 3 + 2 credits were billed once each, not once per tenant "
+            "and not only the largest family"
         )
         text, _ = views.render_business("30", data)
         assert "بحثات هذا الشهر" in text
-        assert "8 من 10000" in text
+        assert "13 من 10000" in text
     finally:
         owner_session.rollback()
         owner_session.execute(_sql(

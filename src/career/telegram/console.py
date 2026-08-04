@@ -24,6 +24,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from career.config import get_settings
 from career.cv.close import rollup_costs
 from career.cv.daily_run import close_from_delivery
 from career.db.models import (
@@ -492,22 +493,26 @@ def _searches_this_month(session: Session, *, now: datetime) -> int:
     local = now.astimezone(_RIYADH)
     month_start = local.replace(day=1, hour=0, minute=0, second=0,
                                 microsecond=0).astimezone(now.tzinfo)
-    # Careful with the arithmetic: a family's credit count is written onto
-    # EVERY tenant that family serves (the cost is split, the count is not),
-    # so summing input_tokens would multiply by the audience. The provider
-    # bills the family ONCE, so the honest figure is the count per (run,
-    # family) taken once — approximated here by the max within each run, then
-    # summed across runs.
-    per_run = select(
-        UsageEvent.run_id.label("run_id"),
-        func.max(UsageEvent.input_tokens).label("credits"),
-    ).where(
-        UsageEvent.kind.in_(SEARCH_KINDS),
-        UsageEvent.occurred_at >= month_start,
-    ).group_by(UsageEvent.run_id).subquery()
-    return int(session.execute(
-        select(func.coalesce(func.sum(per_run.c.credits), 0))
-    ).scalar_one() or 0)
+    # Derived from COST, not from the credit column, and that is the whole
+    # trick. A family's credit count is written onto every tenant it serves
+    # while the COST is split between them — so summing counts multiplies by
+    # the audience, and taking the max per run reports only the biggest
+    # family (one run of three families billing 5+3+2 read as 5 of a real 10).
+    #
+    # The split is exact, so summing cost across every row reconstructs what
+    # the provider actually billed, and dividing by the per-search price gives
+    # the credits. No schema change, and it stays right however many families
+    # a run covers or how many tenants each serves.
+    total_usd = session.execute(
+        select(func.coalesce(func.sum(UsageEvent.cost_usd), 0)).where(
+            UsageEvent.kind.in_(SEARCH_KINDS),
+            UsageEvent.occurred_at >= month_start,
+        )
+    ).scalar_one() or 0
+    price = Decimal(str(get_settings().searchapi_usd_per_search))
+    if price <= 0:
+        return 0
+    return int((Decimal(str(total_usd)) / price).to_integral_value())
 
 
 def _business_data(

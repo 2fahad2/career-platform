@@ -158,11 +158,17 @@ def render_health(h: dict[str, Any]) -> tuple[str, Keyboard]:
 
 PAGE_SIZE = 8
 
+#: The plan codes in the DATABASE, mapped to what the customer buys today.
+#: «elite» never existed as a plan code, while «executive» — the one that
+#: does — had no label at all, so لمّاح+ rendered as a raw Latin token inside
+#: an Arabic line: a missing translation and a direction break in one.
+#: «basic» is retired from sale but kept: historical subscriptions point at
+#: it and the card must still name it.
 _PLAN_AR = {
-    "basic": "أساسي",
-    "professional": "احترافي",
-    "elite": "نخبة",
-    "cv_analysis": "تحليل CV",
+    "cv_analysis": "تقييم لمّاح",
+    "professional": "لمّاح",
+    "executive": "لمّاح+",
+    "basic": "أساسي (متوقّف)",
 }
 
 _JOURNEY_AR = {
