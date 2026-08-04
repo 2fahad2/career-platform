@@ -171,6 +171,15 @@ _PLAN_AR = {
     "basic": "أساسي (متوقّف)",
 }
 
+#: Plans whose customers are answered first — and the ONLY thing that makes
+#: that promise real. لمّاح+ used to sell «أولوية في الطابور» backed by a
+#: database column nothing read: no queue, no ordering, no marker, so the
+#: operator could not tell a 449 customer from a 199 one while replying. There
+#: is no automated queue to reorder (replies are the operator's own hand), so
+#: the honest form of priority is to make the tier VISIBLE at the moment of
+#: choosing whom to answer — here, and on the card itself.
+_PRIORITY_PLANS: frozenset[str] = frozenset({"executive"})
+
 _JOURNEY_AR = {
     "ACTIVE": "✅ نشط",
     "DONE": "✅ مكتمل",
@@ -210,6 +219,12 @@ def _plan(code: str | None) -> str:
     return _PLAN_AR.get(str(code), str(code or "—"))
 
 
+def _plan_marked(code: str | None) -> str:
+    """The plan, starred when its holder is owed a faster human reply."""
+    label = _plan(code)
+    return f"⭐ {label}" if str(code) in _PRIORITY_PLANS else label
+
+
 def render_customers(
     rows: list[dict[str, Any]], page: int, total: int
 ) -> tuple[str, Keyboard]:
@@ -223,7 +238,7 @@ def render_customers(
             str(row.get("journey_state")), str(row.get("journey_state") or "⏳")
         )
         window = _WINDOW_AR.get(str(row.get("window")), "")
-        label = f"{row['code']} · {_plan(row.get('plan_code'))} · {journey}"
+        label = f"{row['code']} · {_plan_marked(row.get('plan_code'))} · {journey}"
         if window:
             label += f" · {window}"
         keyboard.append([(label[:60], f"v1|tenant|{row['code']}")])
@@ -249,7 +264,7 @@ def render_tenant_card(card: dict[str, Any]) -> tuple[str, Keyboard]:
     # way to keep TEN codes and dates on their own lines for exactly this
     # reason — a mixed run re-orders in a right-to-left client and the
     # operator reads a scrambled plan and status.
-    lines.append(f"الخطة: {_plan(card.get('plan_code'))}")
+    lines.append(f"الخطة: {_plan_marked(card.get('plan_code'))}")
     lines.append("الحالة:")
     lines.append(str(card.get("sub_status") or "—"))
     age = card.get("sub_age_days")

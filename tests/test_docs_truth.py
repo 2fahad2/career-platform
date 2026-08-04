@@ -42,6 +42,91 @@ def test_the_products_sheet_says_which_pricing_is_live() -> None:
     assert "لا شيء منها ساري" in head
 
 
+#: Each paid entitlement column, with the Arabic phrases that SELL it on the
+#: store pages. Deliberately a mapping and not a blacklist: the test permits a
+#: phrase the moment its column is actually read by the product, so
+#: implementing the feature un-blocks the copy automatically instead of
+#: requiring somebody to remember this file.
+_SOLD_ENTITLEMENTS: dict[str, tuple[str, ...]] = {
+    "human_review_monthly": ("مراجعة بشرية شهرية", "المراجعة الشهرية"),
+    "queue_priority": ("أولوية في الطابور", "أولوية معالجة"),
+    "intro_blurb": ("نبذة تمهيدية", "نبذة تقديم"),
+    "weekly_report": ("تقرير أسبوعي",),
+}
+
+
+def _read_by_product(column: str) -> bool:
+    """Does any module outside the schema itself consult this entitlement?"""
+    root = pathlib.Path("src/career")
+    for path in root.rglob("*.py"):
+        if path.name == "models.py":
+            continue          # declaring a column is not reading it
+        if re.search(rf"\b{column}\b", path.read_text(encoding="utf-8")):
+            return True
+    return False
+
+
+def test_the_store_never_sells_an_entitlement_no_code_reads() -> None:
+    """لمّاح+ at 449 sold three things backed by nothing.
+
+    `human_review_monthly`, `queue_priority` and `intro_blurb` existed as
+    columns and as sentences on the sales page, and not one line of the
+    product ever read them: no reminder, no queue, no blurb. A customer paying
+    double received exactly what the 199 customer received, and would have
+    discovered it a month later.
+
+    The guard is structural rather than a list of banned words — a column the
+    product genuinely reads may be sold freely.
+    """
+    text = pathlib.Path("docs/STORE-PAGES-AR.md").read_text(encoding="utf-8")
+    for column, phrases in _SOLD_ENTITLEMENTS.items():
+        if _read_by_product(column):
+            continue
+        for phrase in phrases:
+            assert phrase not in text, (
+                f"the store sells «{phrase}» but nothing reads {column} — "
+                "either implement it or stop selling it"
+            )
+
+
+def test_no_refund_is_promised_as_automatic() -> None:
+    """Nothing in this project ever initiates a refund.
+
+    We receive Salla's refund notification and stop the service; the money
+    only moves when a human moves it. «الاسترداد الكامل تلقائي» promised a
+    machine that does not exist, and the customer it fails is by definition
+    one already unhappy enough to ask for their money back."""
+    text = pathlib.Path("docs/STORE-PAGES-AR.md").read_text(encoding="utf-8")
+    for line in text.splitlines():
+        if "استرداد" in line or "نستردّ" in line:
+            assert "تلقائي" not in line, (
+                f"a refund is promised as automatic, and none is: {line!r}"
+            )
+
+
+def test_the_store_quantities_cannot_oversell_the_founding_wave() -> None:
+    """Salla stock is PER PRODUCT and the passes are separate products.
+
+    The settings table asked for quantity 30 on one and 15 on the other while
+    the page promises «ما نبيع الكرسي رقم ٣١» — thirty-one through forty-five
+    were sellable, and nothing in the payment path may refuse them (Constant
+    4: a paid order becomes a subscription). The only place this limit can be
+    enforced is the store configuration, so the sheet that configures it must
+    add up."""
+    from career.salla.seats import FOUNDING_SEATS_CAP
+
+    text = pathlib.Path("docs/STORE-PAGES-AR.md").read_text(encoding="utf-8")
+    quantities = [
+        int(m.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")))
+        for m in re.findall(r"\|\s*كمية «لمّاح\+?»\s*\|\s*\*\*([٠-٩\d]+)\*\*", text)
+    ]
+    assert len(quantities) == 2, "both pass quantities must be in the table"
+    assert sum(quantities) <= FOUNDING_SEATS_CAP, (
+        f"the store is configured to sell {sum(quantities)} founding seats "
+        f"while the page promises {FOUNDING_SEATS_CAP}"
+    )
+
+
 def _arabic_digits(value: str) -> str:
     table = str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩")
     return value.translate(table)
