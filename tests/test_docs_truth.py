@@ -130,3 +130,58 @@ def test_the_store_quantities_cannot_oversell_the_founding_wave() -> None:
 def _arabic_digits(value: str) -> str:
     table = str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩")
     return value.translate(table)
+
+
+def test_a_stale_container_is_visible_on_the_health_screen() -> None:
+    """Committed is not deployed, and nothing used to say so.
+
+    Thirty-two commits — including the fix that made zero-touch activation
+    work for a real customer — sat in the repository for four days while the
+    container serving both webhooks ran the image built before them. Every
+    light on the health screen was green the whole time, honestly: the worker
+    and the timers run from the host checkout and really were current. Only
+    the baked image was stale, and nothing compared the two.
+    """
+    from career.telegram.views import render_health
+
+    same, _ = render_health({"deployed_source": ("abc123abc123", "abc123abc123")})
+    assert "🟢 مطابق للمستودع" in same
+
+    drifted, _ = render_health({"deployed_source": ("oldoldoldold", "newnewnewnew")})
+    assert "🔴" in drifted and "أعد بناء الحاوية" in drifted
+    # both hashes named, and each alone on its line — a Latin hash inside an
+    # Arabic sentence is scrambled by the operator's client
+    assert "oldoldoldold" in drifted.splitlines()
+    assert "newnewnewnew" in drifted.splitlines()
+
+    unknown, _ = render_health({})
+    assert "⚪" in unknown
+
+
+def test_the_fingerprint_changes_when_the_source_changes(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """It must react to an edit, an addition and a deletion — a hash that only
+    covers file contents would miss a renamed or removed module."""
+    from career.fingerprint import source_fingerprint
+
+    (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "b.py").write_text("y = 2\n", encoding="utf-8")
+    first = source_fingerprint(tmp_path)
+
+    assert source_fingerprint(tmp_path) == first, "must be stable"
+
+    (tmp_path / "pkg" / "b.py").write_text("y = 3\n", encoding="utf-8")
+    edited = source_fingerprint(tmp_path)
+    assert edited != first
+
+    (tmp_path / "pkg" / "c.py").write_text("z = 4\n", encoding="utf-8")
+    added = source_fingerprint(tmp_path)
+    assert added != edited
+
+    (tmp_path / "pkg" / "c.py").unlink()
+    assert source_fingerprint(tmp_path) == edited, "a deletion must show"
+
+    # a stray cache directory must not move it
+    (tmp_path / "__pycache__").mkdir()
+    (tmp_path / "__pycache__" / "junk.py").write_text("q = 9\n", encoding="utf-8")
+    assert source_fingerprint(tmp_path) == edited

@@ -145,6 +145,23 @@ def render_health(h: dict[str, Any]) -> tuple[str, Keyboard]:
         if rejected:
             part += f" · 🔴 {rejected} مرفوض"
         lines.append(part)
+    # «Committed» is not «deployed». Every other light on this screen was green
+    # for four days while the container served code from before the fixes —
+    # because the worker and the timers really were healthy and nothing
+    # compared the running image to the repository (see career.fingerprint).
+    deployed = h.get("deployed_source")
+    if deployed is None:
+        lines.append("الكود المنشور: ⚪ ما قدرنا نسأل الواجهة")
+    elif deployed[0] == deployed[1]:
+        lines.append("الكود المنشور: 🟢 مطابق للمستودع")
+    else:
+        # Hashes are Latin — each on its own line or the operator's client
+        # scrambles them into an Arabic sentence.
+        lines.append("الكود المنشور: 🔴 يختلف عن المستودع — أعد بناء الحاوية")
+        lines.append("الحاوية تشغّل:")
+        lines.append(str(deployed[0]))
+        lines.append("والمستودع فيه:")
+        lines.append(str(deployed[1]))
     age = h.get("backup_age_hours")
     if age is None:
         lines.append("آخر نسخة احتياطية: ⚪ غير معروف")

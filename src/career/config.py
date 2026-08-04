@@ -95,6 +95,10 @@ class Settings(BaseSettings):
     # Canary phase: the operator's own WhatsApp number (evening window nudge).
     canary_test_phone: str = Field(default="", alias="CANARY_TEST_PHONE")
 
+    # Loopback port Caddy proxies to — the watchtower asks the API what code
+    # it is actually running through it.
+    api_publish_port: int = Field(default=8000, alias="API_PUBLISH_PORT")
+
     def _dsn(self, user: str, password: str) -> str:
         return (
             f"postgresql+psycopg://{user}:{password}"

@@ -23,6 +23,7 @@ from sqlalchemy import text as sql_text
 from sqlalchemy.orm import Session
 
 from career.config import get_settings
+from career.fingerprint import source_fingerprint
 from career.logging_filters import install_secret_redaction
 from career.storage import FilesystemStorageAdapter
 from career.telegram.admin import HttpTelegramAdminClient, TelegramSendError
@@ -130,6 +131,25 @@ class LiveProbes:  # pragma: no cover — live boundary, facts only
         except Exception:  # noqa: BLE001
             return None
 
+    def _deployed_source(self) -> tuple[str, str] | None:
+        """(what the API container runs, what this checkout holds).
+
+        The watchtower runs on the host from the repository checkout, so the
+        second half is simply this process's own package. The first half has
+        to be asked of the API, because its image is baked at build time —
+        which is precisely how thirty-two commits stayed committed and
+        undeployed for four days behind an all-green health screen.
+        """
+        try:
+            url = f"http://127.0.0.1:{self._settings.api_publish_port}/health"
+            with urlopen(url, timeout=5) as resp:
+                running = json.load(resp).get("source")
+            if not running:
+                return None          # an API too old to report it at all
+            return (str(running), source_fingerprint())
+        except Exception:  # noqa: BLE001 — a probe never breaks the screen
+            return None
+
     def _backup_age_hours(self) -> float | None:
         try:
             out = subprocess.run(
@@ -176,6 +196,7 @@ class LiveProbes:  # pragma: no cover — live boundary, facts only
             "searchapi": self._searchapi(),
             "templates": self._templates(),
             "backup_age_hours": self._backup_age_hours(),
+            "deployed_source": self._deployed_source(),
         }
 
 

@@ -18,6 +18,7 @@ from sqlalchemy import text
 from career import __version__
 from career.config import get_settings
 from career.db.session import SessionLocal, app_engine
+from career.fingerprint import source_fingerprint
 from career.logging_filters import install_secret_redaction
 from career.salla.webhook import WebhookStatus, receive_webhook
 from career.whatsapp.signature import verify_challenge
@@ -166,6 +167,9 @@ async def whatsapp_webhook(request: Request) -> JSONResponse:
 _HEALTH_TTL_SECONDS = 5.0
 _health_cache: tuple[float, dict[str, bool]] | None = None
 
+#: Computed once at import: the tree cannot change under a running process.
+_SOURCE_FINGERPRINT = source_fingerprint()
+
 
 def _health_checks() -> dict[str, bool]:
     global _health_cache
@@ -191,6 +195,11 @@ def health() -> JSONResponse:
             "status": "ok" if ok else "degraded",
             "env": get_settings().env,
             "version": __version__,
+            # The one field that reveals a container still serving code from
+            # four days ago while the repository says otherwise. A content
+            # hash discloses nothing: it is not a version, a path, or a
+            # dependency list, and it cannot be reversed into source.
+            "source": _SOURCE_FINGERPRINT,
             "checks": checks,
         },
     )
