@@ -289,6 +289,65 @@ def test_the_header_heuristic_never_eats_a_city_or_a_job_title() -> None:
     assert "Riyadh Saudi Arabia" in safe
 
 
+# ── the headings an ordinary Saudi CV actually prints (audit 2026-08-05) ─────
+#
+# The section-word list was a list of ONE-word Arabic headings, and «الخبرة
+# العملية» / «المؤهل الدراسي» — what people really type — matched none of
+# them. The CV was not recognised as a document, no header name was inferred,
+# the name went to the model verbatim, and assert_no_pii agreed it was fine
+# because it asked the SAME predicate. Nothing here is adversarial: it is the
+# most ordinary Arabic CV in the country.
+
+CV_ORDINARY_ARABIC_HEADINGS = """فلان الفلاني
+محلل أعمال
+
+الخبرة العملية
+مشرف عمليات فرع في شركة المثال التجارية (2019 - 2023)
+
+المؤهل الدراسي
+بكالوريوس نظم معلومات
+"""
+
+
+def test_the_headings_an_ordinary_arabic_cv_prints_are_recognised() -> None:
+    """«الخبرة العملية» and «المؤهل الدراسي» are not a layout choice — they
+    are what a Saudi CV says. The name rode to the provider unredacted."""
+    assert infer_header_name(CV_ORDINARY_ARABIC_HEADINGS) is not None
+    safe = strip_pii(CV_ORDINARY_ARABIC_HEADINGS, known_name=None).text
+
+    assert "فلان" not in safe
+    assert "الفلاني" not in safe
+    assert "[NAME]" in safe
+    assert "مشرف عمليات فرع" in safe          # the work content survives
+    assert "الخبرة العملية" in safe            # and so does the heading
+
+
+def test_the_backstop_does_not_share_the_strippers_blind_spot() -> None:
+    """The structural defect under the leak above: assert_no_pii gated its
+    residual-name check on ``_looks_like_cv`` — the stripper's own predicate —
+    so the only thing standing behind the stripper was a copy of the
+    stripper's assumption. It could not, by construction, catch a layout the
+    stripper did not recognise.
+
+    This CV runs its headings INLINE, so the heading test does not fire and
+    the stripper genuinely misses the name. The backstop must still refuse it,
+    from evidence the heading vocabulary knows nothing about."""
+    import career.onboarding.extraction as extraction
+
+    headingless = """Fulan Alfulani
+[EMAIL_1] | [PHONE_1]
+Branch operations supervisor, Example Trading — 2019 to 2023
+Business analyst, Example Bank — 2015 to 2019
+B.Sc. Information Systems, 2015
+"""
+    assert not extraction._looks_like_cv(headingless), (
+        "the fixture must be a layout the STRIPPER misses, or this proves "
+        "nothing about the backstop being independent of it"
+    )
+    with pytest.raises(PiiLeak):
+        assert_no_pii(headingless, known_name=None)
+
+
 def test_a_role_title_or_a_whatsapp_answer_is_never_read_as_a_document() -> None:
     """strip_pii is the shared gate of six model boundaries, not a CV
     function. achievement_render hands it a one-line role title and
@@ -303,6 +362,34 @@ def test_a_role_title_or_a_whatsapp_answer_is_never_read_as_a_document() -> None
         "وكل هذا خلال ستة اشهر من بداية المشروع",
     ):
         assert strip_pii(text, known_name=None).text == text
+
+
+def test_an_answer_full_of_career_words_is_not_shredded_into_placeholders(
+) -> None:
+    """AUDIT 2026-08-05. The fixture above passes for the wrong reason — it
+    happens to contain no section words. Put the ordinary nouns of a career
+    back in and the old rule («two section WORDS anywhere, four lines») fired
+    on a customer's own enrichment answer: its short lines then read as header
+    names and «وحققت نتائج ممتازة» went to the model as «[NAME] [NAME]
+    [NAME]». assert_no_pii raises nothing at that — the text is corrupted, not
+    leaked — so the model saw garbage and the achievement bank stored it.
+
+    A heading is a LINE, not a word: a CV prints «الخبرة العملية» on a line of
+    its own, and a person describing their work puts those words in a
+    sentence."""
+    answers = (
+        "قدت فريق التعليم والتدريب\nوطورت المهارات الرقمية\n"
+        "وحققت نتائج ممتازة\nخلال سنة واحدة\nمع فريق صغير",
+        "اشتغلت على المشاريع الكبيرة\nودربت الفريق على المهارات الجديدة\n"
+        "وحققت نتائج ممتازة\nفي وقت قصير\nبدون تأخير",
+        "حدثت الملف الشخصي للعملاء\nوجمعت البيانات من كل الفروع\n"
+        "ورفعت جودة الخدمة\nخلال ستة اشهر\nبدون اي تأخير",
+    )
+    for answer in answers:
+        stripped = strip_pii(answer, known_name=None)
+        assert stripped.text == answer, "the customer's own words came back changed"
+        assert "[NAME]" not in stripped.text
+        assert_no_pii(stripped.text, known_name=None)   # and it is not a leak
 
 
 # ── the fail-closed backstop must be able to fail ────────────────────────────

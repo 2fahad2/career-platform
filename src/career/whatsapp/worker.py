@@ -689,10 +689,22 @@ def _handle_message(
     session.commit()
 
 
-#: The receipt ladder. Meta does NOT guarantee the ORDER in which delivery
-#: receipts arrive — retries and webhook redelivery routinely hand us a
-#: «sent» after a «read» — so a receipt is a claim about a POINT on this
-#: ladder, never «the current truth», and only a higher rung may be written.
+#: THE receipt ladder — one authority, and this module is it, because this is
+#: the only place a receipt is ever WRITTEN to a delivery_messages row.
+#: ``scripts/replay_lost_events.py`` imports it rather than keeping a second
+#: copy: it shipped with its own ladder that ordered `failed` ABOVE `read`,
+#: which is the reverse of this one on the single comparison that matters, and
+#: the consequence was that the recovery tool refused to recover the exact
+#: class of receipt it exists for — a `delivered`/`read` destroyed while the
+#: row sat `failed` was skipped as «already at or past this receipt», leaving
+#: a message the customer had read on record as a failure and out of the
+#: spend. Two ladders that disagree are not two opinions; one of them is a
+#: bug, and there is a test that fails the day a second copy appears again.
+#:
+#: Meta does NOT guarantee the ORDER in which delivery receipts arrive —
+#: retries and webhook redelivery routinely hand us a «sent» after a «read» —
+#: so a receipt is a claim about a POINT on this ladder, never «the current
+#: truth», and only a higher rung may be written.
 #:
 #: `failed` sits between `sent` and `delivered`, deliberately, and it is the
 #: only rung that needed an argument. It is not last: a send can only fail
@@ -707,13 +719,16 @@ def _handle_message(
 #: silently turned an undelivered message into a billed one.
 #:
 #: Unknown rungs rank 0: a status we do not know cannot displace one we do.
-_RECEIPT_ORDER: dict[str, int] = {
+RECEIPT_ORDER: dict[str, int] = {
     "sent": 1, "failed": 2, "delivered": 3, "read": 4,
 }
 
 
-def _receipt_rank(status: str | None) -> int:
-    return _RECEIPT_ORDER.get(str(status or "").lower(), 0)
+def receipt_rank(status: str | None) -> int:
+    """Where a receipt stands on :data:`RECEIPT_ORDER`; 0 for anything we do
+    not know. Public because the replay tool has to answer the same question
+    about the same rows and must answer it identically."""
+    return RECEIPT_ORDER.get(str(status or "").lower(), 0)
 
 
 def _handle_status(session: Session, st: dict[str, Any], *, now: datetime) -> None:
@@ -721,13 +736,29 @@ def _handle_status(session: Session, st: dict[str, Any], *, now: datetime) -> No
     status = st.get("status")
     if not wamid or not status:
         return
-    rank = _receipt_rank(status)
+    rank = receipt_rank(status)
     if rank == 0:
-        logger.warning("unknown whatsapp receipt status: %s", status)
+        # DELIBERATELY still not written. The column feeds two money paths —
+        # `cv/close.whatsapp_spend` bills everything whose status is not
+        # `failed`, and the watchtower's message-status panel is read as the
+        # truth about what reached customers — so a status nobody has placed
+        # on the ladder would be billed and displayed by accident, on the
+        # strength of a name we have never seen. Refusing to guess is right.
+        #
+        # Whispering about it is not. This was a `logger.warning`, and warnings
+        # do not leave this box: the operator's harvester forwards «ERROR:»
+        # lines only (the same rule that put the Meta code on the ERROR line in
+        # cv/daily_run). A rung Meta adds that we never record is a permanent
+        # blind spot in the delivery ledger, and the only way anyone finds out
+        # is if this line is loud enough to arrive.
+        logger.error(
+            "unknown whatsapp receipt status %r — NOT recorded; add it to "
+            "RECEIPT_ORDER or the ledger stays blind to it", status,
+        )
     for dm in session.execute(
         select(DeliveryMessage).where(DeliveryMessage.wa_message_id == wamid)
     ).scalars():
-        if rank <= _receipt_rank(dm.status):
+        if rank <= receipt_rank(dm.status):
             continue  # out of order, or the same receipt twice — a no-op
         dm.status = str(status)
         # the stamp belongs to the receipt that actually WON, so a superseded

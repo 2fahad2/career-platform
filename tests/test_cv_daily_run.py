@@ -568,6 +568,108 @@ def test_stale_held_delivery_expires_into_honest_close(
         _cleanup(owner_session, tid)
 
 
+def test_an_expired_held_bundle_fails_the_whole_night(
+    owner_session: Session, clean_billing: None, tmp_path: Any
+) -> None:
+    """THE INCIDENT THE EXIT-CODE FIX DID NOT CLOSE.
+
+    ``exit_code_for`` shipped naming the 2 August 2026 night it was written
+    for — and on career_staging that night's WHATSAPP_FAILED was written by
+    ``expire_stale_held_deliveries``, at 08:02 on 3 August, the NEXT run.
+    Three more look identical: 21, 22 and 23 July, each stamped 01:3x UTC the
+    following morning, which is the sweep's hour and not the failed day's. The
+    sweep closed a real customer's day as a failure and returned a COUNT, so
+    those tenants never entered ``states``, never reached ``summary`
+    ["delivery"]``, and the verdict never saw them: every one of those nights
+    exited 0 and ``OnFailure=career-alert@`` stayed silent.
+
+    So this drives the real composition — ``run_daily_delivery`` → the
+    summary → the exit code — because that chain is where the break was, and
+    ``exit_code_for`` on its own was green throughout.
+    """
+    from datetime import timedelta
+
+    from career.engine import cli
+
+    tid, channel = _seed_active_tenant(owner_session)
+    try:
+        owner_session.execute(sql_text(
+            "UPDATE customer_channels SET last_inbound_at = NULL WHERE id = :id"),
+            {"id": str(channel.id)},
+        )
+        owner_session.commit()
+        report = _engine_report(owner_session, tid)
+        held_day = NOW - timedelta(days=3)              # Thursday, a run day
+        assert daily_run.run_daily_delivery(
+            owner_session, report=report, deps=_deps(tmp_path), now=held_day,
+        ) == {}                                          # held, no day state
+        owner_session.commit()
+
+        # the next dawn: nobody to serve today, and yesterday to close
+        expired: list[Any] = []
+        empty_report = engine_run.RunReport(
+            report.run_id, report.status, report.counts, {})
+        states = daily_run.run_daily_delivery(
+            owner_session, report=empty_report, deps=_deps(tmp_path), now=NOW,
+            expired_out=expired,
+        )
+        owner_session.commit()
+
+        assert states == {}                       # nobody was served TONIGHT
+        assert [s.state for s in expired] == ["WHATSAPP_FAILED"]
+        assert [s.run_date for s in expired] == [
+            held_day.astimezone(daily_run._RIYADH).date()]
+
+        code = owner_session.execute(
+            sql_text("SELECT code FROM tenants WHERE id = :t"), {"t": str(tid)},
+        ).scalar_one()
+        summary = cli.summarize_delivery(
+            tenant_codes={tid: code}, intended=[], states={},
+            expired=[(s.tenant_id, s.run_date, s.state) for s in expired],
+        )
+        assert summary["delivery"] == {}          # the empty dict that lied
+        assert summary["delivery_expired"] == [
+            {"tenant": code,
+             "run_date": str(held_day.astimezone(daily_run._RIYADH).date()),
+             "state": "WHATSAPP_FAILED"},
+        ]
+        verdict = cli.exit_code_for(
+            "completed",
+            [*summary["delivery"].values(),
+             *(row["state"] for row in summary["delivery_expired"])],
+            delivery_phase=cli.PHASE_RAN,
+        )
+        assert verdict == cli.EXIT_DELIVERY_FAILED
+    finally:
+        _cleanup(owner_session, tid)
+
+
+def test_a_night_that_expires_nothing_still_exits_zero(
+    owner_session: Session, clean_billing: None, tmp_path: Any
+) -> None:
+    """The other side of the same line: the sweep finding nothing must stay a
+    silent zero. Paging on «no held bundle from yesterday» would fire on every
+    healthy night, which is how a truthful alert gets muted."""
+    from career.engine import cli
+
+    tid, _channel = _seed_active_tenant(owner_session)
+    try:
+        report = _engine_report(owner_session, tid)
+        expired: list[Any] = []
+        states = daily_run.run_daily_delivery(
+            owner_session, report=report, deps=_deps(tmp_path), now=NOW,
+            expired_out=expired,
+        )
+        owner_session.commit()
+        assert expired == []
+        assert cli.exit_code_for(
+            "completed", [s.state for s in states.values()],
+            delivery_phase=cli.PHASE_RAN,
+        ) == cli.EXIT_OK
+    finally:
+        _cleanup(owner_session, tid)
+
+
 def test_template_send_crash_closes_whatsapp_failed(
     owner_session: Session, clean_billing: None, tmp_path: Any
 ) -> None:

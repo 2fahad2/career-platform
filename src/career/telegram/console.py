@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import re
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -100,12 +101,17 @@ RESEND_NOTHING_AR = "⚪ لا توجد حزمة معلّقة لإعادة إرس
 
 #: Pause / resume answers. INCIDENT (⏸️ crash loop): the action path had no
 #: guard at all, so `privacy._subscription` raising RequestNotFound for a
-#: tenant with no live subscription escaped `handle_update` — and the runner
-#: stores the Telegram offset only AFTER handle_update returns, so the same
-#: update was re-fed every five seconds forever and the operator's whole
-#: watchtower was dead until someone restarted the service. Shell tenants are
-#: routine (every §04 upgrade leaves one) and the customers list filters
-#: nothing, so the pause button sat live on their cards.
+#: tenant with no live subscription escaped `handle_update` — and at the time
+#: the runner stored the Telegram offset only AFTER handle_update returned, so
+#: the same update was re-fed every five seconds forever and the operator's
+#: whole watchtower was dead until someone restarted the service. That
+#: ordering is gone (``run_admin_bot.process_one_update`` now stores the offset
+#: BEFORE the work, in its own transaction, and announces the skip), so the
+#: same escape today costs one dropped tap instead of the console — but the
+#: guard stays, because a dropped tap on a live customer's card is still a
+#: refusal nobody was told about. Shell tenants are routine (every §04 upgrade
+#: leaves one) and the customers list filters nothing, so the pause button sat
+#: live on their cards.
 #:
 #: The second half of the same incident is the opposite failure: privacy
 #: returns the row UNCHANGED when the state cannot pause / is not paused,
@@ -189,9 +195,8 @@ _ACTIONS = {
 #: `support_events` has been written since C4 — «دعم» from a customer, and now
 #: the funnel's consent stall — and NOTHING has ever read the table. The
 #: operator is paged once, at the moment it happens, and after that the ticket
-#: exists only in the database. This screen is the minimum that makes them
-#: visible: what is open, for how long, and whose (TEN code only). Assignment,
-#: resolution and SLA belong to a later wave.
+#: exists only in the database. This screen is what makes them visible: what is
+#: open, for how long, and whose (TEN code only).
 TICKETS_TITLE_AR = "🎫 التذاكر المفتوحة"
 TICKETS_NONE_AR = "🟢 لا توجد تذاكر مفتوحة"
 #: Ticket kinds, in the words of what actually happened to the customer.
@@ -203,6 +208,39 @@ _TICKET_KIND_AR = {
 #: scroll is a screen they stop reading; the count line stays truthful about
 #: the rest.
 TICKETS_PAGE = 10
+
+#: ── closing a ticket ────────────────────────────────────────────────────────
+#: The screen shipped read-only, and read-only was not a smaller version of
+#: this feature — it was a screen with a fuse. `support_events.status` is
+#: written «open» by ``whatsapp.worker`` and by the funnel, and NOTHING in the
+#: codebase ever wrote it again; `resolved_at` was never written at all. So the
+#: filter «status = open» matched every ticket that had ever existed, the list
+#: is ordered oldest-first and cut at ten, and after the tenth ticket the
+#: operator's screen freezes: the same ten forever, every later «دعم» invisible
+#: behind them, the count line the only hint that anything else exists. The
+#: table's first reader has to be able to write the one column that makes
+#: reading it work.
+#:
+#: Closing is MANUAL and means «I have dealt with this human», not «the system
+#: decided it was over» — nothing about the ticket's own data can know that, so
+#: nothing here closes one automatically. It travels the same one-shot nonce as
+#: every other mutating action; it keeps its own callback names because the
+#: `_ACTIONS` table is keyed by TEN code and a ticket is not a tenant.
+_TICKET_ACTION = "ticket_close"
+#: `support_events.status`. «open» is written by ``whatsapp.worker`` and by the
+#: funnel's consent stall; «resolved» is written HERE and nowhere else, which
+#: is why the tests may no longer conjure it with raw SQL — a state only a test
+#: can produce is a state that was never really tested.
+TICKET_OPEN = "open"
+TICKET_RESOLVED = "resolved"
+TICKET_CONFIRM_AR = (
+    "⚠️ تأكيد إغلاق تذكرة العميل:\n{code}\n"
+    "الإغلاق يعني أنك تكفّلت بها — ما راح تظهر في القائمة بعدها\n"
+    "الزر صالح ٥ دقائق."
+)
+TICKET_CLOSED_AR = "✅ أغلقنا التذكرة\n{code}"
+TICKET_ALREADY_AR = "⚪ التذكرة مغلقة أصلًا — لم نغيّر شيئًا\n{code}"
+TICKET_GONE_AR = "⚪ لم نجد هذه التذكرة — قد تكون أُغلقت من شاشة أخرى"
 
 _WESTERN_TO_ARABIC = str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩")
 
@@ -281,6 +319,12 @@ def _screen(
         return _menu_screen()
     if name == "tickets":
         return _tickets_screen(session, now=now)
+    if name == "tclose":
+        # v1|tclose|<ticket uuid> → the confirm card carrying a one-shot nonce
+        return _ticket_close_card(session, ticket_id=arg, now=now)
+    if name == "tdone":
+        # v1|tdone|<nonce> → the close itself, then the refreshed list
+        return _run_ticket_close(session, nonce=arg, now=now)
     if name == "today":
         return views.render_today(*_today_data(session, now=now))
     if name == "health":
@@ -425,34 +469,124 @@ def _tickets_screen(
     longest, and a paying customer who asked for a human is the one thing
     this product may not lose. TEN codes only (§15.13) — the card behind each
     one is a tap away and carries no PII either.
+
+    Each listed ticket carries a NUMBER and a matching «إغلاق» button. The
+    number exists because the button is the only place the two could be tied
+    together: a label reading «إغلاق TEN-0002» mixes Arabic and Latin on one
+    line and arrives reversed on the operator's client, so the tie is an
+    Arabic-Indic numeral (which is what :func:`_ar_digits` is for) and the
+    code stays alone on its own line in the body.
     """
     rows = session.execute(
-        select(Tenant.code, SupportEvent.kind, SupportEvent.created_at)
+        select(SupportEvent.id, Tenant.code, SupportEvent.kind,
+               SupportEvent.created_at)
         .join(Tenant, Tenant.id == SupportEvent.tenant_id)
-        .where(SupportEvent.status == "open")
+        .where(SupportEvent.status == TICKET_OPEN)
         .order_by(SupportEvent.created_at)
     ).all()
     lines = [f"{TICKETS_TITLE_AR}: {_ar_digits(len(rows))}"]
     if not rows:
         lines.append(TICKETS_NONE_AR)
-    for code, kind, created_at in rows[:TICKETS_PAGE]:
+    close_buttons: list[tuple[str, str]] = []
+    for number, (ticket_id, code, kind, created_at) in enumerate(
+        rows[:TICKETS_PAGE], start=1
+    ):
+        marker = _ar_digits(number)
         lines.append("")
         # an unknown kind keeps its own line: it is a raw Latin token and a
         # mixed Arabic+Latin line arrives scrambled on the operator's client
         known = _TICKET_KIND_AR.get(str(kind))
-        lines.append(f"• {known}" if known else f"•\n{kind}")
+        lines.append(f"{marker} • {known}" if known else f"{marker} •\n{kind}")
         lines.append(str(code))
         lines.append(_age_ar(created_at, now))
+        close_buttons.append((f"✅ إغلاق {marker}", f"v1|tclose|{ticket_id}"))
     if len(rows) > TICKETS_PAGE:
         lines.append("")
         lines.append(
             f"وأقدم {_ar_digits(TICKETS_PAGE)} معروضة من أصل "
             f"{_ar_digits(len(rows))}"
         )
+        # The count line was already honest about the number hidden; what it
+        # could not say, before there was any way to close one, was that the
+        # rest were unreachable rather than merely next.
+        lines.append("أغلق الظاهرة ليطلع اللي بعدها")
     keyboard: Keyboard = [
-        [("🔄 تحديث", "v1|tickets"), ("🏠 الرئيسية", "v1|menu")],
+        close_buttons[i:i + 3] for i in range(0, len(close_buttons), 3)
     ]
+    keyboard.append([("🔄 تحديث", "v1|tickets"), ("🏠 الرئيسية", "v1|menu")])
     return "\n".join(lines), keyboard
+
+
+def _ticket_close_card(
+    session: Session, *, ticket_id: str, now: datetime
+) -> tuple[str, Keyboard] | None:
+    """The confirm card for one ticket — same shape as ``v1|act``'s."""
+    row = _ticket_row(session, ticket_id)
+    if row is None:
+        return None
+    _ticket, code = row
+    nonce = _new_nonce(_TICKET_ACTION, ticket_id, now)
+    return (
+        TICKET_CONFIRM_AR.format(code=code),
+        [[("✅ تأكيد نهائي", f"v1|tdone|{nonce}")],
+         [("↩️ إلغاء", "v1|tickets")]],
+    )
+
+
+def _ticket_row(
+    session: Session, ticket_id: str
+) -> tuple[SupportEvent, str] | None:
+    """(ticket, its tenant's TEN code) — None for anything unparseable or
+    absent, so a stale button answers «gone» instead of raising."""
+    try:
+        parsed = uuid.UUID(ticket_id)
+    except ValueError:
+        return None
+    ticket = session.get(SupportEvent, parsed)
+    if ticket is None:
+        return None
+    code = session.execute(
+        select(Tenant.code).where(Tenant.id == ticket.tenant_id)
+    ).scalars().first()
+    return ticket, str(code or "TEN-????")
+
+
+def _run_ticket_close(
+    session: Session, *, nonce: str, now: datetime
+) -> tuple[str, Keyboard] | None:
+    """Consume the one-shot nonce, resolve the ticket, redraw the list.
+
+    Returns None for an expired or forged nonce so the caller answers with
+    ACTION_EXPIRED_AR, exactly like every other confirmed action. The answer
+    is prepended to a FRESHLY read list rather than to the stale one the
+    operator tapped: closing the top ticket is what lets the eleventh appear,
+    and a screen that still shows the ticket you just closed is the same
+    silence in a new place.
+    """
+    entry = _pending_actions.pop(nonce, None)
+    if entry is None:
+        return None
+    action, ticket_id, expiry = entry
+    if action != _TICKET_ACTION or expiry < now:
+        return None
+    row = _ticket_row(session, ticket_id)
+    if row is None:
+        done = TICKET_GONE_AR
+    else:
+        ticket, code = row
+        if ticket.status != TICKET_OPEN:
+            done = TICKET_ALREADY_AR.format(code=code)
+        else:
+            ticket.status = TICKET_RESOLVED
+            # `resolved_at` has existed on the model since C4 and had never
+            # been written by anything — an SLA cannot be measured from a
+            # column nobody fills, and «when was this dealt with» is the first
+            # question anyone asks of a closed ticket.
+            ticket.resolved_at = now
+            session.commit()
+            done = TICKET_CLOSED_AR.format(code=code)
+    text, keyboard = _tickets_screen(session, now=now)
+    return f"{done}\n\n{text}", keyboard
 
 
 def _today_data(
@@ -913,12 +1047,16 @@ def _run_subscription_action(
     The first is the crash loop: the pause button is drawn on every card,
     including the shell tenants a §04 upgrade leaves behind, and for those
     ``privacy._subscription`` raises RequestNotFound. With no guard on this
-    path the exception left ``handle_update``, the runner never advanced the
-    Telegram offset, and one tap wedged the entire console into a five-second
-    retry of the same dead update. So the live row is resolved HERE, with the
-    same reader privacy uses (``current_subscription`` — its absence is a
-    fact, not an error), and the two named refusals of the subscription layer
-    are answered instead of propagating.
+    path the exception left ``handle_update``; the runner then advanced the
+    Telegram offset only after the work, so it never advanced at all and one
+    tap wedged the entire console into a five-second retry of the same dead
+    update. The runner has since been turned around — the offset is stored
+    first — so the wedge itself is closed, and what is left without this guard
+    is a tap that silently does nothing to a paying customer's subscription.
+    So the live row is resolved HERE, with the same reader privacy uses
+    (``current_subscription`` — its absence is a fact, not an error), and the
+    two named refusals of the subscription layer are answered instead of
+    propagating.
 
     The second is the false success. ``pause_subscription`` returns the row
     untouched from a state it may not leave, and ``resume_subscription``
@@ -1266,20 +1404,29 @@ def handle_update(
     «إعادة إرسال» button is never offered.
 
     This function also carries the last-resort barrier, and the reason is the
-    BLAST RADIUS rather than any one bug. The runner stores the Telegram
-    offset only after we return, so an exception escaping here is not a failed
-    screen — it is a permanent outage: the same update is re-fed every five
-    seconds, no button works, and the operator is told nothing at all. The
-    barrier converts that into one failed tap.
+    BLAST RADIUS rather than any one bug. It was written when the runner stored
+    the Telegram offset only after we returned, which made an exception here a
+    permanent outage: the same update re-fed every five seconds, no button
+    working, the operator told nothing at all. The runner now stores the offset
+    BEFORE it calls us (``run_admin_bot.process_one_update``), so that outage
+    is closed on the other side and this barrier is no longer the only thing
+    standing between one bad tap and a dead console.
+
+    It stays, and it is worth more than the runner's own catch, because the
+    runner can only DROP the update: it logs, it posts «تم تخطيه», and the
+    operator learns that something failed but not that anything is wrong. From
+    inside, we still know which tap it was, we can roll the session back before
+    it poisons the outcomes, and we can answer with a screen. Belt and braces
+    on the operator's only window is the right amount.
 
     It is a barrier, not a blanket: the exception is logged at ERROR with its
     traceback, which puts it in front of the operator on the ⚠️ الأخطاء screen
     (the collector reads our own ERROR lines out of journalctl), and the reply
     names the situation instead of printing Python. The rollback matters as
-    much as the catch — a session left in a failed transaction would make the
-    runner's own ``_store_offset`` throw next, which is the very loop we are
-    closing. Real failures still stop being invisible; they just stop taking
-    the watchtower with them.
+    much as the catch — the runner commits this same session after we return,
+    and a session left in a failed transaction turns one bad tap into a lost
+    screen for a piece of work the operator believes landed. Real failures
+    still stop being invisible; they just stop taking the watchtower with them.
 
     Authorization stays OUTSIDE the barrier on purpose: a foreign chat must
     receive nothing, not even a failure notice.
@@ -1360,7 +1507,10 @@ def _dispatch(
             return [ack, Outcome(kind="edit", message_id=int(message_id),
                                  text=text, keyboard=reply_keyboard)]
         screen = None
-        is_confirm = len(parts) >= 2 and parts[0] == "v1" and parts[1] == "confirm"
+        # both names consume a one-shot nonce, so both deserve the message
+        # that says «the confirmation expired» rather than «press /start»
+        is_confirm = (len(parts) >= 2 and parts[0] == "v1"
+                      and parts[1] in ("confirm", "tdone"))
         if len(parts) >= 2 and parts[0] == "v1":
             name = parts[1]
             arg = "|".join(parts[2:]) if len(parts) > 2 else ""

@@ -11,7 +11,7 @@ import pytest
 from sqlalchemy import text as sql_text
 from sqlalchemy.orm import Session
 
-from career.telegram import views
+from career.telegram import console, views
 from career.telegram.console import EXPIRED_BUTTON_AR, handle_update
 
 NOW = datetime(2026, 7, 15, 9, 0, tzinfo=UTC)   # Wed 12:00 Riyadh
@@ -1911,16 +1911,42 @@ def test_link_replies_are_direction_pure(
 
 def _seed_ticket(
     session: Session, tenant_id: str, channel_id: str, *,
-    kind: str = "support_request", age_hours: int = 1, status: str = "open",
+    kind: str = "support_request", age_hours: int = 1,
 ) -> str:
+    """A ticket exactly as the product makes one: «open», never anything else.
+
+    The status used to be a parameter, and one test set it to «resolved» —
+    a value NO production path could produce, because nothing in the codebase
+    ever wrote that column a second time. The screen it was proving («resolved
+    tickets disappear») therefore proved nothing about the running system: it
+    proved that a state the system could not reach would have behaved. The
+    close action is now real, so the tests reach «resolved» the way the
+    operator does, by pressing the button.
+    """
     ticket_id = str(uuid.uuid4())
     session.execute(sql_text(
         "INSERT INTO support_events (id, tenant_id, channel_id, kind, status,"
-        " created_at) VALUES (:i, :t, :c, :k, :s, :a)"),
+        " created_at) VALUES (:i, :t, :c, :k, 'open', :a)"),
         {"i": ticket_id, "t": tenant_id, "c": channel_id, "k": kind,
-         "s": status, "a": NOW - timedelta(hours=age_hours)})
+         "a": NOW - timedelta(hours=age_hours)})
     session.commit()
     return ticket_id
+
+
+def _close_ticket(session: Session, ticket_id: str, **kw: Any) -> str:
+    """Drive the operator's two taps — confirm card, then confirmation — and
+    return the text of the screen that answers. Nothing here writes SQL."""
+    card = handle_update(
+        session, _cbq(ADMIN, f"v1|tclose|{ticket_id}"), admin_chat_id=ADMIN,
+        probes=FakeProbes(), now=NOW, **kw,
+    )[1]
+    nonces = [data for row in card.keyboard for _label, data in row
+              if data.startswith("v1|tdone|")]
+    assert len(nonces) == 1, card.keyboard
+    return handle_update(
+        session, _cbq(ADMIN, nonces[0]), admin_chat_id=ADMIN,
+        probes=FakeProbes(), now=NOW, **kw,
+    )[1].text
 
 
 def _drop_tickets(session: Session, *tenant_ids: str) -> None:
@@ -1966,22 +1992,220 @@ def test_open_tickets_are_visible_with_their_age_and_whose_they_are(
         _clear_delivery(owner_session, t2)
 
 
-def test_a_resolved_ticket_leaves_the_screen_and_the_empty_state_is_explicit(
+def test_a_closed_ticket_leaves_the_screen_and_the_empty_state_is_explicit(
     owner_session: Session, two_tenants: tuple[str, str]
 ) -> None:
     """«لا توجد تذاكر مفتوحة» is a fact the operator can act on; a blank
-    screen is one they cannot tell apart from a broken one."""
+    screen is one they cannot tell apart from a broken one.
+
+    The ticket now reaches «resolved» through the console, which is the only
+    path that exists — before the close action there was none at all, and this
+    test reached it with an INSERT.
+    """
     t1, _ = two_tenants
     code = _code_of(owner_session, t1)
     channel = _seed_channel(owner_session, t1)
     try:
-        _seed_ticket(owner_session, t1, channel, status="resolved")
+        ticket = _seed_ticket(owner_session, t1, channel)
+        assert code in _tickets(owner_session).text
+
+        answer = _close_ticket(owner_session, ticket)
+        assert "أغلقنا التذكرة" in answer
+        assert code not in answer.split("\n\n", 1)[1]
+        assert "لا توجد تذاكر مفتوحة" in answer
+
         text = _tickets(owner_session).text
         assert code not in text
         assert "لا توجد تذاكر مفتوحة" in text
     finally:
         _drop_tickets(owner_session, t1)
         _clear_delivery(owner_session, t1)
+
+
+def test_closing_a_ticket_records_when_it_was_dealt_with(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """`resolved_at` has been on the model since C4 with nothing ever writing
+    it. «When was this dealt with» is the first question anyone asks of a
+    closed ticket, and an SLA cannot be measured from a column nobody fills."""
+    t1, _ = two_tenants
+    channel = _seed_channel(owner_session, t1)
+    try:
+        ticket = _seed_ticket(owner_session, t1, channel)
+        _close_ticket(owner_session, ticket)
+        row = owner_session.execute(sql_text(
+            "SELECT status, resolved_at FROM support_events WHERE id = :i"),
+            {"i": ticket}).one()
+        assert row.status == "resolved"
+        assert row.resolved_at == NOW
+    finally:
+        _drop_tickets(owner_session, t1)
+        _clear_delivery(owner_session, t1)
+
+
+def test_the_eleventh_ticket_is_reachable_at_all(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """THE FREEZE. The screen filters «open», orders oldest-first and cuts at
+    ten — and nothing in the product ever moved a ticket out of «open». So
+    from the eleventh ticket onward the operator saw the same ten forever and
+    every later «دعم» was invisible behind them, on a table whose entire
+    purpose is «a paying customer asked for a human». Closing the oldest is
+    what lets the next one through, so it has to be possible from here."""
+    t1, t2 = two_tenants
+    code2 = _code_of(owner_session, t2)
+    channel1 = _seed_channel(owner_session, t1)
+    channel2 = _seed_channel(owner_session, t2)
+    try:
+        oldest = [
+            _seed_ticket(owner_session, t1, channel1, age_hours=100 - n)
+            for n in range(console.TICKETS_PAGE)
+        ]
+        _seed_ticket(owner_session, t2, channel2, age_hours=1)  # the eleventh
+
+        text = _tickets(owner_session).text
+        assert code2 not in text                       # buried, and stuck
+        assert "من أصل ١١" in text
+
+        for ticket in oldest[:1]:
+            _close_ticket(owner_session, ticket)
+        assert code2 in _tickets(owner_session).text   # the queue moves again
+    finally:
+        _drop_tickets(owner_session, t1, t2)
+        _clear_delivery(owner_session, t1)
+        _clear_delivery(owner_session, t2)
+
+
+def test_a_ticket_cannot_be_closed_twice_or_by_a_stale_button(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """Same one-shot nonce as every other mutating action: it is consumed by
+    the first tap, and a second tap on the card WhatsApp/Telegram keeps
+    tappable forever gets «expired», never a second silent write."""
+    t1, _ = two_tenants
+    channel = _seed_channel(owner_session, t1)
+    try:
+        ticket = _seed_ticket(owner_session, t1, channel)
+        card = handle_update(
+            owner_session, _cbq(ADMIN, f"v1|tclose|{ticket}"),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+        )[1]
+        nonce = [d for row in card.keyboard for _l, d in row
+                 if d.startswith("v1|tdone|")][0]
+        first = handle_update(
+            owner_session, _cbq(ADMIN, nonce), admin_chat_id=ADMIN,
+            probes=FakeProbes(), now=NOW,
+        )[1]
+        assert "أغلقنا التذكرة" in first.text
+
+        second = handle_update(
+            owner_session, _cbq(ADMIN, nonce), admin_chat_id=ADMIN,
+            probes=FakeProbes(), now=NOW,
+        )
+        assert second[0].kind == "ack"
+        assert second[0].text == console.ACTION_EXPIRED_AR
+
+        # and a nonce older than its five minutes is refused the same way
+        card2 = handle_update(
+            owner_session, _cbq(ADMIN, f"v1|tclose|{ticket}"),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+        )[1]
+        nonce2 = [d for row in card2.keyboard for _l, d in row
+                  if d.startswith("v1|tdone|")][0]
+        late = handle_update(
+            owner_session, _cbq(ADMIN, nonce2), admin_chat_id=ADMIN,
+            probes=FakeProbes(), now=NOW + timedelta(minutes=6),
+        )
+        assert late[0].text == console.ACTION_EXPIRED_AR
+    finally:
+        _drop_tickets(owner_session, t1)
+        _clear_delivery(owner_session, t1)
+
+
+def test_an_unknown_ticket_button_answers_instead_of_raising(
+    owner_session: Session
+) -> None:
+    """A ticket deleted, or a button from a screen two days old. The tap gets
+    an honest ack — never a traceback through the barrier."""
+    gone = handle_update(
+        owner_session, _cbq(ADMIN, f"v1|tclose|{uuid.uuid4()}"),
+        admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+    )
+    assert gone[0].kind == "ack"
+    assert gone[0].text == EXPIRED_BUTTON_AR
+    junk = handle_update(
+        owner_session, _cbq(ADMIN, "v1|tclose|not-a-uuid"),
+        admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+    )
+    assert junk[0].kind == "ack"
+
+
+def test_the_console_never_describes_a_cursor_ordering_that_is_gone() -> None:
+    """Four comments in console.py — the pause/resume header, the
+    subscription-action docstring and two paragraphs of ``handle_update`` —
+    all justified themselves with «the runner stores the Telegram offset only
+    AFTER handle_update returns», and the runner had just been turned around
+    to store it BEFORE. The barrier's entire stated rationale described an
+    ordering that no longer existed, which is worse than no comment: the next
+    reader trusts it, and reasons about a wedge that cannot happen while
+    missing the at-most-once cost that now can.
+
+    This is a source check on purpose. There is no behaviour to assert — the
+    behaviour is right; the prose was the defect — and the only thing that can
+    catch prose drifting away from code is to read them together.
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    runner_src = (root / "scripts" / "run_admin_bot.py").read_text("utf-8")
+    console_src = (root / "src" / "career" / "telegram"
+                   / "console.py").read_text("utf-8")
+
+    # the fact the comments must agree with: the cursor moves first
+    store = runner_src.index("_store_offset(session, update_id)")
+    work = runner_src.index("outcomes = handler(session, update)")
+    assert store < work
+
+    # Comment text is wrapped and re-wrapped, so compare on one flat line.
+    prose = " ".join(console_src.split())
+    # Present tense is the whole test: «stored ... returned» is history and
+    # belongs in these comments; «stores ... returns» is a claim about the
+    # program as it is now, and that claim is false.
+    for claim in (
+        "runner stores the Telegram offset only AFTER handle_update returns",
+        "runner stores the Telegram offset only after we return",
+        "the runner never advanced the Telegram offset",
+    ):
+        assert claim not in prose, claim
+    assert "now stores the offset BEFORE" in prose
+
+
+def test_every_listed_ticket_carries_its_own_close_button(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """The button is tied to the ticket by an Arabic-Indic numeral, not by its
+    TEN code: «إغلاق TEN-0002» mixes Arabic and Latin on one line and arrives
+    reversed on the operator's client (§16)."""
+    import re
+
+    t1, t2 = two_tenants
+    channel1 = _seed_channel(owner_session, t1)
+    channel2 = _seed_channel(owner_session, t2)
+    latin_or_digit = re.compile(r"[A-Za-z0-9]")
+    try:
+        _seed_ticket(owner_session, t1, channel1, age_hours=5)
+        _seed_ticket(owner_session, t2, channel2, age_hours=2)
+        screen = _tickets(owner_session)
+        closes = [(label, data) for row in screen.keyboard
+                  for label, data in row if data.startswith("v1|tclose|")]
+        assert len(closes) == 2
+        assert "١ •" in screen.text and "٢ •" in screen.text
+        for label, _data in closes:
+            assert not latin_or_digit.search(label), label
+    finally:
+        _drop_tickets(owner_session, t1, t2)
+        _clear_delivery(owner_session, t1)
+        _clear_delivery(owner_session, t2)
 
 
 def test_the_tickets_screen_is_reachable_from_the_menu(

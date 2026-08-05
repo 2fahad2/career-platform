@@ -604,6 +604,38 @@ def test_consent_replies_are_read_without_ever_inventing_an_agreement() -> None:
         assert classify_consent_reply(unclear) == CONSENT_UNCLEAR, unclear
 
 
+def test_a_negation_in_another_clause_is_not_a_refusal() -> None:
+    """AUDIT 2026-08-05. «لا مشكلة» and «ما عندي مانع» are among the most
+    natural ways a Saudi customer says YES, and the veto read the «لا» and
+    the «ما» as scoping the agreement standing right next to them. A paying
+    customer agreeing in plain Arabic was told their refusal was recorded.
+
+    The counterweight is the whole point and is asserted in the same test: no
+    line here may be reachable by «affirmation beats negation», because «لا
+    أوافق» contains «أوافق» and inventing a consent is the one failure worse
+    than the loop."""
+    from career.onboarding.orchestrator import (
+        CONSENT_ACK,
+        CONSENT_AGREE,
+        CONSENT_DECLINE,
+        classify_consent_reply,
+    )
+
+    for yes in ("لا مشكلة، موافق", "ما عندي مانع، موافق", "ما شاء الله موافق",
+                "لا مشكلة أوافق", "ما فيه مانع موافق", "ما عندي مشكلة موافق"):
+        assert classify_consent_reply(yes) == CONSENT_AGREE, yes
+
+    # the phrase ALONE is a yes to a human and not one to a regulator — same
+    # call the module already makes on «تمام», so it gets the explicit ask
+    for soft in ("لا مشكلة", "ما عندي مانع", "لا مانع"):
+        assert classify_consent_reply(soft) == CONSENT_ACK, soft
+
+    # …and the negation that really does scope the agreement still wins
+    for no in ("لا أوافق", "ما أوافق", "مو موافق", "ما أبي أوافق",
+               "لا مشكلة بس ما أوافق"):
+        assert classify_consent_reply(no) == CONSENT_DECLINE, no
+
+
 def test_the_consent_gate_ships_with_real_buttons(
     owner_session: Session, clean_billing: None, tmp_path
 ) -> None:
@@ -744,6 +776,45 @@ def test_unreadable_replies_escalate_instead_of_looping_forever(
         assert again == 1
         # and the gate still opens the moment they type the word
         _say_to_funnel(owner_session, channel_id, "موافق", deps, 5)
+        assert _state(owner_session, tenant_id) == funnel_flow.STATE_UPLOAD
+    finally:
+        owner_session.rollback()
+        owner_session.execute(
+            sql_text("DELETE FROM tenants WHERE id = :t"), {"t": tenant_id})
+        owner_session.commit()
+
+
+def test_a_repeated_refusal_reaches_a_human_instead_of_looping(
+    owner_session: Session, clean_billing: None, tmp_path
+) -> None:
+    """AUDIT 2026-08-05, the other half of the ladder. DECLINE never touched
+    the attempt counter: it explained and re-sent the wall, on the first
+    refusal and on the hundredth, so the escalation could not be reached from
+    that branch at all. A customer who reads the consent wall as something to
+    refuse is precisely the customer who needs a human — and they have paid
+    29 riyals to be standing at this gate."""
+    deps = _deps(tmp_path)
+    admin = FakeTelegramAdminClient()
+    deps.admin_client = admin
+    phone = f"+96650{uuid.uuid4().int % 10_000_000:07d}"
+    tenant_id, channel_id = _activate_funnel(owner_session, deps, admin, phone)
+    try:
+        for minute, no in enumerate(("لا أوافق", "لا اوافق", "مو موافق"), 1):
+            _say_to_funnel(owner_session, channel_id, no, deps, minute)
+            assert _grants(owner_session, tenant_id) == 0, no
+
+        opened = owner_session.execute(
+            sql_text("SELECT count(*) FROM support_events WHERE tenant_id = :t "
+                     "AND kind = :k AND status = 'open'"),
+            {"t": tenant_id, "k": funnel_flow.CONSENT_STUCK_KIND},
+        ).scalar_one()
+        assert opened == 1, "three refusals and no ticket is the loop itself"
+        paged = [m for m in admin.messages if "consent stuck" in m]
+        assert len(paged) == 1
+        assert phone not in paged[0]            # §13: the TEN code, never PII
+
+        # the last word is still theirs: the gate opens the moment they agree
+        _say_to_funnel(owner_session, channel_id, "أوافق", deps, 4)
         assert _state(owner_session, tenant_id) == funnel_flow.STATE_UPLOAD
     finally:
         owner_session.rollback()

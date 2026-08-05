@@ -287,13 +287,33 @@ class StrippedText:
 #: CV section headings and role words that look like a name to a naive
 #: heuristic. Kept small and English/Arabic both, because a false positive
 #: only costs one redacted heading — a false negative leaks a real name.
+#:
+#: AUDIT 2026-08-05. The Arabic half of this list was a list of ONE-word
+#: headings, and almost no Saudi CV writes one-word headings: «الخبرة
+#: العملية» and «المؤهل الدراسي» are what people actually type, and neither
+#: «الخبرة» nor «المؤهل» was here. A CV headed that way scored zero section
+#: words, was not recognised as a document at all, and its header name went to
+#: the model verbatim — against «اسمك لا يُرسل إلى أي نموذج», on a CV the
+#: customer had paid us to read. Every word below is a heading word only; the
+#: heading TEST (`_heading_lines`) is what keeps them from firing inside prose.
 _HEADER_STOPWORDS: frozenset[str] = frozenset({
     "curriculum", "vitae", "resume", "cv", "profile", "summary", "objective",
     "contact", "experience", "education", "skills", "projects", "languages",
     "certifications", "references", "personal", "information", "details",
+    "work", "professional", "employment", "history", "academic", "training",
+    "courses", "qualifications", "qualification", "achievements", "awards",
     "السيرة", "الذاتية", "سيرة", "ذاتية", "الملف", "الشخصي", "نبذة",
     "الخبرات", "التعليم", "المهارات", "المشاريع", "اللغات", "الشهادات",
     "معلومات", "الاتصال", "البيانات", "الشخصية",
+    "الخبرة", "العملية", "المهنية", "الوظيفية", "المؤهل", "المؤهلات",
+    "الدراسي", "الدراسية", "العلمية", "العلمي", "الدورات", "التدريبية",
+    "التدريب", "الهدف", "الوظيفي", "الإنجازات", "الدراسات", "المعلومات",
+})
+#: Words that may sit on a heading line without being a heading themselves:
+#: «نبذة عني», "Summary of Qualifications". They can never make a line a
+#: heading alone — a heading line still needs a word from the list above.
+_HEADING_FILLER: frozenset[str] = frozenset({
+    "of", "and", "the", "my", "about", "عني", "عن", "نفسي", "لي",
 })
 
 
@@ -376,6 +396,56 @@ def infer_header_name(text: str, *, max_lines: int = 6) -> str | None:
     return names[0] if names else None
 
 
+#: A heading is SHORT. Past this the line is carrying content, whatever words
+#: it opens with.
+_MAX_HEADING_WORDS = 4
+#: The smallest document we will read a header name out of.
+_MIN_DOC_LINES = 4
+
+
+def _is_heading_word(folded: str) -> bool:
+    """A section word, or one wearing the «و» a bilingual heading joins with
+    («التعليم والتدريب»)."""
+    return folded in _SECTION_WORDS or (
+        folded.startswith("و") and folded[1:] in _SECTION_WORDS
+    )
+
+
+def _heading_lines(text: str) -> set[str]:
+    """The distinct section words that appear as a HEADING — a short line made
+    of nothing but heading words, or the label before a colon.
+
+    AUDIT 2026-08-05, and the whole point of the rewrite. The old test counted
+    two section WORDS anywhere in the text, which is a property ordinary prose
+    has: «قدت فريق التعليم والتدريب / وطورت المهارات الرقمية» is five lines of
+    a customer's own enrichment answer and it scored two headings. strip_pii
+    then read its short lines as header names and replaced «وحققت نتائج
+    ممتازة» with «[NAME] [NAME] [NAME]» — the achievement the customer had
+    just typed, destroyed on the way to the model and stored in the bank as
+    garbage, with assert_no_pii raising nothing because the corruption is not
+    a leak.
+
+    A heading is a LINE, not a word. That single change separates the two
+    populations completely: a CV prints «الخبرة العملية» on a line of its own,
+    and a person writing about their work puts those words inside a sentence.
+    """
+    found: set[str] = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        label = line.split(":", 1)[0] if ":" in line else line
+        words = [_fold(m.group()) for m in _WORD.finditer(label)]
+        if not words or len(words) > _MAX_HEADING_WORDS:
+            continue
+        headings = {w for w in words if _is_heading_word(w)}
+        if not headings:
+            continue
+        if all(_is_heading_word(w) or w in _HEADING_FILLER for w in words):
+            found |= headings
+    return found
+
+
 def _looks_like_cv(text: str) -> bool:
     """Is this a CV-shaped DOCUMENT rather than a role title, a WhatsApp reply
     or a prompt?
@@ -385,20 +455,19 @@ def _looks_like_cv(text: str) -> bool:
     one-line role title, enrichment passes a customer's colloquial answer.
     Inferring a "header name" from those and blanking it would silently
     destroy the very content we are about to send — the achievement the
-    customer just typed. Two distinct section headings plus four lines is the
+    customer just typed. Two distinct section HEADINGS plus four lines is the
     cheap, honest discriminator: every real CV has them and a WhatsApp
-    message has neither."""
+    message has neither.
+
+    A layout this misses — a CV that runs its headings inline — no longer
+    ends in a leak, and that is deliberate: since 2026-08-05 assert_no_pii
+    decides for itself what a document is (:func:`_document_shaped`) instead
+    of asking this function, so a name this misses is caught there and the
+    send fails closed."""
     lines = [ln for ln in text.splitlines() if ln.strip()]
-    if len(lines) < 4:
+    if len(lines) < _MIN_DOC_LINES:
         return False
-    seen: set[str] = set()
-    for match in _WORD.finditer(text):
-        folded = _fold(match.group())
-        if folded in _SECTION_WORDS:
-            seen.add(folded)
-            if len(seen) >= 2:
-                return True
-    return False
+    return len(_heading_lines(text)) >= 2
 
 
 def _inferred_tokens(candidate: str) -> list[str]:
@@ -517,11 +586,53 @@ def _title_cased(token: str) -> bool:
     )
 
 
+#: Employment dates. A CV carries them; a WhatsApp achievement rarely carries
+#: two, and «حققنا 2024» is one.
+_YEAR = re.compile(r"(?<![0-9])(?:19|20)\d{2}(?![0-9])")
+#: A bulleted line, in any of the marks a converted PDF/DOCX leaves behind.
+_BULLET_LINE = re.compile(r"^[ \t]*[-–—•·*▪◦]\s+\S", re.MULTILINE)
+#: A contact placeholder strip_pii has already written. Its presence means the
+#: text carried an email or a phone number, which is a DOCUMENT fact.
+_CONTACT_PLACEHOLDER = re.compile(r"\[(?:EMAIL|PHONE)_\d+\]")
+#: How many bulleted lines make a document. Two is a WhatsApp list.
+_MIN_DOC_BULLETS = 3
+
+
+def _document_shaped(text: str) -> bool:
+    """Is this a FILE we are looking at, rather than something someone typed?
+
+    AUDIT 2026-08-05 — the structural half of the leak. The backstop gated its
+    residual-name check on ``_looks_like_cv``, the stripper's own predicate,
+    so the two failed in exactly the same places: the CV headed «الخبرة
+    العملية» / «المؤهل الدراسي» was invisible to the stripper AND invisible to
+    the thing whose only job is to catch what the stripper misses. A backstop
+    that shares the primary's assumption is not a backstop; it is the same
+    check spelled twice.
+
+    So this asks the question a different way, from signals the heading
+    vocabulary knows nothing about and that no edit to that vocabulary can
+    move: dates, bullets, and contact details that were already redacted.
+    ``_looks_like_cv`` is one route in, never the only one — the union is what
+    makes the coverage independent. It stays strict enough to leave a typed
+    answer alone, because a false alarm here is a customer's achievement
+    silently dropped (see :func:`assert_no_pii`)."""
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if len(lines) < _MIN_DOC_LINES:
+        return False
+    if _looks_like_cv(text):
+        return True
+    if _CONTACT_PLACEHOLDER.search(text):
+        return True
+    if len(set(_YEAR.findall(text))) >= 2:
+        return True
+    return len(_BULLET_LINE.findall(text)) >= _MIN_DOC_BULLETS
+
+
 def _residual_name(text: str) -> str | None:
     """A name that appears to have survived stripping, or None. Only the first
-    two readable lines of a CV-shaped document are examined — see the
-    reasoning in :func:`assert_no_pii`."""
-    if not _looks_like_cv(text):
+    two readable lines of a document are examined — see the reasoning in
+    :func:`assert_no_pii`."""
+    if not _document_shaped(text):
         return None
     for candidate in _header_name_lines(text, max_lines=_HEADER_LINES, max_hits=2):
         tokens = _inferred_tokens(candidate)
@@ -553,8 +664,11 @@ def assert_no_pii(text: str, *, known_name: str | None) -> None:
     intent.py falls back to deterministic parsing; the tailoring chain loses a
     model call on a CV someone has paid for. So RECALL lives in strip_pii,
     where the cost of being wrong is a redacted word inside a prompt, and this
-    function is tuned for PRECISION: it only speaks up about a CV-shaped
-    document (four lines, two section headings), only about its first two
+    function is tuned for PRECISION: it only speaks up about a document
+    (:func:`_document_shaped` — four lines plus dates, bullets, redacted
+    contacts or headings, deliberately NOT the stripper's own predicate, which
+    is how it stayed blind to the stripper's blind spot until 2026-08-05),
+    only about its first two
     readable lines, only when two or more tokens survive the role/place filter,
     and only when they carry a positive person signal — Latin title case, or a
     known Arabic given name or the «اسم + اللقب» article pattern. A name

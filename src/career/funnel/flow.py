@@ -30,6 +30,8 @@ from career.funnel.report import render_report_pdf, whatsapp_summary
 from career.onboarding.consents import PURPOSES, missing_required, record_consent
 from career.onboarding.consents import _load_records as _consent_records
 from career.onboarding.extraction import (
+    ExtractionFailed,
+    PiiLeak,
     infer_header_name,
     run_extraction,
     strip_pii,
@@ -65,9 +67,10 @@ _CONSENT_BUTTONS: tuple[tuple[str, str], ...] = (
     (CONSENT_DECLINE_ID, _DECLINE),
 )
 
-#: How many unreadable replies before a human is put on it. The gate is the
-#: FIRST step of a service the customer has already paid for: walling them in
-#: silently past this point is not an option we get to keep.
+#: How many unresolved replies before a human is put on it — unreadable ones
+#: and refusals alike, since both leave the customer standing at the gate.
+#: The gate is the FIRST step of a service the customer has already paid for:
+#: walling them in silently past this point is not an option we get to keep.
 _MAX_CONSENT_ATTEMPTS = 3
 _CONSENT_ATTEMPTS_KEY = "consent_attempts"
 CONSENT_STUCK_KIND = "funnel_consent_stuck"
@@ -172,16 +175,25 @@ def _prompt_consent(
                   else _consent_wall())
 
 
-def _handle_unreadable_consent(
+def _unresolved_consent(
     session: Session, *, row: FunnelSession, channel: CustomerChannel,
     deps: Deps, verdict: str,
 ) -> None:
-    """The way OUT of the gate (audit 2026-08).
+    """The way OUT of the gate — for EVERY verdict that is not a grant.
 
     The old ``else`` re-sent the identical wall, forever, with no counter, no
     «لم أفهم» and no escalation — for a customer who had already paid 29
     riyals. Now every attempt says something new and the third one puts a
     human on it, while «أوافق» keeps working at any point.
+
+    AUDIT 2026-08-05: DECLINE used to walk straight past this function. It
+    explained why the consent is needed and re-sent the wall, and it did that
+    on the first refusal and on the hundredth — the counter never moved, so
+    the escalation ladder could not be reached from that branch at all. That
+    is the loop the ladder exists to end, and a customer who reads the wall as
+    a refusal every time is exactly the customer who most needs a human. Every
+    non-grant verdict is counted here now: there is no consent outcome left
+    that can repeat unbounded.
     """
     context = dict(row.context or {})
     attempts = int(context.get(_CONSENT_ATTEMPTS_KEY, 0)) + 1
@@ -191,7 +203,11 @@ def _handle_unreadable_consent(
         _escalate_consent(session, row=row, channel=channel, deps=deps,
                           attempts=attempts)
         return
-    if attempts >= 2:
+    if verdict == CONSENT_DECLINE:
+        # A refusal was understood perfectly — it earns the reason, not the
+        # «I did not follow you» copy, at every attempt before the last.
+        lead = _CONSENT_DECLINED_EXPLAIN
+    elif attempts >= 2:
         lead = _CONSENT_HELP
     else:
         lead = _CONSENT_ACK_ASK if verdict == CONSENT_ACK else _CONSENT_NOT_CLEAR
@@ -230,7 +246,7 @@ def _escalate_consent(
             try:
                 deps.admin_client.send_admin(
                     f"⚠️ {code} · funnel consent stuck · "
-                    f"{attempts} unreadable replies · paid cv_analysis"
+                    f"{attempts} unresolved replies · paid cv_analysis"
                 )
             except Exception:  # noqa: BLE001 — the ticket is already written
                 logger.warning("consent stall notify failed", exc_info=True)
@@ -318,13 +334,10 @@ def handle_funnel_text(
             row.context = {k: v for k, v in (row.context or {}).items()
                            if k != _CONSENT_ATTEMPTS_KEY}
             deps.whatsapp_client.send_text(channel.phone_e164, _UPLOAD_PROMPT)
-        elif verdict == CONSENT_DECLINE:
-            deps.whatsapp_client.send_text(
-                channel.phone_e164, _CONSENT_DECLINED_EXPLAIN,
-            )
-            _prompt_consent(deps, channel)
         else:
-            _handle_unreadable_consent(
+            # DECLINE, ACK and UNCLEAR all end up here on purpose — see the
+            # incident in _unresolved_consent. Only a grant leaves the gate.
+            _unresolved_consent(
                 session, row=row, channel=channel, deps=deps, verdict=verdict,
             )
 
@@ -394,10 +407,26 @@ def handle_funnel_document(
     header_name = infer_header_name(text)
     stripped = strip_pii(text, known_name=header_name)
     contact_found = any(k.startswith("[EMAIL_") for k in stripped.replacements)
-    run_extraction(
-        session, tenant_id=row.tenant_id, cv_text=text,
-        known_name=header_name, extractor=deps.extractor,
-    )
+    try:
+        run_extraction(
+            session, tenant_id=row.tenant_id, cv_text=text,
+            known_name=header_name, extractor=deps.extractor,
+        )
+    except (ExtractionFailed, PiiLeak):
+        # Both mean the same thing to the customer: we could not read this
+        # file. PiiLeak specifically means the backstop refused to send text
+        # that still carried a name — since 2026-08-05 it can refuse a layout
+        # the stripper's heading vocabulary missed, which is the fail-closed
+        # direction §15.8 demands. Neither may escape as an unhandled
+        # exception: the funnel session would stay in UPLOAD_PENDING with no
+        # reply at all, which is the silent failure §15.12 forbids. The log
+        # line carries the reason only — never any of the document.
+        logger.warning("funnel cv extraction failed", exc_info=True)
+        deps.whatsapp_client.send_text(
+            channel.phone_e164,
+            "تعذر قراءة الملف — أعد إرساله من فضلك، وإذا تكرر اكتب: دعم",
+        )
+        return
     row.context = {**row.context, "contact_found": contact_found}
     row.state = STATE_PATH
     row.updated_at = now

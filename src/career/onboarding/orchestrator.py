@@ -54,6 +54,7 @@ from career.onboarding.consents import ConsentMissing
 from career.onboarding.extraction import (
     ExtractionFailed,
     ExtractorClient,
+    PiiLeak,
     run_extraction,
 )
 from career.onboarding.upload import Limits, MalwareScanner, process_cv_upload
@@ -318,6 +319,49 @@ _NEGATION_TOKENS: frozenset[str] = frozenset(normalize_ar(w) for w in (
     "لا", "ما", "مو", "مب", "مش", "ماني", "أبد", "أبدًا", "لست",
     "no", "not", "never", "nope",
 ))
+#: Fixed Arabic phrases that CONTAIN a negation and mean the opposite of one
+#: (audit 2026-08-05). «لا مشكلة» and «ما عندي مانع» are among the most
+#: natural Saudi ways to say yes, and «ما شاء الله» is not an answer at all —
+#: it is the interjection half the country prefixes a sentence with. All three
+#: used to come back DECLINE the moment the customer ALSO typed «موافق»,
+#: because the veto below reads a bag of tokens and cannot see that the «لا»
+#: belongs to a different clause than the agreement.
+#:
+#: This is the only safe shape for that fix. «Affirmation wins over negation»
+#: would flip the error in the direction we must never flip it — «لا أوافق»
+#: contains «أوافق» — so instead we recognise a CLOSED set of phrases whose
+#: negation is spoken for, remove them from the message, and let the untouched
+#: rules read whatever is left. A negation we do not recognise still vetoes.
+_NEGATED_AFFIRMATIONS: tuple[tuple[str, ...], ...] = tuple(
+    tuple(normalize_ar(p).split()) for p in (
+        "لا مشكلة", "لا مانع", "لا بأس", "ما فيه مشكلة", "ما في مشكلة",
+        "ما عندي مشكلة", "ما فيه مانع", "ما في مانع", "ما عندي مانع",
+        "ما لدي مانع", "ما عندي اعتراض", "ما فيه اعتراض", "ما شاء الله",
+    )
+)
+
+
+def _consume_negated_affirmations(words: list[str]) -> tuple[list[str], bool]:
+    """Strip the fixed phrases above out of a folded word SEQUENCE.
+
+    Returns the remaining words and whether anything was consumed. Sequence,
+    not set: «لا مشكلة» is only that phrase when the two words are adjacent
+    and in that order — a message that happens to contain «لا» somewhere and
+    «مشكلة» somewhere else has not said it.
+    """
+    out: list[str] = []
+    consumed = False
+    i = 0
+    while i < len(words):
+        for phrase in _NEGATED_AFFIRMATIONS:
+            if tuple(words[i:i + len(phrase)]) == phrase:
+                i += len(phrase)
+                consumed = True
+                break
+        else:
+            out.append(words[i])
+            i += 1
+    return out, consumed
 _REFUSAL_TOKENS: frozenset[str] = frozenset(normalize_ar(w) for w in (
     "أرفض", "نرفض", "رفض", "أرفضها", "مرفوض", "refuse", "decline",
 ))
@@ -337,6 +381,17 @@ def classify_consent_reply(text: str | None) -> str:
     Returns one of CONSENT_AGREE / CONSENT_DECLINE / CONSENT_ACK /
     CONSENT_UNCLEAR. The caller grants ONLY on CONSENT_AGREE; every other
     verdict has a reply of its own, so no branch can end in silence.
+
+    On negation the reading is deliberately asymmetric, and stayed asymmetric
+    through the 2026-08-05 fix. A negation that SCOPES the agreement — «لا
+    أوافق», «ما أوافق», «مو موافق» — is a refusal and nothing may soften it.
+    A negation belonging to a DIFFERENT clause — «لا مشكلة، موافق» — is not,
+    and reading it as one sent a paying customer round the gate forever. We do
+    not resolve that with a precedence rule; we resolve it by naming the fixed
+    phrases whose negation is already spoken for (_NEGATED_AFFIRMATIONS),
+    removing them, and re-reading the rest under the untouched old rules. A
+    negation we cannot place still vetoes, so the direction that would invent
+    a consent is closed by construction rather than by tuning.
     """
     raw = (text or "").strip()
     if raw in (CONSENT_AGREE_ID, _CONSENT_YES):
@@ -347,6 +402,12 @@ def classify_consent_reply(text: str | None) -> str:
     words = normalize_ar(raw).split()
     if not words or len(words) > _CONSENT_MAX_WORDS:
         return CONSENT_UNCLEAR
+    words, softened = _consume_negated_affirmations(words)
+    if not words:
+        # «لا مشكلة» / «ما عندي مانع» and nothing else. It reads as a yes to a
+        # human, and it is NOT one to a regulator — the same call the module
+        # already makes on «تمام». It gets the explicit ask, never a grant.
+        return CONSENT_ACK if softened else CONSENT_UNCLEAR
     tokens = set(words)
 
     if tokens & _REFUSAL_TOKENS:
@@ -1217,7 +1278,15 @@ def handle_document(
             session, tenant_id=channel.tenant_id, cv_text=cv_text,
             known_name=known_name, extractor=deps.extractor,
         )
-    except ExtractionFailed:
+    except (ExtractionFailed, PiiLeak):
+        # PiiLeak means the backstop refused to put this text on the wire, and
+        # since 2026-08-05 it can refuse a layout the stripper did not
+        # recognise — a CV whose headings the vocabulary misses keeps its name
+        # and is stopped here. That is the direction §15.8 requires, but it
+        # was escaping this handler uncaught, which is a silent failure
+        # (§15.12) for the customer: no state, no reply, no ticket. It lands
+        # in the documented CV_PROCESSING failure path with everything else.
+        # The exception text carries a reason and never any of the document.
         logger.warning("cv extraction failed", exc_info=True)
         journey.state = fsm.regress_on_failure("CV_PROCESSING")
         journey.state_entered_at = now

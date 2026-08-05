@@ -507,12 +507,25 @@ def expire_stale_held_deliveries(
     *,
     now: datetime,
     suppressor: close_mod.Suppressor = record_suppression_by_url,
-) -> int:
+) -> list[TenantDayState]:
     """Audit fix (§15.12 gap): a PENDING_WINDOW bundle from a PREVIOUS run
     day whose customer never opened the window would otherwise leave that day
     with no state at all. Expire it and close the day honestly — nothing was
     delivered, so the state authority yields WHATSAPP_FAILED. The descend
-    path no longer matches the row (status left PENDING only for today)."""
+    path no longer matches the row (status left PENDING only for today).
+
+    RETURNS THE DAY STATES IT CLOSED, and that is the whole point of the
+    change. This function used to return a COUNT, and a count is not something
+    the night's verdict can be computed from: the tenants it fails never enter
+    ``run_daily_delivery``'s ``states``, so they never reached the run
+    summary and ``exit_code_for`` never saw them. Four real nights closed
+    WHATSAPP_FAILED from exactly here — 21, 22 and 23 July and 2 August 2026,
+    each one written by the NEXT morning's sweep (the day states are stamped
+    at 01:3x UTC, the sweep's hour, not the failed day's) — and every one of
+    those runs exited 0 with ``OnFailure`` silent. The exit-code fix landed in
+    the same commit and did not close its own incident, because it was wired
+    to the only channel this path never used.
+    """
     today = now.astimezone(_RIYADH).date()
     stale = session.execute(
         select(Delivery).where(
@@ -520,13 +533,14 @@ def expire_stale_held_deliveries(
             Delivery.run_date < today,
         )
     ).scalars().all()
+    closed: list[TenantDayState] = []
     for delivery in stale:
         delivery.status = DELIVERY_EXPIRED
         snapshot = delivery.bundle.get("close") or {}
         groups = [
             str(e.get("group")) for e in delivery.bundle.get("jobs", [])
         ]
-        close_mod.close_tenant_day(
+        state = close_mod.close_tenant_day(
             session,
             tenant_id=delivery.tenant_id,
             run_date=delivery.run_date,
@@ -539,6 +553,8 @@ def expire_stale_held_deliveries(
             failed_groups=groups,
             suppressor=suppressor,
         )
+        if state is not None:
+            closed.append(state)
         try:
             # AUDIT ك-15: expired days carried real usage (generation) that
             # never reached cost_allocations — roll it up here too (§14).
@@ -547,7 +563,7 @@ def expire_stale_held_deliveries(
             )
         except Exception:  # noqa: BLE001 — accounting never blocks expiry
             logger.warning("expiry cost rollup failed", exc_info=True)
-    return len(stale)
+    return closed
 
 
 def run_daily_delivery(
@@ -563,16 +579,30 @@ def run_daily_delivery(
     canary_tenant_id: uuid.UUID | None = None,
     canary_delay_seconds: float = 0.0,
     sleeper: Callable[[float], None] | None = None,
+    expired_out: list[TenantDayState] | None = None,
 ) -> dict[uuid.UUID, TenantDayState]:
     """One delivery day. Tenants are isolated — one tenant's crash never
     touches the others; the admin summary reports every closed tenant.
     ``include_weekend`` exists for manual canary runs only — the timer
-    never sets it (§08: Sunday–Thursday)."""
+    never sets it (§08: Sunday–Thursday).
+
+    ``expired_out``, when given, is filled with the day states the stale-bundle
+    sweep closed for PREVIOUS days. They are handed back on their own channel
+    rather than merged into the returned dict on purpose: that dict is keyed by
+    tenant id and describes TODAY, and a tenant can legitimately have both —
+    yesterday expired at 04:30 and today delivered a minute later. Merging them
+    would let one of the two days silently overwrite the other, and the one
+    that loses is always the failure. The caller (``engine.cli``) reports both
+    and fails the night on either; see :func:`expire_stale_held_deliveries` for
+    the four live nights that exited 0 while this channel did not exist.
+    """
     expired = expire_stale_held_deliveries(session, suppressor=suppressor, now=now)
+    if expired_out is not None:
+        expired_out.extend(expired)
     if expired:
         try:
             deps.admin_client.send_admin(
-                f"⌛ أُغلقت {expired} تسليمة معلقة من يوم سابق — "
+                f"⌛ أُغلقت {len(expired)} تسليمة معلقة من يوم سابق — "
                 "النافذة لم تُفتح (WHATSAPP_FAILED)"
             )
         except Exception:  # noqa: BLE001 — reporting never breaks the day

@@ -166,6 +166,40 @@ EXIT_OK = 0
 EXIT_DISCOVERY_FAILED = 1
 EXIT_NO_SEARCH_KEY = 2
 EXIT_DELIVERY_FAILED = 3
+#: 4 is the twin of 2 and points at the same shape of runbook entry: a
+#: credential is missing, so the run could not even attempt the thing it exists
+#: to do. It is NOT 3 — 3 sends the operator hunting for which customer broke,
+#: and here nobody broke: nobody was served at all.
+EXIT_NO_WHATSAPP_TOKEN = 4
+
+#: The four things ``delivery_phase`` can say, named rather than spelled out at
+#: every call site: the exit code now keys off one of them, and a verdict that
+#: turns on a string literal typed twice is a verdict one typo from silence.
+PHASE_RAN = "ran"
+PHASE_NO_DELIVER = "skipped:no-deliver"
+PHASE_NO_CREDENTIALS = "skipped:no-whatsapp-credentials"
+PHASE_NO_TENANTS = "skipped:no-tenants"
+
+
+def delivery_phase_for(
+    *, deliver: bool, has_whatsapp_token: bool, has_tenants: bool
+) -> str:
+    """Why the delivery phase did or did not run — the reason, not the ashes.
+
+    Lifted out of ``main`` because the verdict now turns on it: one of these
+    four answers means «total outage» and the other three do not, and a
+    decision with a customer-facing consequence does not belong in the one
+    function in this module that no test can reach. The order matters and is
+    the operator's own reading order: what he asked for, then what he is
+    missing, then who there was to serve.
+    """
+    if not deliver:
+        return PHASE_NO_DELIVER
+    if not has_whatsapp_token:
+        return PHASE_NO_CREDENTIALS
+    if not has_tenants:
+        return PHASE_NO_TENANTS
+    return PHASE_RAN
 
 #: The four day states that mean a human has to look at tonight (§15.12).
 FAILED_DAY_STATES: frozenset[str] = frozenset({
@@ -183,7 +217,10 @@ HONEST_DAY_STATES: frozenset[str] = frozenset({
 
 
 def exit_code_for(
-    status: str, delivery_states: Iterable[str] | None = None
+    status: str,
+    delivery_states: Iterable[str] | None = None,
+    *,
+    delivery_phase: str | None = None,
 ) -> int:
     """The night's verdict as one number — §15 constant 12.
 
@@ -216,11 +253,27 @@ def exit_code_for(
     truthful alert gets ignored. What the emptiness MEANS is reported instead,
     in ``summarize_delivery``.
 
+    ``delivery_phase`` is the ONE emptiness that is not honest. When
+    ``WHATSAPP_ACCESS_TOKEN`` is blank the delivery phase never runs at all:
+    no tenant is served, no day state is written, ``delivery`` is ``{}`` — and
+    under the rule above that is a 0, every night, forever, for a total
+    outage. The credential this depends on is a temporary Meta token that has
+    been on the «replace before it dies» list since 17 July, so this is the
+    likeliest way the product goes dark, and the emptiness rule was exactly
+    the wrong shape to catch it. It gets code 4 rather than 3 because the
+    runbook entry is «put a token in the file», not «find out whose delivery
+    broke». ``--no-deliver`` (a digest run the operator asked for) and «no
+    tenants tonight» stay 0: both are intended.
+
     An unrecognised state counts as a failure: a ninth day state added
     without deciding its side of this line should shout, not go quiet.
     """
     if status == "discovery_failed":
+        # kept first: every tenant closed DISCOVERY_FAILED on that path, so
+        # both rules agree on «not zero», and 1 names the bigger fire.
         return EXIT_DISCOVERY_FAILED
+    if delivery_phase == PHASE_NO_CREDENTIALS:
+        return EXIT_NO_WHATSAPP_TOKEN
     if any(state not in HONEST_DAY_STATES for state in (delivery_states or ())):
         return EXIT_DELIVERY_FAILED
     return EXIT_OK
@@ -231,6 +284,7 @@ def summarize_delivery(
     tenant_codes: dict[uuid.UUID, str],
     intended: Iterable[uuid.UUID],
     states: dict[uuid.UUID, str],
+    expired: Iterable[tuple[uuid.UUID, date, str]] = (),
 ) -> dict[str, Any]:
     """The delivery half of the journal line, with its silences named.
 
@@ -244,6 +298,15 @@ def summarize_delivery(
     TEN code: an empty ``delivery`` beside a populated ``delivery_unclosed``
     is a legible night, and an empty ``delivery`` beside an empty
     ``delivery_unclosed`` truly means there was no one to serve.
+
+    ``delivery_expired`` is the third channel, and it is a LIST of rows rather
+    than a code→state map because these days are not tonight: they are the
+    PREVIOUS days the stale-bundle sweep closed at the top of this run, they
+    carry their own date, and one tenant can bring more than one. Folding them
+    into ``delivery`` by tenant code would have been shorter and would have
+    dropped a day every time a tenant was both expired and served — see
+    ``cv.daily_run.run_daily_delivery``. Until this key existed those closures
+    reached no reader at all: not the journal, not the exit code.
     """
     return {
         "delivery": {
@@ -254,6 +317,14 @@ def summarize_delivery(
             tenant_codes.get(tid, "TEN-????")
             for tid in intended if tid not in states
         ),
+        "delivery_expired": [
+            {
+                "tenant": tenant_codes.get(tid, "TEN-????"),
+                "run_date": str(run_date),
+                "state": state,
+            }
+            for tid, run_date, state in expired
+        ],
     }
 
 
@@ -432,6 +503,31 @@ def verify_environment(
             ))
 
     problems.extend(_token_expiry_problems(settings, today, warn_days))
+
+    # The credential the whole product speaks through, and the one this check
+    # did not look at. It watched four Salla facts — all of them about SELLING,
+    # all of them degrading the new-order path only — while the token that
+    # DELIVERS to everyone who already bought was unwatched, and it is the
+    # temporary one: a Meta user token that has been «replace it before it
+    # dies» in the project notes since 17 July. Empty means the nightly run
+    # skips its delivery phase entirely and every paying customer gets nothing
+    # (see exit_code_for, which now also refuses to call that night a success).
+    if not (getattr(settings, "whatsapp_access_token", "") or "").strip():
+        problems.append(EnvProblem(
+            "WHATSAPP_ACCESS_TOKEN",
+            "empty — the nightly run skips delivery entirely and NO customer "
+            "receives anything",
+            "توكن واتساب غير مضبوط — التسليم اليومي لن يعمل ولن يصل العملاء شيء",
+        ))
+    elif not (getattr(settings, "whatsapp_phone_number_id", "") or "").strip():
+        # A token with nothing to send FROM fails at the first Graph call, per
+        # message, for every customer — the same outage one layer down.
+        problems.append(EnvProblem(
+            "WHATSAPP_PHONE_NUMBER_ID",
+            "empty — the WhatsApp client has no number to send from, so every "
+            "delivery attempt fails at Meta",
+            "رقم واتساب المرسِل غير مضبوط — كل محاولة إرسال سترفضها ميتا",
+        ))
 
     if not (settings.salla_store_url or "").strip():
         # §16: lifecycle.py degrades to a link-less renewal message rather
@@ -704,20 +800,16 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
     # result list (engine.run._tenants_without_results), and each one closes
     # DISCOVERY_FAILED here. No CV is generated and no message is sent on
     # that path — the empty final list sees to that.
-    delivery_phase_ran = bool(
-        args.deliver and settings.whatsapp_access_token and report.per_tenant
-    )
     # P0-7: name the reason instead of leaving the reader to infer it from a
     # missing key. A run that never entered the phase used to print no
     # «delivery» at all, which reads exactly like a run that entered it and
     # closed nobody.
-    summary["delivery_phase"] = (
-        "ran" if delivery_phase_ran
-        else "skipped:no-deliver" if not args.deliver
-        else "skipped:no-whatsapp-credentials"
-        if not settings.whatsapp_access_token
-        else "skipped:no-tenants"
+    summary["delivery_phase"] = delivery_phase_for(
+        deliver=bool(args.deliver),
+        has_whatsapp_token=bool(settings.whatsapp_access_token),
+        has_tenants=bool(report.per_tenant),
     )
+    delivery_phase_ran = summary["delivery_phase"] == PHASE_RAN
     if args.digest_only is None and not delivery_phase_ran:
         # ح-3: intended to deliver but the phase never ran (no creds / no
         # tenants) — flip the record so it never claims sends that didn't
@@ -776,11 +868,17 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
                             )
                         )
                     ).scalars().first()
+                # Filled by the stale-bundle sweep with the PREVIOUS days it
+                # closed. Four live nights (21/22/23 July, 2 August) failed a
+                # real customer from that sweep and exited 0 because those
+                # closures had no way back to this function.
+                expired_states: list[Any] = []
                 states = run_daily_delivery(
                     session, report=report, deps=deps,
                     now=datetime.now(UTC),
                     include_weekend=args.include_weekend,
                     canary_tenant_id=canary_tid,
+                    expired_out=expired_states,
                     # Fahad, 2 August: «كل شي الساعة ١١». The canary hour
                     # belonged to the review phase — it pushed every other
                     # customer's delivery to noon. Ordering is kept (his
@@ -790,18 +888,21 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
                 )
                 # read INSIDE the session — the rows expire on close
                 # AUDIT ك-17: TEN codes in the journal, never raw uuids
+                closed_ids = set(states) | {s.tenant_id for s in expired_states}
                 dcodes = {
                     row.id: row.code
                     for row in session.execute(
                         select(Tenant.id, Tenant.code).where(
-                            Tenant.id.in_(list(states))
+                            Tenant.id.in_(sorted(closed_ids))
                         )
                     ).all()
-                } if states else {}
+                } if closed_ids else {}
                 summary.update(summarize_delivery(
                     tenant_codes={**codes, **dcodes},
                     intended=list(report.per_tenant),
                     states={tid: state.state for tid, state in states.items()},
+                    expired=[(s.tenant_id, s.run_date, s.state)
+                             for s in expired_states],
                 ))
                 session.commit()
         finally:
@@ -809,16 +910,34 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
 
     print(json.dumps(summary, ensure_ascii=False, default=str))
 
+    # Every tenant-day this run CLOSED, tonight's and the previous days the
+    # stale-bundle sweep finished off. Both halves are the same kind of fact
+    # and the verdict must be computed over both — reading only the first half
+    # is the exact defect that let four expired nights exit 0.
+    closed_states = [
+        *summary.get("delivery", {}).values(),
+        *(row["state"] for row in summary.get("delivery_expired", [])),
+    ]
     failed = sorted(
         code for code, state in summary.get("delivery", {}).items()
         if state not in HONEST_DAY_STATES
+    ) + sorted(
+        f"{row['tenant']} ({row['run_date']})"
+        for row in summary.get("delivery_expired", [])
+        if row["state"] not in HONEST_DAY_STATES
     )
     if failed:
         # The exit code summons the operator; this line tells him WHO, and it
         # is an ERROR because that is the only level his journal harvester
         # forwards. Before P0-7 neither existed.
         logger.error("delivery failed tonight for %s", ", ".join(failed))
-    return exit_code_for(report.status, summary.get("delivery", {}).values())
+    if summary["delivery_phase"] == PHASE_NO_CREDENTIALS:
+        logger.error(
+            "WHATSAPP_ACCESS_TOKEN is empty — the delivery phase never ran "
+            "and no customer was served tonight"
+        )
+    return exit_code_for(report.status, closed_states,
+                         delivery_phase=summary["delivery_phase"])
 
 
 if __name__ == "__main__":  # pragma: no cover

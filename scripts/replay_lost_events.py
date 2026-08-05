@@ -24,19 +24,26 @@ typed by a human who has thought about it. On top of that gate, every message
 id in the payload is checked against ``inbound_messages`` first: the worker is
 idempotent per ``wa_message_id`` and returns before sending anything for a
 message it has already recorded, so an event whose messages are all recorded is
-skipped as pointless rather than replayed as risky.
+skipped as pointless rather than replayed as risky. That guard has a hole it
+does not cover on its own, and it is the reason a ``failed`` row is refused
+outright for outbound-capable kinds: the worker writes ``failed`` after a
+rollback, so its outbound already happened while the ``inbound_messages`` row
+that proves it did not survive. See :func:`_verdict_for_messages`.
 
 *A reply to a conversation that has moved on.* An inbound from three weeks ago
 replayed today is answered today, in the present tense, out of nowhere. Age is
 irrelevant for a delivery receipt and decisive for a message, so
 ``--max-age-days`` is enforced on outbound-capable kinds only.
 
-*Silently rolling a delivery backwards.* ``_handle_status`` assigns the receipt's
-status unconditionally, so replaying a stale ``sent`` over a message that has
-since been ``read`` would erase the newer truth. Every status entry is compared
-against what ``delivery_messages`` already holds and only a strictly forward
-move is replayed. This is why the tool reads the target rows instead of
-trusting the timestamps.
+*Silently rolling a delivery backwards.* Every status entry is compared against
+what ``delivery_messages`` already holds and only a strictly forward move is
+replayed, which is why the tool reads the target rows instead of trusting the
+timestamps. «Forward» is not this file's opinion: the ladder is imported from
+``career.whatsapp.worker``, the one module that writes the column, because a
+second copy of it here shipped disagreeing with the first (see :func:`_rank`).
+The worker itself also refuses a backwards receipt, so a mis-ranked replay
+costs an operator a false report rather than a corrupted row — but a false
+report on a recovery tool is what the ledger then makes permanent.
 
 IDEMPOTENCY
 -----------
@@ -78,6 +85,7 @@ from sqlalchemy.orm import Session
 from career.config import get_settings
 from career.db.models import DeliveryMessage, InboundMessage, WebhookEvent
 from career.logging_filters import install_secret_redaction
+from career.whatsapp.worker import receipt_rank
 
 #: Where the replay ledger lives. Under data/ so it is gitignored: it is an
 #: operational record, not source, and it names live event ids.
@@ -86,14 +94,10 @@ DEFAULT_AUDIT_PATH = Path("data/ops/replay_lost_events.jsonl")
 #: The kind whose handler provably cannot message a customer.
 SAFE_EVENT_TYPES = frozenset({"statuses"})
 
-#: Meta's receipt progression. ``_handle_status`` overwrites the stored status
-#: with whatever the receipt says, so a replay may only ever move a delivery
-#: FORWARD along this ladder. ``failed`` sits at the top deliberately — once a
-#: send is known failed, an older optimistic receipt must not overwrite it.
-_STATUS_RANK = {
-    "": -1, "queued": 0, "accepted": 1, "sent": 2,
-    "delivered": 3, "read": 4, "failed": 5,
-}
+#: The status a replay may NEVER treat as «nothing happened yet». See
+#: :func:`_verdict_for_messages` — the worker had already spoken to the
+#: customer before it rolled back.
+ROLLED_BACK_STATUS = "failed"
 
 
 @dataclass(frozen=True)
@@ -110,7 +114,27 @@ class Outcome:
 
 
 def _rank(status: str | None) -> int:
-    return _STATUS_RANK.get((status or "").lower(), -1)
+    """The receipt ladder, borrowed from the only module that writes it.
+
+    This file used to carry its own, and it disagreed with the worker's on the
+    one comparison with a customer behind it: it put ``failed`` at the TOP, so
+    a ``delivered`` or ``read`` receipt destroyed while the row still said
+    ``failed`` was ranked BACKWARDS and skipped as «already at or past this
+    receipt» — the tool refused to recover precisely the receipts worth
+    recovering, the row stayed ``failed``, ``cv/close.whatsapp_spend`` went on
+    excluding a message the customer had read, and the console showed the
+    operator a failure for a message that had arrived. The mirror case was as
+    bad in the other direction: a stale ``sent`` over a ``failed`` ranked
+    FORWARD here, so the tool re-queued an event the worker then correctly
+    no-ops — and the audit ledger refuses that event a second time forever, so
+    the report the operator acted on was simply false.
+
+    The argument for the worker's order lives with the order, on
+    ``worker.RECEIPT_ORDER``. It wins for the plain reason that it is the one
+    the write path obeys: a verdict computed on a ladder the writer does not
+    use is a prediction about a different program.
+    """
+    return receipt_rank(status)
 
 
 def _entries(payload: dict[str, Any], key: str) -> list[dict[str, Any]]:
@@ -185,10 +209,47 @@ def _verdict_for_messages(
     *, max_age_days: int, now: datetime,
 ) -> Outcome:
     """An inbound is worth replaying only if it was never recorded, and only if
-    answering it now would still make sense to the human who sent it."""
+    answering it now would still make sense to the human who sent it.
+
+    AND only if the worker has not already answered it once. The two statuses
+    this tool selects by default are NOT alike, and treating them alike is how
+    it could send a customer the same thing twice:
+
+    ``ignored`` is a row the Salla sweep marked terminal without any WhatsApp
+    code ever looking at it. Nothing was sent, nothing was written, and the
+    idempotency argument below holds in full.
+
+    ``failed`` is the opposite. It is written by ``worker`` in its own except
+    block, AFTER ``owner_session.rollback()`` — which means the worker DID run
+    the event: it may have activated an order, replied to an unknown number,
+    sent a support ack, landed a held bundle. Those are HTTP calls to Meta and
+    they are not in the transaction; the rollback took back only our side, the
+    ``inbound_messages`` row included. So the per-``wa_message_id`` guard that
+    makes a replay safe is exactly the row the rollback destroyed:
+    ``unrecorded`` counts every one of those messages as «never handled», and
+    replaying hands the worker a message it will process from the top and send
+    for a second time. The customer reads it twice; for an activation or a
+    delivery that is not a cosmetic duplicate.
+
+    A ``failed`` row is therefore refused for any outbound-capable kind, with
+    no flag to override it, because nothing in the payload can tell us whether
+    the send happened before the exception or after it — and «probably not»
+    is not a standard for talking to a paying customer. Receipts are
+    unaffected: ``_handle_status`` sends nothing, so ``statuses`` events are
+    still recovered from ``failed`` exactly as before, which is the recovery
+    the 2026-08-03 incident actually needs.
+    """
     if not items:
         return _outcome(event, len(items), action="skip",
                         reason="payload carries no inbound messages")
+
+    if event.processing_status == ROLLED_BACK_STATUS:
+        return _outcome(
+            event, len(items), action="skip",
+            reason="the worker already processed this and rolled back — its "
+                   "outbound is on the wire and cannot be un-sent; replaying "
+                   "would message the customer twice",
+        )
 
     unrecorded = 0
     for item in items:
@@ -319,6 +380,14 @@ def main() -> int:
     print(f"  provider    : {args.provider}")
     print(f"  statuses    : {', '.join(statuses)}")
     print(f"  event types : {', '.join(event_types)}")
+    if ROLLED_BACK_STATUS in statuses and unsafe:
+        # Say the rule out loud BEFORE the verdicts, so an operator who came
+        # here to recover a customer's lost message is told why none of the
+        # `failed` ones will move — rather than reading ten skip lines and
+        # concluding the tool is broken.
+        print(f"  refusing    : {ROLLED_BACK_STATUS} + {', '.join(unsafe)} — "
+              "the worker already sent, then rolled back; a replay would "
+              "message the customer twice")
     if args.since or args.until:
         print(f"  window      : {args.since or '-'} .. {args.until or '-'}")
     print(f"  ledger      : {audit_path} ({len(already)} already replayed)")

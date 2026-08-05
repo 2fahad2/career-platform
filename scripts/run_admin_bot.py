@@ -248,11 +248,66 @@ def _skip_poisoned_update(client: HttpTelegramAdminClient) -> None:
     impossible to miss, so this is the other half of that decision — and it is
     itself best-effort: if Telegram is the thing that is broken, the journal
     line above still stands and the loop still moves on.
+
+    «Best-effort» has to mean every way this can fail, not the one we named.
+    ``TelegramSendError`` is raised for a refusal Telegram ARTICULATED; the
+    transport underneath is ``requests``, and a ``ConnectionError`` or a
+    ``ReadTimeout`` — the normal weather on a long-poll socket — is neither
+    caught by that name nor a reason to abandon the batch. It escaped from
+    inside ``process_one_update``'s own except block, which is the one place
+    an exception is least expected and most expensive: the announcement never
+    happened, the cycle died, and the at-most-once bargain («we drop updates,
+    but never quietly») was broken in exactly the case it was made for.
     """
     try:
         client.send_admin(_SKIPPED_AR)
-    except TelegramSendError:
+    except Exception:  # noqa: BLE001 — see above: the notice is best-effort
         logger.warning("skip notice failed", exc_info=True)
+
+
+def deliver_outcomes(
+    client: HttpTelegramAdminClient, outcomes: list[Any]
+) -> None:
+    """Push one update's screens to Telegram; one failure never eats the rest.
+
+    Lifted out of the poll loop for the same reason ``process_one_update``
+    was: it needs to be testable, because the failure it handles is a network
+    failure and those do not happen on demand.
+
+    The narrow ``except TelegramSendError`` this replaces was written for the
+    routine case — «message is not modified» on an unchanged refresh, which is
+    an answer, not a fault — and quietly assumed the transport never failed
+    any other way. It does: ``requests`` raises ``ConnectionError`` and
+    ``ReadTimeout`` on its own, those names are not ``TelegramSendError``, and
+    one of them aborted the whole poll cycle. The work was already committed
+    and the cursor already past it, so the operator lost the screens for every
+    update after the failure with nothing to say so.
+
+    The two failures are still logged differently on purpose. A refusal
+    Telegram spelled out is routine and stays at INFO; anything else is an
+    ERROR, because ERROR is the level the journal harvester forwards to the
+    ⚠️ الأخطاء screen and «the console cannot reach Telegram» is the kind of
+    fact the operator has to be able to find.
+    """
+    for outcome in outcomes:
+        try:
+            if outcome.kind == "send":
+                client.send_screen(
+                    outcome.text, outcome.keyboard,
+                    force_reply=outcome.force_reply,
+                )
+            elif outcome.kind == "edit" and outcome.message_id:
+                client.edit_screen(
+                    outcome.message_id, outcome.text, outcome.keyboard
+                )
+            elif outcome.kind == "ack" and outcome.callback_query_id:
+                client.answer_callback(
+                    outcome.callback_query_id, outcome.text
+                )
+        except TelegramSendError:
+            logger.info("outcome delivery skipped", exc_info=True)
+        except Exception:  # noqa: BLE001 — a dead socket is not a dead console
+            logger.error("outcome delivery failed", exc_info=True)
 
 
 def process_one_update(
@@ -351,7 +406,19 @@ def main() -> None:  # pragma: no cover — live runner over tested parts
                 offset = _load_offset(session)
             updates = client.get_updates(offset + 1, timeout=POLL_TIMEOUT)
             for update in updates:
-                update_id = int(update.get("update_id", offset))
+                raw_id = update.get("update_id")
+                if raw_id is None:
+                    # The cursor may only ever move FORWARD. This defaulted to
+                    # the CURRENT offset, which for any update after the first
+                    # in a batch is a step BACKWARDS — and a cursor that goes
+                    # backwards re-fetches updates this same loop has already
+                    # handled, which for «إعادة إرسال» is a second real
+                    # delivery to a real customer. Telegram always sends the
+                    # field; a shape we cannot place is skipped, not guessed.
+                    logger.error("watchtower update carried no update_id — "
+                                 "skipped rather than moving the cursor back")
+                    continue
+                update_id = int(raw_id)
                 outcomes = process_one_update(
                     engine, update, update_id=update_id,
                     handler=lambda session, upd: handle_update(
@@ -362,25 +429,7 @@ def main() -> None:  # pragma: no cover — live runner over tested parts
                     ),
                     on_skip=lambda: _skip_poisoned_update(client),
                 )
-                for outcome in outcomes:
-                    try:
-                        if outcome.kind == "send":
-                            client.send_screen(
-                                outcome.text, outcome.keyboard,
-                                force_reply=outcome.force_reply,
-                            )
-                        elif outcome.kind == "edit" and outcome.message_id:
-                            client.edit_screen(
-                                outcome.message_id, outcome.text, outcome.keyboard
-                            )
-                        elif outcome.kind == "ack" and outcome.callback_query_id:
-                            client.answer_callback(
-                                outcome.callback_query_id, outcome.text
-                            )
-                    except TelegramSendError:
-                        # e.g. "message is not modified" on an unchanged
-                        # refresh — never kills the loop
-                        logger.info("outcome delivery skipped", exc_info=True)
+                deliver_outcomes(client, outcomes)
         except Exception:  # noqa: BLE001 — the console must survive anything
             logger.error("watchtower cycle failed", exc_info=True)
             time.sleep(ERROR_PAUSE)

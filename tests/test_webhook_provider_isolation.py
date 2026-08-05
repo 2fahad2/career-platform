@@ -462,11 +462,17 @@ class TestReplayLostEvents:
     def test_a_stale_inbound_is_not_answered_weeks_later(
         self, owner_session: Session, clean_billing: None, tmp_path: Path
     ) -> None:
-        """The real 'failed' row in staging is from 2026-07-19. Replaying it
-        would reply, today, to a message sent two and a half weeks ago."""
+        """A row from 2026-07-19. Replaying it would reply, today, to a
+        message sent two and a half weeks ago.
+
+        Seeded 'ignored', not 'failed': a 'failed' row is now refused outright
+        for message-bearing kinds (the worker had already sent and then rolled
+        back), and that refusal comes first, so it would hide the age rule this
+        test exists to pin rather than exercise it.
+        """
         event_id = _seed(
             owner_session, provider="whatsapp", event_type="messages",
-            status="failed", received_at=datetime.now(UTC) - timedelta(days=18),
+            status="ignored", received_at=datetime.now(UTC) - timedelta(days=18),
             payload=_messages_payload(f"wamid.{uuid.uuid4().hex}", "السلام عليكم"),
         )
 
@@ -474,14 +480,19 @@ class TestReplayLostEvents:
                        "--apply", ledger=tmp_path / "ledger.jsonl")
 
         assert "would answer a conversation that has moved on" in proc.stdout
-        assert _row(owner_session, event_id).processing_status == "failed"
+        assert _row(owner_session, event_id).processing_status == "ignored"
 
     def test_an_inbound_already_recorded_elsewhere_is_skipped(
         self, owner_session: Session, clean_billing: None, tmp_path: Path
     ) -> None:
         """Verification before recovery: the message reached inbound_messages
         by some other path, so the worker would return before sending anything
-        and the replay would be pure risk for no gain."""
+        and the replay would be pure risk for no gain.
+
+        Seeded 'ignored' for the same reason as the age test above — a 'failed'
+        row never reaches this check now, because the worker's rollback means
+        the absence of the row proves nothing about whether it spoke.
+        """
         from career.db.models import InboundMessage
 
         wamid = f"wamid.{uuid.uuid4().hex}"
@@ -501,14 +512,14 @@ class TestReplayLostEvents:
         ))
         owner_session.commit()
         event_id = _seed(owner_session, provider="whatsapp",
-                         event_type="messages", status="failed",
+                         event_type="messages", status="ignored",
                          payload=_messages_payload(wamid, "test"))
 
         proc = _replay("--event-type", "messages", "--allow-outbound",
                        "--apply", ledger=tmp_path / "ledger.jsonl")
 
         assert "already recorded by another path" in proc.stdout
-        assert _row(owner_session, event_id).processing_status == "failed"
+        assert _row(owner_session, event_id).processing_status == "ignored"
 
     def test_the_report_leaks_no_phone_body_or_message_id(
         self, owner_session: Session, clean_billing: None, tmp_path: Path

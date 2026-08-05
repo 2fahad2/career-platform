@@ -101,15 +101,66 @@ class TestSpellingsThatUsedToBeMissed:
         «الدعم» — the word with the article a customer naturally types — was
         not the escape hatch «دعم» is promised to be everywhere."""
         for phrase in ("مساعده", "مساعدة", "المساعدة", "الدعم", "دعم",
-                       "ساعدني", "خدمة العملاء"):
+                       "ساعدني"):
             kind, _ = classify_inbound(phrase)
             assert kind is InboundKind.SUPPORT, phrase
 
     def test_resume_folds_its_own_spellings(self) -> None:
-        for phrase in ("تشغيل الرسائل", "ابدأ", "ابدا", "رجّعني", "رجعني",
+        for phrase in ("تشغيل الرسائل", "رجّعني", "رجعني",
                        "استئناف", "start"):
             kind, _ = classify_inbound(phrase)
             assert kind is InboundKind.RESUME, phrase
+
+
+class TestWhatTheFoldCostUs:
+    """AUDIT 2026-08-05. Folding is what makes this module work on real
+    keyboards, and it is also what erased the two distinctions below. Both
+    failures land on a compliance surface."""
+
+    def test_an_opt_out_after_a_negated_clause_is_still_an_opt_out(self) -> None:
+        """The veto ran over the whole message as one bag of tokens, so a
+        «لا» in the FIRST clause killed the command in the second. These are
+        Meta-mandated opt-outs, and they were returning OTHER — the silent
+        failure classify_inbound's own docstring claims STOP is biased
+        against."""
+        for phrase in ("لا تراسلوني، إلغاء الاشتراك", "ما أبغى رسائل، إيقاف",
+                       "ما عاد أبيكم. إلغاء الاشتراك",
+                       "لا تتصلون علي\nإيقاف الرسائل"):
+            kind, _ = classify_inbound(phrase)
+            assert kind is InboundKind.STOP, phrase
+
+    def test_a_negation_still_vetoes_the_clause_it_belongs_to(self) -> None:
+        """The counterweight, and the reason this is a clause rule and not an
+        «any keyword wins» rule: one clause, one negation, no command."""
+        for phrase in ("ما ابي الغاء الاشتراك", "لا أريد إيقاف الرسائل",
+                       "مو قصدي الغاء", "لا احتاج مساعدة"):
+            kind, _ = classify_inbound(phrase)
+            assert kind is InboundKind.OTHER, phrase
+
+    def test_never_is_not_start(self) -> None:
+        """«ابدأ» and «أبدًا» fold to the SAME string, and the resume set was
+        checked first — so a customer answering «أبدًا» («never») had their
+        opt-out cleared and the messages resumed. RESUME's whole reason to be
+        narrow is that it un-silences someone who asked for silence."""
+        for phrase in ("أبدًا", "ابدا", "ابدأ"):
+            kind, _ = classify_inbound(phrase)
+            assert kind is not InboundKind.RESUME, phrase
+        # the word we actually teach still works
+        assert classify_inbound("تشغيل الرسائل")[0] is InboundKind.RESUME
+
+    def test_a_job_field_is_not_a_call_for_a_human(self) -> None:
+        """«خدمة العملاء» was a whole-message SUPPORT phrase. It is one of the
+        commonest job fields in the Kingdom and our own gap question — «وش
+        أبرز خبرة عملية عندك؟» — invites it, but SUPPORT resolves before any
+        onboarding routing, so the answer was discarded and a ticket raised.
+        Same reasoning that already keeps «دعم فني» out of the set."""
+        for phrase in ("خدمة العملاء", "خدمه العملاء", "خدمة عملاء"):
+            kind, _ = classify_inbound(phrase)
+            assert kind is InboundKind.OTHER, phrase
+        # …while the escape hatch we DO print everywhere is untouched
+        for phrase in ("دعم", "الدعم", "مساعدة", "ابي مساعده لو سمحت"):
+            kind, _ = classify_inbound(phrase)
+            assert kind is InboundKind.SUPPORT, phrase
 
 
 class TestCommandsInsideARequest:

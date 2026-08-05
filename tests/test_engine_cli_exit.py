@@ -119,7 +119,117 @@ def test_a_weekend_night_lists_everyone_as_unclosed() -> None:
 
 def test_a_night_with_nobody_to_serve_is_empty_on_both_sides() -> None:
     out = cli.summarize_delivery(tenant_codes={}, intended=[], states={})
-    assert out == {"delivery": {}, "delivery_unclosed": []}
+    assert out == {"delivery": {}, "delivery_unclosed": [],
+                   "delivery_expired": []}
+
+
+# ── the exit fix did not close its own incident: the expiry path ────────────
+
+
+def test_an_expired_previous_day_reaches_the_summary_and_the_verdict() -> None:
+    """LIVE EVIDENCE. Four nights closed a real customer WHATSAPP_FAILED and
+    exited 0 — 21, 22 and 23 July and 2 August 2026 — every one of them from
+    ``expire_stale_held_deliveries`` (career_staging: the day state is stamped
+    at 01:3x UTC, the NEXT morning's sweep, not the failed day's run). Those
+    tenants never enter today's states, so before ``delivery_expired`` existed
+    there was no path from that closure to this number at all."""
+    tid = uuid.uuid4()
+    out = cli.summarize_delivery(
+        tenant_codes={tid: "TEN-0002"}, intended=[], states={},
+        expired=[(tid, date(2026, 8, 4), "WHATSAPP_FAILED")],
+    )
+    assert out["delivery"] == {}                 # nobody served TONIGHT
+    assert out["delivery_expired"] == [
+        {"tenant": "TEN-0002", "run_date": "2026-08-04",
+         "state": "WHATSAPP_FAILED"},
+    ]
+    verdict = cli.exit_code_for(
+        "completed",
+        [*out["delivery"].values(),
+         *(row["state"] for row in out["delivery_expired"])],
+    )
+    assert verdict == cli.EXIT_DELIVERY_FAILED
+
+
+def test_an_expired_day_is_reported_beside_the_tenant_it_did_not_stop() -> None:
+    """A tenant can be both: yesterday expired at 04:30 and today delivered a
+    minute later. Keyed by tenant id the two days overwrite each other and the
+    loser is always the failure — so they travel on separate channels."""
+    tid = uuid.uuid4()
+    out = cli.summarize_delivery(
+        tenant_codes={tid: "TEN-0002"}, intended=[tid],
+        states={tid: "DELIVERED"},
+        expired=[(tid, date(2026, 8, 4), "WHATSAPP_FAILED")],
+    )
+    assert out["delivery"] == {"TEN-0002": "DELIVERED"}
+    assert [row["state"] for row in out["delivery_expired"]] == \
+        ["WHATSAPP_FAILED"]
+    assert cli.exit_code_for("completed", ["DELIVERED", "WHATSAPP_FAILED"]) \
+        == cli.EXIT_DELIVERY_FAILED
+
+
+def test_the_expired_channel_never_prints_a_raw_tenant_uuid() -> None:
+    tid = uuid.uuid4()
+    out = cli.summarize_delivery(
+        tenant_codes={}, intended=[], states={},
+        expired=[(tid, date(2026, 8, 4), "WHATSAPP_FAILED")],
+    )
+    assert str(tid) not in str(out)
+    assert out["delivery_expired"][0]["tenant"] == "TEN-????"
+
+
+# ── the total outage that exits 0 forever: no WhatsApp token ────────────────
+
+
+def test_a_missing_whatsapp_token_is_a_named_reason_not_a_silence() -> None:
+    assert cli.delivery_phase_for(
+        deliver=True, has_whatsapp_token=False, has_tenants=True,
+    ) == cli.PHASE_NO_CREDENTIALS
+
+
+def test_the_three_honest_phases_keep_their_own_names() -> None:
+    assert cli.delivery_phase_for(
+        deliver=False, has_whatsapp_token=False, has_tenants=False,
+    ) == cli.PHASE_NO_DELIVER            # the operator asked for a digest
+    assert cli.delivery_phase_for(
+        deliver=True, has_whatsapp_token=True, has_tenants=False,
+    ) == cli.PHASE_NO_TENANTS
+    assert cli.delivery_phase_for(
+        deliver=True, has_whatsapp_token=True, has_tenants=True,
+    ) == cli.PHASE_RAN
+
+
+def test_a_night_with_no_whatsapp_token_can_never_be_a_success() -> None:
+    """The emptiness rule («an empty delivery dict is not a failure») is
+    right for a weekend and wrong for exactly one case: the token is blank,
+    the phase never ran, and NOBODY was served. That night produced an empty
+    dict too, and so exited 0 — every night, for as long as the token stayed
+    missing. It is the likeliest way this product goes dark: the Meta token in
+    use is the temporary one."""
+    assert cli.exit_code_for(
+        "completed", [], delivery_phase=cli.PHASE_NO_CREDENTIALS,
+    ) == cli.EXIT_NO_WHATSAPP_TOKEN
+
+
+def test_the_honest_empty_nights_still_exit_zero() -> None:
+    # a weekend / a digest run / nobody active — none of them a fault
+    for phase in (cli.PHASE_NO_DELIVER, cli.PHASE_NO_TENANTS, cli.PHASE_RAN):
+        assert cli.exit_code_for("completed", [], delivery_phase=phase) == 0
+
+
+def test_the_missing_token_gets_its_own_runbook_number() -> None:
+    """Not 3. Code 3 sends the operator hunting for whose delivery broke, and
+    on this night nobody's broke — nobody was attempted."""
+    assert cli.EXIT_NO_WHATSAPP_TOKEN not in (
+        cli.EXIT_OK, cli.EXIT_DISCOVERY_FAILED, cli.EXIT_NO_SEARCH_KEY,
+        cli.EXIT_DELIVERY_FAILED,
+    )
+
+
+def test_a_collapsed_discovery_still_outranks_the_missing_token() -> None:
+    assert cli.exit_code_for(
+        "discovery_failed", [], delivery_phase=cli.PHASE_NO_CREDENTIALS,
+    ) == cli.EXIT_DISCOVERY_FAILED
 
 
 def test_the_summary_never_prints_a_raw_tenant_uuid() -> None:
@@ -154,6 +264,9 @@ def _settings(**overrides: str) -> SimpleNamespace:
         "salla_product_pricing": '{"1": [199.00, "SAR"]}',
         "salla_token_expires_at": "2026-12-31",
         "salla_store_url": "https://store.example/lammah",
+        # the delivery credentials the check used to ignore entirely
+        "whatsapp_access_token": "EAAG-not-a-real-token",
+        "whatsapp_phone_number_id": "123456789",
     }
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -259,6 +372,32 @@ def test_an_unset_or_unreadable_expiry_is_not_a_pass() -> None:
 def test_a_missing_store_url_is_caught() -> None:
     problems = _check(salla_store_url="   ")
     assert [p.key for p in problems] == ["SALLA_STORE_URL"]
+
+
+def test_a_missing_whatsapp_token_is_caught_at_boot() -> None:
+    """The check watched four Salla facts, every one of them about SELLING and
+    every one degrading only the new-order path — and said nothing about the
+    credential the whole product DELIVERS through. It is also the temporary
+    one: a Meta user token flagged «replace before it dies» since 17 July.
+    Empty means the nightly skips delivery and no paying customer gets
+    anything, which is the largest failure this file can see coming."""
+    problems = _check(whatsapp_access_token="   ")
+    assert [p.key for p in problems] == ["WHATSAPP_ACCESS_TOKEN"]
+    assert "NO customer receives anything" in problems[0].english
+
+
+def test_a_token_with_no_number_to_send_from_is_caught_too() -> None:
+    problems = _check(whatsapp_phone_number_id="")
+    assert [p.key for p in problems] == ["WHATSAPP_PHONE_NUMBER_ID"]
+
+
+def test_the_whatsapp_alert_stays_direction_pure() -> None:
+    text = cli.format_env_alert(_check(whatsapp_access_token=""))
+    for line in text.splitlines():
+        has_arabic = any("؀" <= ch <= "ۿ" for ch in line)
+        has_latin = any(ch.isascii() and ch.isalpha() for ch in line)
+        assert not (has_arabic and has_latin), line
+    assert "WHATSAPP_ACCESS_TOKEN" in text
 
 
 def test_an_empty_catalog_reports_only_what_it_can_prove() -> None:

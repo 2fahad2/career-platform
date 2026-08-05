@@ -856,6 +856,186 @@ def test_proof_of_receipt_outranks_a_failure_that_cannot_have_happened(
     assert row.status_updated_at == LATER
 
 
+def test_an_unknown_receipt_status_is_refused_loudly_not_quietly(
+    owner_session: Session, clean_billing: None, caplog: Any
+) -> None:
+    """Two decisions pinned at once.
+
+    NOT WRITTEN — and that is deliberate. The column feeds money
+    (`cv/close.whatsapp_spend` bills everything whose status is not «failed»)
+    and the operator's message-status panel, so a rung nobody has placed would
+    be billed and displayed on the strength of a name we have never seen.
+
+    LOUDLY — and that is the fix. It was a `logger.warning`, and warnings do
+    not leave this box: the operator's harvester forwards «ERROR:» lines only.
+    A status Meta adds that we silently never record is a permanent blind spot
+    in the delivery ledger, and a warning nobody reads is how it stays one.
+    """
+    from career.whatsapp import worker as wa_worker
+
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    phone = _activate_phone(owner_session, wa, admin)
+    wamid = f"wamid-{uuid.uuid4()}"
+    _seed_outbound(owner_session, phone, wamid)
+
+    assert wa_worker.receipt_rank("deleted") == 0
+    with caplog.at_level("ERROR"):
+        _receipt(owner_session, wamid, "deleted", now=LATER)
+
+    assert _receipt_row(owner_session, wamid).status == "sent"
+    assert any("deleted" in r.getMessage() for r in caplog.records
+               if r.levelname == "ERROR")
+
+
+# ── one receipt ladder, imported (scripts/replay_lost_events.py) ────────────
+
+
+def _replay_tool() -> Any:
+    """The recovery script, loaded as a module. It must be registered in
+    ``sys.modules`` before execution — its ``@dataclass`` resolves annotations
+    through ``sys.modules[cls.__module__]`` and raises without it."""
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / "replay_lost_events.py"
+    spec = importlib.util.spec_from_file_location("career_replay_lost", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["career_replay_lost"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_replay_tool_and_the_worker_can_never_rank_receipts_differently(
+) -> None:
+    """The guard against a second ladder appearing.
+
+    Both files shipped one, in the same commit, each with a docstring arguing
+    its order was deliberate — and they disagreed on the comparison that
+    matters: the worker put `failed` between `sent` and `delivered`, the tool
+    put it on top. This walks every ordered pair of statuses either file knows
+    and asserts the two answer «is this receipt a forward move» identically,
+    so re-introducing a local table fails here rather than in production.
+    """
+    from career.whatsapp import worker as wa_worker
+
+    tool = _replay_tool()
+    statuses = ["", "queued", "accepted", "sent", "failed", "delivered",
+                "read", "deleted"]
+    for current in statuses:
+        for incoming in statuses:
+            assert (tool._rank(incoming) > tool._rank(current)) == (
+                wa_worker.receipt_rank(incoming)
+                > wa_worker.receipt_rank(current)
+            ), f"{current!r} → {incoming!r}"
+
+
+def test_the_tool_recovers_the_receipt_class_it_used_to_refuse(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """The harm the second ladder did. With `failed` ranked top, a `read`
+    destroyed while the row sat `failed` was «already at or past this receipt»
+    — so the tool skipped the one recovery worth making, the row stayed
+    failed, `whatsapp_spend` went on excluding a message the customer had
+    read, and the console showed the operator a failure for a message that had
+    arrived."""
+    from career.db.models import WebhookEvent as _WebhookEvent
+
+    tool = _replay_tool()
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    phone = _activate_phone(owner_session, wa, admin)
+    wamid = f"wamid-{uuid.uuid4()}"
+    _seed_outbound(owner_session, phone, wamid)
+    _receipt(owner_session, wamid, "failed", now=NOW)
+    assert _receipt_row(owner_session, wamid).status == "failed"
+
+    lost = _WebhookEvent(
+        id=uuid.uuid4(), provider="whatsapp", event_type="statuses",
+        event_fingerprint=f"wa:{uuid.uuid4()}", signature_valid=True,
+        payload=_payload(statuses=[{"id": wamid, "status": "read"}]),
+        processing_status="ignored", received_at=NOW,
+    )
+    verdict = tool._verdict(owner_session, lost, max_age_days=2, now=LATER)
+    assert verdict.action == "replay"
+
+    # and the mirror: a stale «sent» over a «failed» is NOT a forward move,
+    # so re-queuing it would spend the tool's one-shot ledger entry on an
+    # event the worker then no-ops — a false report the ledger makes permanent
+    stale = _WebhookEvent(
+        id=uuid.uuid4(), provider="whatsapp", event_type="statuses",
+        event_fingerprint=f"wa:{uuid.uuid4()}", signature_valid=True,
+        payload=_payload(statuses=[{"id": wamid, "status": "sent"}]),
+        processing_status="ignored", received_at=NOW,
+    )
+    assert tool._verdict(
+        owner_session, stale, max_age_days=2, now=LATER).action == "skip"
+
+
+def test_a_rolled_back_event_is_never_replayed_at_a_customer(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """The default selection is «ignored,failed», and the two are not alike.
+
+    ``ignored`` is a row the Salla sweep marked terminal without any WhatsApp
+    code touching it: nothing sent, nothing written, safe to replay.
+    ``failed`` is written by the worker AFTER ``rollback()`` — its outbound
+    HTTP already happened while the ``inbound_messages`` row that proves it
+    did not survive. The tool's own safety argument («idempotent per
+    wa_message_id») therefore reads that message as never-handled and replays
+    it, and the customer receives it a second time.
+    """
+    from career.db.models import WebhookEvent as _WebhookEvent
+
+    tool = _replay_tool()
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    phone = _activate_phone(owner_session, wa, admin)
+
+    def _event(status: str) -> Any:
+        return _WebhookEvent(
+            id=uuid.uuid4(), provider="whatsapp", event_type="messages",
+            event_fingerprint=f"wa:{uuid.uuid4()}", signature_valid=True,
+            payload=_payload([_text_msg(f"wamid-{uuid.uuid4()}", phone, "دعم")]),
+            processing_status=status, received_at=NOW,
+        )
+
+    rolled_back = tool._verdict(
+        owner_session, _event(tool.ROLLED_BACK_STATUS),
+        max_age_days=2, now=NOW,
+    )
+    assert rolled_back.action == "skip"
+    assert "twice" in rolled_back.reason
+
+    # the class the tool exists for is untouched: never handled, so replay it
+    untouched = tool._verdict(
+        owner_session, _event("ignored"), max_age_days=2, now=NOW)
+    assert untouched.action == "replay"
+
+
+def test_a_rolled_back_receipt_is_still_recoverable(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """The refusal is scoped to what can SPEAK. ``_handle_status`` sends
+    nothing at all, so a `failed` statuses event is exactly the recovery the
+    2026-08-03 incident needs and must not be caught by the new guard."""
+    from career.db.models import WebhookEvent as _WebhookEvent
+
+    tool = _replay_tool()
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    phone = _activate_phone(owner_session, wa, admin)
+    wamid = f"wamid-{uuid.uuid4()}"
+    _seed_outbound(owner_session, phone, wamid)
+
+    event = _WebhookEvent(
+        id=uuid.uuid4(), provider="whatsapp", event_type="statuses",
+        event_fingerprint=f"wa:{uuid.uuid4()}", signature_valid=True,
+        payload=_payload(statuses=[{"id": wamid, "status": "delivered"}]),
+        processing_status=tool.ROLLED_BACK_STATUS, received_at=NOW,
+    )
+    assert tool._verdict(
+        owner_session, event, max_age_days=2, now=NOW).action == "replay"
+
+
 # ── the watchtower runner's cursor (scripts/run_admin_bot.py) ───────────────
 # Placed here because that runner has no test module of its own and this
 # change set owns both files; it belongs beside the console tests the day
@@ -924,3 +1104,72 @@ def test_one_poisoned_update_can_never_wedge_the_watchtower(
         with Session(owner_engine) as s:
             runner._store_offset(s, before)
             s.commit()
+
+
+class _FlakyTelegram:
+    """A client whose transport dies the way ``requests`` actually dies."""
+
+    def __init__(self, *, fail_on: int = 0) -> None:
+        self.sent: list[str] = []
+        self.acked: list[str] = []
+        self._n = 0
+        self._fail_on = fail_on
+
+    def _maybe_die(self) -> None:
+        self._n += 1
+        if self._n == self._fail_on:
+            # requests.ConnectionError is an OSError subclass and is NOT a
+            # TelegramSendError — which is the whole point
+            raise ConnectionError("connection reset by peer")
+
+    def send_screen(self, text: str, keyboard: Any = None,
+                    force_reply: bool = False) -> None:
+        self._maybe_die()
+        self.sent.append(text)
+
+    def edit_screen(self, message_id: int, text: str, keyboard: Any = None) -> None:
+        self._maybe_die()
+        self.sent.append(text)
+
+    def answer_callback(self, cbq_id: str, text: str = "") -> None:
+        self._maybe_die()
+        self.acked.append(cbq_id)
+
+    def send_admin(self, text: str) -> str:
+        self._maybe_die()
+        self.sent.append(text)
+        return "ok"
+
+
+def test_a_dead_socket_does_not_swallow_the_rest_of_the_screens(
+    caplog: Any,
+) -> None:
+    """The outcome loop caught ``TelegramSendError`` only. That name covers a
+    refusal Telegram ARTICULATED («message is not modified» on an unchanged
+    refresh); it does not cover the transport underneath, and ``requests``
+    raises ``ConnectionError``/``ReadTimeout`` on its own. One of those
+    escaped the loop, aborted the poll cycle, and — because the work was
+    already committed and the cursor already past it — the operator lost the
+    screens for it with nothing anywhere saying so."""
+    from career.telegram.console import Outcome
+
+    runner = _admin_runner()
+    client = _FlakyTelegram(fail_on=1)
+    with caplog.at_level("ERROR"):
+        runner.deliver_outcomes(client, [
+            Outcome(kind="ack", callback_query_id="cbq1"),
+            Outcome(kind="send", text="the screen that must still arrive"),
+        ])
+    assert client.sent == ["the screen that must still arrive"]
+    assert any("outcome delivery failed" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_the_skip_notice_survives_a_dead_socket_too() -> None:
+    """The at-most-once bargain is «we drop updates, but never quietly», and
+    this notice is the «never quietly» half. It caught ``TelegramSendError``
+    only, so a network failure raised out of ``process_one_update``'s OWN
+    except block: the announcement never happened AND the cycle died — in
+    precisely the case the bargain was made for."""
+    runner = _admin_runner()
+    runner._skip_poisoned_update(_FlakyTelegram(fail_on=1))   # must not raise

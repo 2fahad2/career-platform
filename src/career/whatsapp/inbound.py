@@ -18,12 +18,18 @@ by folding the phrase sets and the message through the SAME normaliser the
 conversation layers already trust (``normalize_ar``: diacritics, tatweel,
 hamza seats, taa-marbuta, alef maqsura, punctuation and emoji).
 
+The fold is not free, and the 2026-08-05 audit is where the bill arrived: it
+erases the punctuation a sentence is built from, and it collapses «ابدأ» into
+«أبدًا». Both cost a compliance surface — see :func:`_clauses` and
+``_RESUME_PHRASES``. Anything read on a clause boundary is now split off the
+RAW message, before folding.
+
 Folding alone is not the whole fix, though, because it only equates spellings
 of the SAME words. The three sets are also matched with different generosity,
 and deliberately so — see :func:`classify_inbound`, which carries the reasoning
 for each one. The one rule they share is agent-D's discipline from the consent
-gate one layer down: whole tokens, a negation vetoes the command outright, and
-a single word we do not know means "this is a sentence, not a command".
+gate one layer down: whole tokens, a negation vetoes the command it scopes,
+and a single word we do not know means "this is a sentence, not a command".
 
 It also answers the question the worker must ask before routing anything into
 the conversation: did the customer actually SAY something we can read? A voice
@@ -97,9 +103,19 @@ _STOP_OBJECTS = _folded({
 #: which does not clear it either. Meta's own convention is STOP/START, so
 #: both the English and the Arabic a Saudi customer would actually type are
 #: accepted, plus «استئناف» because our privacy copy already teaches it.
+#:
+#: «ابدأ» is pointedly ABSENT (audit 2026-08-05). The fold that makes this
+#: module work at all also makes «ابدأ» and «أبدًا» the same string, "ابدا" —
+#: the resume word and the strongest negation in Arabic are indistinguishable
+#: here, and the set was matched first, so a customer answering «أبدًا» —
+#: «never» — had their opt-out CLEARED and the messages started again. That is
+#: the exact compliance surface RESUME is supposed to protect, breached from
+#: the inside. When two readings collide and only one of them can be right,
+#: this set is the one that gives way: the opt-out confirmation prints
+#: «تشغيل الرسائل» verbatim, so nothing is lost but a word we never taught.
 _RESUME_PHRASES = _folded({
     "start", "unstop", "resume",
-    "تشغيل الرسائل", "شغل الرسائل", "ابدأ", "رجّعني", "استئناف",
+    "تشغيل الرسائل", "شغل الرسائل", "رجّعني", "استئناف",
     "استئناف الرسائل", "عودة", "ارجعوا الرسائل", "رجعوا الرسائل",
 })
 
@@ -109,8 +125,18 @@ _RESUME_PHRASES = _folded({
 #: career field our own onboarding asks about, and a customer answering the
 #: path question with their own profession must not be escalated instead of
 #: heard. «دعم» alone already reaches a human.
+#:
+#: AUDIT 2026-08-05: «خدمة العملاء» was here, and it is the same mistake the
+#: line above was written to avoid — only worse, because customer service is
+#: one of the commonest job fields in the Kingdom and our own gap question
+#: («وش أبرز خبرة عملية عندك؟») invites exactly that answer. SUPPORT is
+#: resolved before any onboarding routing, so the answer was thrown away, a
+#: ticket was raised against a customer who had asked for nothing, and the
+#: question came back. Nothing is lost by removing it: «دعم» is the escape
+#: hatch every error message, the onboarding copy and the store page print,
+#: and «خدمة العملاء» is printed nowhere as a way to reach us.
 _SUPPORT_PHRASES = _folded({
-    "دعم", "support", "مساعدة", "help", "خدمة العملاء",
+    "دعم", "support", "مساعدة", "help",
 })
 #: The words that ASK for a human. «الدعم» is listed beside «دعم» because the
 #: fold does not strip a definite article — and «دعم» is the escape hatch
@@ -136,13 +162,25 @@ _REQUEST_FILLER = _folded({
 #: with the command's own verb — «ما أبي إلغاء الاشتراك», «لا أحتاج مساعدة» —
 #: which is the one case where reading the keyword would put the opposite of
 #: their words into their mouth.
+#:
+#: «don't» is gone (audit 2026-08-05): the fold turns an apostrophe into a
+#: space, so the entry was the two-word string "don t" and could never equal a
+#: token — a dead line that read as coverage. «dont» carries the spelling, and
+#: an English contraction folds to «don» + «t», two words this vocabulary does
+#: not know, which drops the message to OTHER by the unknown-word rule anyway.
 _NEGATION_TOKENS = _folded({
     "لا", "ما", "مو", "مب", "مش", "ماني", "أبد", "أبدًا", "لست", "بدون",
-    "no", "not", "never", "dont", "don't",
+    "no", "not", "never", "dont",
 })
 #: A command is SHORT. Past this it is a sentence with a condition or a
 #: question in it, and those are answered by the conversation, not obeyed.
 _COMMAND_MAX_WORDS = 5
+
+#: Where one clause ends and the next begins. This split happens on the RAW
+#: message, before the fold — ``normalize_ar`` turns every one of these marks
+#: into a space, so by the time we have tokens the sentence structure is gone
+#: and «لا تراسلوني، إلغاء الاشتراك» is an indistinguishable bag of words.
+_CLAUSE_SPLIT = re.compile(r"[،؛,;.!؟?\n\r]+|\s+-\s+")
 
 # Activation deep link prefills "تفعيل <token>" (or "activate <token>").
 _ACTIVATION_RE = re.compile(r"^(?:تفعيل|activate)\s+([A-Za-z0-9_\-]{20,})$", re.IGNORECASE)
@@ -224,6 +262,33 @@ def _is_command(
     return unique <= (core | filler)
 
 
+def _clauses(text: str) -> list[str]:
+    """One message split into the clauses it is actually made of, each folded.
+
+    AUDIT 2026-08-05, and the reason this exists. The negation veto was
+    applied to the whole message as one bag of tokens, so a negation ANYWHERE
+    killed the command — and the two most natural ways to opt out in Arabic
+    open with one:
+
+        «لا تراسلوني، إلغاء الاشتراك»   → OTHER
+        «ما أبغى رسائل، إيقاف»          → OTHER
+
+    Both of those are Meta-mandated opt-outs failing in silence, which the
+    docstring of :func:`classify_inbound` claims is the one outcome STOP is
+    biased against. The bug was not the veto; it was reading a negation that
+    scopes ONE clause as if it scoped the message. «ما أبي إلغاء الاشتراك» —
+    a customer refusing to cancel — is a single clause and must still be
+    vetoed, and it still is: a clause is only obeyed when the clause ITSELF
+    is a whole command with no negation in it. Splitting can therefore only
+    find a command inside a sentence that already contained one outright.
+    """
+    return [
+        folded for folded in
+        (normalize_ar(part) for part in _CLAUSE_SPLIT.split(text))
+        if folded
+    ]
+
+
 def classify_inbound(text: str | None) -> tuple[InboundKind, str | None]:
     """Read one inbound message. Returns (kind, activation token or None).
 
@@ -238,17 +303,24 @@ def classify_inbound(text: str | None) -> tuple[InboundKind, str | None]:
     straight back, and the operator is paged with the TEN code. So the verb
     may arrive wrapped in a request («أبي إلغاء الاشتراك لو سمحت») and still
     counts, bounded by the closed vocabulary above: an unknown word or a
-    negation drops it back to OTHER, where the conversation answers it.
+    negation drops it back to OTHER, where the conversation answers it. Since
+    2026-08-05 that bias is real rather than asserted — the reading is per
+    CLAUSE (:func:`_clauses`), because a whole-message negation veto turned
+    «لا تراسلوني، إلغاء الاشتراك» into OTHER and this paragraph described a
+    generosity the code did not have.
 
     RESUME — bias toward NOT detecting it, the one set that is deliberately
-    narrower than its neighbours. A false resume clears ``opt_out_at`` and
-    starts sending again to someone on record as having asked for silence:
-    the SAME compliance surface STOP protects, from the other side, and the
-    customer has no reason to expect it. The miss costs nothing to speak of,
-    because the opt-out confirmation prints «تشغيل الرسائل» on its own line —
-    we tell them the exact word, so an exact match is enough, and a customer
-    who types something else stays silenced for one more message rather than
-    being un-silenced by a guess.
+    narrower than its neighbours: the WHOLE message, never a clause, and no
+    request wrapping. A false resume clears ``opt_out_at`` and starts sending
+    again to someone on record as having asked for silence: the SAME
+    compliance surface STOP protects, from the other side, and the customer
+    has no reason to expect it. The miss costs nothing to speak of, because
+    the opt-out confirmation prints «تشغيل الرسائل» on its own line — we tell
+    them the exact word, so an exact match is enough, and a customer who types
+    something else stays silenced for one more message rather than being
+    un-silenced by a guess. That is also why «ابدأ» left the set: after the
+    fold it IS «أبدًا», and a guess that reads «never» as «start» is this
+    error in its worst form.
 
     SUPPORT — bias toward DETECTING it, most generously of the three. «دعم»
     is the escape hatch printed in every error message, in the onboarding
@@ -259,6 +331,8 @@ def classify_inbound(text: str | None) -> tuple[InboundKind, str | None]:
     coming. The accepted cost is that a bare «دعم» typed as an ANSWER (it is
     a real career field) escalates instead of being recorded — one ticket
     against a customer who cannot reach a human, which is not a close call.
+    It IS a close call for a phrase we never taught, though, which is why
+    «خدمة العملاء» is no longer in the set above.
 
     Activation is extracted from the whitespace-normalised text and never the
     folded one: the token is case-sensitive and carries «-» and «_», all of
@@ -271,15 +345,24 @@ def classify_inbound(text: str | None) -> tuple[InboundKind, str | None]:
     if token is not None:
         return (InboundKind.ACTIVATION, token)
     folded = normalize_ar(norm)
-    tokens = folded.split()
-    if folded in _STOP_PHRASES or _is_command(
-        tokens, core=_STOP_VERBS, filler=_STOP_OBJECTS | _REQUEST_FILLER
+    # the RAW text, never ``norm``: normalize() collapses newlines, and a line
+    # break is a clause boundary a customer uses as readily as a comma.
+    clauses = _clauses(text or "")
+    if any(
+        clause in _STOP_PHRASES or _is_command(
+            clause.split(), core=_STOP_VERBS,
+            filler=_STOP_OBJECTS | _REQUEST_FILLER,
+        )
+        for clause in clauses
     ):
         return (InboundKind.STOP, None)
     if folded in _RESUME_PHRASES:
         return (InboundKind.RESUME, None)
-    if folded in _SUPPORT_PHRASES or _is_command(
-        tokens, core=_SUPPORT_CORE, filler=_REQUEST_FILLER
+    if any(
+        clause in _SUPPORT_PHRASES or _is_command(
+            clause.split(), core=_SUPPORT_CORE, filler=_REQUEST_FILLER,
+        )
+        for clause in clauses
     ):
         return (InboundKind.SUPPORT, None)
     return (InboundKind.OTHER, None)
