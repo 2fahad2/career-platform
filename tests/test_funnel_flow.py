@@ -5,6 +5,12 @@ delivered Arabic report within one conversation, all through the SAME worker
 entry the production webhook feeds — the funnel reuses the C5 authorities
 (consents, §11 upload, extraction) verbatim and never touches the
 onboarding FSM.
+
+The second half of this file drives ``funnel/flow.py`` DIRECTLY. The audit of
+2026-08 found that this module — named after the funnel flow — imported the
+orchestrator and the extractor and never the flow at all, so the 29-riyal
+consent gate (the one step every paying analysis customer must pass) had no
+test of its own while it was an infinite loop in production.
 """
 
 from __future__ import annotations
@@ -16,6 +22,7 @@ from decimal import Decimal
 from sqlalchemy import text as sql_text
 from sqlalchemy.orm import Session
 
+from career.funnel import flow as funnel_flow
 from career.onboarding import extraction, orchestrator
 from career.salla.client import FakeSallaClient, SallaOrder
 from career.salla.provisioning import provision_order
@@ -510,3 +517,283 @@ def test_header_inference_skips_section_headings() -> None:
     assert infer_header_name("السيرة الذاتية\nنبذة عني\n") is None
     assert infer_header_name("Senior Analyst, Riyadh\n") is None   # punctuation
     assert infer_header_name("Team of 5 engineers\n") is None       # digits
+
+
+# ═══════════ THE CONSENT GATE — the 29-riyal customer's first step ═══════════
+#
+# AUDIT 2026-08. The gate compared RAW bytes against «أوافق» and re-sent the
+# identical wall on every miss, forever: «اوافق» (the hamza-less spelling the
+# default Saudi Android keyboard produces), «موافق», «نعم», «تمام» and «اوك»
+# all landed in the else. The customer had already PAID. These tests pin both
+# halves of the fix: the reply is understood, and when it truly is not, the
+# conversation still has a way out.
+
+
+def _activate_funnel(
+    owner: Session, deps: orchestrator.Deps, admin: FakeTelegramAdminClient,
+    phone: str,
+) -> tuple[str, uuid.UUID]:
+    """Take a paid analysis order all the way to the open consent gate.
+    Returns (tenant_id, channel_id) so the tests can drive ``flow`` itself."""
+    token = _provision_funnel(owner)
+    _handle_message(
+        owner, _msg_text(phone, f"تفعيل {token}"),
+        whatsapp_client=deps.whatsapp_client, admin_client=admin,
+        now=NOW, onboarding=deps,
+    )
+    row = owner.execute(
+        sql_text("SELECT id, tenant_id FROM customer_channels "
+                 "WHERE phone_e164 = :p"), {"p": phone},
+    ).one()
+    return str(row.tenant_id), row.id
+
+
+def _say_to_funnel(
+    owner: Session, channel_id: uuid.UUID, body: str,
+    deps: orchestrator.Deps, minutes: int,
+) -> None:
+    funnel_flow.handle_funnel_text(
+        owner, channel_id=channel_id, text=body, deps=deps,
+        now=NOW + timedelta(minutes=minutes),
+    )
+
+
+def _state(owner: Session, tenant_id: str) -> str:
+    return owner.execute(
+        sql_text("SELECT state FROM funnel_sessions WHERE tenant_id = :t"),
+        {"t": tenant_id},
+    ).scalar_one()
+
+
+def _grants(owner: Session, tenant_id: str) -> int:
+    return owner.execute(
+        sql_text("SELECT count(*) FROM consent_events WHERE tenant_id = :t "
+                 "AND action = 'granted'"), {"t": tenant_id},
+    ).scalar_one()
+
+
+def test_consent_replies_are_read_without_ever_inventing_an_agreement() -> None:
+    """The classifier the gate runs on. Two rules decide every line here:
+    the obvious spellings of «أوافق» must pass, and NOTHING ambiguous may be
+    recorded as consent — a granted consent event is a legal artifact (PDPL),
+    so «تمام» gets a clarifying ask, never a grant."""
+    from career.onboarding.orchestrator import (
+        CONSENT_ACK,
+        CONSENT_AGREE,
+        CONSENT_DECLINE,
+        CONSENT_UNCLEAR,
+        classify_consent_reply,
+    )
+
+    for yes in ("أوافق", "اوافق", "أوافق ✅", "موافق", "موافقة", "نعم",
+                "اوافق يا اخوي", "نعم أوافق", "consent_agree"):
+        assert classify_consent_reply(yes) == CONSENT_AGREE, yes
+
+    # negation FIRST: substring matching on «اوافق» would read every one of
+    # these as a grant, which is worse than the loop it replaces.
+    for no in ("لا أوافق", "لا اوافق", "ما أوافق", "ما اوافق", "مو موافق",
+               "لا", "لا شكرا", "أرفض", "ارفض", "consent_decline"):
+        assert classify_consent_reply(no) == CONSENT_DECLINE, no
+
+    # acknowledgement ≠ agreement — answered, but never recorded as consent
+    for maybe in ("تمام", "اوك", "أوكي", "ماشي", "طيب", "خلاص", "أكيد"):
+        assert classify_consent_reply(maybe) == CONSENT_ACK, maybe
+
+    for unclear in ("", "   ", "ما فهمت", "وش هذا", "كيف أرفع سيرتي؟",
+                    "أوافق بس عندي سؤال أول"):
+        assert classify_consent_reply(unclear) == CONSENT_UNCLEAR, unclear
+
+
+def test_the_consent_gate_ships_with_real_buttons(
+    owner_session: Session, clean_billing: None, tmp_path
+) -> None:
+    """The funnel got the copy without the buttons: onboarding sends real
+    interactive replies at the same gate, the funnel sent plain text and told
+    the customer to TYPE an Arabic word with a hamza on it."""
+    deps = _deps(tmp_path)
+    phone = f"+96650{uuid.uuid4().int % 10_000_000:07d}"
+    tenant_id, _ = _activate_funnel(
+        owner_session, deps, FakeTelegramAdminClient(), phone)
+    try:
+        prompt = deps.whatsapp_client.sent[-1]
+        assert prompt.kind == "interactive"
+        assert funnel_flow.CONSENT_AGREE_ID in prompt.buttons
+        assert funnel_flow.CONSENT_DECLINE_ID in prompt.buttons
+    finally:
+        owner_session.rollback()
+        owner_session.execute(
+            sql_text("DELETE FROM tenants WHERE id = :t"), {"t": tenant_id})
+        owner_session.commit()
+
+
+def test_the_hamza_less_agreement_opens_the_upload_step(
+    owner_session: Session, clean_billing: None, tmp_path
+) -> None:
+    """«اوافق» is what most Saudi Android keyboards produce. It used to fall
+    into the else branch of a gate the customer had already paid to pass."""
+    deps = _deps(tmp_path)
+    phone = f"+96650{uuid.uuid4().int % 10_000_000:07d}"
+    tenant_id, channel_id = _activate_funnel(
+        owner_session, deps, FakeTelegramAdminClient(), phone)
+    try:
+        _say_to_funnel(owner_session, channel_id, "اوافق", deps, 1)
+        assert _state(owner_session, tenant_id) == funnel_flow.STATE_UPLOAD
+        assert _grants(owner_session, tenant_id) == 3     # the three required
+        assert "أرسل سيرتك" in (deps.whatsapp_client.sent[-1].body or "")
+    finally:
+        owner_session.rollback()
+        owner_session.execute(
+            sql_text("DELETE FROM tenants WHERE id = :t"), {"t": tenant_id})
+        owner_session.commit()
+
+
+def test_a_negated_reply_never_records_a_grant(
+    owner_session: Session, clean_billing: None, tmp_path
+) -> None:
+    """«ما أوافق» and «لا اوافق» contain the agreement word. Reading them as
+    agreement would record a consent the customer explicitly refused — the
+    one failure worse than the loop."""
+    deps = _deps(tmp_path)
+    phone = f"+96650{uuid.uuid4().int % 10_000_000:07d}"
+    tenant_id, channel_id = _activate_funnel(
+        owner_session, deps, FakeTelegramAdminClient(), phone)
+    try:
+        for minute, reply in enumerate(("ما أوافق", "لا اوافق", "مو موافق"), 1):
+            _say_to_funnel(owner_session, channel_id, reply, deps, minute)
+            assert _grants(owner_session, tenant_id) == 0, reply
+            assert _state(owner_session, tenant_id) == funnel_flow.STATE_CONSENT
+        assert any("ضرورية" in (m.body or "")
+                   for m in deps.whatsapp_client.sent[-2:])
+    finally:
+        owner_session.rollback()
+        owner_session.execute(
+            sql_text("DELETE FROM tenants WHERE id = :t"), {"t": tenant_id})
+        owner_session.commit()
+
+
+def test_an_acknowledgement_is_answered_but_never_granted(
+    owner_session: Session, clean_billing: None, tmp_path
+) -> None:
+    """«تمام» means «got it», not «I consent». The customer must get a clear,
+    DIFFERENT ask — and the consent ledger must stay empty until they say the
+    word."""
+    deps = _deps(tmp_path)
+    phone = f"+96650{uuid.uuid4().int % 10_000_000:07d}"
+    tenant_id, channel_id = _activate_funnel(
+        owner_session, deps, FakeTelegramAdminClient(), phone)
+    try:
+        wall = deps.whatsapp_client.sent[-1].body or ""
+        _say_to_funnel(owner_session, channel_id, "تمام", deps, 1)
+        reply = deps.whatsapp_client.sent[-1].body or ""
+        assert _grants(owner_session, tenant_id) == 0
+        assert reply != wall                     # not the identical wall again
+        assert deps.whatsapp_client.sent[-1].kind == "interactive"
+        # and the word itself still works right after
+        _say_to_funnel(owner_session, channel_id, "أوافق", deps, 2)
+        assert _state(owner_session, tenant_id) == funnel_flow.STATE_UPLOAD
+    finally:
+        owner_session.rollback()
+        owner_session.execute(
+            sql_text("DELETE FROM tenants WHERE id = :t"), {"t": tenant_id})
+        owner_session.commit()
+
+
+def test_unreadable_replies_escalate_instead_of_looping_forever(
+    owner_session: Session, clean_billing: None, tmp_path
+) -> None:
+    """The heart of the defect: the gate had no attempt counter, no «لم أفهم»
+    and no escalation, so a paying customer whose words we cannot read was
+    walled in permanently. Every attempt must now say something NEW, and the
+    last one must put a human on it."""
+    deps = _deps(tmp_path)
+    admin = FakeTelegramAdminClient()
+    deps.admin_client = admin              # wired the way the runner wires it
+    phone = f"+96650{uuid.uuid4().int % 10_000_000:07d}"
+    tenant_id, channel_id = _activate_funnel(owner_session, deps, admin, phone)
+    try:
+        bodies: list[str] = []
+        for minute, junk in enumerate(("وش هذا", "ما فهمت عليك", "كيف يعني"), 1):
+            _say_to_funnel(owner_session, channel_id, junk, deps, minute)
+            bodies.append(deps.whatsapp_client.sent[-1].body or "")
+        assert len(set(bodies)) == 3            # never the same wall twice
+
+        escalated = bodies[-1]
+        assert "دعم" in escalated                # the escape hatch, spelled out
+        opened = owner_session.execute(
+            sql_text("SELECT count(*) FROM support_events WHERE tenant_id = :t "
+                     "AND kind = :k AND status = 'open'"),
+            {"t": tenant_id, "k": funnel_flow.CONSENT_STUCK_KIND},
+        ).scalar_one()
+        assert opened == 1                       # the operator has the ticket
+        code = owner_session.execute(
+            sql_text("SELECT code FROM tenants WHERE id = :t"), {"t": tenant_id},
+        ).scalar_one()
+        paged = [m for m in admin.messages if "consent stuck" in m]
+        assert len(paged) == 1                   # …and was paged, once
+        assert code in paged[0]                  # §13: the TEN code, never PII
+
+        # a fourth unreadable reply is still ANSWERED (never silence) and does
+        # not open a second ticket for the same stall
+        _say_to_funnel(owner_session, channel_id, "؟؟", deps, 4)
+        assert (deps.whatsapp_client.sent[-1].body or "") != ""
+        again = owner_session.execute(
+            sql_text("SELECT count(*) FROM support_events WHERE tenant_id = :t "
+                     "AND kind = :k"),
+            {"t": tenant_id, "k": funnel_flow.CONSENT_STUCK_KIND},
+        ).scalar_one()
+        assert again == 1
+        # and the gate still opens the moment they type the word
+        _say_to_funnel(owner_session, channel_id, "موافق", deps, 5)
+        assert _state(owner_session, tenant_id) == funnel_flow.STATE_UPLOAD
+    finally:
+        owner_session.rollback()
+        owner_session.execute(
+            sql_text("DELETE FROM tenants WHERE id = :t"), {"t": tenant_id})
+        owner_session.commit()
+
+
+def test_the_path_step_holds_its_state_on_an_empty_target(
+    owner_session: Session, clean_billing: None, tmp_path
+) -> None:
+    """The other half of the flow's own state machine, driven directly: a
+    one-character path is re-asked and PATH_PENDING survives."""
+    deps = _deps(tmp_path)
+    phone = f"+96650{uuid.uuid4().int % 10_000_000:07d}"
+    admin = FakeTelegramAdminClient()
+    tenant_id, channel_id = _activate_funnel(owner_session, deps, admin, phone)
+    try:
+        _say_to_funnel(owner_session, channel_id, "أوافق", deps, 1)
+        funnel_flow.handle_funnel_document(
+            owner_session, channel_id=channel_id, media_id="media-9",
+            filename="cv.pdf", deps=deps, now=NOW + timedelta(minutes=5),
+        )
+        assert _state(owner_session, tenant_id) == funnel_flow.STATE_PATH
+        _say_to_funnel(owner_session, channel_id, "ا", deps, 6)
+        assert _state(owner_session, tenant_id) == funnel_flow.STATE_PATH
+        assert "المسار الوظيفي" in (deps.whatsapp_client.sent[-1].body or "")
+    finally:
+        owner_session.rollback()
+        owner_session.execute(
+            sql_text("DELETE FROM tenants WHERE id = :t"), {"t": tenant_id})
+        owner_session.commit()
+
+
+def test_the_consent_copy_is_direction_pure() -> None:
+    """§16 / Fahad's client: a line mixing Arabic with Latin letters or digits
+    is scrambled on delivery. Every line the consent gate can send is checked
+    — the gate is the one screen a paying customer cannot skip."""
+    import re
+
+    arabic = re.compile(r"[؀-ۿ]")
+    latin = re.compile(r"[A-Za-z0-9]")
+
+    bodies = [(name, value) for name, value in vars(funnel_flow).items()
+              if "CONSENT" in name and isinstance(value, str)]
+    bodies.append(("_consent_wall", funnel_flow._consent_wall()))
+    assert len(bodies) >= 5           # the whole gate, not one lucky constant
+    for name, body in bodies:
+        for line in body.splitlines():
+            if arabic.search(line) and latin.search(line):
+                raise AssertionError(
+                    f"{name}: mixed-direction line would scramble: {line!r}"
+                )

@@ -18,7 +18,13 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from career.db.models import CustomerChannel, FunnelSession, ProfileFact
+from career.db.models import (
+    CustomerChannel,
+    FunnelSession,
+    ProfileFact,
+    SupportEvent,
+    Tenant,
+)
 from career.funnel.evaluation import evaluate
 from career.funnel.report import render_report_pdf, whatsapp_summary
 from career.onboarding.consents import PURPOSES, missing_required, record_consent
@@ -28,7 +34,15 @@ from career.onboarding.extraction import (
     run_extraction,
     strip_pii,
 )
-from career.onboarding.orchestrator import Deps
+from career.onboarding.orchestrator import (
+    CONSENT_ACK,
+    CONSENT_AGREE,
+    CONSENT_AGREE_ID,
+    CONSENT_DECLINE,
+    CONSENT_DECLINE_ID,
+    Deps,
+    classify_consent_reply,
+)
 from career.onboarding.upload import process_cv_upload
 from career.storage import tenant_key
 
@@ -41,6 +55,51 @@ STATE_DONE = "DONE"
 
 _AGREE = "أوافق"
 _DECLINE = "لا أوافق"
+
+#: Real interactive buttons, the same shape onboarding has always sent at the
+#: same gate. AUDIT 2026-08: the funnel got the copy WITHOUT the buttons and
+#: asked the customer to type an Arabic word with a hamza on it, then compared
+#: what arrived byte-for-byte. Both button ids and the typed words resolve.
+_CONSENT_BUTTONS: tuple[tuple[str, str], ...] = (
+    (CONSENT_AGREE_ID, _AGREE),
+    (CONSENT_DECLINE_ID, _DECLINE),
+)
+
+#: How many unreadable replies before a human is put on it. The gate is the
+#: FIRST step of a service the customer has already paid for: walling them in
+#: silently past this point is not an option we get to keep.
+_MAX_CONSENT_ATTEMPTS = 3
+_CONSENT_ATTEMPTS_KEY = "consent_attempts"
+CONSENT_STUCK_KIND = "funnel_consent_stuck"
+
+_CONSENT_DECLINED_EXPLAIN = (
+    "هذه الموافقة ضرورية للتشغيل الأساسي — بدونها لا نستطيع قراءة "
+    "سيرتك. حقوقك محفوظة: تسحبها وتحذف بياناتك متى شئت."
+)
+#: First miss: a short, honest nudge — not the identical wall a second time.
+_CONSENT_NOT_CLEAR = "أحتاج ردّك على الموافقة عشان نكمل 🙏"
+#: An acknowledgement («تمام»، «أوك») is not a consent. Say what is missing.
+_CONSENT_ACK_ASK = (
+    "أبشر 👌\n"
+    "بس أحتاج كلمة الموافقة صريحة عشان تنحفظ في سجل موافقاتك"
+)
+#: Second miss: stop repeating, start explaining exactly what to do.
+_CONSENT_HELP = (
+    "خلّها بضغطة وحدة 👇\n"
+    "اختر من الأزرار تحت، أو اكتب كلمة وحدة:\n"
+    "«أوافق» ونبدأ فورًا، أو «لا أوافق» ونوقف هنا"
+)
+#: Third miss: a human takes it. Every promise here is one we keep — a ticket
+#: row is written, the operator channel is pinged when it is wired, and «دعم»
+#: is the escalation the whole product already trusts (the C4 worker
+#: intercepts it before any conversation and pages the operator), so this is a
+#: door that really opens.
+_CONSENT_STUCK = (
+    "ما أبي أعلّقك أكثر 🙏\n"
+    "سجّلت حالتك عند الفريق ونتابعها معك\n"
+    "وإذا تبي أحد يكلمك الحين اكتب: دعم\n"
+    "وتقدر تكمل بضغطة من الزر تحت"
+)
 
 _WELCOME = (
     "أهلًا بك في تحليل السيرة الذاتية! 📊\n"
@@ -85,16 +144,97 @@ def incomplete_funnel(session: Session, tenant_id: uuid.UUID) -> FunnelSession |
     return row
 
 
-def _prompt_consent(deps: Deps, channel: CustomerChannel) -> None:
+def _consent_wall() -> str:
     """CHANGELOG §10: one merged message for the three required purposes."""
     bullets = "\n".join(
         f"• {p.title_ar}: {p.description_ar}" for p in _required_purposes()
     )
-    deps.whatsapp_client.send_text(
-        channel.phone_e164,
+    return (
         "قبل ما نبدأ — موافقة واحدة تغطي تشغيل الخدمة:\n"
-        f"{bullets}\n\nرد بـ«{_AGREE}» أو «{_DECLINE}».",
+        f"{bullets}\n\n"
+        f"اضغط الزر تحت، أو اكتب «{_AGREE}» أو «{_DECLINE}»."
     )
+
+
+def _send_consent(deps: Deps, channel: CustomerChannel, body: str) -> None:
+    """Every message this gate sends carries the buttons — including the ones
+    that follow a reply we could not read, so the way forward is always one
+    tap away and never depends on spelling."""
+    deps.whatsapp_client.send_interactive(
+        channel.phone_e164, body, _CONSENT_BUTTONS
+    )
+
+
+def _prompt_consent(
+    deps: Deps, channel: CustomerChannel, *, lead: str = ""
+) -> None:
+    _send_consent(deps, channel, f"{lead}\n{_consent_wall()}" if lead
+                  else _consent_wall())
+
+
+def _handle_unreadable_consent(
+    session: Session, *, row: FunnelSession, channel: CustomerChannel,
+    deps: Deps, verdict: str,
+) -> None:
+    """The way OUT of the gate (audit 2026-08).
+
+    The old ``else`` re-sent the identical wall, forever, with no counter, no
+    «لم أفهم» and no escalation — for a customer who had already paid 29
+    riyals. Now every attempt says something new and the third one puts a
+    human on it, while «أوافق» keeps working at any point.
+    """
+    context = dict(row.context or {})
+    attempts = int(context.get(_CONSENT_ATTEMPTS_KEY, 0)) + 1
+    row.context = {**context, _CONSENT_ATTEMPTS_KEY: attempts}
+
+    if attempts >= _MAX_CONSENT_ATTEMPTS:
+        _escalate_consent(session, row=row, channel=channel, deps=deps,
+                          attempts=attempts)
+        return
+    if attempts >= 2:
+        lead = _CONSENT_HELP
+    else:
+        lead = _CONSENT_ACK_ASK if verdict == CONSENT_ACK else _CONSENT_NOT_CLEAR
+    _prompt_consent(deps, channel, lead=lead)
+
+
+def _escalate_consent(
+    session: Session, *, row: FunnelSession, channel: CustomerChannel,
+    deps: Deps, attempts: int,
+) -> None:
+    """Hand the stall to the operator — once per stall — and keep answering.
+
+    One OPEN ticket per tenant: a customer who keeps writing must never stop
+    getting a reply (no silent failure, §15.12), but must not page the
+    operator on every message either. The log line carries the TEN code only
+    (§13 — never a phone, never a name).
+    """
+    already_open = session.execute(
+        select(SupportEvent.id).where(
+            SupportEvent.tenant_id == row.tenant_id,
+            SupportEvent.kind == CONSENT_STUCK_KIND,
+            SupportEvent.status == "open",
+        ).limit(1)
+    ).scalar_one_or_none()
+    if already_open is None:
+        session.add(SupportEvent(
+            id=uuid.uuid4(), tenant_id=row.tenant_id, channel_id=channel.id,
+            kind=CONSENT_STUCK_KIND, status="open",
+        ))
+        tenant = session.get(Tenant, row.tenant_id)
+        code = tenant.code if tenant is not None else "unknown tenant"
+        logger.warning(
+            "funnel consent unresolved after %d replies — %s", attempts, code,
+        )
+        if deps.admin_client is not None:
+            try:
+                deps.admin_client.send_admin(
+                    f"⚠️ {code} · funnel consent stuck · "
+                    f"{attempts} unreadable replies · paid cv_analysis"
+                )
+            except Exception:  # noqa: BLE001 — the ticket is already written
+                logger.warning("consent stall notify failed", exc_info=True)
+    _send_consent(deps, channel, _CONSENT_STUCK)
 
 
 def start_funnel(
@@ -161,7 +301,13 @@ def handle_funnel_text(
     body = text.strip()
 
     if row.state == STATE_CONSENT:
-        if body == _AGREE:
+        # Byte equality against «أوافق» lived here. «اوافق» — the spelling the
+        # default Saudi Android keyboard produces — fell into the else and got
+        # the identical wall back, forever (audit 2026-08). The reading is the
+        # onboarding authority verbatim: obvious spellings pass, negation
+        # never does, and an acknowledgement is never rounded up to a grant.
+        verdict = classify_consent_reply(body)
+        if verdict == CONSENT_AGREE:
             # one tap → the three required purposes, each its own event
             for purpose in _required_purposes():
                 record_consent(
@@ -169,16 +315,18 @@ def handle_funnel_text(
                     purpose=purpose.key, action="granted",
                 )
             row.state = STATE_UPLOAD
+            row.context = {k: v for k, v in (row.context or {}).items()
+                           if k != _CONSENT_ATTEMPTS_KEY}
             deps.whatsapp_client.send_text(channel.phone_e164, _UPLOAD_PROMPT)
-        elif body == _DECLINE:
+        elif verdict == CONSENT_DECLINE:
             deps.whatsapp_client.send_text(
-                channel.phone_e164,
-                "هذه الموافقة ضرورية للتشغيل الأساسي — بدونها لا نستطيع قراءة "
-                "سيرتك. حقوقك محفوظة: تسحبها وتحذف بياناتك متى شئت.",
+                channel.phone_e164, _CONSENT_DECLINED_EXPLAIN,
             )
             _prompt_consent(deps, channel)
         else:
-            _prompt_consent(deps, channel)
+            _handle_unreadable_consent(
+                session, row=row, channel=channel, deps=deps, verdict=verdict,
+            )
 
     elif row.state == STATE_UPLOAD:
         deps.whatsapp_client.send_text(channel.phone_e164, _UPLOAD_PROMPT)

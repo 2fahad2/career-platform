@@ -38,7 +38,7 @@ from career.db.models import CustomerChannel, Subscription, SubscriptionEvent
 from career.salla import subscriptions as sub_states
 from career.whatsapp.phones import phone_variants
 
-#: Pass plans only. The 49-SAR analysis is a one-shot product with no period,
+#: Pass plans only. The 29-SAR analysis is a one-shot product with no period,
 #: and a funnel-only tenant upgrading is a different path entirely (§04
 #: inheritance, handled at activation) — neither is a renewal.
 RENEWABLE_PLANS: frozenset[str] = frozenset({"basic", "professional", "executive"})

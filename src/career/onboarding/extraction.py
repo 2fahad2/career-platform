@@ -4,8 +4,10 @@ Order of defenses:
 1. Consent gate (§12) — nothing runs before the required consents exist.
 2. PII stripping (§15.8) — the customer's name, phone numbers (Western or
    Arabic-Indic digits) and emails are replaced with placeholders BEFORE any
-   external call. A validator then proves the stripped text is clean; a leak
-   raises instead of sending.
+   external call. The name comes from what the customer typed AND from what
+   the CV prints at its top, matched on folded fuzzy tokens, because a Saudi
+   name has no single spelling (audit 2026-08-05). A validator then proves
+   the stripped text is clean; a leak raises instead of sending.
 3. The extractor boundary is an injectable Protocol — tests use fakes with no
    network; AnthropicExtractor is the real implementation (Claude only — D1).
 4. Extraction output is NOT truth (§15.5): facts are stored as EXTRACTED rows
@@ -52,6 +54,211 @@ _DIGITS = re.compile(r"[0-9٠-٩۰-۹]")
 #: blanking them would eat unrelated words like "Al Falak Systems".
 _MIN_NAME_TOKEN = 3
 
+#: The placeholder every name hit collapses to. Downstream contracts depend on
+#: the exact shapes: funnel/flow.py counts ``[EMAIL_`` keys to decide whether
+#: the CV carried contact details, _SYSTEM tells the model to ignore [NAME],
+#: and tests pin "[NAME]" in the stripped text. Never reshape these.
+_NAME = "[NAME]"
+
+# ── name matching (audit 2026-08-05) ─────────────────────────────────────────
+#
+# What went wrong: name stripping was a literal case-insensitive substring
+# match on ``CustomerProfile.cv_full_name``, a field collection.py forces to
+# be LATIN. So the guarantee «اسمك لا يُرسل إلى أي نموذج» was only ever as
+# good as one exact Latin string, and three ordinary Saudi CVs broke it —
+# a bilingual header whose Arabic half matched nothing, a CV that spells the
+# same name differently from what the customer typed on WhatsApp, and a
+# missing profile row, which stripped no name at all and made assert_no_pii
+# silently assert nothing. The 29-SAR analysis funnel was BETTER protected,
+# because it never has a typed name and therefore had to derive one from the
+# CV header. That asymmetry is what this section removes: the CV itself is
+# now a name source everywhere, and comparison happens on folded, fuzzy
+# tokens instead of raw bytes.
+#
+# Direction of error, deliberately: over-stripping costs one redacted word in
+# a prompt; under-stripping costs the promise printed on the store page.
+
+#: Arabic combining marks — harakat, tatweel, quranic marks. «فُلان» and
+#: «فلان» are the same name to every human and to no substring matcher.
+_AR_MARKS = "\u064B-\u0652\u0670\u0640\u06D6-\u06ED"
+_AR_DIACRITICS = re.compile(f"[{_AR_MARKS}]")
+#: Hamza forms, alef maqsura and taa marbuta fold — the same normalisation
+#: achievement_render.normalize_ar performs. It is duplicated rather than
+#: imported on purpose: this module is the leaf every model boundary imports
+#: (cv.generate, intent, enrichment, bullet_panel, achievement_render all
+#: import IT), and achievement_render reaches into career.cv.generate at
+#: module level, so importing upwards from here would close a cycle around
+#: the one function that must never fail to load.
+_AR_FOLD = str.maketrans({
+    "أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا",
+    "ى": "ي", "ة": "ه", "ؤ": "و", "ئ": "ي",
+})
+_NON_WORD = re.compile(r"[^\w]", re.UNICODE)
+
+#: A word = letters plus Arabic marks, joined by an internal hyphen or
+#: apostrophe, so "Al-Fulani" and "O'Hara" stay ONE token and «فُلان» is not
+#: split at its damma (a mark is not \w, which is exactly how it used to
+#: escape). Placeholders are matched first in _TOKEN so a name that happens to
+#: skeletonise like "EMAIL" can never chew a placeholder apart.
+_LETTER = f"(?:[^\\W\\d_]|[{_AR_MARKS}])"
+_WORD = re.compile(f"{_LETTER}+(?:['’-]{_LETTER}+)*")
+_PLACEHOLDER = re.compile(r"\[[A-Z][A-Z0-9_]*\]")
+_TOKEN = re.compile(f"{_PLACEHOLDER.pattern}|{_WORD.pattern}")
+
+#: Bilingual headers put both halves on one line: «Fulan Alfulani / فلان
+#: الفلاني». Only these separators split a header line — a comma still
+#: disqualifies the whole line, which is what keeps "Senior Analyst, Riyadh"
+#: from being read as a name.
+_HEADER_SPLIT = re.compile(r"\s*[/|•·]\s*|\s+[—–-]\s+")
+_HEADER_EDGE = re.compile(r"^[\s*_|—–-]+|[\s*_|—–-]+$")
+
+#: Words that sit on a header line and are NOT the person: job titles and
+#: places. Filtered per TOKEN, never per line — "Fulan Alfulani Senior
+#: Analyst" must still yield the two name tokens, so rejecting the whole line
+#: would leak exactly the CVs that print a title next to the name.
+_ROLE_WORDS: frozenset[str] = frozenset({
+    "analyst", "manager", "engineer", "developer", "specialist", "consultant",
+    "director", "officer", "supervisor", "technician", "accountant",
+    "designer", "administrator", "coordinator", "assistant", "executive",
+    "lead", "senior", "junior", "head", "chief", "intern", "trainee",
+    "operations", "business", "project", "sales", "marketing", "finance",
+    "support", "quality", "security", "software", "systems", "system",
+    "مدير", "مهندس", "محاسب", "اخصائي", "مشرف", "فني", "مطور", "مستشار",
+    "رئيس", "مساعد", "منسق", "موظف", "عمليات", "مبيعات", "تسويق",
+})
+_PLACE_WORDS: frozenset[str] = frozenset({
+    "riyadh", "jeddah", "dammam", "khobar", "dhahran", "mecca", "makkah",
+    "medina", "madinah", "taif", "abha", "jubail", "yanbu", "buraidah",
+    "saudi", "arabia", "ksa", "kingdom", "dubai", "emirates", "bahrain",
+    "الرياض", "جدة", "الدمام", "الخبر", "مكة", "المدينة", "السعودية",
+    "المملكة", "العربية", "الشرقية",
+})
+
+
+def _fold(token: str) -> str:
+    """The comparison key for one token: marks dropped, hamza/yaa/taa folded,
+    punctuation removed, lowercased. «الفلانى» and «الفلاني» collapse; so do
+    "Al-Fulani" and "alfulani"."""
+    body = _AR_DIACRITICS.sub("", token).translate(_AR_FOLD)
+    return _NON_WORD.sub("", body).lower()
+
+
+#: Common Saudi given names, FOLDED. This list is a precision device for the
+#: backstop only — never a recall device: nothing depends on a name being in
+#: it (stripping works from the header and the typed name regardless), and a
+#: name missing from it merely means the backstop stays quiet, which is the
+#: failure direction assert_no_pii chooses on purpose.
+_AR_GIVEN_NAMES: frozenset[str] = frozenset(_fold(n) for n in {
+    "محمد", "احمد", "فهد", "خالد", "سعد", "سلطان", "سعود", "نايف", "تركي",
+    "بندر", "ماجد", "ناصر", "مشعل", "يوسف", "ابراهيم", "عمر", "علي", "حسن",
+    "حسين", "صالح", "سلمان", "راشد", "طلال", "وليد", "زياد", "فيصل", "منصور",
+    "مازن", "انس", "ريان", "نواف", "عادل", "بدر", "رياض", "هاني", "سامي",
+    "سارة", "ساره", "نورة", "نوره", "هند", "ريم", "مها", "امل", "لمي",
+    "منيرة", "منيره", "الجوهرة", "شيماء", "دانة", "دانه", "غاده", "غادة",
+})
+
+
+
+def _variants(folded: str) -> tuple[str, ...]:
+    """The folded token plus the forms an Arabic proclitic hides it behind —
+    «وفهد» / «الفهد» are the same name token as «فهد»."""
+    forms = [folded]
+    for prefix in ("ال", "و", "ف", "ب", "ل", "ك"):
+        if folded.startswith(prefix) and len(folded) - len(prefix) >= _MIN_NAME_TOKEN:
+            forms.append(folded[len(prefix):])
+    return tuple(forms)
+
+
+_VOWELS = re.compile(r"[aeiouy]")
+_DOUBLED = re.compile(r"(.)\1+")
+
+
+def _skeleton(folded: str) -> str:
+    """Consonant skeleton of a Latin token, first letter kept, doubles
+    collapsed: fahad/fahd → fhd, mohammed/mohamed/muhammad → mhmd. This is
+    the whole point — Arabic names have no canonical transliteration, so the
+    vowels a customer types are noise and the consonants are the name."""
+    if not folded.isascii():
+        return ""  # Arabic needs no skeleton: folding already normalises it
+    return _DOUBLED.sub(r"\1", folded[:1] + _VOWELS.sub("", folded[1:]))
+
+
+def _within_one_edit(a: str, b: str) -> bool:
+    """One insertion, substitution or transposition apart. Pruned on length
+    and first letter first, so this stays O(1) for almost every word of a CV
+    and never turns the strip into a quadratic scan."""
+    if abs(len(a) - len(b)) > 1 or a[:1] != b[:1]:
+        return False
+    if a == b:
+        return True
+    if len(a) > len(b):
+        a, b = b, a
+    i = 0
+    while i < len(a) and a[i] == b[i]:
+        i += 1
+    if len(a) == len(b):
+        return a[i + 1:] == b[i + 1:] or (
+            a[i:i + 1] == b[i + 1:i + 2]
+            and a[i + 1:i + 2] == b[i:i + 1]
+            and a[i + 2:] == b[i + 2:]
+        )
+    return a[i:] == b[i + 1:]
+
+
+class _NameMatcher:
+    """Does this word look like one of the customer's name tokens?
+
+    Three rules, cheapest first: folded equality, consonant skeleton, one
+    edit. Every answer is memoised per distinct word, so a 5000-word CV costs
+    one fold per DISTINCT token and the name set is a handful of entries —
+    linear in the document, never a scan per token per name."""
+
+    __slots__ = ("_exact", "_skeletons", "_fuzzy", "_cache")
+
+    def __init__(self, tokens: list[str]) -> None:
+        self._exact: set[str] = set()
+        self._skeletons: set[str] = set()
+        self._fuzzy: set[str] = set()
+        self._cache: dict[str, bool] = {}
+        for token in tokens:
+            folded = _fold(token)
+            if len(folded) < _MIN_NAME_TOKEN:
+                continue
+            for form in _variants(folded):
+                self._exact.add(form)
+                if len(form) >= 4:
+                    skeleton = _skeleton(form)
+                    if len(skeleton) >= 3:
+                        self._skeletons.add(skeleton)
+                if len(form) >= 6:
+                    self._fuzzy.add(form)
+
+    def __bool__(self) -> bool:
+        return bool(self._exact)
+
+    def matches(self, word: str) -> bool:
+        cached = self._cache.get(word)
+        if cached is None:
+            cached = self._cache[word] = self._match(word)
+        return cached
+
+    def _match(self, word: str) -> bool:
+        folded = _fold(word)
+        if len(folded) < _MIN_NAME_TOKEN:
+            return False
+        for form in _variants(folded):
+            if form in self._exact:
+                return True
+            if len(form) >= 4:
+                skeleton = _skeleton(form)
+                if len(skeleton) >= 3 and skeleton in self._skeletons:
+                    return True
+            if len(form) >= 6 and any(
+                _within_one_edit(form, known) for known in self._fuzzy
+            ):
+                return True
+        return False
+
 
 class PiiLeak(Exception):
     """Stripped text still contains PII — refuse to send it anywhere."""
@@ -90,10 +297,71 @@ _HEADER_STOPWORDS: frozenset[str] = frozenset({
 })
 
 
+#: Folded forms of every word that may sit on a header line without being the
+#: person. Folding matters: «نبذة» stored here compares as «نبذه».
+_SECTION_WORDS: frozenset[str] = frozenset(_fold(w) for w in _HEADER_STOPWORDS)
+_NOT_A_NAME: frozenset[str] = _SECTION_WORDS | frozenset(
+    _fold(w) for w in (_ROLE_WORDS | _PLACE_WORDS)
+)
+
+#: How far down the page a name may hide. Past this we are reading the body.
+_HEADER_LINES = 6
+
+
+def _clean_header_line(raw: str) -> str:
+    """One physical line, ready to be read as a header: placeholders removed
+    (an already-redacted name must not look like a fresh one) and decorative
+    edges trimmed."""
+    return _HEADER_EDGE.sub("", _PLACEHOLDER.sub(" ", raw)).strip()
+
+
+def _is_name_line(segment: str) -> bool:
+    """The original conservative header test, now applied per SEGMENT so a
+    bilingual line yields both halves instead of nothing."""
+    line = segment.strip()
+    if not (2 <= len(line.split()) <= 4) or len(line) > 60:
+        return False
+    if any(ch.isdigit() for ch in line) or "@" in line:
+        return False
+    if any(ch in line for ch in ",:;/\\()[]{}<>"):
+        return False
+    words = [w.strip(".").lower() for w in line.split()]
+    if any(_fold(w) in _SECTION_WORDS for w in words):
+        return False
+    # Arabic marks are not alphabetic to str.isalpha, so «فُلان» fails this
+    # test unless the marks come off first — that alone leaked diacritised
+    # names past the funnel's inference.
+    return all(
+        _AR_DIACRITICS.sub("", w).replace("'", "").replace("-", "").isalpha()
+        for w in words
+    )
+
+
+def _header_name_lines(text: str, *, max_lines: int, max_hits: int) -> list[str]:
+    """Name candidates from the top of a document, at most ``max_hits`` LINES
+    worth. Two lines is the honest ceiling: a CV puts the name on the first
+    line or two, and reading further trades a name we already have for a
+    redacted city or job title further down the page."""
+    found: list[str] = []
+    hits = 0
+    for raw in text.splitlines()[:max_lines]:
+        line = _clean_header_line(raw)
+        if not line:
+            continue
+        segments = [s for s in _HEADER_SPLIT.split(line) if s and _is_name_line(s)]
+        if not segments:
+            continue
+        found.extend(s.strip() for s in segments)
+        hits += 1
+        if hits >= max_hits:
+            break
+    return found
+
+
 def infer_header_name(text: str, *, max_lines: int = 6) -> str | None:
     """The name printed at the top of a CV, or None.
 
-    Why this exists: the funnel product (49 SAR) never asks the customer for
+    Why this exists: the funnel product (29 SAR) never asks the customer for
     their name — they just upload a CV — so ``known_name`` was None and the
     name line went to the model verbatim, while the published privacy page
     promises «اسمك ورقم جوالك لا يُرسلان إلى أي نموذج». This recovers a name
@@ -104,25 +372,58 @@ def infer_header_name(text: str, *, max_lines: int = 6) -> str | None:
     heading. It may miss an unusual layout — the model still never sees an
     email or a phone, and a miss is visible, whereas a wrong redaction only
     costs a heading."""
-    for raw in text.splitlines()[:max_lines]:
-        line = raw.strip().strip("*_|—–-").strip()
-        if not (2 <= len(line.split()) <= 4) or len(line) > 60:
-            continue
-        if any(ch.isdigit() for ch in line) or "@" in line:
-            continue
-        if any(ch in line for ch in ",:;/\\()[]{}<>"):
-            continue
-        words = [w.strip(".").lower() for w in line.split()]
-        if any(w in _HEADER_STOPWORDS for w in words):
-            continue
-        if not all(w.replace("'", "").replace("-", "").isalpha() for w in words):
-            continue
-        return line
-    return None
+    names = _header_name_lines(text, max_lines=max_lines, max_hits=1)
+    return names[0] if names else None
+
+
+def _looks_like_cv(text: str) -> bool:
+    """Is this a CV-shaped DOCUMENT rather than a role title, a WhatsApp reply
+    or a prompt?
+
+    The header heuristic is only meaningful on a document, and strip_pii is
+    the shared gate of six model boundaries: achievement_render passes a
+    one-line role title, enrichment passes a customer's colloquial answer.
+    Inferring a "header name" from those and blanking it would silently
+    destroy the very content we are about to send — the achievement the
+    customer just typed. Two distinct section headings plus four lines is the
+    cheap, honest discriminator: every real CV has them and a WhatsApp
+    message has neither."""
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if len(lines) < 4:
+        return False
+    seen: set[str] = set()
+    for match in _WORD.finditer(text):
+        folded = _fold(match.group())
+        if folded in _SECTION_WORDS:
+            seen.add(folded)
+            if len(seen) >= 2:
+                return True
+    return False
+
+
+def _inferred_tokens(candidate: str) -> list[str]:
+    """The tokens of an INFERRED header name that could be the person. The
+    typed name is authoritative and never filtered; a guess is, because
+    "Fulan Alfulani Senior Analyst" and "Riyadh Saudi Arabia" both survive the
+    header test and only one of them is a human."""
+    tokens: list[str] = []
+    for match in _WORD.finditer(candidate):
+        folded = _fold(match.group())
+        if len(folded) >= _MIN_NAME_TOKEN and folded not in _NOT_A_NAME:
+            tokens.append(match.group())
+    return tokens
 
 
 def strip_pii(text: str, *, known_name: str | None) -> StrippedText:
-    """Replace emails, phone numbers and the customer's name with placeholders."""
+    """Replace emails, phone numbers and the customer's name with placeholders.
+
+    The name is taken from BOTH sources we have: what the customer typed
+    (authoritative) and what the CV prints at the top of itself (the only
+    source that knows the Arabic half of a bilingual header, or the spelling
+    the customer's own CV uses). Matching is on folded, fuzzy tokens, so
+    «الفلانى» reaches «الفلاني» and "Fahd Al-Mulhim" reaches "Fahad
+    Almulhim" — the transliteration of a Saudi name is not stable and never
+    was safe to compare byte-for-byte."""
     replacements: dict[str, str] = {}
     out = text
 
@@ -136,24 +437,143 @@ def strip_pii(text: str, *, known_name: str | None) -> StrippedText:
         replacements[placeholder] = match.group()
         out = out.replace(match.group(), placeholder)
 
-    for token in _name_tokens(known_name):
+    typed = _name_tokens(known_name)
+    inferred: list[str] = []
+    header: str | None = None
+    if _looks_like_cv(out):
+        # Read the header AFTER the contact sweep: «Fulan Alfulani — [EMAIL_1]»
+        # only becomes readable as a name once the email is a placeholder.
+        for candidate in _header_name_lines(out, max_lines=_HEADER_LINES, max_hits=2):
+            tokens = _inferred_tokens(candidate)
+            if tokens:
+                header = header or candidate
+                inferred.extend(tokens)
+
+    hit = False
+    # Pass 1 — the literal substring sweep that shipped, byte-for-byte. It
+    # catches a typed name glued inside another word («وفهد», "Fahadco"),
+    # which a tokeniser by definition cannot see. Longest token first: with
+    # "Fulan Alfulani" the short token used to eat the long one from the
+    # inside and leave "Al[NAME]i" on the wire — no leak, but a mangled
+    # employer the extractor then reads as a fact.
+    for token in sorted(typed, key=len, reverse=True):
         pattern = re.compile(re.escape(token), re.IGNORECASE)
         if pattern.search(out):
-            replacements["[NAME]"] = known_name or ""
-            out = pattern.sub("[NAME]", out)
+            hit = True
+            out = pattern.sub(_NAME, out)
+
+    # Pass 2 — ONE tokeniser pass over the document for the folded/fuzzy
+    # forms of every name token we hold. Linear in the text, memoised per
+    # distinct word; placeholders are consumed whole so [EMAIL_1] can never be
+    # rewritten into [[NAME]_1] by a customer whose name skeletonises alike.
+    matcher = _NameMatcher(typed + inferred)
+    if matcher:
+        def _replace(match: re.Match[str]) -> str:
+            nonlocal hit
+            word = match.group()
+            if word.startswith("["):
+                return word
+            if matcher.matches(word):
+                hit = True
+                return _NAME
+            return word
+
+        out = _TOKEN.sub(_replace, out)
+
+    if hit:
+        replacements[_NAME] = known_name or header or ""
 
     return StrippedText(text=out, replacements=replacements)
 
 
+def _person_shaped(tokens: list[str]) -> bool:
+    """Does this run of words look like a PERSON, as opposed to any other
+    short line a document may open with? Two or more surviving tokens, and:
+
+    Latin — every token is Title Case or ALL CAPS, the way a CV prints a name
+    and the way prose does not.
+
+    Arabic — carries a given name we know, or the «اسم + اللقب» shape where
+    the family name takes the definite article and the given name does not.
+    Arabic has no letter case, so this is the only signal available without
+    guessing."""
+    latin = [t for t in tokens if t.isascii()]
+    arabic = [_fold(t) for t in tokens if not t.isascii()]
+    if len(latin) >= 2 and all(_title_cased(t) for t in latin):
+        return True
+    if len(arabic) >= 2:
+        if any(f in _AR_GIVEN_NAMES or f.startswith("عبدال") for f in arabic):
+            return True
+        if not arabic[0].startswith("ال") and arabic[-1].startswith("ال"):
+            return True
+    return False
+
+
+def _title_cased(token: str) -> bool:
+    parts = [p for p in re.split(r"['’-]", token) if p]
+    return bool(parts) and all(
+        p[:1].isupper() and (len(p) == 1 or p[1:].islower() or p.isupper())
+        for p in parts
+    )
+
+
+def _residual_name(text: str) -> str | None:
+    """A name that appears to have survived stripping, or None. Only the first
+    two readable lines of a CV-shaped document are examined — see the
+    reasoning in :func:`assert_no_pii`."""
+    if not _looks_like_cv(text):
+        return None
+    for candidate in _header_name_lines(text, max_lines=_HEADER_LINES, max_hits=2):
+        tokens = _inferred_tokens(candidate)
+        if len(tokens) >= 2 and _person_shaped(tokens):
+            return candidate
+    return None
+
+
+def _body_words(text: str) -> list[str]:
+    """Every word of the text except the ones inside a placeholder."""
+    return [m.group() for m in _TOKEN.finditer(text) if not m.group().startswith("[")]
+
+
 def assert_no_pii(text: str, *, known_name: str | None) -> None:
-    """Fail closed: raise :class:`PiiLeak` if anything personal survived."""
+    """Fail closed: raise :class:`PiiLeak` if anything personal survived.
+
+    This is the backstop, and until the 2026-08-05 audit it could not fail in
+    the way that mattered. It re-ran the caller's own three rules on the
+    caller's own ``known_name``, so it was depth against a typo in strip_pii
+    and blind to the failure that actually happens in production: the caller
+    holding the WRONG name, or no name at all. It now also reads the DOCUMENT
+    — the source the caller failed to consult — and refuses text whose top
+    still carries something person-shaped.
+
+    The trade-off is not symmetric and the choice here is deliberate. A false
+    negative costs one leaked name at one model boundary. A false POSITIVE
+    costs a paying customer: enrichment.handle_answer turns any exception into
+    a soft_fail and the achievement the customer just typed is dropped;
+    intent.py falls back to deterministic parsing; the tailoring chain loses a
+    model call on a CV someone has paid for. So RECALL lives in strip_pii,
+    where the cost of being wrong is a redacted word inside a prompt, and this
+    function is tuned for PRECISION: it only speaks up about a CV-shaped
+    document (four lines, two section headings), only about its first two
+    readable lines, only when two or more tokens survive the role/place filter,
+    and only when they carry a positive person signal — Latin title case, or a
+    known Arabic given name or the «اسم + اللقب» article pattern. A name
+    buried in the body of a document goes undetected on purpose: we will not
+    block a customer's delivery on a heuristic that cannot tell a person from
+    an employer."""
     if _EMAIL.search(text):
         raise PiiLeak("email survived stripping")
     if _phone_hits(text):
         raise PiiLeak("phone-like digit run survived stripping")
-    for token in _name_tokens(known_name):
+    typed = _name_tokens(known_name)
+    for token in typed:
         if re.search(re.escape(token), text, re.IGNORECASE):
             raise PiiLeak("customer name survived stripping")
+    matcher = _NameMatcher(typed)
+    if matcher and any(matcher.matches(word) for word in _body_words(text)):
+        raise PiiLeak("a spelling variant of the customer name survived stripping")
+    if _residual_name(text) is not None:
+        raise PiiLeak("a personal name survived stripping")
 
 
 # ── the extractor boundary ───────────────────────────────────────────────────

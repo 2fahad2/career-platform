@@ -14,10 +14,14 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import IntegrityError, ProgrammingError
+from sqlalchemy.exc import DBAPIError, IntegrityError, ProgrammingError
 from sqlalchemy.orm import Session
 
-from career.db.session import app_engine, tenant_session
+from career.db.session import (
+    NO_TENANT_CONTEXT_SQLSTATE,
+    app_engine,
+    tenant_session,
+)
 
 NOW = datetime(2026, 7, 15, 21, 0, tzinfo=UTC)
 
@@ -149,10 +153,13 @@ def test_decisions_are_tenant_isolated(
             with tenant_session(a) as s:
                 _insert_decision(s, b, run_id, posting_id)  # forged tenant
         assert "row-level security" in str(err.value).lower()
-        with app_engine.connect() as conn:  # no context → fail closed
-            assert conn.execute(
-                text("SELECT count(*) FROM tenant_job_decisions")
-            ).scalar_one() == 0
+        # Migration 0021: no context is now REFUSED, not answered with zero.
+        # It used to return 0 rows in silence, which is what a tenant with no
+        # decisions today also looks like.
+        with pytest.raises(DBAPIError) as noctx:
+            with app_engine.begin() as conn:
+                conn.execute(text("SELECT count(*) FROM tenant_job_decisions"))
+        assert noctx.value.orig.sqlstate == NO_TENANT_CONTEXT_SQLSTATE
     finally:
         _cleanup_pool(owner_engine, posting_id, run_id)
 

@@ -2,10 +2,14 @@
 
 Polls pending WhatsApp webhook events every few seconds and feeds them to the
 tested worker with REAL boundaries: the Graph client (documents resolve from
-tenant storage), the REAL Claude extractor, and the onboarding orchestrator.
-The admin channel logs to the journal (TEN codes only) until Telegram is
-wired. The §11 upload pipeline stays fully armed — the canary scanner only
-stands in for the external AV hook, which was never in scope.
+tenant storage), the REAL Claude extractor, the §11 upload pipeline with the
+scanner this host actually has, and the onboarding orchestrator. The admin
+channel logs to the journal (TEN codes only) until Telegram is wired.
+
+It also runs the P0-8 boot verification before the first poll: the selling
+environment checked against the database, loudly, without ever refusing to
+start — see :func:`career.engine.cli.report_environment` for why the answer
+is «warn» and not «fail hard».
 """
 
 from __future__ import annotations
@@ -13,7 +17,6 @@ from __future__ import annotations
 import logging
 import time
 from datetime import UTC, date, datetime
-from decimal import Decimal
 from typing import IO
 from zoneinfo import ZoneInfo
 
@@ -22,6 +25,11 @@ from sqlalchemy.orm import Session
 
 from career.config import get_settings
 from career.db.models import CustomerChannel
+from career.engine.cli import (
+    parse_product_catalog,
+    parse_product_pricing,
+    report_environment,
+)
 from career.logging_filters import install_secret_redaction
 from career.onboarding.achievement_render import (
     AnthropicAchievementRenderer,
@@ -31,6 +39,7 @@ from career.onboarding.bullet_panel import AnthropicBulletJudge
 from career.onboarding.extraction import AnthropicExtractor
 from career.onboarding.intent import AnthropicIntentClassifier
 from career.onboarding.orchestrator import Deps, send_due_reminders
+from career.onboarding.upload import build_scanner, scanner_health
 from career.salla.client import HttpSallaClient
 from career.salla.provisioning import process_pending_webhooks
 from career.storage import FilesystemStorageAdapter
@@ -46,27 +55,11 @@ REMINDER_SWEEP_SECONDS = 3600.0  # §05 stall nudges — hourly is plenty for 24
 _RIYADH = ZoneInfo("Asia/Riyadh")
 
 
-def _salla_catalog(raw: str) -> dict[str, str]:
-    import json
-
-    try:
-        parsed = json.loads(raw or "{}")
-        return {str(k): str(v) for k, v in parsed.items()}
-    except ValueError:
-        return {}
-
-
-def _salla_pricing(raw: str) -> dict[str, tuple[Decimal, str]]:
-    import json
-
-    try:
-        parsed = json.loads(raw or "{}")
-        return {
-            str(k): (Decimal(str(v[0])), str(v[1]))
-            for k, v in parsed.items()
-        }
-    except (ValueError, LookupError, ArithmeticError):
-        return {}
+#: P0-8: both parsers moved to ``career.engine.cli`` so the boot check and
+#: the loop can never read the same environment two different ways — the
+#: check is only worth having if it inspects the map the loop actually uses.
+_salla_catalog = parse_product_catalog
+_salla_pricing = parse_product_pricing
 
 
 class JournalAdminClient:
@@ -75,17 +68,6 @@ class JournalAdminClient:
     def send_admin(self, text: str) -> str:
         logger.info("ADMIN: %s", text)
         return "journal"
-
-
-class CanaryScanner:
-    """Stands in for the external AV hook only — every §11 structural check
-    (magic sniff, PDF/DOCX inspection, sanitization, sandboxed extraction)
-    still runs at full strength."""
-
-    def scan(self, data: bytes) -> str | None:
-        return None
-
-
 
 
 def _acquire_single_instance_lock(name: str) -> IO[str]:
@@ -119,19 +101,13 @@ def main() -> None:  # pragma: no cover — the C7.8 live runner
         settings.whatsapp_phone_number_id,
         storage=storage,
     )
-    deps = Deps(
-        whatsapp_client=whatsapp,
-        scanner=CanaryScanner(),
-        storage=storage,
-        extractor=AnthropicExtractor(api_key=settings.anthropic_api_key),
-        achievement_renderer=AnthropicAchievementRenderer(
-            api_key=settings.anthropic_api_key),
-        examples_writer=AnthropicExamplesWriter(
-            api_key=settings.anthropic_api_key),
-        bullet_judge=AnthropicBulletJudge(api_key=settings.anthropic_api_key),
-        intent_classifier=AnthropicIntentClassifier(
-            api_key=settings.anthropic_api_key),
-    )
+    # The operator channel is resolved BEFORE the deps that carry it. The
+    # funnel's consent stall pages the operator only «when admin_client is
+    # wired» (funnel.flow._escalate_consent), and this construction did not
+    # wire it — so the one escalation a conversation can raise on its own
+    # opened its support_events ticket, logged its WARNING, and reached
+    # nobody. The ticket table has no reader yet either, which is what made
+    # the missing line invisible rather than merely quiet.
     admin: TelegramAdminClient
     if settings.telegram_admin_bot_token and settings.telegram_admin_chat_id:
         admin = HttpTelegramAdminClient(
@@ -144,26 +120,77 @@ def main() -> None:  # pragma: no cover — the C7.8 live runner
             admin = JournalAdminClient()
     else:
         admin = JournalAdminClient()
+    # The §11 malware scanner this host actually has. What stood here was a
+    # CanaryScanner whose scan() returned None — the value that means «clean» —
+    # for every byte of every upload, so the pipeline presented a control it
+    # was not running and every cv_uploads row read `clean`. build_scanner
+    # returns a real clamd client when a socket is configured and the honest
+    # UnconfiguredScanner when none is; the latter RAISES rather than passing,
+    # and validate_upload's declared policy stamps the row `unscanned`.
+    scanner = build_scanner(
+        settings.cv_scan_clamd_socket, timeout_s=settings.cv_scan_timeout_s
+    )
+    deps = Deps(
+        whatsapp_client=whatsapp,
+        scanner=scanner,
+        storage=storage,
+        extractor=AnthropicExtractor(api_key=settings.anthropic_api_key),
+        achievement_renderer=AnthropicAchievementRenderer(
+            api_key=settings.anthropic_api_key),
+        examples_writer=AnthropicExamplesWriter(
+            api_key=settings.anthropic_api_key),
+        bullet_judge=AnthropicBulletJudge(api_key=settings.anthropic_api_key),
+        intent_classifier=AnthropicIntentClassifier(
+            api_key=settings.anthropic_api_key),
+        # The SAME client the worker pages «دعم» on — one operator, one
+        # channel. A JournalAdminClient fallback is still a wiring: the
+        # escalation lands in the journal, which the watchtower's error
+        # screen harvests, instead of nowhere.
+        admin_client=admin,
+    )
     logger.info("worker loop up — polling every %.0fs", POLL_SECONDS)
 
     salla = HttpSallaClient(settings.salla_api_key)
     catalog = _salla_catalog(settings.salla_product_catalog)
     pricing = _salla_pricing(settings.salla_product_pricing)
-    # AUDIT ح-4: the triple-match gate now fails closed per product, and a
-    # coverage hole is announced at boot instead of discovered at refund time.
-    uncovered = sorted(set(catalog) - set(pricing))
-    if uncovered:
-        logger.error(
-            "SALLA_PRODUCT_PRICING misses cataloged products %s — their "
-            "orders will FAIL CLOSED to manual review", uncovered,
+    # AUDIT ح-4 / P0-8: the triple-match gate fails closed per product, and
+    # what used to be announced at boot was only the coverage hole (a
+    # cataloged product with no price). That missed the worse shape: a
+    # catalog that is FULLY covered and entirely wrong — for twelve days it
+    # sold a retired plan at a retired price, looking configured the whole
+    # time. The check now compares the environment against the database and
+    # the canonical sale table, and it warns rather than refusing to start:
+    # this process is serving customers who already paid (report_environment).
+    # alert=False: this unit is Restart=always/RestartSec=5, so a crash loop
+    # would put the same alert on his phone every five seconds. The ERROR
+    # lines still reach him through the journal harvester, and the nightly
+    # oneshot sends the one Telegram copy a day.
+    with Session(engine) as session:
+        report_environment(settings=settings, session=session,
+                           admin_client=admin, alert=False)
+    # The second thing this boot says out loud, for the same reason as the
+    # first: a control that is not running must not look like one that is. The
+    # environment report above catches a catalog that is configured and wrong;
+    # this catches a scanner that is configured and dead — a socket path with a
+    # typo, or a clamd that failed to come back after a host reboot — before a
+    # customer's upload is the thing that discovers it.
+    #
+    # Logged, never alerted, exactly like report_environment's alert=False just
+    # above: this unit is Restart=always with RestartSec=5, so an alerting boot
+    # check would put the same message on his phone twelve times a minute
+    # through a crash loop. The WARNING still reaches him — the journal
+    # harvester feeds the watchtower's error screen — and the health screen
+    # renders the live state on every tap.
+    boot_scan_health = scanner_health(scanner)
+    if boot_scan_health.ok:
+        logger.info("upload scanner ready: %s", boot_scan_health.engine)
+    else:
+        # detail is a PII-free slug by contract (§15.13) — safe to journal
+        logger.warning(
+            "upload scanner is NOT scanning: %s (%s) — uploads are recorded"
+            " as unscanned",
+            boot_scan_health.state, boot_scan_health.detail,
         )
-        try:
-            admin.send_admin(
-                "⚠️ تسعيرة سلة ناقصة لمنتجات في الكتالوج — طلباتها ستُحوّل "
-                "للمراجعة اليدوية حتى تكتمل التسعيرة"
-            )
-        except Exception:  # noqa: BLE001
-            logger.warning("pricing warning notify failed", exc_info=True)
     last_reminder_sweep = 0.0
     last_window_nudge: date | None = None
     last_weekly_report: date | None = None

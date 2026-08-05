@@ -207,6 +207,193 @@ def test_bank_transfer_confirmation_event_provisions(
     assert results and results[0].status is ProvisionStatus.PROVISIONED
 
 
+class TestTheAdminChannelHoldsNoCredential:
+    """The activation deep link used to be posted to the admin Telegram
+    channel on every fresh provision, live for seven days. The DB never stored
+    the raw token — the chat log did, forever, and anyone reading the channel
+    could bind any phone to that paid subscription. These tests pin that the
+    announcement carries no credential and that the operator kept the
+    capability it was standing in for."""
+
+    def test_new_subscription_announcement_carries_no_raw_token(
+        self, owner_session: Session, clean_billing: None
+    ) -> None:
+        from career.salla.provisioning import _announce_provision
+        from career.telegram.admin import FakeTelegramAdminClient
+
+        order_id = f"ORD-{uuid.uuid4()}"
+        client = FakeSallaClient({order_id: _order(order_id)})
+        result = provision_order(
+            owner_session, order_id, salla_client=client,
+            product_catalog=CATALOG, expected_pricing=PRICING,
+        )
+        assert result.activation_token
+
+        admin = FakeTelegramAdminClient()
+        _announce_provision(
+            owner_session, result, admin_client=admin,
+            whatsapp_number_e164="+966500000000", whatsapp_client=None,
+        )
+
+        assert admin.messages, "the operator must still hear about a sale"
+        blob = "\n".join(admin.messages)
+        assert result.activation_token not in blob
+        assert "wa.me" not in blob
+        assert "?text=" not in blob      # the pre-filled deep-link parameter
+        # The prose may well say «التفعيل»; what must never appear is the
+        # activation PHRASING that a WhatsApp client would send verbatim.
+        from career.salla.activation_link import activation_message
+
+        assert activation_message(result.activation_token) not in blob
+
+    def test_operator_can_still_issue_a_link_for_an_unclaimed_order(
+        self, owner_session: Session, clean_billing: None
+    ) -> None:
+        from career.salla.provisioning import (
+            LinkIssueStatus,
+            issue_activation_link,
+        )
+        from career.whatsapp.inbound import InboundKind, classify_inbound
+
+        order_id = f"ORD-{uuid.uuid4()}"
+        client = FakeSallaClient({order_id: _order(order_id)})
+        result = provision_order(
+            owner_session, order_id, salla_client=client,
+            product_catalog=CATALOG, expected_pricing=PRICING,
+        )
+        code = owner_session.execute(
+            text("SELECT code FROM tenants WHERE id::text = :t"),
+            {"t": result.tenant_id},
+        ).scalar_one()
+
+        issued = issue_activation_link(
+            owner_session, tenant_code=code,
+            whatsapp_number_e164="+966500000000",
+        )
+
+        assert issued.status is LinkIssueStatus.ISSUED
+        assert issued.link and issued.link.startswith("https://wa.me/966500000000")
+        # The link the operator hands over must actually activate: the
+        # pre-filled text has to survive the inbound classifier.
+        from urllib.parse import parse_qs, urlparse
+
+        prefilled = parse_qs(urlparse(issued.link).query)["text"][0]
+        kind, token = classify_inbound(prefilled)
+        assert kind is InboundKind.ACTIVATION
+        assert token is not None
+
+    def test_issuing_retires_the_previous_token(
+        self, owner_session: Session, owner_engine: Engine, clean_billing: None
+    ) -> None:
+        """Two live tokens on one subscription is not merely untidy: the
+        zero-touch claim path selects the single unused token with
+        scalar_one_or_none, so a leftover would raise inside the WhatsApp
+        worker and lock that customer out of activating at all."""
+        from career.salla.provisioning import issue_activation_link
+
+        order_id = f"ORD-{uuid.uuid4()}"
+        client = FakeSallaClient({order_id: _order(order_id)})
+        result = provision_order(
+            owner_session, order_id, salla_client=client,
+            product_catalog=CATALOG, expected_pricing=PRICING,
+        )
+        code = owner_session.execute(
+            text("SELECT code FROM tenants WHERE id::text = :t"),
+            {"t": result.tenant_id},
+        ).scalar_one()
+        first = issue_activation_link(
+            owner_session, tenant_code=code, whatsapp_number_e164="+966500000000")
+        second = issue_activation_link(
+            owner_session, tenant_code=code, whatsapp_number_e164="+966500000000")
+
+        assert first.link != second.link
+        with Session(owner_engine) as s:
+            unused = s.execute(
+                text("SELECT count(*) FROM activation_tokens at"
+                     " JOIN subscriptions sub ON sub.id = at.subscription_id"
+                     " WHERE sub.salla_order_id = :o AND at.used_at IS NULL"),
+                {"o": order_id},
+            ).scalar_one()
+        assert unused == 1
+
+    def test_issued_link_is_short_lived(
+        self, owner_session: Session, clean_billing: None
+    ) -> None:
+        from career.salla.provisioning import (
+            ACTIVATION_TOKEN_TTL_DAYS,
+            OPERATOR_LINK_TTL_MINUTES,
+            issue_activation_link,
+        )
+
+        order_id = f"ORD-{uuid.uuid4()}"
+        client = FakeSallaClient({order_id: _order(order_id)})
+        result = provision_order(
+            owner_session, order_id, salla_client=client,
+            product_catalog=CATALOG, expected_pricing=PRICING,
+        )
+        code = owner_session.execute(
+            text("SELECT code FROM tenants WHERE id::text = :t"),
+            {"t": result.tenant_id},
+        ).scalar_one()
+
+        issued = issue_activation_link(
+            owner_session, tenant_code=code, whatsapp_number_e164="+966500000000")
+
+        assert issued.expires_at is not None
+        from datetime import UTC, datetime
+
+        minutes = (issued.expires_at - datetime.now(UTC)).total_seconds() / 60
+        assert 0 < minutes <= OPERATOR_LINK_TTL_MINUTES
+        assert OPERATOR_LINK_TTL_MINUTES < ACTIVATION_TOKEN_TTL_DAYS * 24 * 60
+
+    def test_no_link_for_an_account_that_is_already_activated(
+        self, owner_session: Session, clean_billing: None
+    ) -> None:
+        """Once the order is claimed there is nothing to hand over, and a link
+        minted anyway would be a way INTO a live account."""
+        from career.salla.provisioning import (
+            LinkIssueStatus,
+            issue_activation_link,
+        )
+
+        order_id = f"ORD-{uuid.uuid4()}"
+        client = FakeSallaClient({order_id: _order(order_id)})
+        result = provision_order(
+            owner_session, order_id, salla_client=client,
+            product_catalog=CATALOG, expected_pricing=PRICING,
+        )
+        owner_session.execute(
+            text("UPDATE subscriptions SET status = :s WHERE salla_order_id = :o"),
+            {"s": st.ACTIVE, "o": order_id},
+        )
+        owner_session.commit()
+        code = owner_session.execute(
+            text("SELECT code FROM tenants WHERE id::text = :t"),
+            {"t": result.tenant_id},
+        ).scalar_one()
+
+        issued = issue_activation_link(
+            owner_session, tenant_code=code, whatsapp_number_e164="+966500000000")
+
+        assert issued.status is LinkIssueStatus.ALREADY_ACTIVATED
+        assert issued.link is None
+
+    def test_unknown_tenant_code_yields_nothing(
+        self, owner_session: Session, clean_billing: None
+    ) -> None:
+        from career.salla.provisioning import (
+            LinkIssueStatus,
+            issue_activation_link,
+        )
+
+        issued = issue_activation_link(
+            owner_session, tenant_code="TEN-9999",
+            whatsapp_number_e164="+966500000000")
+
+        assert issued.status is LinkIssueStatus.NO_UNCLAIMED_ORDER
+        assert issued.link is None
+
+
 def test_tenant_code_survives_deletion_gap(
     owner_session: Session, clean_billing: None
 ) -> None:

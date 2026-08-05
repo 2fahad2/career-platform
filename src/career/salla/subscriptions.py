@@ -71,6 +71,24 @@ _ALLOWED: dict[str, frozenset[str]] = {
     SUSPENDED: frozenset({ACTIVE, CANCELED, REFUNDED, CHARGEBACK}),
 }
 
+#: The states a pause may legally leave, DERIVED from the table above and
+#: never restated anywhere else.
+#:
+#: onboarding.privacy kept a hand-written copy of this set and the two drifted:
+#: it counted GRACE as pausable while no GRACE→PAUSED edge was ever added here,
+#: so `transition` raised InvalidTransition straight through the standing
+#: privacy command into the WhatsApp worker. The customer whose paid period had
+#: just ended — exactly the person most likely to type «وقف مؤقت» — got their
+#: inbound row rolled back, their event marked failed, and no reply at all.
+#: GRACE stays out on the product's own terms (§05: the period has ALREADY
+#: ended there, the 48 hours are a countdown to expiry, and a pause «لا يمدد
+#: المدة» so it cannot buy a single one of them back), but the point of
+#: publishing the set is that nobody has to remember that: whoever wants to
+#: know whether a state can be paused asks the machine.
+PAUSABLE_STATES: frozenset[str] = frozenset(
+    state for state, allowed in _ALLOWED.items() if PAUSED in allowed
+)
+
 # Salla order lifecycle event → the target service-off state.
 _ORDER_EVENT_TO_STATE = {
     "order.refunded": REFUNDED,

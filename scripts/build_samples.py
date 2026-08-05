@@ -140,7 +140,7 @@ _TAILORED = TailoredCV(
 
 
 
-# ── the sample analysis report (the 49-SAR product) ─────────────────────────
+# ── the sample analysis report (the 29-SAR product) ─────────────────────────
 # Built from the SAME evaluation engine production runs, over facts that
 # mirror the fictional persona above — so the sample scores are real output,
 # not numbers typed by hand.

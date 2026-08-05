@@ -35,6 +35,7 @@ from career.db.models import (
     OnboardingSession,
     OutcomeEvent,
     Subscription,
+    SupportEvent,
     Tenant,
     TenantDayState,
     TenantJobSuppression,
@@ -97,17 +98,113 @@ RESEND_CLOSED_AR = (
 RESEND_OPTED_OUT_AR = "🚫 العميل أوقف الرسائل — لن نرسل له شيئًا\n{code}"
 RESEND_NOTHING_AR = "⚪ لا توجد حزمة معلّقة لإعادة إرسالها لهذا العميل\n{code}"
 
+#: Pause / resume answers. INCIDENT (⏸️ crash loop): the action path had no
+#: guard at all, so `privacy._subscription` raising RequestNotFound for a
+#: tenant with no live subscription escaped `handle_update` — and the runner
+#: stores the Telegram offset only AFTER handle_update returns, so the same
+#: update was re-fed every five seconds forever and the operator's whole
+#: watchtower was dead until someone restarted the service. Shell tenants are
+#: routine (every §04 upgrade leaves one) and the customers list filters
+#: nothing, so the pause button sat live on their cards.
+#:
+#: The second half of the same incident is the opposite failure: privacy
+#: returns the row UNCHANGED when the state cannot pause / is not paused,
+#: while the console printed «✅ أوقفنا / استأنفنا» unconditionally. So every
+#: reply below is derived from what the subscription ACTUALLY is after the
+#: call — never from the fact that the call returned. Lines stay
+#: direction-pure: the TEN code and the raw status token each stand alone.
+ACTION_NO_SUB_AR = "⚪ لا يوجد اشتراك لهذا العميل — لم نغيّر شيئًا\n{code}"
+PAUSE_ALREADY_AR = "ℹ️ الخدمة موقوفة مؤقتًا أصلًا — لم نغيّر شيئًا\n{code}"
+PAUSE_REFUSED_AR = (
+    "⚪ لا يقبل هذا الاشتراك الإيقاف المؤقت وحالته:\n{status}\n"
+    "لم نغيّر شيئًا\n{code}"
+)
+RESUME_NOT_PAUSED_AR = (
+    "⚪ الاشتراك ليس موقوفًا حتى نستأنفه وحالته:\n{status}\n"
+    "لم نغيّر شيئًا\n{code}"
+)
+#: Last resort for this action only: something inside the subscription layer
+#: refused in a way we do not have a name for. Never a traceback — the
+#: operator gets the situation, the log gets the exception.
+ACTION_FAILED_AR = (
+    "🔴 لم ينفَّذ الإجراء ولم نغيّر شيئًا\n"
+    "التفاصيل في شاشة الأخطاء\n{code}"
+)
+#: The barrier's own answer — see :func:`handle_update`.
+SCREEN_FAILED_AR = "🔴 تعذّر تنفيذ هذه الخطوة — التفاصيل في شاشة الأخطاء"
+
+#: ── «إصدار رابط تفعيل»: the operator's fallback when zero-touch cannot ──
+#:
+#: The standing deep link used to be posted to this channel on every sale and
+#: sat there live for seven days per order; it was removed and replaced by
+#: ``salla.provisioning.issue_activation_link`` — on demand, sixty minutes,
+#: rotating, refused for a claimed order. That left the capability with no
+#: TRIGGER: an API the operator could not call is not a fallback, and the
+#: buyer whose order carries no usable phone stays unactivated.
+#:
+#: Three things the operator must be told, because each one otherwise reads as
+#: a bug: the link dies in an hour, it is single-use, and issuing a new one
+#: retires the old one — an expired or retired link answers the buyer «رمز
+#: التفعيل مستخدم مسبقًا», which looks exactly like a broken system to
+#: whoever did not know they replaced it.
+LINK_ISSUED_AR = (
+    "🔑 أصدرنا رابط تفعيل جديد للعميل\n"
+    "{code}\n"
+    "صالح {ttl} دقيقة فقط، ولمرة واحدة\n"
+    "أرسله للمشتري في محادثته وحده — لا تنشره ولا تعيد توجيهه\n"
+    "أي رابط سابق لهذا الطلب أُلغي الآن، ولو استخدمه المشتري بيجيه\n"
+    "«رمز التفعيل مستخدم مسبقًا» وهذا ليس عطلًا\n"
+    "{link}"
+)
+#: Refusing OUT LOUD. Silence here is worse than a refusal: the operator taps
+#: because a buyer is waiting on the phone, and an action that answers nothing
+#: sends them looking for a fault that is not there.
+LINK_ALREADY_ACTIVATED_AR = (
+    "⚪ طلب هذا العميل مُفعَّل أصلًا — لم نصدر أي رابط\n"
+    "الرابط يُصدر فقط لطلب مدفوع لم يُطالَب به بعد\n{code}"
+)
+LINK_NO_ORDER_AR = (
+    "⚪ لا يوجد طلب مدفوع بانتظار التفعيل لهذا العميل — لم نصدر شيئًا\n{code}"
+)
+
 #: The mutating actions the console may perform. pause/resume are pure-DB;
-#: resend re-attempts a held bundle over WhatsApp (needs an injected client).
+#: resend re-attempts a held bundle over WhatsApp (needs an injected client);
+#: issue_link mints a one-hour activation credential for a waiting order.
 #: NOTE «رد على العميل» is deliberately NOT here: it does not use the
 #: confirm-card path (the typed text is the confirmation), so keeping it out
 #: makes a forged ``v1|confirm|<reply nonce>`` fall through _run_action's
 #: ``action not in _ACTIONS`` guard and do nothing.
+#: The ✅ lines are reachable ONLY after the new status has been read back
+#: from the subscription — see :func:`_run_subscription_action`. The second
+#: element of an entry whose runner composes its own answer (resend,
+#: issue_link) is the REFUSAL, never a tick: nothing here may inherit a ✅.
 _ACTIONS = {
     "pause": ("⏸️ إيقاف مؤقت", "✅ أوقفنا الخدمة مؤقتًا للعميل\n{code}"),
     "resume": ("▶️ استئناف", "✅ استأنفنا الخدمة للعميل\n{code}"),
     "resend": ("📤 إعادة إرسال الحزمة", RESEND_NOTHING_AR),
+    "issue_link": ("🔑 إصدار رابط تفعيل", LINK_NO_ORDER_AR),
 }
+
+#: ── open support tickets ────────────────────────────────────────────────────
+#: `support_events` has been written since C4 — «دعم» from a customer, and now
+#: the funnel's consent stall — and NOTHING has ever read the table. The
+#: operator is paged once, at the moment it happens, and after that the ticket
+#: exists only in the database. This screen is the minimum that makes them
+#: visible: what is open, for how long, and whose (TEN code only). Assignment,
+#: resolution and SLA belong to a later wave.
+TICKETS_TITLE_AR = "🎫 التذاكر المفتوحة"
+TICKETS_NONE_AR = "🟢 لا توجد تذاكر مفتوحة"
+#: Ticket kinds, in the words of what actually happened to the customer.
+_TICKET_KIND_AR = {
+    "support_request": "طلب التواصل مع الدعم",
+    "funnel_consent_stuck": "متعثّر عند بوابة الموافقة",
+}
+#: How many tickets one screen shows. A watchtower screen the operator has to
+#: scroll is a screen they stop reading; the count line stays truthful about
+#: the rest.
+TICKETS_PAGE = 10
+
+_WESTERN_TO_ARABIC = str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩")
 
 # ── the operator's one free-form reply (audit: «دعم» paged and left them
 # hunting for the phone). Same one-shot nonce as every mutating action; the
@@ -130,6 +227,13 @@ REPLY_PROMPT_AR = (
     "المهلة خمس دقائق\n{marker}"
 )
 REPLY_SENT_AR = "✅ أرسلنا ردك للعميل\n{code}"
+#: The half-success nobody had a word for: واتساب accepted the message and our
+#: own ledger write failed. «لم يصل» would have the operator type it again and
+#: the customer read it twice, «✅» would hide a hole in §14's conversation log.
+REPLY_SENT_UNLOGGED_AR = (
+    "🟠 وصل ردك للعميل ولم نتمكن من تسجيله في سجل المحادثة\n"
+    "لا تعد إرساله\n{code}"
+)
 REPLY_FAILED_AR = (
     "🔴 لم يصل الرد — واتساب رفض الإرسال ولم نسجّل شيئًا؛ أعد المحاولة"
     "\n{code}"
@@ -174,7 +278,9 @@ def _screen(
     now: datetime, whatsapp_client: WhatsAppClient | None = None,
 ) -> tuple[str, Keyboard] | None:
     if name == "menu":
-        return views.render_menu()
+        return _menu_screen()
+    if name == "tickets":
+        return _tickets_screen(session, now=now)
     if name == "today":
         return views.render_today(*_today_data(session, now=now))
     if name == "health":
@@ -188,7 +294,7 @@ def _screen(
     if name == "tenant":
         card = _tenant_card(session, code=arg, now=now,
                             whatsapp_client=whatsapp_client)
-        return views.render_tenant_card(card) if card else None
+        return _tenant_screen(card) if card else None
     if name == "business":
         if arg not in ("7", "30", "all"):
             return None
@@ -205,7 +311,7 @@ def _screen(
             return None
         card = _tenant_card(session, code=code, now=now,
                             whatsapp_client=whatsapp_client)
-        return views.render_tenant_card(card) if card else None
+        return _tenant_screen(card) if card else None
     if name == "act":
         # v1|act|<TEN>|<action> → a confirm card carrying a one-shot nonce
         parts2 = arg.split("|")
@@ -220,6 +326,12 @@ def _screen(
             # never mint a confirmation for a resend that can only answer
             # "nothing to resend" (no held bundle / opted out / no client)
             return None
+        # NOTE issue_link has no such gate on purpose. A doomed resend costs
+        # one of three delivery attempts, so it is refused before the nonce
+        # exists; a doomed issue costs nothing and its refusal is the very
+        # answer the operator needs («the order is already claimed»). Hiding
+        # it behind an «انتهت صلاحية الزر» would be the silent failure the
+        # button was added to end.
         nonce = _new_nonce(action, code, now)
         label = _ACTIONS[action][0]
         # every line direction-pure: the TEN code stands alone
@@ -239,11 +351,108 @@ def _screen(
                             whatsapp_client=whatsapp_client)
         if card is None:
             return (done_msg, [[("🏠 الرئيسية", "v1|menu")]])
-        text, keyboard = views.render_tenant_card(card)
+        text, keyboard = _tenant_screen(card)
         return (f"{done_msg}\n\n{text}", keyboard)
     if name == "soon":
         return views.render_soon(arg)
     return None
+
+
+def _ar_digits(value: Any) -> str:
+    """Western digits → Arabic-Indic, so a number can live INSIDE an Arabic
+    line without scrambling it (§16). The alternative — a bare Latin numeral
+    on a line of its own — is what the rest of this file does for values we
+    do not control; these we do."""
+    return str(value).translate(_WESTERN_TO_ARABIC)
+
+
+def _menu_screen() -> tuple[str, Keyboard]:
+    """The menu, plus the row that leads to the open tickets.
+
+    The row is added here rather than in ``views`` for the same reason the
+    activation-link button is (see :func:`_tenant_screen`): the screens this
+    module can actually serve are defined in this module, and a trigger that
+    lives beside its handler cannot be forgotten the way the activation link's
+    was.
+    """
+    text, keyboard = views.render_menu()
+    return text, [*keyboard, [("🎫 التذاكر المفتوحة", "v1|tickets")]]
+
+
+def _tenant_screen(card: dict[str, Any]) -> tuple[str, Keyboard]:
+    """The customer card, plus the actions this module owns.
+
+    ``views`` renders the card and its standing buttons; the activation-link
+    row is added here, next to ``_ACTIONS`` and its runner, because the whole
+    incident behind this button was a capability that existed with no way to
+    reach it. Keeping the trigger in the same file as the action table means
+    the two cannot drift apart again.
+
+    It is inserted BEFORE the navigation row so «الرئيسية» stays where the
+    operator's thumb already expects it.
+    """
+    text, keyboard = views.render_tenant_card(card)
+    if card.get("can_issue_link"):
+        label = _ACTIONS["issue_link"][0]
+        row = [(label, f"v1|act|{card['code']}|issue_link")]
+        keyboard = [*keyboard[:-1], row, keyboard[-1]]
+    return text, keyboard
+
+
+def _age_ar(since: datetime | None, now: datetime) -> str:
+    """«منذ ٣ ساعات» — how long this has been waiting, which is the whole
+    point of showing a ticket at all. Rounded down to the largest unit that
+    is not a lie: a ticket open for ninety minutes reads as an hour, and one
+    open for three days reads as three days, not seventy-two hours."""
+    if since is None:
+        return "منذ وقت غير معروف"
+    minutes = max(0, int((now - since).total_seconds() // 60))
+    if minutes < 60:
+        return f"منذ {_ar_digits(minutes)} دقيقة"
+    hours = minutes // 60
+    if hours < 24:
+        return f"منذ {_ar_digits(hours)} ساعة"
+    return f"منذ {_ar_digits(hours // 24)} يوم"
+
+
+def _tickets_screen(
+    session: Session, *, now: datetime
+) -> tuple[str, Keyboard]:
+    """Every open support ticket, oldest first — the table's first reader.
+
+    Oldest first because age is the only priority signal this screen has: the
+    ticket that has been open longest is the customer who has been waiting
+    longest, and a paying customer who asked for a human is the one thing
+    this product may not lose. TEN codes only (§15.13) — the card behind each
+    one is a tap away and carries no PII either.
+    """
+    rows = session.execute(
+        select(Tenant.code, SupportEvent.kind, SupportEvent.created_at)
+        .join(Tenant, Tenant.id == SupportEvent.tenant_id)
+        .where(SupportEvent.status == "open")
+        .order_by(SupportEvent.created_at)
+    ).all()
+    lines = [f"{TICKETS_TITLE_AR}: {_ar_digits(len(rows))}"]
+    if not rows:
+        lines.append(TICKETS_NONE_AR)
+    for code, kind, created_at in rows[:TICKETS_PAGE]:
+        lines.append("")
+        # an unknown kind keeps its own line: it is a raw Latin token and a
+        # mixed Arabic+Latin line arrives scrambled on the operator's client
+        known = _TICKET_KIND_AR.get(str(kind))
+        lines.append(f"• {known}" if known else f"•\n{kind}")
+        lines.append(str(code))
+        lines.append(_age_ar(created_at, now))
+    if len(rows) > TICKETS_PAGE:
+        lines.append("")
+        lines.append(
+            f"وأقدم {_ar_digits(TICKETS_PAGE)} معروضة من أصل "
+            f"{_ar_digits(len(rows))}"
+        )
+    keyboard: Keyboard = [
+        [("🔄 تحديث", "v1|tickets"), ("🏠 الرئيسية", "v1|menu")],
+    ]
+    return "\n".join(lines), keyboard
 
 
 def _today_data(
@@ -444,6 +653,11 @@ def _tenant_card(
             and channel is not None
             and window != "opted_out"
         ),
+        # «إصدار رابط تفعيل» is offered exactly where it can do anything: a
+        # paid order still waiting to be claimed. It is NOT a gate on the
+        # action — a stale card that has since been activated must still get
+        # a spoken refusal, not a dead button (see the act branch).
+        "can_issue_link": str(sub.status if sub else "") == "PAID_UNCLAIMED",
         # what LANDED, not only the status word: a PARTIAL whose delivered
         # list is empty must never read as «وصل جزء منها» (§15.12).
         "last_delivery": (
@@ -689,6 +903,117 @@ def _new_nonce(action: str, code: str, now: datetime) -> str:
     return nonce
 
 
+def _run_subscription_action(
+    session: Session, *, tenant_id: Any, action: str, code: str
+) -> str:
+    """Pause or resume, then say what ACTUALLY happened to the subscription.
+
+    Two halves of one incident live here.
+
+    The first is the crash loop: the pause button is drawn on every card,
+    including the shell tenants a §04 upgrade leaves behind, and for those
+    ``privacy._subscription`` raises RequestNotFound. With no guard on this
+    path the exception left ``handle_update``, the runner never advanced the
+    Telegram offset, and one tap wedged the entire console into a five-second
+    retry of the same dead update. So the live row is resolved HERE, with the
+    same reader privacy uses (``current_subscription`` — its absence is a
+    fact, not an error), and the two named refusals of the subscription layer
+    are answered instead of propagating.
+
+    The second is the false success. ``pause_subscription`` returns the row
+    untouched from a state it may not leave, and ``resume_subscription``
+    returns it untouched unless the status is exactly PAUSED — while the
+    console printed «✅ استأنفنا الخدمة للعميل» either way. On the one action
+    that puts a paying customer back in service, a green tick that means
+    «nothing moved» is worse than an error. Every reply below is therefore
+    read back from the subscription after the call, and the ✅ is emitted only
+    when the status is the one we asked for.
+    """
+    from career.onboarding import privacy
+    from career.salla import subscriptions as sub_states
+    from career.salla.renewal import current_subscription
+
+    subscription = current_subscription(session, tenant_id)
+    if subscription is None:
+        return ACTION_NO_SUB_AR.format(code=code)
+    before = str(subscription.status)
+    if action == "pause" and before == sub_states.PAUSED:
+        # idempotent, and honest about it: a second ✅ reads as a fresh pause
+        return PAUSE_ALREADY_AR.format(code=code)
+    if action == "resume" and before != sub_states.PAUSED:
+        return RESUME_NOT_PAUSED_AR.format(code=code, status=before)
+    wanted = sub_states.PAUSED if action == "pause" else sub_states.ACTIVE
+    try:
+        if action == "pause":
+            privacy.pause_subscription(session, tenant_id=tenant_id)
+        else:
+            privacy.resume_subscription(session, tenant_id=tenant_id)
+    except sub_states.InvalidTransition:
+        # the state machine has no edge for it — e.g. GRACE, which privacy
+        # counts as pausable while `_ALLOWED` has no GRACE→PAUSED edge. The
+        # refusal is a fact about the state, so name the state.
+        logger.error("watchtower %s refused by the state machine", action,
+                     exc_info=True)
+        session.rollback()
+        return _refused_ar(action).format(code=code, status=before)
+    except privacy.RequestNotFound:
+        # the live row vanished between our read and the call (a race we did
+        # not create); nothing was written, so say nothing changed
+        logger.error("watchtower %s lost its subscription", action,
+                     exc_info=True)
+        session.rollback()
+        return ACTION_NO_SUB_AR.format(code=code)
+    after = str(subscription.status)
+    if after != wanted:
+        # privacy declined silently — no exception, no change, no ✅
+        session.rollback()
+        return _refused_ar(action).format(code=code, status=after)
+    session.commit()
+    return _ACTIONS[action][1].format(code=code)
+
+
+def _refused_ar(action: str) -> str:
+    return PAUSE_REFUSED_AR if action == "pause" else RESUME_NOT_PAUSED_AR
+
+
+def _run_issue_link(session: Session, *, code: str, now: datetime) -> str:
+    """Mint one activation link for a waiting order and hand it back.
+
+    The return value of this function is a LIVE CREDENTIAL: whoever opens the
+    link binds their phone to that paid subscription. It therefore goes
+    exactly one place — the string this function returns, which the console
+    delivers to the operator's own chat as the answer to the button they just
+    pressed. It is never logged (not even at DEBUG, not even on the failure
+    paths), never sent through ``admin_client.send_admin``, and never put in
+    an exception message. The previous design posted it to this same channel
+    automatically on every sale, and that is the incident this whole path
+    exists to undo — the redaction filter cannot cover for a mistake here,
+    because the token rides in a ``text=`` query parameter and matches no key
+    name and no provider token shape.
+
+    ``issue_activation_link`` commits its own work (a new token row, the
+    retirement of any outstanding one, an audit row), so there is nothing to
+    commit here and nothing to roll back.
+    """
+    from career.salla.provisioning import (
+        OPERATOR_LINK_TTL_MINUTES,
+        LinkIssueStatus,
+        issue_activation_link,
+    )
+
+    issue = issue_activation_link(
+        session, tenant_code=code,
+        whatsapp_number_e164=get_settings().whatsapp_number_e164, now=now,
+    )
+    if issue.status is LinkIssueStatus.ALREADY_ACTIVATED:
+        return LINK_ALREADY_ACTIVATED_AR.format(code=code)
+    if issue.status is not LinkIssueStatus.ISSUED or not issue.link:
+        return LINK_NO_ORDER_AR.format(code=code)
+    return LINK_ISSUED_AR.format(
+        code=code, ttl=_ar_digits(OPERATOR_LINK_TTL_MINUTES), link=issue.link,
+    )
+
+
 def _run_action(
     session: Session, *, nonce: str, now: datetime,
     whatsapp_client: WhatsAppClient | None = None,
@@ -706,13 +1031,13 @@ def _run_action(
     ).scalars().first()
     if tenant is None:
         return None
-    from career.onboarding import privacy
-
-    if action == "pause":
-        privacy.pause_subscription(session, tenant_id=tenant.id)
-    elif action == "resume":
-        privacy.resume_subscription(session, tenant_id=tenant.id)
-    elif action == "resend":
+    if action in ("pause", "resume"):
+        return code, _run_subscription_action(
+            session, tenant_id=tenant.id, action=action, code=code
+        )
+    if action == "issue_link":
+        return code, _run_issue_link(session, code=code, now=now)
+    if action == "resend":
         if whatsapp_client is None:      # no client injected → nothing to do
             return None
         result = resend_pending_delivery(
@@ -756,8 +1081,13 @@ def _run_action(
         else:                            # nothing claimable at all
             message = RESEND_NOTHING_AR
         return code, message.format(code=code)
-    session.commit()
-    return code, _ACTIONS[action][1].format(code=code)
+    # Unreachable while _ACTIONS holds exactly the three above — and kept that
+    # way deliberately. The old tail here committed and printed
+    # ``_ACTIONS[action][1]`` for anything that fell through, which is how a
+    # ✅ came to be emitted without anyone checking the outcome. A new action
+    # must state its own verified result; inheriting a tick is not allowed.
+    logger.error("watchtower action %s has no runner", action)
+    return code, ACTION_FAILED_AR.format(code=code)
 
 
 def _reply_target(
@@ -858,11 +1188,20 @@ def _run_reply(
         return REPLY_FAILED_AR.format(code=code)
     # §14: the customer received it, so the conversation log and the reach
     # metrics must carry it exactly like any other outbound.
-    record_out(
-        session, tenant_id=tenant.id, channel_id=channel.id, kind=REPLY_KIND,
-        wa_message_id=wa_message_id, now=now,
-    )
-    session.commit()
+    try:
+        record_out(
+            session, tenant_id=tenant.id, channel_id=channel.id,
+            kind=REPLY_KIND, wa_message_id=wa_message_id, now=now,
+        )
+        session.commit()
+    except Exception:  # noqa: BLE001 — the send already happened
+        # The message IS with the customer; only our ledger failed. Answering
+        # «لم يصل» here would send the operator to type it again and the
+        # customer would read it twice — so the reply says exactly which half
+        # succeeded, and the missing row is an ERROR the operator can see.
+        logger.error("operator reply landed but was not recorded", exc_info=True)
+        session.rollback()
+        return REPLY_SENT_UNLOGGED_AR.format(code=code)
     return REPLY_SENT_AR.format(code=code)
 
 
@@ -901,6 +1240,18 @@ def _chat_id_of(update: dict[str, Any]) -> str | None:
     return None
 
 
+def _failure_outcome(update: dict[str, Any]) -> list[Outcome]:
+    """What the operator sees when a tap could not be served at all. A
+    callback is ACKed so its spinner stops; a plain message is answered with a
+    fresh one carrying the way home."""
+    cbq_id = str((update.get("callback_query") or {}).get("id") or "")
+    if cbq_id:
+        return [Outcome(kind="ack", callback_query_id=cbq_id,
+                        text=SCREEN_FAILED_AR)]
+    return [Outcome(kind="send", text=SCREEN_FAILED_AR,
+                    keyboard=[[("🏠 الرئيسية", "v1|menu")]])]
+
+
 def handle_update(
     session: Session,
     update: dict[str, Any],
@@ -912,14 +1263,56 @@ def handle_update(
 ) -> list[Outcome]:
     """``whatsapp_client`` is injected by the runner (same style as every other
     side-effecting path); without it the console stays read-only and the
-    «إعادة إرسال» button is never offered."""
+    «إعادة إرسال» button is never offered.
+
+    This function also carries the last-resort barrier, and the reason is the
+    BLAST RADIUS rather than any one bug. The runner stores the Telegram
+    offset only after we return, so an exception escaping here is not a failed
+    screen — it is a permanent outage: the same update is re-fed every five
+    seconds, no button works, and the operator is told nothing at all. The
+    barrier converts that into one failed tap.
+
+    It is a barrier, not a blanket: the exception is logged at ERROR with its
+    traceback, which puts it in front of the operator on the ⚠️ الأخطاء screen
+    (the collector reads our own ERROR lines out of journalctl), and the reply
+    names the situation instead of printing Python. The rollback matters as
+    much as the catch — a session left in a failed transaction would make the
+    runner's own ``_store_offset`` throw next, which is the very loop we are
+    closing. Real failures still stop being invisible; they just stop taking
+    the watchtower with them.
+
+    Authorization stays OUTSIDE the barrier on purpose: a foreign chat must
+    receive nothing, not even a failure notice.
+    """
     chat_id = _chat_id_of(update)
     if chat_id is None:
         return []
     if chat_id != str(admin_chat_id):
         logger.warning("watchtower: ignored update from foreign chat")
         return []
+    try:
+        return _dispatch(
+            session, update, probes=probes, now=now,
+            whatsapp_client=whatsapp_client,
+        )
+    except Exception:  # noqa: BLE001 — see the docstring: outage vs failed tap
+        logger.error("watchtower update failed", exc_info=True)
+        try:
+            session.rollback()
+        except Exception:  # noqa: BLE001 — a dead session must not loop either
+            logger.error("watchtower rollback failed", exc_info=True)
+        return _failure_outcome(update)
 
+
+def _dispatch(
+    session: Session,
+    update: dict[str, Any],
+    *,
+    probes: HealthProbes,
+    now: datetime,
+    whatsapp_client: WhatsAppClient | None = None,
+) -> list[Outcome]:
+    """The router proper — reached only for the allow-listed operator."""
     message = update.get("message")
     if message is not None:
         replied_to = str(
@@ -938,7 +1331,7 @@ def handle_update(
                            ("🏠 الرئيسية", "v1|menu")]],
             )]
         # any other text from the operator lands on the menu — one habit
-        text, keyboard = views.render_menu()
+        text, keyboard = _menu_screen()
         return [Outcome(kind="send", text=text, keyboard=keyboard)]
 
     callback = update.get("callback_query")

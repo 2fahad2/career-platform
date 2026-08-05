@@ -7,6 +7,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import pytest
 from sqlalchemy import text as sql_text
 from sqlalchemy.orm import Session
 
@@ -432,6 +433,262 @@ def test_action_nonce_expires_after_five_minutes(
         owner_session.commit()
 
 
+def _seed_subscription(session: Session, tenant_id: str, status: str) -> None:
+    session.execute(sql_text(
+        "INSERT INTO subscriptions (id, tenant_id, plan_code, status,"
+        " salla_order_id) VALUES (:i, :t, 'professional', :s, :o)"),
+        {"i": str(uuid.uuid4()), "t": tenant_id, "s": status,
+         "o": f"O-{uuid.uuid4()}"})
+    session.commit()
+
+
+def _sub_status(session: Session, tenant_id: str) -> str:
+    return str(session.execute(sql_text(
+        "SELECT status FROM subscriptions WHERE tenant_id = :t"),
+        {"t": tenant_id}).scalar_one())
+
+
+def _drop_subscriptions(session: Session, tenant_id: str) -> None:
+    session.rollback()
+    session.execute(sql_text(
+        "DELETE FROM subscription_events WHERE tenant_id = :t"), {"t": tenant_id})
+    session.execute(sql_text(
+        "DELETE FROM subscriptions WHERE tenant_id = :t"), {"t": tenant_id})
+    session.commit()
+
+
+def _confirm(
+    session: Session, code: str, action: str, **kw: Any
+) -> list[Any]:
+    """Tap the action button, then its confirmation — the operator's two taps."""
+    act = handle_update(
+        session, _cbq(ADMIN, f"v1|act|{code}|{action}"),
+        admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW, **kw,
+    )
+    return handle_update(
+        session, _cbq(ADMIN, act[1].keyboard[0][0][1]), admin_chat_id=ADMIN,
+        probes=FakeProbes(), now=NOW, **kw,
+    )
+
+
+def test_pause_and_resume_survive_a_tenant_with_no_live_subscription(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """INCIDENT: one tap on ⏸️ took the WHOLE watchtower down for good.
+
+    A tenant with no live subscription is routine, not exotic — every §04
+    upgrade leaves a shell behind and the customers list filters nothing — and
+    its card carries a live pause button. ``privacy._subscription`` raises
+    RequestNotFound for it, the action path had no guard, and the runner
+    stores the Telegram offset only AFTER handle_update returns: the same
+    update was re-fed forever, five seconds apart, and no button worked at
+    all until someone restarted the service.
+
+    Nothing the operator can tap may leave this function by raising.
+    """
+    import career.telegram.console as console
+
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    card = handle_update(
+        owner_session, _cbq(ADMIN, f"v1|tenant|{code}"), admin_chat_id=ADMIN,
+        probes=FakeProbes(), now=NOW,
+    )
+    assert f"v1|act|{code}|pause" in _buttons(card[1])   # genuinely reachable
+
+    for action in ("pause", "resume"):
+        # a stale card still offers «استئناف» after a resume, so both halves
+        # of the pair are reachable for a tenant that has no subscription
+        done = _confirm(owner_session, code, action)
+        assert [o.kind for o in done] == ["ack", "edit"]
+        assert done[1].text.startswith(console.ACTION_NO_SUB_AR.format(code=code))
+        assert "✅" not in console.ACTION_NO_SUB_AR
+
+
+def test_resume_never_claims_a_success_it_did_not_achieve(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """AUDIT: ``resume_subscription`` returns the row UNCHANGED whenever the
+    status is not exactly PAUSED, while the console printed «✅ استأنفنا
+    الخدمة للعميل» unconditionally. A false success on the one action the
+    operator needs most — putting a paying customer back in service — sends
+    them away believing the customer is served while nothing moved."""
+    import career.telegram.console as console
+
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    _seed_subscription(owner_session, t1, "EXPIRED")
+    try:
+        done = _confirm(owner_session, code, "resume")
+        assert "استأنفنا" not in done[1].text
+        assert done[1].text.startswith(
+            console.RESUME_NOT_PAUSED_AR.format(code=code, status="EXPIRED")
+        )
+        assert _sub_status(owner_session, t1) == "EXPIRED"   # nothing moved
+    finally:
+        _drop_subscriptions(owner_session, t1)
+
+
+def test_pause_never_claims_a_success_it_did_not_achieve(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """The same lie in the other direction: pausing an EXPIRED subscription
+    is a no-op inside privacy, and the console answered «✅ أوقفنا الخدمة»."""
+    import career.telegram.console as console
+
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    _seed_subscription(owner_session, t1, "EXPIRED")
+    try:
+        done = _confirm(owner_session, code, "pause")
+        assert "أوقفنا" not in done[1].text
+        assert done[1].text.startswith(
+            console.PAUSE_REFUSED_AR.format(code=code, status="EXPIRED")
+        )
+        assert _sub_status(owner_session, t1) == "EXPIRED"
+    finally:
+        _drop_subscriptions(owner_session, t1)
+
+
+def test_pausing_an_already_paused_customer_says_so_plainly(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """Idempotent, and honest about being idempotent — «✅ أوقفنا» on a second
+    tap reads as a fresh pause of a customer who was already off."""
+    import career.telegram.console as console
+
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    _seed_subscription(owner_session, t1, "PAUSED")
+    try:
+        done = _confirm(owner_session, code, "pause")
+        assert done[1].text.startswith(
+            console.PAUSE_ALREADY_AR.format(code=code)
+        )
+        assert _sub_status(owner_session, t1) == "PAUSED"
+    finally:
+        _drop_subscriptions(owner_session, t1)
+
+
+def test_pause_in_grace_is_refused_not_crashed(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """The second crash path, same shape as the first. privacy._PAUSABLE
+    counts GRACE as pausable while the state machine has no GRACE→PAUSED edge,
+    so the tap raised InvalidTransition out of handle_update — and a customer
+    whose period just ended is exactly who the operator reaches for."""
+    import career.telegram.console as console
+
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    _seed_subscription(owner_session, t1, "GRACE")
+    try:
+        done = _confirm(owner_session, code, "pause")
+        assert [o.kind for o in done] == ["ack", "edit"]
+        assert done[1].text.startswith(
+            console.PAUSE_REFUSED_AR.format(code=code, status="GRACE")
+        )
+        assert _sub_status(owner_session, t1) == "GRACE"
+    finally:
+        _drop_subscriptions(owner_session, t1)
+
+
+def test_pause_and_resume_still_work_and_say_so(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """The honest ✅ is still reachable — verified against the DB, both ways."""
+    import career.telegram.console as console
+
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    _seed_subscription(owner_session, t1, "ACTIVE")
+    try:
+        done = _confirm(owner_session, code, "pause")
+        assert done[1].text.startswith("✅ أوقفنا")
+        assert _sub_status(owner_session, t1) == "PAUSED"
+        back = _confirm(owner_session, code, "resume")
+        assert back[1].text.startswith(
+            console._ACTIONS["resume"][1].format(code=code)
+        )
+        assert _sub_status(owner_session, t1) == "ACTIVE"
+    finally:
+        _drop_subscriptions(owner_session, t1)
+
+
+def test_no_single_screen_can_take_the_console_down(
+    owner_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The blast radius, not the bug: because the runner advances the Telegram
+    offset only after handle_update returns, ANY escaping exception is a
+    permanent console outage rather than one failed tap. The barrier turns it
+    back into one failed tap — logged as an ERROR (so it still surfaces on the
+    ⚠️ الأخطاء screen) and never printed as a Python traceback."""
+    import career.telegram.console as console
+
+    def boom(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("a bug nobody predicted")
+
+    monkeypatch.setattr(console, "_today_data", boom)
+    out = handle_update(
+        owner_session, _cbq(ADMIN, "v1|today"), admin_chat_id=ADMIN,
+        probes=FakeProbes(), now=NOW,
+    )
+    assert [o.kind for o in out] == ["ack"]
+    assert out[0].text == console.SCREEN_FAILED_AR
+    assert "RuntimeError" not in out[0].text
+    # and the very next tap is served normally — no loop, no wedged session
+    assert handle_update(
+        owner_session, _cbq(ADMIN, "v1|menu"), admin_chat_id=ADMIN,
+        probes=FakeProbes(), now=NOW,
+    )[1].kind == "edit"
+
+
+def test_a_broken_screen_is_never_answered_to_a_foreign_chat(
+    owner_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The barrier must not become a reply channel for anyone but the
+    operator — auth is decided before it, not inside it."""
+    import career.telegram.console as console
+
+    def boom(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("a bug nobody predicted")
+
+    monkeypatch.setattr(console, "_today_data", boom)
+    assert handle_update(
+        owner_session, _cbq("999", "v1|today"), admin_chat_id=ADMIN,
+        probes=FakeProbes(), now=NOW,
+    ) == []
+
+
+def test_subscription_action_replies_are_direction_pure(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """Fahad's client scrambles any line mixing Arabic with Latin/digits: the
+    TEN code and the raw status token each stand on a line of their own."""
+    import re
+
+    import career.telegram.console as console
+
+    arabic = re.compile(r"[؀-ۿ]")
+    latin_or_digit = re.compile(r"[A-Za-z0-9]")
+
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    texts = [
+        console.ACTION_NO_SUB_AR.format(code=code),
+        console.PAUSE_ALREADY_AR.format(code=code),
+        console.ACTION_FAILED_AR.format(code=code),
+        console.SCREEN_FAILED_AR,
+        console.REPLY_SENT_UNLOGGED_AR.format(code=code),
+        console.PAUSE_REFUSED_AR.format(code=code, status="GRACE"),
+        console.RESUME_NOT_PAUSED_AR.format(code=code, status="EXPIRED"),
+    ]
+    for text in texts:
+        for line in text.splitlines():
+            if arabic.search(line):
+                assert not latin_or_digit.search(line), line
+
+
 def test_weekly_report_format_is_arabic_and_complete() -> None:
     from datetime import date
 
@@ -446,7 +703,7 @@ def test_weekly_report_format_is_arabic_and_complete() -> None:
         {"DELIVERED": 9, "SKIPPED_OPTED_OUT": 1, "NO_MATCHES": 2},
     )
     assert "التقرير الأسبوعي" in report
-    assert "احترافي: 2" in report
+    assert "لمّاح: 2" in report          # the product's ONE name (see below)
     assert "558 ريال" in report
     assert "قدّم 3/4 (75٪)" in report
     assert "موقف الرسائل: 1" in report
@@ -1441,3 +1698,392 @@ def test_the_business_screen_shows_the_search_allowance(
         owner_session.execute(_sql(
             "DELETE FROM usage_events WHERE run_id = :r"), {"r": str(run)})
         owner_session.commit()
+
+
+# ── «إصدار رابط تفعيل»: the operator-facing half of the activation fallback ──
+
+
+def _seed_unclaimed_order(session: Session, tenant_id: str) -> None:
+    """A paid order nobody has claimed yet — the ONLY state that can be
+    handed an activation link."""
+    session.execute(sql_text(
+        "INSERT INTO subscriptions (id, tenant_id, plan_code, status,"
+        " salla_order_id) VALUES (:i, :t, 'professional', 'PAID_UNCLAIMED',"
+        " :o)"),
+        {"i": str(uuid.uuid4()), "t": tenant_id, "o": f"O-{uuid.uuid4()}"})
+    session.commit()
+
+
+def _tokens_of(session: Session, tenant_id: str) -> list[Any]:
+    return list(session.execute(sql_text(
+        "SELECT id, used_at FROM activation_tokens WHERE tenant_id = :t"
+        " ORDER BY created_at"), {"t": tenant_id}).all())
+
+
+def _link_in(text: str) -> str:
+    for line in text.splitlines():
+        if line.startswith("https://wa.me/"):
+            return line
+    raise AssertionError(f"no activation link in the reply:\n{text}")
+
+
+def test_the_link_button_appears_only_for_an_order_still_waiting(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """The capability the operator could not reach. It is offered exactly
+    where it can do something — a paid order nobody has claimed — and not on
+    the card of a customer who is already live."""
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    try:
+        _seed_subscription(owner_session, t1, "ACTIVE")
+        out = handle_update(
+            owner_session, _cbq(ADMIN, f"v1|tenant|{code}"),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+        )
+        assert f"v1|act|{code}|issue_link" not in _buttons(out[1])
+        _drop_subscriptions(owner_session, t1)
+
+        _seed_unclaimed_order(owner_session, t1)
+        out = handle_update(
+            owner_session, _cbq(ADMIN, f"v1|tenant|{code}"),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+        )
+        assert f"v1|act|{code}|issue_link" in _buttons(out[1])
+    finally:
+        _drop_subscriptions(owner_session, t1)
+
+
+def test_issuing_a_link_says_it_is_short_lived_single_use_and_rotating(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """An operator who does not know the link expires — and that issuing a
+    new one retires the old — reads «رمز التفعيل مستخدم مسبقًا» as a bug in
+    the product rather than as the fail-closed answer it is."""
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    try:
+        _seed_unclaimed_order(owner_session, t1)
+        done = _confirm(owner_session, code, "issue_link")
+        text = done[1].text
+        assert _link_in(text).startswith("https://wa.me/")
+        assert code in text
+        assert "٦٠ دقيقة" in text            # the real TTL, in Arabic digits
+        assert "لمرة واحدة" in text
+        assert "أُلغي" in text                # a new link retires the old one
+        assert "رمز التفعيل مستخدم مسبقًا" in text
+        # and it really minted one live token for the waiting order
+        tokens = _tokens_of(owner_session, t1)
+        assert len(tokens) == 1
+        assert tokens[0][1] is None
+    finally:
+        _drop_subscriptions(owner_session, t1)
+
+
+def test_issuing_a_second_link_retires_the_first(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """Rotation is what makes on-demand issuance safe, and the reply promises
+    it — so the promise is pinned here: the old token is retired, and exactly
+    one live token survives (two would break activation for that buyer)."""
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    try:
+        _seed_unclaimed_order(owner_session, t1)
+        first = _link_in(_confirm(owner_session, code, "issue_link")[1].text)
+        second = _link_in(_confirm(owner_session, code, "issue_link")[1].text)
+        assert first != second
+        tokens = _tokens_of(owner_session, t1)
+        assert len(tokens) == 2
+        assert tokens[0][1] is not None      # retired as the new one was cut
+        assert tokens[1][1] is None
+    finally:
+        _drop_subscriptions(owner_session, t1)
+
+
+def test_an_already_claimed_order_is_refused_out_loud(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """The operator taps because a buyer is waiting. A silent no-op sends
+    them hunting for a fault that is not there, so the refusal is spoken and
+    names the reason — and nothing is minted."""
+    import career.telegram.console as console
+
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    try:
+        _seed_subscription(owner_session, t1, "ACTIVE")
+        done = _confirm(owner_session, code, "issue_link")
+        assert done[1].text.startswith(
+            console.LINK_ALREADY_ACTIVATED_AR.format(code=code)
+        )
+        assert "https://wa.me/" not in done[1].text
+        assert _tokens_of(owner_session, t1) == []
+    finally:
+        _drop_subscriptions(owner_session, t1)
+
+
+def test_a_tenant_with_no_order_at_all_is_refused_out_loud(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    import career.telegram.console as console
+
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    done = _confirm(owner_session, code, "issue_link")
+    assert done[1].text.startswith(console.LINK_NO_ORDER_AR.format(code=code))
+    assert "https://wa.me/" not in done[1].text
+
+
+def test_the_link_goes_to_the_operator_alone_and_never_to_a_log(
+    owner_session: Session, two_tenants: tuple[str, str], caplog: Any
+) -> None:
+    """The link IS the credential: whoever opens it binds their phone to a
+    paid subscription. The previous design posted it to this channel on every
+    sale and it sat there live for seven days per order — and the secret
+    filter cannot cover for that, because the token rides in a `text=` query
+    parameter and matches no key name and no provider token shape.
+
+    So it may exist in exactly one place: the answer to the button the
+    operator just pressed, in their own chat. Never a log line, at any level.
+    """
+    import logging
+
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    try:
+        _seed_unclaimed_order(owner_session, t1)
+        with caplog.at_level(logging.DEBUG):
+            done = _confirm(owner_session, code, "issue_link")
+        link = _link_in(done[1].text)
+        raw_token = link.rsplit("%20", 1)[-1]
+        assert len(raw_token) >= 20
+
+        carriers = [o for o in done if link in (o.text or "")]
+        assert len(carriers) == 1                    # exactly one, and it is
+        assert carriers[0] is done[1]                # the operator's screen
+        for record in caplog.records:
+            assert link not in record.getMessage()
+            assert raw_token not in record.getMessage()
+            assert raw_token not in str(record.args or "")
+    finally:
+        _drop_subscriptions(owner_session, t1)
+
+
+def test_link_replies_are_direction_pure(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """§16: no Latin or digits inside an Arabic line. The TEN code and the
+    link each stand alone — a mixed line arrives scrambled on the operator's
+    client, and a scrambled link is an unusable one."""
+    import re
+
+    import career.telegram.console as console
+
+    arabic = re.compile(r"[؀-ۿ]")
+    latin_or_digit = re.compile(r"[A-Za-z0-9]")
+
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    try:
+        _seed_unclaimed_order(owner_session, t1)
+        issued = _confirm(owner_session, code, "issue_link")[1].text
+        _drop_subscriptions(owner_session, t1)
+        _seed_subscription(owner_session, t1, "ACTIVE")
+        refused = _confirm(owner_session, code, "issue_link")[1].text
+        act = handle_update(
+            owner_session, _cbq(ADMIN, f"v1|act|{code}|issue_link"),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+        )[1].text
+        # only the ANSWER — the tenant card re-rendered under it belongs to
+        # views and is pinned by its own tests
+        for text in (issued.split("\n\n")[0], refused.split("\n\n")[0], act,
+                     console.LINK_NO_ORDER_AR.format(code=code)):
+            for line in text.splitlines():
+                if arabic.search(line):
+                    assert not latin_or_digit.search(line), line
+    finally:
+        _drop_subscriptions(owner_session, t1)
+
+
+# ── open support tickets: the first reader `support_events` has ever had ─────
+
+
+def _seed_ticket(
+    session: Session, tenant_id: str, channel_id: str, *,
+    kind: str = "support_request", age_hours: int = 1, status: str = "open",
+) -> str:
+    ticket_id = str(uuid.uuid4())
+    session.execute(sql_text(
+        "INSERT INTO support_events (id, tenant_id, channel_id, kind, status,"
+        " created_at) VALUES (:i, :t, :c, :k, :s, :a)"),
+        {"i": ticket_id, "t": tenant_id, "c": channel_id, "k": kind,
+         "s": status, "a": NOW - timedelta(hours=age_hours)})
+    session.commit()
+    return ticket_id
+
+
+def _drop_tickets(session: Session, *tenant_ids: str) -> None:
+    session.rollback()
+    for tenant_id in tenant_ids:
+        session.execute(sql_text(
+            "DELETE FROM support_events WHERE tenant_id = :t"), {"t": tenant_id})
+    session.commit()
+
+
+def _tickets(session: Session, **kw: Any) -> Any:
+    return handle_update(
+        session, _cbq(ADMIN, "v1|tickets"), admin_chat_id=ADMIN,
+        probes=FakeProbes(), now=NOW, **kw,
+    )[1]
+
+
+def test_open_tickets_are_visible_with_their_age_and_whose_they_are(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """`support_events` has been written since C4 and read by nobody: the
+    operator was paged once, at the moment it happened, and after that the
+    ticket existed only in the database. Oldest first, because age is the
+    only priority signal this screen has."""
+    t1, t2 = two_tenants
+    code1, code2 = _code_of(owner_session, t1), _code_of(owner_session, t2)
+    channel1 = _seed_channel(owner_session, t1)
+    channel2 = _seed_channel(owner_session, t2)
+    try:
+        _seed_ticket(owner_session, t2, channel2, age_hours=2)
+        _seed_ticket(owner_session, t1, channel1,
+                     kind="funnel_consent_stuck", age_hours=50)
+        text = _tickets(owner_session).text
+        assert "طلب التواصل مع الدعم" in text
+        assert "متعثّر عند بوابة الموافقة" in text
+        assert "منذ ٢ ساعة" in text
+        assert "منذ ٢ يوم" in text
+        # oldest first — the customer who has been waiting longest is on top
+        assert text.index(code1) < text.index(code2)
+    finally:
+        _drop_tickets(owner_session, t1, t2)
+        _clear_delivery(owner_session, t1)
+        _clear_delivery(owner_session, t2)
+
+
+def test_a_resolved_ticket_leaves_the_screen_and_the_empty_state_is_explicit(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """«لا توجد تذاكر مفتوحة» is a fact the operator can act on; a blank
+    screen is one they cannot tell apart from a broken one."""
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    channel = _seed_channel(owner_session, t1)
+    try:
+        _seed_ticket(owner_session, t1, channel, status="resolved")
+        text = _tickets(owner_session).text
+        assert code not in text
+        assert "لا توجد تذاكر مفتوحة" in text
+    finally:
+        _drop_tickets(owner_session, t1)
+        _clear_delivery(owner_session, t1)
+
+
+def test_the_tickets_screen_is_reachable_from_the_menu(
+    owner_session: Session
+) -> None:
+    """A screen with no way in is the same defect as an action with no
+    button — which is the other half of this change."""
+    menu = handle_update(
+        owner_session, _msg(ADMIN, "/start"), admin_chat_id=ADMIN,
+        probes=FakeProbes(), now=NOW,
+    )[0]
+    assert any("v1|tickets" == data
+               for row in menu.keyboard for _label, data in row)
+
+
+def test_the_tickets_screen_is_pii_free_and_direction_pure(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """§15.13 — TEN codes only, never a phone. And no Latin or digits inside
+    an Arabic line: the code stands alone, the age uses Arabic digits."""
+    import re
+
+    arabic = re.compile(r"[؀-ۿ]")
+    latin_or_digit = re.compile(r"[A-Za-z0-9]")
+
+    t1, _ = two_tenants
+    channel = _seed_channel(owner_session, t1)
+    phone = owner_session.execute(sql_text(
+        "SELECT phone_e164 FROM customer_channels WHERE id = :c"),
+        {"c": channel}).scalar_one()
+    try:
+        _seed_ticket(owner_session, t1, channel, age_hours=0)
+        text = _tickets(owner_session).text
+        assert phone not in text
+        assert "+966" not in text
+        assert "منذ ٠ دقيقة" in text
+        for line in text.splitlines():
+            if arabic.search(line):
+                assert not latin_or_digit.search(line), line
+    finally:
+        _drop_tickets(owner_session, t1)
+        _clear_delivery(owner_session, t1)
+
+
+# ── one product, one Arabic name, on every screen ────────────────────────────
+
+
+def test_weekly_report_and_customer_card_cannot_name_a_plan_differently() -> None:
+    """Three names for one product is what the second copy bought us: the
+    weekly report said «احترافي» where the card said «لمّاح», it carried
+    «elite» — a plan code that never existed — and it had no ``executive`` at
+    all, so لمّاح+ went out as a raw Latin token every Sunday. This fails the
+    moment either screen grows a mapping the other does not share.
+    """
+    from datetime import date
+
+    from career.telegram.weekly_report import format_weekly_report
+
+    for code, expected in views._PLAN_AR.items():
+        report = format_weekly_report(
+            date(2026, 7, 26), {"subs_by_plan": {code: 1}}, {}
+        )
+        assert f"{expected}: 1" in report, code
+        assert code not in report          # never the raw Latin plan code
+
+
+def test_weekly_report_speaks_every_plan_and_every_day_state() -> None:
+    """A plan or a day state with no Arabic word renders as Latin inside an
+    Arabic line, which Fahad's client scrambles — so an unmapped code is a
+    formatting bug, not a cosmetic one."""
+    from datetime import date
+
+    from career.cv.close import DAILY_STATES
+    from career.salla.renewal import RENEWABLE_PLANS
+    from career.telegram.weekly_report import _STATE_AR, format_weekly_report
+
+    assert set(DAILY_STATES) <= set(_STATE_AR)
+    for code in {*RENEWABLE_PLANS, "cv_analysis"}:
+        assert code in views._PLAN_AR, code
+
+    report = format_weekly_report(
+        date(2026, 7, 26),
+        {"subs_by_plan": {"executive": 1, "cv_analysis": 2}},
+        dict.fromkeys(DAILY_STATES, 1),
+    )
+    assert "لمّاح+: 1" in report
+    for state in DAILY_STATES:
+        assert state not in report
+
+
+def test_weekly_report_carries_no_second_plan_map() -> None:
+    """The class of bug, not the instance: the drift was only possible because
+    the mapping existed twice. A new dict here would let it happen again with
+    every assertion above still green."""
+    from pathlib import Path
+
+    import career.telegram.weekly_report as wr
+
+    source = Path(wr.__file__).read_text(encoding="utf-8")
+    assert "_PLAN_AR = {" not in source
+    # No module-level dict here may key plan codes, whatever it is called —
+    # and the labels must be the console's own function, not a lookalike.
+    assert [v for v in vars(wr).values()
+            if isinstance(v, dict) and "professional" in v] == []
+    assert wr._plan_ar is views._plan

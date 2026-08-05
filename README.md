@@ -23,10 +23,10 @@ SQLAlchemy + Alembic · Docker Compose · pytest · Anthropic API only for LLM.
 
 | | |
 |---|---|
-| 🧪 Test suite | **944 passing** (fresh-run gated commits, disposable `career_test` DB only — enforced by a hard guard) |
-| 🗄️ Schema | migration `0019` (36 tables, 30 with RLS enabled), live-verified drift-free (host **and** deployed container) |
+| 🧪 Test suite | `pytest -q` prints the count — **do not restate it from memory** (see [Testing](#testing)); disposable `career_test` DB only, enforced by a hard guard |
+| 🗄️ Schema | migration head — `alembic heads`; deployed — `SELECT version_num FROM alembic_version` (**`0020`** on staging, 36 tables, 30 with RLS enabled), live-verified drift-free (host **and** deployed container) |
 | 🔍 Last full audit | 2026-07-23, 42-agent adversarial sweep — all 5 critical + 20/23 major findings **fixed** (see `docs/AUDIT-2026-07-23.md`) |
-| 🚀 Live | worker loop, admin watchtower bot, nightly engine timer (04:30 Riyadh) — real customer journey completed end-to-end incl. first real CV delivery |
+| 🚀 Live | worker loop, admin watchtower bot, nightly engine timer (11:00 Riyadh) — real customer journey completed end-to-end incl. first real CV delivery |
 | 🏗️ Phases | C1–C8 **code**-complete · C3 and C4 exit conditions are NOT met (no real riyal purchase yet; two templates the code sends do not exist at Meta) · C9 gated on the store go-live |
 
 ## System overview
@@ -39,12 +39,12 @@ SQLAlchemy + Alembic · Docker Compose · pytest · Anthropic API only for LLM.
                           ▼
                  ┌─────────────────┐
                  │  PostgreSQL 16  │  Row-Level Security (FORCE)
-                 │  webhook_events │  26 tenant-isolated tables
+                 │  webhook_events │  29 tenant-isolated tables
                  └────┬───────┬────┘
         polls         │       │          reads/writes
   ┌───────────────────┘       └───────────────────────┐
   ▼                                                   ▼
-┌──────────────────────┐   04:30 Riyadh   ┌──────────────────────────┐
+┌──────────────────────┐   11:00 Riyadh   ┌──────────────────────────┐
 │  career-worker       │  ┌────────────▶  │  career-engine-nightly   │
 │  conversation loop   │  │               │  discover → gate → rank  │
 │  ├ Salla provisioning│  │ systemd timer │  → CV (Claude) → deliver │
@@ -201,7 +201,7 @@ absent from the raw Arabic → the customer confirms (English + Arabic gloss)
 | `orchestrator.py` | Conversation brain: consent, 14 questions, batch confirmation, privacy commands, reminders. |
 | `collection.py` | Question bank (labels ≤ 20 chars — WhatsApp cap) + answer parsing. |
 | `consents.py` | Purpose-separated append-only consent ledger + fail-closed gate. |
-| `upload.py` | Six-stage hardened upload pipeline (sniff → scan → inspect → sanitize → sandbox). |
+| `upload.py` | Six-stage hardened upload pipeline (sniff → scan → inspect → sanitize → sandbox) + the clamd client, its three-way readiness state and the declared policy for a file no engine could read. |
 | `extract_worker.py` | Sandbox child: rlimits before parsing, defusedxml, output caps. |
 | `extraction.py` | PII strip → assert-absent → Claude structured extraction (results ≠ truth). |
 | `confirmation.py` | Facts → achievement bank; rejections feed `forbidden_claims`. |
@@ -288,6 +288,7 @@ absent from the raw Arabic → the customer confirms (English + Arabic gloss)
 | `0017` | 🆕 `role_enrichments` — the F-ENRICH once-ever ledger. |
 | `0018` | `outbox_events` FORCE RLS (caught by the RLS meta-test). |
 | `0019` | `usage_events` prompt-cache token columns (§14 cost coverage). |
+| `0020` | لمّاح pricing: one pass at 199, `basic` retired from sale (kept — subscriptions point at it). |
 
 ### `scripts/` — live runners
 
@@ -304,7 +305,7 @@ absent from the raw Arabic → the customer confirms (English + Arabic gloss)
 | Path | Purpose |
 |------|---------|
 | `systemd/career-worker.service` | Conversation loop (Restart=always). |
-| `systemd/career-engine-nightly.{service,timer}` | 04:30 Riyadh nightly (Persistent=true). |
+| `systemd/career-engine-nightly.{service,timer}` | 11:00 Riyadh nightly (Persistent=true) — the timer file itself is the authority and carries the why. |
 | `systemd/career-admin-bot.service` | Watchtower (isolated from the worker). |
 | `systemd/career-backup.{service,timer}` `systemd/career-restore-test.{service,timer}` | Daily backup + monthly restore drill. |
 | `systemd/career-alert@.service` | `OnFailure=` handler: tells the operator a unit stayed down. |
@@ -347,13 +348,19 @@ absent from the raw Arabic → the customer confirms (English + Arabic gloss)
 
 ## Security model
 
-- **Tenant isolation** — 26 tables under `ENABLE + FORCE` RLS with fail-closed
-  transaction-local GUC; adversarial tests (forged writes, cross-reads,
-  no-context) run in CI.
+- **Tenant isolation** — every table carrying `tenant_id` (29 today) under
+  `ENABLE + FORCE` RLS with a fail-closed transaction-local GUC; adversarial
+  tests (forged writes, cross-reads, no-context) run in CI. The count is not
+  maintained by hand — `tests/test_rls_meta.py` derives the table list from the
+  catalog and fails CI if any of them loses ENABLE, FORCE or its policy.
 - **Webhooks** — constant-time HMAC on both providers; empty secret verifies
   nothing; dedupe before processing.
 - **Uploads** — magic-byte sniffing, structural inspection, metadata
-  sanitization, rlimited sandbox extraction.
+  sanitization, rlimited sandbox extraction, and a malware engine (clamd over
+  its unix socket) that is either **answering, unreachable, or absent** — the
+  state is a light on the watchtower health screen, never an assumption. An
+  upload nobody could scan is accepted or refused by a *declared* policy and
+  its row says `unscanned`; it is never recorded as `clean`.
 - **LLM boundary** — PII stripped and asserted-absent before any call;
   byte-verbatim prompts; literal placeholder filling; invented-content +
   forbidden-claims + Arabic-leak output guards; rule fallbacks everywhere.
@@ -364,7 +371,7 @@ absent from the raw Arabic → the customer confirms (English + Arabic gloss)
 
 ```text
 career-worker.service          conversation loop (3s poll, Restart=always)
-career-engine-nightly.timer    04:30 Asia/Riyadh, Persistent=true
+career-engine-nightly.timer    11:00 Asia/Riyadh, Persistent=true
 career-admin-bot.service       operator console (long-poll)
 career-backup.timer            daily encrypted backup -> Backblaze B2
 career-restore-test.timer      monthly restore drill
@@ -396,9 +403,16 @@ export CI_REQUIRE_DB=1
 
 # or simply, which runs CI's exact sequence including lint, types and drift:
 ./scripts/gate.sh
+
+# How many tests are there? Ask, never remember. This README carried «944
+# passing» for long enough that it was wrong by dozens in both directions,
+# and a number nobody can regenerate is a number nobody corrects:
+.venv/bin/python -m pytest --collect-only -q | tail -1   # collected count
+ls tests/test_*.py | wc -l                               # test files
+# (collected > `def test_` count: parametrize expands.)
 ```
 
-**944 tests**, zero skips with a full environment: adversarial RLS (plus a
+Zero skips with a full environment: adversarial RLS (plus a
 catalog **meta-test** enforcing ENABLE+FORCE+policy on every tenant table),
 webhook
 idempotency, upload attack files, CV binding/quarantine, the seven-state
@@ -418,6 +432,7 @@ Every variable is documented in [`.env.example`](.env.example):
 | WhatsApp | `WHATSAPP_ACCESS_TOKEN` · `WHATSAPP_PHONE_NUMBER_ID` · `WHATSAPP_WABA_ID` · `WHATSAPP_APP_SECRET` · `WHATSAPP_VERIFY_TOKEN` |
 | LLM / search | `ANTHROPIC_API_KEY` · `SEARCHAPI_API_KEY` |
 | Operator | `TELEGRAM_ADMIN_BOT_TOKEN` · `TELEGRAM_ADMIN_CHAT_ID` · `CANARY_TEST_PHONE` |
+| Upload scanning | `CV_SCAN_CLAMD_SOCKET` (empty = no engine, and the health screen says so) · `CV_SCAN_TIMEOUT_S` |
 
 ## Quick start (staging)
 

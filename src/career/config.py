@@ -39,6 +39,24 @@ class Settings(BaseSettings):
     # Object storage (filesystem-backed StorageAdapter for now).
     storage_root: str = Field(default="./data", alias="STORAGE_ROOT")
 
+    # Malware scanning of customer uploads — §11 step 3, the control that was
+    # an interface with nothing behind it for the whole live period (the runner
+    # injected a stand-in whose scan() returned None, i.e. «clean», for every
+    # file). An EMPTY socket path is a real, declared posture and not a
+    # misconfiguration: career.onboarding.upload.build_scanner returns the
+    # UnconfiguredScanner, the declared ScanPolicy accepts the file and stamps
+    # the row `unscanned` rather than `clean`, and the watchtower shows the
+    # missing engine for as long as it stays missing.
+    #
+    # These live here rather than being read out of os.environ inside
+    # build_scanner so that the runners pass them in explicitly: a
+    # CV_SCAN_TIMEOUT_S that is not a number then fails at boot with the rest
+    # of the environment, instead of raising ValueError inside a customer's
+    # first upload; and the path itself is proven at boot by the health line
+    # the worker logs beside its environment report.
+    cv_scan_clamd_socket: str = Field(default="", alias="CV_SCAN_CLAMD_SOCKET")
+    cv_scan_timeout_s: float = Field(default=8.0, alias="CV_SCAN_TIMEOUT_S")
+
     # Anthropic — the only LLM provider (locked). Unused until C7.
     anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
 

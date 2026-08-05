@@ -369,6 +369,145 @@ def test_privacy_command_works_mid_journey(
         assert journey.state == "CONSENT_PENDING"
 
 
+def test_privacy_commands_survive_the_spellings_a_real_keyboard_produces() -> None:
+    """AUDIT 2026-08. The standing commands were matched by RAW byte equality
+    (``_PRIVACY_COMMANDS.get(text.strip())``, and inbound's ``normalize`` only
+    collapses whitespace), so the deletion the customer is told to send
+    VERBATIM did not execute when they typed the hamza-less «اؤكد» their
+    keyboard offers — a statutory PDPL request failing in total silence, the
+    worst available failure mode. These are all the same command."""
+    from career.onboarding.orchestrator import _privacy_command
+
+    assert _privacy_command("أؤكد حذف بياناتي") == "delete_execute"
+    assert _privacy_command("اؤكد حذف بياناتي") == "delete_execute"
+    assert _privacy_command("اؤكد حذف بياناتى") == "delete_execute"
+    assert _privacy_command("حالة اشتراكي") == "status"
+    assert _privacy_command("حالة اشتراكى") == "status"
+    assert _privacy_command("حاله اشتراكي؟") == "status"
+    assert _privacy_command("تجديد الإشتراك") == "status"
+    assert _privacy_command("  وقف   مؤقت  ") == "pause"
+    assert _privacy_command("تصدير بياناتى") == "export"
+    assert _privacy_command("حذف بياناتى") == "delete_warn"
+    assert _privacy_command("سؤال عن حالة اشتراكي") is None   # not a command
+
+
+def test_normalisation_does_not_widen_the_two_step_deletion_gate() -> None:
+    """The second step is a deliberate safety gate. Folding hamza forms adds
+    ONLY spellings of the very same three words: no synonym, no bare «نعم»,
+    and no substring — «لا أؤكد حذف بياناتي» carries the phrase and must
+    still not delete anything."""
+    from career.onboarding.orchestrator import _privacy_command
+
+    for text in ("نعم", "تم", "أوافق", "اوك", "أؤكد", "أؤكد الحذف", "احذف",
+                 "لا أؤكد حذف بياناتي", "أؤكد حذف بياناتي بعدين",
+                 "قال لي أرسل أؤكد حذف بياناتي"):
+        assert _privacy_command(text) != "delete_execute", text
+    # the FIRST step still only warns — it never executes
+    assert _privacy_command("حذف بياناتي") == "delete_warn"
+
+
+def test_the_hamza_less_confirmation_really_executes_the_deletion(
+    two_tenants: tuple[str, str], tmp_path
+) -> None:
+    """Same two-step journey as below, typed the way a Saudi phone types it."""
+    a, _ = two_tenants
+    tid = uuid.UUID(a)
+    deps = _deps(tmp_path)
+    with tenant_session(a) as s:
+        sub_id, channel_id = _seed_activated_tenant(s, tid)
+        orchestrator.start_journey(
+            s, tenant_id=tid, subscription_id=sub_id, channel_id=channel_id,
+            deps=deps, now=NOW,
+        )
+        _say(s, deps, channel_id, "حذف بياناتي", 1)
+        # an ordinary «نعم» must NOT be read as the confirmation
+        _say(s, deps, channel_id, "نعم", 2)
+        assert s.execute(
+            sql_text("SELECT count(*) FROM privacy_requests")
+        ).scalar_one() == 0
+        _say(s, deps, channel_id, "اؤكد حذف بياناتي", 3)
+    with tenant_session(a) as s:
+        req = s.execute(sql_text("SELECT kind, status FROM privacy_requests")).one()
+        channels = s.execute(
+            sql_text("SELECT count(*) FROM customer_channels")
+        ).scalar_one()
+    assert (req.kind, req.status) == ("delete", "fulfilled")
+    assert channels == 0
+
+
+def test_typed_consent_without_the_hamza_is_accepted(
+    two_tenants: tuple[str, str], tmp_path
+) -> None:
+    """The gate sends buttons here, but the copy also invites the typed word —
+    and the typed word was compared byte-for-byte against «أوافق»."""
+    a, _ = two_tenants
+    tid = uuid.UUID(a)
+    deps = _deps(tmp_path)
+    with tenant_session(a) as s:
+        sub_id, channel_id = _seed_activated_tenant(s, tid)
+        orchestrator.start_journey(
+            s, tenant_id=tid, subscription_id=sub_id, channel_id=channel_id,
+            deps=deps, now=NOW,
+        )
+        _say(s, deps, channel_id, "اوافق", 1)
+        assert "الاسم" in _last_sent(deps)          # the questions began
+        granted = s.execute(
+            sql_text("SELECT count(*) FROM consent_events "
+                     "WHERE action = 'granted'")
+        ).scalar_one()
+        assert granted == 3
+
+
+def test_a_negated_consent_is_never_read_as_agreement(
+    two_tenants: tuple[str, str], tmp_path
+) -> None:
+    """«ما أوافق» and «لا اوافق» both CONTAIN the agreement word. Recording a
+    grant from either would be consent by accident — worse than any loop."""
+    a, _ = two_tenants
+    tid = uuid.UUID(a)
+    deps = _deps(tmp_path)
+    with tenant_session(a) as s:
+        sub_id, channel_id = _seed_activated_tenant(s, tid)
+        orchestrator.start_journey(
+            s, tenant_id=tid, subscription_id=sub_id, channel_id=channel_id,
+            deps=deps, now=NOW,
+        )
+        for minute, reply in enumerate(("ما أوافق", "لا اوافق", "مو موافق"), 1):
+            _say(s, deps, channel_id, reply, minute)
+            granted = s.execute(
+                sql_text("SELECT count(*) FROM consent_events "
+                         "WHERE action = 'granted'")
+            ).scalar_one()
+            assert granted == 0, reply
+            assert orchestrator.get_journey(s, tenant_id=tid).state \
+                == "CONSENT_PENDING"
+
+
+def test_an_acknowledgement_never_grants_the_consent(
+    two_tenants: tuple[str, str], tmp_path
+) -> None:
+    """«تمام» is an acknowledgement, not a legal consent. It is answered with
+    a clear ask; the ledger stays empty until the customer says the word."""
+    a, _ = two_tenants
+    tid = uuid.UUID(a)
+    deps = _deps(tmp_path)
+    with tenant_session(a) as s:
+        sub_id, channel_id = _seed_activated_tenant(s, tid)
+        orchestrator.start_journey(
+            s, tenant_id=tid, subscription_id=sub_id, channel_id=channel_id,
+            deps=deps, now=NOW,
+        )
+        _say(s, deps, channel_id, "تمام", 1)
+        granted = s.execute(
+            sql_text("SELECT count(*) FROM consent_events "
+                     "WHERE action = 'granted'")
+        ).scalar_one()
+        assert granted == 0
+        assert "موافقة واحدة" in _last_sent(deps)      # re-asked, not advanced
+        _say(s, deps, channel_id, "موافق", 2)
+        assert "الاسم" in _last_sent(deps)             # and then it opens
+
+
 def test_deletion_needs_the_explicit_second_step(
     two_tenants: tuple[str, str], tmp_path
 ) -> None:

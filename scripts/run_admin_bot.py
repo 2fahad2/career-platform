@@ -2,9 +2,10 @@
 
 Thin composition over the tested console: getUpdates → handle_update →
 execute outcomes. The cursor lives in admin_bot_state (id=1) so restarts
-neither replay nor lose commands. Live health probes are gathered here (the
-only place allowed to touch systemd/Graph/SearchAPI directly) and injected
-into the pure console.
+neither replay nor lose commands, and it advances BEFORE the work so that no
+single update can wedge the loop (see process_one_update, which owns that
+trade-off). Live health probes are gathered here (the only place allowed to
+touch systemd/Graph/SearchAPI directly) and injected into the pure console.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import json
 import logging
 import subprocess
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import IO, Any
 from urllib.request import urlopen
@@ -25,6 +27,7 @@ from sqlalchemy.orm import Session
 from career.config import get_settings
 from career.fingerprint import source_fingerprint
 from career.logging_filters import install_secret_redaction
+from career.onboarding.upload import HEALTH_KEY, build_scanner, scanner_health
 from career.storage import FilesystemStorageAdapter
 from career.telegram.admin import HttpTelegramAdminClient, TelegramSendError
 from career.telegram.console import handle_update
@@ -186,9 +189,25 @@ class LiveProbes:  # pragma: no cover — live boundary, facts only
         except Exception:  # noqa: BLE001
             return []
 
+    def _scanner(self) -> Any:
+        """The §11 upload scanner, asked the same question the worker asks.
+
+        Built from ``self._settings`` — the same two fields the worker passes
+        to ``build_scanner`` — and not from a path typed again here, because a
+        screen that reports a DIFFERENT scanner than the one guarding uploads
+        is worse than no light at all: it is a green one over a control nobody
+        is running. It is only a PING, so it is cheap enough to redraw on every
+        tap of «تحديث» and it never sends a customer's bytes anywhere.
+        """
+        return scanner_health(build_scanner(
+            self._settings.cv_scan_clamd_socket,
+            timeout_s=self._settings.cv_scan_timeout_s,
+        ))
+
     def collect(self) -> dict[str, Any]:
         days_left = (_salla_expiry(self._settings) - datetime.now(UTC)).days
         return {
+            HEALTH_KEY: self._scanner(),
             "worker_active": self._systemd_active("career-worker.service"),
             "timer_next": self._timer_next(),
             "meta_token_ok": self._meta_token_ok(),
@@ -214,6 +233,72 @@ def _store_offset(session: Session, offset: int) -> None:
     )
 
 
+#: What the operator sees when an update was dropped. No detail: the screen is
+#: not the place for a traceback, and the journal already has it.
+_SKIPPED_AR = (
+    "⚠️ أمر في البرج فشل تنفيذه وتم تخطيه — أعد المحاولة، "
+    "وإذا تكرر راجع السجل"
+)
+
+
+def _skip_poisoned_update(client: HttpTelegramAdminClient) -> None:
+    """Say out loud that an update was dropped.
+
+    Advancing the cursor past a failure is only defensible if the failure is
+    impossible to miss, so this is the other half of that decision — and it is
+    itself best-effort: if Telegram is the thing that is broken, the journal
+    line above still stands and the loop still moves on.
+    """
+    try:
+        client.send_admin(_SKIPPED_AR)
+    except TelegramSendError:
+        logger.warning("skip notice failed", exc_info=True)
+
+
+def process_one_update(
+    engine: Any,
+    update: dict[str, Any],
+    *,
+    update_id: int,
+    handler: Callable[[Session, dict[str, Any]], list[Any]],
+    on_skip: Callable[[], None],
+) -> list[Any]:
+    """Advance the cursor, THEN do the work. Returns the outcomes to deliver.
+
+    The cursor used to move last, inside the same transaction as the work, so
+    anything escaping the handler — or a commit that failed after the outcomes
+    were built — left the offset where it was and ``getUpdates(offset + 1)``
+    handed back the very same update five seconds later, forever. The console
+    is the operator's only window into the system and one tap could close it
+    until someone restarted the service. Worse than the wedge: a handler that
+    sends before it fails (a resend re-runs a customer's delivery) repeated
+    that send at a real customer's phone every five seconds.
+
+    The cost is deliberate and is the smaller one. An update whose processing
+    genuinely failed is DROPPED rather than retried — but every screen here is
+    operator-initiated and re-tappable, the keyboard is still on their phone,
+    and the skip is announced and journalled. At-most-once on a control
+    channel beats at-least-once with real customer sends behind it, and it
+    beats a dead console outright.
+
+    The two halves are separate transactions on purpose: a cursor that only
+    advances when the work commits is exactly the coupling being removed here.
+    The outcomes are built inside the work's transaction and describe what it
+    wrote, so they are returned only once that transaction has landed — a
+    screen drawn over a rolled-back commit is a lie the operator acts on.
+    """
+    with Session(engine) as session:
+        _store_offset(session, update_id)
+        session.commit()
+    try:
+        with Session(engine) as session:
+            outcomes = handler(session, update)
+            session.commit()
+    except Exception:  # noqa: BLE001 — one update, never the loop
+        logger.error("watchtower update failed — skipped", exc_info=True)
+        on_skip()
+        return []
+    return outcomes
 
 
 def _acquire_single_instance_lock(name: str) -> IO[str]:
@@ -267,15 +352,16 @@ def main() -> None:  # pragma: no cover — live runner over tested parts
             updates = client.get_updates(offset + 1, timeout=POLL_TIMEOUT)
             for update in updates:
                 update_id = int(update.get("update_id", offset))
-                with Session(engine) as session:
-                    outcomes = handle_update(
-                        session, update,
+                outcomes = process_one_update(
+                    engine, update, update_id=update_id,
+                    handler=lambda session, upd: handle_update(
+                        session, upd,
                         admin_chat_id=settings.telegram_admin_chat_id,
                         probes=probes, now=datetime.now(UTC),
                         whatsapp_client=whatsapp,
-                    )
-                    _store_offset(session, update_id)
-                    session.commit()
+                    ),
+                    on_skip=lambda: _skip_poisoned_update(client),
+                )
                 for outcome in outcomes:
                     try:
                         if outcome.kind == "send":

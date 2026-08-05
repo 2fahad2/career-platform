@@ -151,6 +151,47 @@ def _ten_code(session: Session, tenant_id: uuid.UUID) -> str:
     return tenant.code if tenant is not None else "(unknown)"
 
 
+def _event_ten_codes(session: Session, payload: dict[str, Any]) -> str:
+    """The TEN codes an event touches, for the operator's failure notice.
+
+    «A WhatsApp message failed» with no name told the operator that someone
+    somewhere lost their turn and left them to find out who by reading the
+    journal. The payload carries phone numbers, never the code, so it is
+    resolved here — and only the code ever leaves this function (§15.13).
+    """
+    from career.whatsapp.phones import phone_variants
+
+    phones: list[str] = []
+    for entry in payload.get("entry", []) or []:
+        for change in entry.get("changes", []) or []:
+            value = change.get("value", {}) or {}
+            for msg in value.get("messages", []) or []:
+                raw = msg.get("from")
+                if isinstance(raw, str):
+                    phones.append(raw)
+            for st in value.get("statuses", []) or []:
+                raw = st.get("recipient_id")
+                if isinstance(raw, str):
+                    phones.append(raw)
+    codes: list[str] = []
+    try:
+        for phone in phones:
+            channel = session.execute(
+                select(CustomerChannel).where(
+                    CustomerChannel.provider == "whatsapp",
+                    CustomerChannel.phone_e164.in_(phone_variants(phone)),
+                )
+            ).scalars().first()
+            if channel is None:
+                continue
+            code = _ten_code(session, channel.tenant_id)
+            if code not in codes:
+                codes.append(code)
+    except Exception:  # noqa: BLE001 — the alert matters more than the name
+        logger.warning("tenant code lookup failed", exc_info=True)
+    return " · ".join(codes) if codes else "(رقم غير مرتبط بعميل)"
+
+
 def _channel_for_phone(session: Session, phone: str) -> CustomerChannel | None:
     return session.execute(
         select(CustomerChannel).where(
@@ -348,23 +389,30 @@ def _handle_message(
 
     if kind is InboundKind.STOP:
         channel.opt_out_at = now
-        _record_inbound(session, tenant_id=channel.tenant_id, channel_id=channel.id,
+        tenant_id = channel.tenant_id
+        _record_inbound(session, tenant_id=tenant_id, channel_id=channel.id,
                         wamid=wamid, message_type=message_type, text_body=text_body,
                         classification="stop", payload=msg, now=now)
-        whatsapp_client.send_text(from_phone, _STOP_CONFIRM)
+        # COMMIT FIRST, then talk. An opt-out is a compliance fact and the
+        # confirmation is a courtesy: the send used to come first and
+        # unwrapped, so a 429 or a 5xx from Meta threw out of here into the
+        # event loop's rollback, opt_out_at went back to NULL, and the
+        # customer who had just been told «ما راح نرسل لك شي» received the
+        # next morning's delivery. A duplicate confirmation costs nothing; a
+        # lost opt-out is the one failure we may not have.
+        session.commit()
+        _reply(whatsapp_client, from_phone, _STOP_CONFIRM)
         # A paying customer going quiet is the single loudest churn signal we
         # get, and «إلغاء الاشتراك» is in the STOP set — they may well mean
         # cancel the BILLING, which no message of ours can do. The operator
         # hears about it (TEN code only, §15.13).
         try:
-            tenant = session.get(Tenant, channel.tenant_id)
             admin_client.send_admin(
-                f"🔇 عميل أوقف الرسائل {tenant.code if tenant else '?'} — "
+                f"🔇 عميل أوقف الرسائل {_ten_code(session, tenant_id)} — "
                 "لو كان قصده إلغاء الاشتراك فالفوترة ما زالت شغالة، راجعه"
             )
         except Exception:  # noqa: BLE001 — alerting never blocks the opt-out
             logger.warning("stop alert failed", exc_info=True)
-        session.commit()
         return
 
     if kind is InboundKind.RESUME and opted_out:
@@ -379,11 +427,15 @@ def _handle_message(
         _record_inbound(session, tenant_id=channel.tenant_id, channel_id=channel.id,
                         wamid=wamid, message_type=message_type, text_body=text_body,
                         classification="resume", payload=msg, now=now)
-        whatsapp_client.send_text(from_phone, _RESUME_CONFIRM)
+        # Same ordering as STOP and for the same reason: the flag is the fact,
+        # the message is the courtesy. A send failure here used to roll the
+        # channel back to silenced — the customer had asked to come back, was
+        # told nothing, and stayed muted with no way of knowing it.
         # a silenced customer who comes back may ALSO be paused at the
         # subscription level; serve that with the standing command they
         # already know rather than making them guess a second word.
         session.commit()
+        _reply(whatsapp_client, from_phone, _RESUME_CONFIRM)
         return
 
     if kind is InboundKind.SUPPORT:
@@ -401,18 +453,26 @@ def _handle_message(
         from career.salla.renewal import current_subscription
 
         sub = current_subscription(session, channel.tenant_id)
-        admin_client.send_admin(admin_msg.support_request(
-            _ten_code(session, channel.tenant_id),
-            sub.plan_code if sub is not None else None,
-        ))
+        ten_code = _ten_code(session, channel.tenant_id)
+        plan_code = sub.plan_code if sub is not None else None
+        phone = channel.phone_e164
+        # The ticket is the durable half — commit it before either transport
+        # is touched. The Telegram page was unwrapped and ran first, so a
+        # Telegram blip discarded the support_events row along with the
+        # inbound: the customer who asked for a human got no ack, no ticket,
+        # and no operator. Both sends below are best-effort over a fact that
+        # is already recorded.
+        session.commit()
+        try:
+            admin_client.send_admin(
+                admin_msg.support_request(ten_code, plan_code)
+            )
+        except Exception:  # noqa: BLE001 — the ticket is already recorded
+            logger.warning("support escalation failed", exc_info=True)
         # closure audit: «دعم» is the escape hatch printed in every error
         # message and on the store page — and it used to page the operator
         # while answering the CUSTOMER with nothing at all.
-        try:
-            whatsapp_client.send_text(channel.phone_e164, _SUPPORT_ACK)
-        except Exception:  # noqa: BLE001 — the ticket is already recorded
-            logger.warning("support ack failed", exc_info=True)
-        session.commit()
+        _reply(whatsapp_client, phone, _SUPPORT_ACK)
         return
 
     # OTHER — record; route to the onboarding journey when one is running,
@@ -543,8 +603,13 @@ def _handle_message(
                 )
             else:
                 thanks = followup.ALREADY_ANSWERED_AR
-            whatsapp_client.send_text(channel.phone_e164, thanks)
+            # the answer is the datum §20 exists to collect and it cannot be
+            # asked for twice — record it, then thank them. Sending first meant
+            # a Meta hiccup rolled the recorded outcome back and the tap was
+            # spent: the card is answered, so the question never returns.
+            phone = channel.phone_e164
             session.commit()
+            _reply(whatsapp_client, phone, thanks)
             return
 
         outcome = cv_deliver.parse_outcome_button(effective)
@@ -554,11 +619,14 @@ def _handle_message(
                 session, tenant_id=channel.tenant_id, job_ref=job_ref,
                 outcome=outcome_kind, reason=None, now=now,
             )
-            whatsapp_client.send_text(
-                channel.phone_e164,
+            # same ordering as the outcome answer above: the recorded feedback
+            # survives a failed thank-you, never the other way round.
+            phone = channel.phone_e164
+            session.commit()
+            _reply(
+                whatsapp_client, phone,
                 "شكرًا! سجلنا ملاحظتك — تساعدنا نحسّن اختياراتنا لك. 🙏",
             )
-            session.commit()
             return
 
         landed = descend_pending_delivery(
@@ -621,15 +689,49 @@ def _handle_message(
     session.commit()
 
 
+#: The receipt ladder. Meta does NOT guarantee the ORDER in which delivery
+#: receipts arrive — retries and webhook redelivery routinely hand us a
+#: «sent» after a «read» — so a receipt is a claim about a POINT on this
+#: ladder, never «the current truth», and only a higher rung may be written.
+#:
+#: `failed` sits between `sent` and `delivered`, deliberately, and it is the
+#: only rung that needed an argument. It is not last: a send can only fail
+#: while it is merely sent — nothing that has reached the handset can
+#: un-arrive — so a `failed` after `sent` is the ordinary race and must win,
+#: while a `delivered`/`read` after a `failed` is positive proof of receipt
+#: for this exact wa_message_id and outranks a failure that, by Meta's own
+#: model, cannot have happened to it (almost always the receipt belongs to a
+#: different send attempt). And it is not first either: that is the direction
+#: with money on it — `cv/close.whatsapp_spend` bills every template whose
+#: status is not `failed`, so letting a stale `sent` overwrite a `failed`
+#: silently turned an undelivered message into a billed one.
+#:
+#: Unknown rungs rank 0: a status we do not know cannot displace one we do.
+_RECEIPT_ORDER: dict[str, int] = {
+    "sent": 1, "failed": 2, "delivered": 3, "read": 4,
+}
+
+
+def _receipt_rank(status: str | None) -> int:
+    return _RECEIPT_ORDER.get(str(status or "").lower(), 0)
+
+
 def _handle_status(session: Session, st: dict[str, Any], *, now: datetime) -> None:
     wamid = st.get("id")
     status = st.get("status")
     if not wamid or not status:
         return
+    rank = _receipt_rank(status)
+    if rank == 0:
+        logger.warning("unknown whatsapp receipt status: %s", status)
     for dm in session.execute(
         select(DeliveryMessage).where(DeliveryMessage.wa_message_id == wamid)
     ).scalars():
+        if rank <= _receipt_rank(dm.status):
+            continue  # out of order, or the same receipt twice — a no-op
         dm.status = str(status)
+        # the stamp belongs to the receipt that actually WON, so a superseded
+        # duplicate never makes a row look freshly updated
         dm.status_updated_at = now
 
 
@@ -673,8 +775,14 @@ def process_pending_whatsapp(
             ev.processing_status = "failed"       # honest, no silent retry loop
             counts["failed"] += 1
             try:
-                admin_client.send_admin("⚠️ رسالة واتساب واردة فشلت معالجتها "
-                                        "وعُزلت — راجع السجل")
+                # WHOSE turn was lost. The unnamed notice made the operator
+                # read the journal to find out, and «راجع السجل» is not an
+                # instruction anyone can act on at 6am.
+                admin_client.send_admin(
+                    "⚠️ رسالة واتساب واردة فشلت معالجتها وعُزلت "
+                    f"{_event_ten_codes(owner_session, ev.payload or {})} "
+                    "— راجع السجل"
+                )
             except Exception:  # noqa: BLE001
                 logger.warning("admin note failed", exc_info=True)
         ev.processed_at = func.now()

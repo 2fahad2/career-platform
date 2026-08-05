@@ -639,3 +639,288 @@ def test_every_customer_reply_is_direction_pure() -> None:
                 raise AssertionError(
                     f"{name}: mixed-direction line would scramble: {line!r}"
                 )
+
+
+# ── a lost opt-out is worse than a duplicate confirmation (AUDIT, 5 Aug) ─────
+# Theme: every branch below writes a FACT and then talks about it. The talking
+# used to come first, unwrapped, inside the same transaction — so a 429 or a
+# 5xx from Meta took the fact down with it and left the customer believing
+# something that was no longer true.
+
+
+class _MetaRefusing(FakeWhatsAppClient):
+    """Meta answering 429/5xx on the send. Everything else stays real."""
+
+    def send_text(self, to_phone: str, body: str) -> str:
+        from career.whatsapp.client import WhatsAppSendError
+
+        raise WhatsAppSendError("429")
+
+
+class _TelegramRefusing(FakeTelegramAdminClient):
+    """The operator channel down — never the customer's problem."""
+
+    def send_admin(self, body: str) -> None:
+        from career.telegram.admin import TelegramSendError
+
+        raise TelegramSendError("500")
+
+
+def test_an_opt_out_is_never_lost_to_a_failed_confirmation(
+    owner_session: Session, owner_engine: Engine, clean_billing: None
+) -> None:
+    """Opt-out is a compliance surface. The STOP branch set opt_out_at, then
+    sent «تم إيقاف الرسائل» UNWRAPPED before committing: one 429 from Meta
+    unwound the whole turn, opt_out_at went back to NULL, and the customer who
+    had just been told we would never write again received the next morning's
+    delivery. Losing one opt-out is worse than sending two confirmations."""
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    phone = _activate_phone(owner_session, wa, admin)
+    _insert_event(owner_session, _payload(
+        [_text_msg(f"wamid-{uuid.uuid4()}", phone, "إيقاف الرسائل")]))
+
+    counts = _run(owner_session, _MetaRefusing(), admin)
+
+    assert counts["failed"] == 0          # a failed courtesy is not a failure
+    with Session(owner_engine) as s:
+        opt_out = s.execute(text(
+            "SELECT opt_out_at FROM customer_channels WHERE phone_e164 = :p"),
+            {"p": phone}).scalar_one()
+    assert opt_out is not None, "the opt-out was rolled back by a failed send"
+
+
+def test_a_support_ticket_survives_a_deaf_operator_channel(
+    owner_session: Session, owner_engine: Engine, clean_billing: None
+) -> None:
+    """«دعم» is the escape hatch printed in every error message. The Telegram
+    page ran first and unwrapped, so a Telegram blip discarded the
+    support_events row along with the inbound: the customer who asked for a
+    human got no ticket, no ack, and no operator."""
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    phone = _activate_phone(owner_session, wa, admin)
+    _insert_event(owner_session, _payload(
+        [_text_msg(f"wamid-{uuid.uuid4()}", phone, "دعم")]))
+
+    counts = _run(owner_session, wa, _TelegramRefusing())
+
+    assert counts["failed"] == 0
+    with Session(owner_engine) as s:
+        tickets = s.execute(text(
+            "SELECT count(*) FROM support_events se JOIN customer_channels c"
+            " ON c.id = se.channel_id WHERE c.phone_e164 = :p"),
+            {"p": phone}).scalar_one()
+    assert tickets == 1
+    assert "الفريق" in (wa.sent[-1].body or "")   # and they were answered
+
+
+def test_an_outcome_tap_is_recorded_before_it_is_thanked(
+    owner_session: Session, owner_engine: Engine, clean_billing: None
+) -> None:
+    """§20's answer is a datum that cannot be collected twice — the card is
+    answered, so the question never comes back. The thank-you used to be sent
+    before the commit, so a Meta hiccup rolled the recorded tap back and the
+    inbound row with it, spending the customer's tap on nothing."""
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    phone = _activate_phone(owner_session, wa, admin)
+    wamid = f"wamid-{uuid.uuid4()}"
+    _insert_event(owner_session, _payload(
+        [_text_msg(wamid, phone, "oc_interview")]))
+
+    counts = _run(owner_session, _MetaRefusing(), admin)
+
+    assert counts["failed"] == 0
+    with Session(owner_engine) as s:
+        recorded = s.execute(text(
+            "SELECT count(*) FROM inbound_messages WHERE wa_message_id = :w"),
+            {"w": wamid}).scalar_one()
+    assert recorded == 1, "the tap was rolled back by a failed thank-you"
+
+
+# ── delivery receipts only ever move forwards (AUDIT, 5 Aug) ────────────────
+
+
+LATER = NOW + timedelta(hours=2)
+
+
+def _seed_outbound(owner_session: Session, phone: str, wamid: str, *,
+                   status: str = "sent", template: str | None = None,
+                   kind: str = "template") -> uuid.UUID:
+    from career.whatsapp.delivery import record_out
+
+    channel = owner_session.execute(select(CustomerChannel).where(
+        CustomerChannel.phone_e164 == phone)).scalar_one()
+    record_out(owner_session, tenant_id=channel.tenant_id,
+               channel_id=channel.id, kind=kind, wa_message_id=wamid,
+               template_name=template, now=NOW, status=status)
+    owner_session.commit()
+    return channel.tenant_id
+
+
+def _receipt(owner_session: Session, wamid: str, status: str, *,
+             now: datetime = NOW) -> None:
+    _insert_event(owner_session, _payload(statuses=[
+        {"id": wamid, "status": status, "recipient_id": "966500000000"},
+    ]))
+    _run(owner_session, FakeWhatsAppClient(), FakeTelegramAdminClient(), now=now)
+
+
+def _receipt_row(owner_session: Session, wamid: str) -> Any:
+    return owner_session.execute(text(
+        "SELECT status, status_updated_at FROM delivery_messages"
+        " WHERE wa_message_id = :w"), {"w": wamid}).one()
+
+
+def test_a_late_sent_never_unreads_a_read(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """Meta does not guarantee receipt ORDER — a retried «sent» after a «read»
+    is routine — and the handler wrote whatever arrived last, walking the
+    delivery backwards and dating it now."""
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    phone = _activate_phone(owner_session, wa, admin)
+    wamid = f"wamid-{uuid.uuid4()}"
+    _seed_outbound(owner_session, phone, wamid)
+
+    _receipt(owner_session, wamid, "read", now=NOW)
+    _receipt(owner_session, wamid, "sent", now=LATER)
+
+    row = _receipt_row(owner_session, wamid)
+    assert row.status == "read"
+    assert row.status_updated_at == NOW      # the receipt that WON dates it
+
+
+def test_a_duplicate_receipt_changes_nothing(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """The same receipt twice (Meta redelivers freely) must not make a row
+    look freshly updated — the stamp is evidence the operator reads."""
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    phone = _activate_phone(owner_session, wa, admin)
+    wamid = f"wamid-{uuid.uuid4()}"
+    _seed_outbound(owner_session, phone, wamid)
+
+    _receipt(owner_session, wamid, "delivered", now=NOW)
+    _receipt(owner_session, wamid, "delivered", now=LATER)
+
+    row = _receipt_row(owner_session, wamid)
+    assert row.status == "delivered"
+    assert row.status_updated_at == NOW
+
+
+def test_a_failed_message_never_becomes_billable_again(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """The rung with money on it. `cv/close.whatsapp_spend` bills every
+    template whose status is not «failed», so a stale «sent» arriving after
+    the failure flipped an undelivered message back into a billed one — and
+    told the operator it had been sent. A failure outranks a `sent`; nothing
+    weaker than it may overwrite it."""
+    from career.cv import close as cv_close
+
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    phone = _activate_phone(owner_session, wa, admin)
+    wamid = f"wamid-{uuid.uuid4()}"
+    tenant_id = _seed_outbound(owner_session, phone, wamid,
+                               template=DAILY_UTILITY.name)
+
+    _receipt(owner_session, wamid, "failed", now=NOW)
+    assert _receipt_row(owner_session, wamid).status == "failed"
+    assert cv_close.whatsapp_spend(owner_session, tenant_id=tenant_id) == {}
+
+    _receipt(owner_session, wamid, "sent", now=LATER)      # the stale racer
+
+    row = _receipt_row(owner_session, wamid)
+    assert row.status == "failed"
+    assert row.status_updated_at == NOW
+    assert cv_close.whatsapp_spend(owner_session, tenant_id=tenant_id) == {}
+
+
+def test_proof_of_receipt_outranks_a_failure_that_cannot_have_happened(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """The deliberate half of the ladder. `failed` is not last: a send can
+    only fail while it is merely sent, so a `read` for this exact
+    wa_message_id is positive proof the failure belonged to another attempt —
+    and a message the customer demonstrably opened is not an undelivered
+    one."""
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    phone = _activate_phone(owner_session, wa, admin)
+    wamid = f"wamid-{uuid.uuid4()}"
+    _seed_outbound(owner_session, phone, wamid)
+
+    _receipt(owner_session, wamid, "failed", now=NOW)
+    _receipt(owner_session, wamid, "read", now=LATER)
+
+    row = _receipt_row(owner_session, wamid)
+    assert row.status == "read"
+    assert row.status_updated_at == LATER
+
+
+# ── the watchtower runner's cursor (scripts/run_admin_bot.py) ───────────────
+# Placed here because that runner has no test module of its own and this
+# change set owns both files; it belongs beside the console tests the day
+# someone gives it one.
+
+
+def _admin_runner() -> Any:
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / "run_admin_bot.py"
+    spec = importlib.util.spec_from_file_location("career_run_admin_bot", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_one_poisoned_update_can_never_wedge_the_watchtower(
+    owner_engine: Engine,
+) -> None:
+    """INCIDENT: the offset was stored AFTER handle_update, in its transaction.
+    Anything that escaped left the cursor where it was, so getUpdates handed
+    back the same update five seconds later, forever — the operator's only
+    window into the system, closed by one tap until someone restarted the
+    service. Worse than the wedge: a handler that sends before it fails
+    repeated that send at a real customer's phone every five seconds.
+
+    So the cursor moves FIRST and the failure is announced. The dropped update
+    is the deliberate cost: every screen here is operator-initiated and
+    re-tappable, and at-most-once on a control channel beats at-least-once
+    with real customer sends behind it.
+    """
+    runner = _admin_runner()
+    with Session(owner_engine) as s:
+        before = runner._load_offset(s)
+    seen_while_working: list[int] = []
+    skips: list[str] = []
+
+    def poisoned(session: Session, update: dict[str, Any]) -> list[Any]:
+        with Session(owner_engine) as inner:
+            seen_while_working.append(runner._load_offset(inner))
+        raise RuntimeError("poisoned update")
+
+    def healthy(session: Session, update: dict[str, Any]) -> list[Any]:
+        return ["one screen"]
+
+    try:
+        outcomes = runner.process_one_update(
+            owner_engine, {"update_id": before + 1}, update_id=before + 1,
+            handler=poisoned, on_skip=lambda: skips.append("said so"),
+        )
+        assert outcomes == []                      # nothing drawn over a failure
+        assert skips == ["said so"]                # and never silently
+        assert seen_while_working == [before + 1]  # cursor had ALREADY moved
+        with Session(owner_engine) as s:
+            assert runner._load_offset(s) == before + 1
+
+        # the healthy path still works, and still returns its screens
+        assert runner.process_one_update(
+            owner_engine, {"update_id": before + 2}, update_id=before + 2,
+            handler=healthy, on_skip=lambda: skips.append("wrong"),
+        ) == ["one screen"]
+        assert skips == ["said so"]
+    finally:
+        with Session(owner_engine) as s:
+            runner._store_offset(s, before)
+            s.commit()

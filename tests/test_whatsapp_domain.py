@@ -79,6 +79,106 @@ class TestClassification:
             kind, _ = classify_inbound(phrase)
             assert kind is InboundKind.SUPPORT, phrase
 
+
+class TestSpellingsThatUsedToBeMissed:
+    """P0-15: the sets were byte-exact, so a customer's own keyboard decided
+    whether an opt-out or a call for help was heard at all."""
+
+    def test_the_opt_out_spellings_a_real_keyboard_produces(self) -> None:
+        """LIVE MISS: «الغاء الإشتراك» — a hamza on the alef of الاشتراك —
+        was not read as an opt-out. Meta requires us to honor it, and it was
+        failing in silence, which is the worst shape a compliance bug takes."""
+        for phrase in (
+            "الغاء الإشتراك", "إلغاء الإشتراك", "إلغاء الاشتراك",
+            "الغاء الاشتراك", "إلغَاء الاشتراك", "ايقاف الرسائل",
+            "إيقاف الرسائل", "الغاء", "إلغاء",
+        ):
+            kind, _ = classify_inbound(phrase)
+            assert kind is InboundKind.STOP, phrase
+
+    def test_the_help_spellings_a_real_keyboard_produces(self) -> None:
+        """LIVE MISS: «مساعده» (taa-marbuta typed as haa) reached nobody, and
+        «الدعم» — the word with the article a customer naturally types — was
+        not the escape hatch «دعم» is promised to be everywhere."""
+        for phrase in ("مساعده", "مساعدة", "المساعدة", "الدعم", "دعم",
+                       "ساعدني", "خدمة العملاء"):
+            kind, _ = classify_inbound(phrase)
+            assert kind is InboundKind.SUPPORT, phrase
+
+    def test_resume_folds_its_own_spellings(self) -> None:
+        for phrase in ("تشغيل الرسائل", "ابدأ", "ابدا", "رجّعني", "رجعني",
+                       "استئناف", "start"):
+            kind, _ = classify_inbound(phrase)
+            assert kind is InboundKind.RESUME, phrase
+
+
+class TestCommandsInsideARequest:
+    """STOP and SUPPORT tolerate the words a Saudi customer wraps a request
+    in; RESUME deliberately does not (a false resume re-opens messaging to
+    someone who asked for silence)."""
+
+    def test_a_polite_opt_out_is_still_an_opt_out(self) -> None:
+        for phrase in ("ابي الغاء الاشتراك", "الغاء الاشتراك لو سمحت",
+                       "أبغى إيقاف الرسائل من فضلك", "أوقفوا الرسائل"):
+            kind, _ = classify_inbound(phrase)
+            assert kind is InboundKind.STOP, phrase
+
+    def test_a_polite_call_for_help_is_still_a_call_for_help(self) -> None:
+        for phrase in ("ابي مساعده", "محتاج دعم لو سمحت", "ممكن مساعدة",
+                       "يا اخوي ساعدني"):
+            kind, _ = classify_inbound(phrase)
+            assert kind is InboundKind.SUPPORT, phrase
+
+    def test_resume_stays_narrow_and_is_not_guessed(self) -> None:
+        """A missed resume costs one retyped word — the opt-out confirmation
+        prints «تشغيل الرسائل» verbatim. A guessed one starts messaging a
+        customer who is on record asking us to stop."""
+        for phrase in ("ابغى ارجع", "ودي ترجع الرسائل", "شغل"):
+            kind, _ = classify_inbound(phrase)
+            assert kind is InboundKind.OTHER, phrase
+
+
+class TestTrapsTheseCommandsMustNotFallInto:
+    def test_a_negation_kills_the_command_outright(self) -> None:
+        """«ما أبي إلغاء الاشتراك» is a customer REFUSING to cancel. Reading
+        the keyword there would put the opposite of their words in their
+        mouth — the same rule the consent gate uses one layer down."""
+        for phrase in ("ما ابي الغاء الاشتراك", "لا أريد إيقاف الرسائل",
+                       "مو قصدي الغاء", "لا احتاج مساعدة", "ما ابغى دعم"):
+            kind, _ = classify_inbound(phrase)
+            assert kind is InboundKind.OTHER, phrase
+
+    def test_one_unknown_word_makes_it_a_sentence_not_a_command(self) -> None:
+        for phrase in ("أريد إيقاف الرسائل غدًا وليس الآن",
+                       "متى ينتهي الاشتراك", "ابي الغاء الموعد بكرة",
+                       "دعم فني", "مساعد إداري"):
+            kind, _ = classify_inbound(phrase)
+            assert kind is InboundKind.OTHER, phrase
+
+    def test_the_pause_command_is_never_read_as_an_opt_out(self) -> None:
+        """§05's «وقف مؤقت» / «إيقاف مؤقت» pause the SUBSCRIPTION, and the
+        worker resolves STOP before it ever reaches the privacy commands — so
+        a pause read as an opt-out would silence the customer instead."""
+        for phrase in ("وقف مؤقت", "إيقاف مؤقت", "ايقاف مؤقت"):
+            kind, _ = classify_inbound(phrase)
+            assert kind is InboundKind.OTHER, phrase
+
+    def test_the_subscription_nouns_alone_are_never_a_command(self) -> None:
+        """«حالة اشتراكي» and «تجديد الاشتراك» (an approved template button)
+        share their noun with the opt-out and must never share its fate."""
+        for phrase in ("حالة اشتراكي", "تجديد الاشتراك", "الاشتراك",
+                       "الرسائل", "لو سمحت"):
+            kind, _ = classify_inbound(phrase)
+            assert kind is InboundKind.OTHER, phrase
+
+    def test_folding_never_touches_the_activation_token(self) -> None:
+        """The fold lowercases and drops punctuation; the token carries case,
+        «-» and «_». Extraction must keep reading the RAW text."""
+        token = "AbC-dEf_123456789012345"
+        kind, extracted = classify_inbound(f"تفعيل {token}")
+        assert kind is InboundKind.ACTIVATION
+        assert extracted == token
+
     def test_other(self) -> None:
         assert classify_inbound("نعم أوافق")[0] is InboundKind.OTHER
         assert classify_inbound("")[0] is InboundKind.OTHER

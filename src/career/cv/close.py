@@ -115,24 +115,10 @@ def close_tenant_day(
         "failed_sends": len(failed_groups),
     }
 
-    row = session.execute(
-        select(TenantDayState).where(
-            TenantDayState.tenant_id == tenant_id,
-            TenantDayState.run_date == run_date,
-        )
-    ).scalar_one_or_none()
-    if row is None:
-        row = TenantDayState(
-            id=uuid.uuid4(), tenant_id=tenant_id, run_date=run_date,
-            state=state_value, counts=counts, recorded_at=now,
-        )
-        session.add(row)
-    elif _outranks(state_value, row.state):
-        row.state = state_value
-        row.counts = counts
-        row.recorded_at = now
-    session.flush()
-    return row
+    return _record_day_state(
+        session, tenant_id=tenant_id, run_date=run_date,
+        state=state_value, counts=counts, now=now,
+    )
 
 
 #: Only a DELIVERY is protected. A day that already delivered cannot be
@@ -173,18 +159,32 @@ def _outranks(new_state: str, existing: str) -> bool:
     return new_state in _PROTECTED
 
 
-def close_skipped_opted_out(
+def _record_day_state(
     session: Session,
     *,
     tenant_id: uuid.UUID,
     run_date: date,
+    state: str,
+    counts: dict[str, int],
     now: datetime,
-    gate_passes: int,
 ) -> TenantDayState:
-    """CHANGELOG §12: the eighth honest state — opted-out customer whose day
-    had gate passes. Recorded, never counted as success or failure."""
-    counts = {"gate_passes": gate_passes, "cv_resolved": 0, "cv_failed": 0,
-              "delivered": 0, "failed_sends": 0}
+    """The ONE writer of ``tenant_day_states`` — every path comes through here.
+
+    The monotonic rule (:func:`_outranks`) used to live inside
+    ``close_tenant_day`` only, and the second writer that arrived later
+    (``close_skipped_opted_out``, CHANGELOG §12) simply did not ask it: a bare
+    ``else`` overwrote whatever was there. That path runs AFTER the delivery
+    phase, so a customer who received his jobs at 06:00 and pressed «إيقاف» at
+    06:10 had his real DELIVERED day — with its real counts — rewritten to
+    SKIPPED_OPTED_OUT with ``delivered: 0``, while the suppression rows kept
+    recording those very jobs as sent. The ledger the operator trusts then
+    contradicted itself, and the number he reports as «سُلِّم اليوم» silently
+    lost a real delivery.
+
+    So the gate is no longer something a writer must remember to call — it is
+    the only door. A future ninth state gets the rule for free, which is the
+    property that failed here: the rule was correct and merely bypassable.
+    """
     row = session.execute(
         select(TenantDayState).where(
             TenantDayState.tenant_id == tenant_id,
@@ -194,15 +194,37 @@ def close_skipped_opted_out(
     if row is None:
         row = TenantDayState(
             id=uuid.uuid4(), tenant_id=tenant_id, run_date=run_date,
-            state="SKIPPED_OPTED_OUT", counts=counts, recorded_at=now,
+            state=state, counts=counts, recorded_at=now,
         )
         session.add(row)
-    else:
-        row.state = "SKIPPED_OPTED_OUT"
+    elif _outranks(state, row.state):
+        row.state = state
         row.counts = counts
         row.recorded_at = now
     session.flush()
     return row
+
+
+def close_skipped_opted_out(
+    session: Session,
+    *,
+    tenant_id: uuid.UUID,
+    run_date: date,
+    now: datetime,
+    gate_passes: int,
+) -> TenantDayState:
+    """CHANGELOG §12: the eighth honest state — opted-out customer whose day
+    had gate passes. Recorded, never counted as success or failure.
+
+    An opt-out is an event about TOMORROW, never about what already arrived:
+    it cannot un-send this morning's delivery, so it cannot outrank it either
+    (see :func:`_record_day_state`, which enforces that for every writer)."""
+    counts = {"gate_passes": gate_passes, "cv_resolved": 0, "cv_failed": 0,
+              "delivered": 0, "failed_sends": 0}
+    return _record_day_state(
+        session, tenant_id=tenant_id, run_date=run_date,
+        state="SKIPPED_OPTED_OUT", counts=counts, now=now,
+    )
 
 
 # ── the admin daily summary (TEN codes + numbers only, §15.13) ───────────────

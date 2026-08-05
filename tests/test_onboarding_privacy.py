@@ -12,7 +12,9 @@ PII-free tenant skeleton. Pause suspends without extending the period (§05:
 from __future__ import annotations
 
 import json
+import re
 import uuid
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -386,3 +388,180 @@ def test_the_renewal_button_meta_really_sends_is_understood() -> None:
 
     assert _PRIVACY_COMMANDS["تجديد الاشتراك"] == "status"
     assert _PRIVACY_COMMANDS["حالة اشتراكي"] == "status"
+
+
+# ── the pause the state machine never agreed to (AUDIT, 5 August) ────────────
+
+
+@contextmanager
+def _tenant_in_status(owner_session, status: str):
+    """A tenant holding one pass subscription in the given state.
+
+    The shape every pause/resume question needs, and the cleanup the repo
+    lesson demands: an open transaction wedges the clean_billing teardown.
+    """
+    tid = uuid.uuid4()
+    owner_session.execute(sql_text(
+        "INSERT INTO tenants (id, code) VALUES (:i, :c)"),
+        {"i": str(tid), "c": f"TEN-S{uuid.uuid4().int % 100_000:05d}"})
+    owner_session.execute(sql_text(
+        "INSERT INTO subscriptions (id, tenant_id, plan_code, status,"
+        " salla_order_id, amount_sar, currency)"
+        " VALUES (:i, :t, 'professional', :s, :o, 279, 'SAR')"),
+        {"i": str(uuid.uuid4()), "t": str(tid), "s": status,
+         "o": f"ORD-{uuid.uuid4()}"})
+    owner_session.commit()
+    try:
+        yield tid
+    finally:
+        owner_session.rollback()
+        for table in ("subscription_events", "privacy_requests", "subscriptions"):
+            owner_session.execute(sql_text(
+                f"DELETE FROM {table} WHERE tenant_id = :t"), {"t": str(tid)})  # noqa: S608
+        owner_session.execute(sql_text("DELETE FROM tenants WHERE id = :t"),
+                              {"t": str(tid)})
+        owner_session.commit()
+
+
+def _db_status(owner_session, tenant_id: uuid.UUID) -> str:
+    return owner_session.execute(sql_text(
+        "SELECT status FROM subscriptions WHERE tenant_id = :t"),
+        {"t": str(tenant_id)}).scalar_one()
+
+
+def test_pausing_in_grace_answers_the_customer_instead_of_crashing(
+    owner_session, clean_billing
+):
+    """INCIDENT: «وقف مؤقت» from GRACE raised InvalidTransition.
+
+    ``_PAUSABLE`` was written by hand and counted GRACE as pausable while the
+    state machine has no GRACE→PAUSED edge, so the transition raised straight
+    through the standing privacy command into the WhatsApp worker: the inbound
+    row was rolled back, the event was marked failed — a terminal status
+    nothing re-reads — and the customer, whose paid period had just ended and
+    who is therefore exactly the person most likely to type it, was answered
+    with nothing at all.
+    """
+    from career.onboarding import privacy as _p
+    from career.salla import subscriptions as _st
+
+    with _tenant_in_status(owner_session, _st.GRACE) as tid:
+        result = _p.pause_subscription(owner_session, tenant_id=tid)  # no raise
+        assert result.outcome is _p.ActionOutcome.NOT_ELIGIBLE
+        assert result.changed is False
+        assert result.status == _st.GRACE
+        assert _db_status(owner_session, tid) == _st.GRACE  # untouched
+
+
+def test_the_pausable_set_belongs_to_the_state_machine(owner_session):
+    """The drift itself, not one instance of it. Two modules agreed about
+    which states may be paused only by coincidence, and the coincidence
+    lapsed. Restating the set anywhere is now a failing test."""
+    from career.onboarding import privacy as _p
+    from career.salla import subscriptions as _st
+
+    derived = frozenset(
+        state for state in _st.ALL_STATES
+        if _st.can_transition(state, _st.PAUSED)
+    )
+    assert _p._PAUSABLE == derived
+    assert _st.GRACE not in _p._PAUSABLE
+    assert {_st.ACTIVE, _st.ONBOARDING} <= _p._PAUSABLE  # still the real ones
+
+
+def test_a_refusal_is_never_shaped_like_a_success(owner_session, clean_billing):
+    """AUDIT: both actions returned the subscription row UNCHANGED when they
+    declined, so «paused it» and «refused to pause it» were the same value.
+    Every caller had to re-read the status to tell them apart and one did not
+    — which is how «✅ استأنفنا الخدمة للعميل» was printed over an account
+    that was never resumed. The outcome now travels with the answer."""
+    from career.onboarding import privacy as _p
+    from career.salla import subscriptions as _st
+
+    with _tenant_in_status(owner_session, _st.ACTIVE) as tid:
+        first = _p.pause_subscription(owner_session, tenant_id=tid)
+        assert first.outcome is _p.ActionOutcome.CHANGED
+        assert first.changed and first.status == _st.PAUSED
+
+        again = _p.pause_subscription(owner_session, tenant_id=tid)
+        assert again.outcome is _p.ActionOutcome.ALREADY
+        assert not again.changed              # idempotent, and says so
+
+        back = _p.resume_subscription(owner_session, tenant_id=tid)
+        assert back.outcome is _p.ActionOutcome.CHANGED
+        assert _db_status(owner_session, tid) == _st.ACTIVE
+
+        nothing = _p.resume_subscription(owner_session, tenant_id=tid)
+        assert nothing.outcome is _p.ActionOutcome.ALREADY
+        assert not nothing.changed
+
+    with _tenant_in_status(owner_session, _st.EXPIRED) as tid:
+        refused = _p.resume_subscription(owner_session, tenant_id=tid)
+        assert refused.outcome is _p.ActionOutcome.NOT_ELIGIBLE
+        assert not refused.changed and refused.status == _st.EXPIRED
+        assert _db_status(owner_session, tid) == _st.EXPIRED
+
+
+def test_a_tenant_with_no_subscription_is_answered_not_silenced(
+    owner_session, clean_billing
+):
+    """«حالة اشتراكي» is the most advertised command in the product, and for a
+    tenant with no live row — the shells a §04 upgrade leaves behind, an order
+    still being provisioned — it raised RequestNotFound: a privacy-REQUEST
+    exception standing in for «no subscription», thrown on the customer path.
+    Their whole turn died with no reply at all."""
+    from career.onboarding import privacy as _p
+
+    tid = uuid.uuid4()
+    owner_session.execute(sql_text(
+        "INSERT INTO tenants (id, code) VALUES (:i, :c)"),
+        {"i": str(tid), "c": f"TEN-N{uuid.uuid4().int % 100_000:05d}"})
+    owner_session.commit()
+    try:
+        summary = _p.subscription_status_summary(
+            owner_session, tenant_id=tid, now=NOW)      # no raise
+        assert "دعم" in summary                        # never a dead end
+        assert "حالة اشتراكي" in summary
+
+        # the two actions on the same path answer instead of raising too
+        paused = _p.pause_subscription(owner_session, tenant_id=tid)
+        assert paused.outcome is _p.ActionOutcome.NO_SUBSCRIPTION
+        assert paused.subscription is None and not paused.changed
+        resumed = _p.resume_subscription(owner_session, tenant_id=tid)
+        assert resumed.outcome is _p.ActionOutcome.NO_SUBSCRIPTION
+    finally:
+        owner_session.rollback()
+        owner_session.execute(sql_text("DELETE FROM tenants WHERE id = :t"),
+                              {"t": str(tid)})
+        owner_session.commit()
+
+
+def test_every_state_has_an_arabic_name_and_no_line_mixes_directions():
+    """PENDING_PAYMENT was missing from the map, so «حالة اشتراكي» answered
+    with an Arabic sentence carrying a raw Latin token in the middle of it —
+    a line Fahad's client scrambles on delivery (§16), and one that means
+    nothing to the reader either way. The guard is structural: a twelfth
+    subscription state with no Arabic name fails here."""
+    from career.onboarding import privacy as _p
+    from career.salla import subscriptions as _st
+
+    assert _st.ALL_STATES <= set(_p._STATUS_AR)
+
+    arabic = re.compile(r"[؀-ۿ]")
+    latin = re.compile(r"[A-Za-z]")
+    bodies: list[tuple[str, str]] = []
+    for name, value in vars(_p).items():
+        if name.startswith("__"):
+            continue
+        if isinstance(value, str) and arabic.search(value):
+            bodies.append((name, value))
+        elif isinstance(value, dict):
+            bodies.extend((name, v) for v in value.values()
+                          if isinstance(v, str) and arabic.search(v))
+    assert bodies
+    for name, body in bodies:
+        for line in body.splitlines():
+            if arabic.search(line) and latin.search(line):
+                raise AssertionError(
+                    f"{name}: mixed-direction line would scramble: {line!r}"
+                )

@@ -1,18 +1,33 @@
 """CV upload security pipeline acceptance tests (whitepaper §11) — before code.
 
 Controls under test: magic-byte MIME sniffing (extension is never trusted),
-size and page limits, injectable malware scanner, structural PDF inspection
-(encryption, JavaScript, embedded files, open-actions), DOCX inspection
-(macros, OLE embeddings, remote templates, zip anomalies), metadata-stripping
-sanitization, sandboxed text extraction (timeout + memory), and the consent
-gate: nothing is processed before the required consents exist.
+size and page limits, the malware engine (a real clamd client, its three-way
+readiness state and the declared policy for an upload nobody could scan),
+structural PDF inspection (encryption, JavaScript, embedded files,
+open-actions), DOCX inspection (macros, OLE embeddings, remote templates, zip
+anomalies), metadata-stripping sanitization, sandboxed text extraction
+(timeout + memory), and the consent gate: nothing is processed before the
+required consents exist.
+
+The engine tests run a real clamd-speaking socket server in a thread rather
+than a mock: the failure that shipped was a scanner interface with nothing
+behind it, so a test that only proves the interface is called would have
+passed then too.
 """
 
 from __future__ import annotations
 
+import contextlib
 import io
+import os
+import socket
+import struct
+import tempfile
+import threading
+import time
 import uuid
 import zipfile
+from collections.abc import Iterator
 
 import pytest
 from pypdf import PdfReader, PdfWriter
@@ -189,6 +204,190 @@ def test_scanner_finding_rejects_the_file() -> None:
     assert "malware_detected:Eicar-Test-Signature" in report.findings
 
 
+# ── the real engine: a clamd-speaking socket, not a mock ─────────────────────
+
+
+def _recv_exact(conn: socket.socket, n: int, pending: bytearray) -> bytes:
+    while len(pending) < n:
+        chunk = conn.recv(65536)
+        if not chunk:
+            break
+        pending.extend(chunk)
+    out = bytes(pending[:n])
+    del pending[:n]
+    return out
+
+
+def _drain_request(conn: socket.socket) -> None:
+    """Speak clamd's side of the wire properly: the command is NUL-terminated,
+    and INSTREAM is length-prefixed chunks ending in a zero length. Sniffing
+    for four zero bytes would misread a PDF that happens to contain them."""
+    pending = bytearray()
+    cmd = bytearray()
+    while b"\x00" not in cmd:
+        byte = _recv_exact(conn, 1, pending)
+        if not byte:
+            return
+        cmd.extend(byte)
+    if not bytes(cmd).startswith(b"zINSTREAM"):
+        return
+    while True:
+        header = _recv_exact(conn, 4, pending)
+        if len(header) < 4:
+            return
+        size = struct.unpack("!I", header)[0]
+        if size == 0:
+            return
+        _recv_exact(conn, size, pending)
+
+
+@contextlib.contextmanager
+def _fake_clamd(reply: bytes, *, delay: float = 0.0) -> Iterator[str]:
+    """A clamd stand-in on a real unix socket. Yields the socket path."""
+    directory = tempfile.mkdtemp()  # short path: AF_UNIX caps at ~107 bytes
+    path = os.path.join(directory, "clamd.sock")
+    stop = threading.Event()
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(path)
+    server.listen(4)
+    server.settimeout(0.2)
+
+    def _serve() -> None:
+        while not stop.is_set():
+            try:
+                conn, _ = server.accept()
+            except (TimeoutError, OSError):
+                continue
+            with conn:
+                conn.settimeout(3.0)
+                try:
+                    _drain_request(conn)
+                    if delay:
+                        time.sleep(delay)
+                    conn.sendall(reply)
+                except OSError:
+                    pass
+
+    thread = threading.Thread(target=_serve, daemon=True)
+    thread.start()
+    try:
+        yield path
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+        server.close()
+        os.unlink(path)
+        os.rmdir(directory)
+
+
+def test_clamd_reports_a_clean_file() -> None:
+    with _fake_clamd(b"stream: OK\x00") as path:
+        assert upload.ClamdScanner(path, timeout_s=3.0).scan(_pdf_with_text()) is None
+
+
+def test_clamd_detection_becomes_a_malware_finding() -> None:
+    with _fake_clamd(b"stream: Win.Test.EICAR_HDB-1 FOUND\x00") as path:
+        report = upload.validate_upload(
+            _pdf_with_text(),
+            scanner=upload.ClamdScanner(path, timeout_s=3.0),
+            limits=LIMITS,
+        )
+    assert not report.ok
+    assert "malware_detected:Win.Test.EICAR_HDB-1" in report.findings
+    assert report.scanned
+
+
+def test_clamd_ping_is_the_ready_light() -> None:
+    with _fake_clamd(b"PONG\x00") as path:
+        health = upload.scanner_health(upload.ClamdScanner(path, timeout_s=3.0))
+    assert health.state == upload.SCANNER_READY
+    assert health.ok and health.engine == "clamd"
+
+
+def test_engine_timeout_is_a_declared_rejection_not_a_pass() -> None:
+    """The hang is the dangerous one: an engine that never answers used to be
+    indistinguishable from an engine that said OK."""
+    with _fake_clamd(b"stream: OK\x00", delay=3.0) as path:
+        scanner = upload.ClamdScanner(path, timeout_s=0.4)
+        with pytest.raises(upload.ScannerUnavailable) as err:
+            scanner.scan(_pdf_with_text())
+        assert "timeout" in str(err.value)
+        report = upload.validate_upload(
+            _pdf_with_text(), scanner=scanner, limits=LIMITS
+        )
+    assert not report.ok
+    assert "scanner_unavailable:engine_timeout" in report.findings
+
+
+def test_engine_unreachable_rejects_and_shows_a_red_light() -> None:
+    scanner = upload.ClamdScanner("/nonexistent/clamd.sock", timeout_s=1.0)
+    with pytest.raises(upload.ScannerUnavailable):
+        scanner.scan(_pdf_with_text())
+    health = upload.scanner_health(scanner)
+    assert health.state == upload.SCANNER_UNREACHABLE
+    assert health.detail == "engine_unreachable"
+    report = upload.validate_upload(_pdf_with_text(), scanner=scanner, limits=LIMITS)
+    assert "scanner_unavailable:engine_unreachable" in report.findings
+
+
+def test_unreachable_engine_may_be_degraded_deliberately() -> None:
+    """Configurable, because an operator riding out a daemon outage should be
+    able to choose to keep selling — visibly, with every row marked."""
+    scanner = upload.ClamdScanner("/nonexistent/clamd.sock", timeout_s=1.0)
+    report = upload.validate_upload(
+        _pdf_with_text(), scanner=scanner, limits=LIMITS,
+        policy=upload.ScanPolicy(on_unavailable=upload.ACCEPT_UNSCANNED),
+    )
+    assert report.ok
+    assert not report.scanned
+    assert report.unscanned_reason == "engine_unreachable"
+
+
+def test_no_engine_configured_accepts_but_never_claims_clean() -> None:
+    scanner = upload.build_scanner("")
+    assert isinstance(scanner, upload.UnconfiguredScanner)
+    assert upload.scanner_health(scanner).state == upload.SCANNER_ABSENT
+    report = upload.validate_upload(_pdf_with_text(), scanner=scanner, limits=LIMITS)
+    assert report.ok                      # the paying customer is not blocked
+    assert not report.scanned             # and we do not pretend otherwise
+    assert report.unscanned_reason == "no_engine_configured"
+
+
+def test_absent_engine_can_be_made_fail_closed() -> None:
+    report = upload.validate_upload(
+        _pdf_with_text(), scanner=upload.UnconfiguredScanner(), limits=LIMITS,
+        policy=upload.ScanPolicy(on_absent=upload.REJECT),
+    )
+    assert "scanner_unavailable:no_engine_configured" in report.findings
+
+
+def test_file_above_the_engine_size_bound_is_never_streamed() -> None:
+    """clamd aborts an over-limit stream mid-send, which reads back as a
+    network fault. The bound is ours to check, and it is checked before the
+    socket is even opened — the path here does not exist."""
+    scanner = upload.ClamdScanner("/nonexistent/clamd.sock", max_bytes=1024)
+    with pytest.raises(upload.ScannerUnavailable) as err:
+        scanner.scan(b"%PDF-1.4" + b"\x00" * 2048)
+    assert str(err.value) == "file_exceeds_scanner_limit"
+
+
+def test_a_scanner_with_no_health_contract_is_never_green() -> None:
+    """The stand-in that shipped answered every file «clean» and had nothing to
+    ask about its readiness. Anything shaped like it now reads red."""
+    health = upload.scanner_health(CleanScanner())
+    assert health.state == upload.SCANNER_UNREACHABLE
+    assert health.detail == "scanner_reports_no_health"
+
+
+def test_build_scanner_reads_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CV_SCAN_CLAMD_SOCKET", raising=False)
+    assert isinstance(upload.build_scanner(), upload.UnconfiguredScanner)
+    monkeypatch.setenv("CV_SCAN_CLAMD_SOCKET", "/var/run/clamav/clamd.ctl")
+    built = upload.build_scanner()
+    assert isinstance(built, upload.ClamdScanner)
+    assert built.socket_path == "/var/run/clamav/clamd.ctl"
+
+
 # ── structural PDF threats ───────────────────────────────────────────────────
 
 
@@ -329,6 +528,46 @@ def test_clean_pdf_is_stored_sanitized_with_extracted_text(
         assert row.extracted_text_storage_key
         text = storage.get(row.extracted_text_storage_key).decode("utf-8")
         assert "Hello CV" in text
+
+
+def test_unscanned_upload_is_processed_but_says_so_in_its_row(
+    two_tenants: tuple[str, str], tmp_path
+) -> None:
+    """The paid customer still gets their upload; the row stops lying about it.
+    ``scan_status`` read «clean» for every file the product ever took, on a
+    host with no engine at all."""
+    a, _ = two_tenants
+    tid = uuid.UUID(a)
+    storage = FilesystemStorageAdapter(tmp_path)
+    with tenant_session(a) as s:
+        _grant_required(s, tid)
+        row = upload.process_cv_upload(
+            s, tenant_id=tid, data=_pdf_with_text("Hello CV"),
+            original_filename="cv.pdf", scanner=upload.UnconfiguredScanner(),
+            storage=storage, limits=LIMITS,
+        )
+        assert row.status == "processed"
+        assert row.scan_status == "unscanned"
+        assert row.scan_findings["unscanned"] == "no_engine_configured"
+        assert row.document_id is not None
+
+
+def test_a_scanned_clean_upload_still_says_clean(
+    two_tenants: tuple[str, str], tmp_path
+) -> None:
+    a, _ = two_tenants
+    tid = uuid.UUID(a)
+    storage = FilesystemStorageAdapter(tmp_path)
+    with _fake_clamd(b"stream: OK\x00") as path, tenant_session(a) as s:
+        _grant_required(s, tid)
+        row = upload.process_cv_upload(
+            s, tenant_id=tid, data=_pdf_with_text("Hello CV"),
+            original_filename="cv.pdf",
+            scanner=upload.ClamdScanner(path, timeout_s=3.0),
+            storage=storage, limits=LIMITS,
+        )
+        assert row.scan_status == "clean"
+        assert "unscanned" not in row.scan_findings
 
 
 def test_malicious_pdf_is_rejected_and_nothing_is_stored(

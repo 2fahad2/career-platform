@@ -316,9 +316,14 @@ def provision_order(
         # that is never coming.
         logger.error("paid order carries no usable phone — zero-touch is off "
                      "for this buyer")
+        # The old line said «أرسل له رابط التفعيل يدويًا من القناة» — from the
+        # channel, where the link no longer is and must never be again. An
+        # instruction pointing at a capability we deliberately removed is worse
+        # than none: it sends the operator hunting through chat history at the
+        # exact moment a paying customer is stuck.
         _alert(admin_client_hint, (
             "⚠️ طلب مدفوع بلا رقم جوال صالح — التفعيل التلقائي معطّل لهذا "
-            "المشتري\nأرسل له رابط التفعيل يدويًا من القناة"
+            "المشتري\nأصدر له رابط تفعيل من لوحة التحكم وسلّمه له مباشرة"
         ))
 
     # CHANGELOG §16 — is this the same human paying again? Decided BEFORE
@@ -440,6 +445,24 @@ _LIFECYCLE_EVENTS = frozenset(sub_states._ORDER_EVENT_TO_STATE)
 #: must never pass in silence: it is the ONLY moment a replacement credential
 #: is ever offered to us.
 _AUTHORIZE_EVENT = "app.store.authorize"
+
+#: The one value of ``webhook_events.provider`` this worker owns.
+#:
+#: INCIDENT 2026-08-03: the sweep below selected purely on
+#: ``processing_status == 'received'``, and ``webhook_events`` is one table
+#: shared by every intake in webhooks/intake.py — today Salla and WhatsApp.
+#: WhatsApp rows therefore entered the Salla routing, matched neither the
+#: provision nor the lifecycle event names, and landed in the final ``else``
+#: that marks a row ``ignored``: terminal, and re-read by nothing. Four
+#: ``whatsapp/statuses`` events were destroyed that way between 08:05:41 and
+#: 08:05:43 while the WhatsApp worker was inside an LLM turn — both workers
+#: poll every three seconds, so whichever reached the row first won it.
+#:
+#: The predicate belongs in the SELECT and not in a filter over the fetched
+#: rows: the batch is what ``limit`` measures, so a foreign backlog must not
+#: be able to occupy it (see the limit note in process_pending_webhooks), and
+#: a row this worker never selects is a row it can never mark.
+SALLA_PROVIDER = "salla"
 
 #: After Salla refuses or fails us, stop hammering it. The worker loop polls
 #: every 3 seconds; without a pause a dead token means twenty pointless calls
@@ -595,6 +618,12 @@ def process_pending_webhooks(
     failures (401/403, 429, 5xx, timeouts) now leave the event untouched and
     say plainly what is wrong; the orders sit there and provision themselves
     when the token is renewed.
+
+    ``limit`` counts SALLA events, which is the only reading that means
+    anything: while the query spanned the whole table a WhatsApp backlog could
+    fill the batch and push every paid order past the cut on every three-second
+    pass, so the order that could not be seen was also the order that could not
+    be provisioned. Scoped to one provider, a hundred is a hundred real orders.
     """
     global _backoff_until
 
@@ -607,7 +636,10 @@ def process_pending_webhooks(
     events = list(
         owner_session.execute(
             select(WebhookEvent)
-            .where(WebhookEvent.processing_status == "received")
+            .where(
+                WebhookEvent.provider == SALLA_PROVIDER,
+                WebhookEvent.processing_status == "received",
+            )
             .order_by(WebhookEvent.received_at)
             .limit(limit)
         ).scalars().all()
@@ -635,9 +667,14 @@ def process_pending_webhooks(
                 logger.error("salla unreachable — paid orders deferred, not "
                              "failed", exc_info=True)
                 if _due("salla_down"):
+                    # Salla's backlog, not the table's. Counting every waiting
+                    # row told the operator that the WhatsApp queue depth was
+                    # the number of paid orders stuck behind a dead token —
+                    # hundreds, when the true answer was one.
                     waiting = int(owner_session.execute(
                         select(func.count(WebhookEvent.id)).where(
-                            WebhookEvent.processing_status == "received"
+                            WebhookEvent.provider == SALLA_PROVIDER,
+                            WebhookEvent.processing_status == "received",
                         )
                     ).scalar_one())
                     if isinstance(exc, SallaAuthError):
@@ -798,6 +835,141 @@ def _announce_renewal(
             logger.warning("renewal admin notice failed", exc_info=True)
 
 
+class LinkIssueStatus(StrEnum):
+    ISSUED = "issued"
+    #: No tenant by that code, or none of their orders is waiting to be claimed.
+    NO_UNCLAIMED_ORDER = "no_unclaimed_order"
+    #: The order is already claimed — there is nothing left to hand over, and
+    #: minting a link for a live account would be handing out a way in.
+    ALREADY_ACTIVATED = "already_activated"
+
+
+@dataclass(frozen=True)
+class ActivationLinkIssue:
+    status: LinkIssueStatus
+    #: A LIVE credential — whoever holds it binds their phone to a paid
+    #: subscription. Hand it to the buyer and to nobody else: never log it,
+    #: never write it anywhere with a history.
+    link: str | None = None
+    tenant_code: str | None = None
+    expires_at: datetime | None = None
+
+
+#: An operator-issued link is handed over inside a conversation that is
+#: happening right now, so it has no reason to outlive that conversation. The
+#: seven days a thank-you-page link needs are seven days of standing risk here.
+OPERATOR_LINK_TTL_MINUTES = 60
+
+
+def issue_activation_link(
+    owner_session: Session,
+    *,
+    tenant_code: str,
+    whatsapp_number_e164: str,
+    now: datetime | None = None,
+) -> ActivationLinkIssue:
+    """Mint a fresh activation link for one waiting order, on request.
+
+    Until this existed, every fresh provision posted its raw activation token
+    into the admin Telegram channel as a ``wa.me/…?text=تفعيل <token>`` deep
+    link. The database was careful — only the SHA-256 hash is stored — and
+    then the live value was written to a chat log that keeps it forever, for
+    every sale, valid for seven days. Anyone who could read that channel could
+    bind ANY phone to a paid subscription, and the secret-redaction filter
+    could not save us: the token rides in a ``text=`` query parameter and
+    matches no shape rule, so it went through untouched.
+
+    The capability the operator actually needs is not a token in a log, it is
+    the ability to get a buyer activated when zero-touch cannot. So the link is
+    no longer broadcast and stored — it is ISSUED, on demand, one at a time,
+    and it is a different token every time. That inverts the exposure: instead
+    of a standing credential per sale it is a deliberate act with a name, an
+    audit row, and an hour to live.
+
+    Rotation is what makes on-demand issuance possible at all — the token
+    minted at provisioning cannot be shown again, because we only kept its
+    hash, which is exactly the property worth keeping. Any outstanding unused
+    token for the order is retired first, and not only for tidiness:
+    ``activate_by_order_phone`` looks up the subscription's single unused token
+    with ``scalar_one_or_none``, so a second live token would raise inside the
+    WhatsApp worker and break the zero-touch claim for that customer. Retiring
+    is written as ``used_at``, which the schema gives us and which makes the
+    old link answer «رمز التفعيل مستخدم مسبقًا» — a fail-closed answer, and an
+    honest one. A ``revoked_at`` column would say it better and is worth a
+    migration the day anything else needs the distinction.
+
+    Returns the raw link exactly once, to the caller, and never touches a
+    logger or the admin channel with it.
+    """
+    from career.audit import record_audit
+    from career.salla.activation_link import build_activation_link
+
+    now = now or datetime.now(UTC)
+    tenant = owner_session.execute(
+        select(Tenant).where(Tenant.code == tenant_code)
+    ).scalars().first()
+    if tenant is None:
+        return ActivationLinkIssue(LinkIssueStatus.NO_UNCLAIMED_ORDER)
+
+    subscription = owner_session.execute(
+        select(Subscription).where(
+            Subscription.tenant_id == tenant.id,
+            Subscription.status == sub_states.PAID_UNCLAIMED,
+        ).order_by(Subscription.created_at.desc())
+    ).scalars().first()
+    if subscription is None:
+        claimed = owner_session.execute(
+            select(Subscription.id).where(Subscription.tenant_id == tenant.id)
+        ).first()
+        return ActivationLinkIssue(
+            LinkIssueStatus.ALREADY_ACTIVATED if claimed is not None
+            else LinkIssueStatus.NO_UNCLAIMED_ORDER,
+            tenant_code=tenant.code,
+        )
+
+    outstanding = list(owner_session.execute(
+        select(ActivationToken).where(
+            ActivationToken.subscription_id == subscription.id,
+            ActivationToken.used_at.is_(None),
+        )
+    ).scalars().all())
+    for old in outstanding:
+        old.used_at = now
+
+    raw_token = new_activation_token()
+    expires_at = now + timedelta(minutes=OPERATOR_LINK_TTL_MINUTES)
+    owner_session.add(
+        ActivationToken(
+            id=uuid.uuid4(),
+            tenant_id=tenant.id,
+            subscription_id=subscription.id,
+            token_hash=hash_token(raw_token),
+            expires_at=expires_at,
+        )
+    )
+    record_audit(
+        owner_session,
+        tenant_id=tenant.id,
+        actor="operator",
+        action="activation_link_issued",
+        resource_type="subscription",
+        resource_id=subscription.id,
+        details={
+            "retired_tokens": len(outstanding),
+            "ttl_minutes": OPERATOR_LINK_TTL_MINUTES,
+        },
+    )
+    owner_session.commit()
+    return ActivationLinkIssue(
+        LinkIssueStatus.ISSUED,
+        link=build_activation_link(
+            whatsapp_number_e164=whatsapp_number_e164, token=raw_token
+        ),
+        tenant_code=tenant.code,
+        expires_at=expires_at,
+    )
+
+
 def _announce_provision(
     owner_session: Session,
     result: ProvisionResult,
@@ -807,9 +979,16 @@ def _announce_provision(
     whatsapp_client: Any,
 ) -> None:
     """CHANGELOG §11 — zero-touch activation: send the APPROVED welcome
-    template to the buyer's order phone (their reply from that number claims
-    the subscription), and surface the wa.me deep link to the admin channel
-    as the support fallback. Best-effort: announcing never blocks billing."""
+    template to the buyer's order phone, so their reply from that number claims
+    the subscription, and tell the operator a sale landed. Best-effort:
+    announcing never blocks billing.
+
+    The announcement used to carry the raw activation deep link as a «support
+    fallback». It carries no credential now — see issue_activation_link, which
+    is where that fallback moved. What the operator needs from this message is
+    only whether the buyer can claim the order by themselves; when they cannot,
+    the message says so and names the one action that fixes it.
+    """
     sub = owner_session.get(
         Subscription, uuid.UUID(str(result.subscription_id))
     ) if result.subscription_id else None
@@ -818,7 +997,8 @@ def _announce_provision(
     ) if result.tenant_id else None
     code = tenant.code if tenant else "?"
 
-    if whatsapp_client is not None and sub is not None and sub.order_phone_e164:
+    zero_touch = sub is not None and bool(sub.order_phone_e164)
+    if whatsapp_client is not None and zero_touch and sub is not None:
         from career.whatsapp.templates import WELCOME_ACTIVATION
         try:
             whatsapp_client.send_template(
@@ -828,18 +1008,21 @@ def _announce_provision(
         except Exception:  # noqa: BLE001
             logger.warning("welcome template send failed", exc_info=True)
 
-    if admin_client is not None and whatsapp_number_e164 and result.activation_token:
-        from career.salla.activation_link import build_activation_link
+    if admin_client is not None:
+        # Every line direction-pure (§16): the TEN code stands alone.
+        line = (
+            f"🟢 اشتراك جديد\n{code}\n"
+            "أرسلنا له رسالة التفعيل — أي رد منه على نفس رقم الطلب يفعّل "
+            "اشتراكه تلقائيًا"
+        ) if zero_touch else (
+            f"🟢 اشتراك جديد\n{code}\n"
+            "⚠️ الطلب بلا رقم جوال صالح — التفعيل التلقائي معطّل لهذا المشتري\n"
+            "أصدر له رابط تفعيل من لوحة التحكم وسلّمه له مباشرة"
+        )
         try:
-            link = build_activation_link(
-                whatsapp_number_e164=whatsapp_number_e164,
-                token=result.activation_token,
-            )
-            admin_client.send_admin(
-                f"🟢 اشتراك جديد {code} — رابط التفعيل الاحتياطي:\n{link}"
-            )
+            admin_client.send_admin(line)
         except Exception:  # noqa: BLE001
-            logger.warning("activation link surface failed", exc_info=True)
+            logger.warning("provision announcement failed", exc_info=True)
 
 
 def _apply_lifecycle(owner_session: Session, ev: WebhookEvent) -> None:

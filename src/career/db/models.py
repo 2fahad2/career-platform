@@ -1139,3 +1139,36 @@ class RoleEnrichment(Base):
     answered_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+
+
+class BreakGlassLog(Base):
+    """Every deliberate crossing of the tenant boundary, and why.
+
+    Migration 0021 created this table and no model matched it, so
+    ``alembic check`` — the gate step whose whole job is to notice the schema
+    and the models drifting apart — asked to DROP it. That is the correct
+    behaviour of the guard and the reason this class exists: a table the ORM
+    cannot see is a table the next autogenerate will try to delete.
+
+    Written only by ``app.break_glass``, which is the audited escape hatch for
+    an admin path that genuinely must span tenants. It is never on a daily
+    service path — the sweeps use the NOLOGIN sweep role, whose grants are
+    column-level and cannot reach a message body at all. So a row here is a
+    question worth asking, not routine.
+
+    ``db_user`` is Postgres's ``name`` type, which SQLAlchemy has no direct
+    mapping for; ``String`` reads it faithfully and the column is never
+    written from Python.
+    """
+
+    __tablename__ = "break_glass_log"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    db_user: Mapped[str] = mapped_column(String, nullable=False)
+    target_tenant_id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)

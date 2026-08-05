@@ -107,7 +107,8 @@ def _light(ok: bool | None, ok_text: str, bad_text: str) -> str:
 def render_health(h: dict[str, Any]) -> tuple[str, Keyboard]:
     """``h`` keys (all optional, None = unknown): worker_active, timer_next,
     meta_token_ok, salla_days_left, searchapi (allowance, remaining),
-    templates {status: count}, backup_age_hours."""
+    templates {status: count}, virus_scanner (a ScannerHealth), deployed_source
+    (running, repository), backup_age_hours."""
     lines = ["🩺 صحة المنصة"]
     lines.append("عامل المحادثة: " + _light(h.get("worker_active"), "يعمل", "متوقف"))
     timer_next = h.get("timer_next")
@@ -145,6 +146,39 @@ def render_health(h: dict[str, Any]) -> tuple[str, Keyboard]:
         if rejected:
             part += f" · 🔴 {rejected} مرفوض"
         lines.append(part)
+    # The §11 malware scanner, and the reason this line exists at all: for the
+    # whole live period the worker injected a stand-in whose scan() returned
+    # «clean» for every file, and this screen — the operator's only window —
+    # said nothing about uploads whatsoever. There are exactly three states and
+    # each gets its own colour, because «not installed» and «installed and
+    # dead» are different facts he acts on differently. The absent line says
+    # plainly that files are passing unscanned rather than hiding behind an
+    # amber word: it is a chosen posture, and a chosen posture has to be
+    # visible or it is just an undisclosed one.
+    from career.onboarding.upload import (
+        HEALTH_KEY,
+        SCANNER_ABSENT,
+        SCANNER_READY,
+        SCANNER_UNREACHABLE,
+    )
+
+    scanner_state = getattr(h.get(HEALTH_KEY), "state", None)
+    if scanner_state == SCANNER_READY:
+        lines.append("فاحص الملفات: 🟢 يعمل ويجيب")
+    elif scanner_state == SCANNER_ABSENT:
+        lines.append("فاحص الملفات: 🟠 غير مركّب — الملفات تمر بلا فحص")
+    elif scanner_state == SCANNER_UNREACHABLE:
+        lines.append("فاحص الملفات: 🔴 مركّب ولا يستجيب")
+        # The slug says WHICH failure (timeout · unreachable · unrecognized
+        # reply), which is the difference between restarting a daemon and
+        # fixing a path. It is Latin, so it lives on its own line — the same
+        # rule the deployed-source hashes below follow, and for the same
+        # client that scrambles a mixed run.
+        detail = getattr(h.get(HEALTH_KEY), "detail", None)
+        if detail:
+            lines.append(str(detail))
+    else:
+        lines.append("فاحص الملفات: ⚪ غير معروف")
     # «Committed» is not «deployed». Every other light on this screen was green
     # for four days while the container served code from before the fixes —
     # because the worker and the timers really were healthy and nothing
@@ -286,7 +320,18 @@ def render_tenant_card(card: dict[str, Any]) -> tuple[str, Keyboard]:
     lines.append(str(card.get("sub_status") or "—"))
     age = card.get("sub_age_days")
     if age is not None:
-        lines.append(f"عمر الاشتراك: {age} يوم")
+        # Two defects in one line. The number sat INSIDE an Arabic sentence,
+        # which the operator's client re-orders — the rule the rest of this
+        # module keeps carefully. And it went NEGATIVE: the age is computed as
+        # (now - created_at).days, so a subscription row created microseconds
+        # ahead of the console's clock — or any clock skew between the API
+        # container and the host — rendered «عمر الاشتراك: -22 يوم». A
+        # negative age reads as corruption and sends the operator hunting a
+        # data problem that does not exist, so today is floored at zero and
+        # says so in words.
+        days = max(0, int(age))
+        lines.append("عمر الاشتراك:")
+        lines.append("اليوم" if days == 0 else f"{days} يوم")
     journey = card.get("journey_state")
     lines.append(
         "الرحلة: " + _JOURNEY_AR.get(str(journey), str(journey or "لم تبدأ"))

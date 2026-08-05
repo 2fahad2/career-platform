@@ -8,9 +8,11 @@ and has an explicit ``--no-digest-only`` off form; no flag governs two
 effects. The report goes to stdout as JSON with TEN codes instead of tenant
 UUIDs (journal = same no-PII discipline as the admin channel, §15.13).
 
-Exit codes are honest and boring: 0 when the run produced a truthful outcome
-(completed / partial / no_active_tenants — the report carries the details),
-1 only for discovery_failed (every source down: nothing was discovered).
+Exit codes are honest and boring, and §15 constant 12 («ورموز الخروج تعكس
+الحقيقة») decides what «honest» means: the code reports what happened to the
+CUSTOMERS' day, not what happened to the process. 0 when every tenant's day
+closed in a truthful state, 1 when discovery collapsed, 3 when at least one
+tenant's delivery genuinely failed. See :func:`exit_code_for`.
 """
 
 from __future__ import annotations
@@ -20,18 +22,23 @@ import json
 import logging
 import sys
 import uuid
-from datetime import UTC, datetime
+from collections.abc import Iterable
+from dataclasses import dataclass
+from datetime import UTC, date, datetime
+from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 from career.config import get_settings
-from career.db.models import DiscoveryRun, Tenant
+from career.db.models import DiscoveryRun, PlanEntitlement, Tenant
 from career.engine.enrichment import UrllibPageFetcher
 from career.engine.run import RunReport, run_nightly
 from career.engine.sources import HttpSearchApiClient, PythonJobSpyClient
 from career.logging_filters import install_secret_redaction
+from career.salla.provisioning import TOKEN_EXPIRY_WARN_DAYS
 
 logger = logging.getLogger("career.engine.cli")
 
@@ -151,8 +158,424 @@ def summarize(
     }
 
 
-def exit_code_for(status: str) -> int:
-    return 1 if status == "discovery_failed" else 0
+#: The codes the operator's runbook keys off. They are a vocabulary, not a
+#: severity scale: systemd only ever asks «is it zero», but the number is what
+#: the human reads in ``systemctl status`` and it must point at ONE runbook
+#: entry. 2 was already spent on «SEARCHAPI_API_KEY is empty».
+EXIT_OK = 0
+EXIT_DISCOVERY_FAILED = 1
+EXIT_NO_SEARCH_KEY = 2
+EXIT_DELIVERY_FAILED = 3
+
+#: The four day states that mean a human has to look at tonight (§15.12).
+FAILED_DAY_STATES: frozenset[str] = frozenset({
+    "DISCOVERY_FAILED", "CV_GENERATION_FAILED", "WHATSAPP_FAILED",
+    "LEDGER_FAILED",
+})
+#: The four that are the truth arriving safely. NO_MATCHES is the one that
+#: keeps being mistaken for a fault: a day with no fitting job is the gate
+#: doing its job, and paging the operator for it teaches him to mute the pager.
+#: SKIPPED_OPTED_OUT is the same shape — the customer asked for silence and
+#: got it. PARTIAL_DELIVERY already reached the customer with what worked.
+HONEST_DAY_STATES: frozenset[str] = frozenset({
+    "DELIVERED", "PARTIAL_DELIVERY", "NO_MATCHES", "SKIPPED_OPTED_OUT",
+})
+
+
+def exit_code_for(
+    status: str, delivery_states: Iterable[str] | None = None
+) -> int:
+    """The night's verdict as one number — §15 constant 12.
+
+    THE INCIDENT. On 2 August 2026 the run closed the only real customer's day
+    ``CV_GENERATION_FAILED`` (a UniqueViolation on the one-delivery-per-day
+    constraint, full traceback in the journal) and returned 0. The delivery
+    phase had never been allowed to influence the return value, so
+    ``OnFailure=career-alert@%n.service`` did not fire, systemd recorded a
+    clean success, and the failure was found by reading logs days later.
+
+    ANY tenant failing is enough to fail the night, deliberately. The
+    alternative — a threshold, or «most of them worked» — sounds reasonable
+    at a hundred customers and is indefensible at one: today a single failure
+    IS the whole night, and a rule that stays quiet while one paying customer
+    receives nothing is exactly the rule that produced the incident. The exit
+    code is a summons, not a statistic; WHO failed is in the journal summary
+    and in the admin channel, which is where per-customer detail belongs.
+
+    ``discovery_failed`` still outranks, and keeps code 1. On that path every
+    tenant's day closes DISCOVERY_FAILED anyway, so both rules agree on «not
+    zero»; 1 is kept because it points at a different runbook entry (every
+    source down — check the providers) than 3 (discovery worked, the delivery
+    pipeline broke for someone).
+
+    An EMPTY or missing ``delivery_states`` is a 0. Three honest nights
+    produce no day state at all — a Riyadh weekend (§08 delivers Sun–Thu),
+    a re-run on a day whose tenants were already served, and a bundle held
+    for a closed WhatsApp window that the descend path closes later. None of
+    them is a failure, and the weekly Friday page they would cause is how a
+    truthful alert gets ignored. What the emptiness MEANS is reported instead,
+    in ``summarize_delivery``.
+
+    An unrecognised state counts as a failure: a ninth day state added
+    without deciding its side of this line should shout, not go quiet.
+    """
+    if status == "discovery_failed":
+        return EXIT_DISCOVERY_FAILED
+    if any(state not in HONEST_DAY_STATES for state in (delivery_states or ())):
+        return EXIT_DELIVERY_FAILED
+    return EXIT_OK
+
+
+def summarize_delivery(
+    *,
+    tenant_codes: dict[uuid.UUID, str],
+    intended: Iterable[uuid.UUID],
+    states: dict[uuid.UUID, str],
+) -> dict[str, Any]:
+    """The delivery half of the journal line, with its silences named.
+
+    AUDIT P0-7: the summary used to print ``"delivery": {}`` on eleven of the
+    last sixteen nights, and the audit read that as a reporting bug. It is
+    not — the dict faithfully mirrors what ``run_daily_delivery`` returned,
+    and it returns nothing for a weekend, for a tenant already served today,
+    and for a bundle held until the customer's window reopens. The bug was
+    that all three, plus «nothing happened at all», printed identically. So
+    the tenants the run INTENDED to serve but did not close are now listed by
+    TEN code: an empty ``delivery`` beside a populated ``delivery_unclosed``
+    is a legible night, and an empty ``delivery`` beside an empty
+    ``delivery_unclosed`` truly means there was no one to serve.
+    """
+    return {
+        "delivery": {
+            tenant_codes.get(tid, "TEN-????"): state
+            for tid, state in states.items()
+        },
+        "delivery_unclosed": sorted(
+            tenant_codes.get(tid, "TEN-????")
+            for tid in intended if tid not in states
+        ),
+    }
+
+
+# ── boot verification: the environment against the database (P0-8) ─────────
+
+
+@dataclass(frozen=True)
+class EnvProblem:
+    """One provable contradiction between ``.env`` and the money trail.
+
+    ``key`` is the environment variable a human has to edit; ``english`` goes
+    to the journal (the operator's harvester forwards ``ERROR:`` lines) and
+    ``arabic`` to the admin channel. The Arabic line carries NO Latin token —
+    a variable name inside an Arabic sentence breaks the line's direction in
+    his client, so the names are listed separately by :func:`format_env_alert`.
+    """
+
+    key: str
+    english: str
+    arabic: str
+
+
+def parse_product_catalog(raw: str) -> dict[str, str]:
+    """``SALLA_PRODUCT_CATALOG``: product id → plan code. Tolerant by design —
+    a malformed map must not stop a process, it must be REPORTED (an empty
+    catalog is itself one of the conditions the boot check names)."""
+    try:
+        parsed = json.loads(raw or "{}")
+        return {str(k): str(v) for k, v in parsed.items()}
+    except (ValueError, AttributeError):
+        return {}
+
+
+def parse_product_pricing(raw: str) -> dict[str, tuple[Decimal, str]]:
+    """``SALLA_PRODUCT_PRICING``: product id → (amount, currency), the §09
+    triple-match prices. Same tolerance, same reason."""
+    try:
+        parsed = json.loads(raw or "{}")
+        return {
+            str(k): (Decimal(str(v[0])), str(v[1]))
+            for k, v in parsed.items()
+        }
+    except (ValueError, AttributeError, LookupError, ArithmeticError):
+        return {}
+
+
+def approved_plan_prices(session: Session) -> dict[str, Decimal]:
+    """plan code → the price the DATABASE says that plan costs.
+
+    ``indicative_price_sar`` is not the money path (the §09 match reads the
+    real amount from the environment) but it is what the watchtower's revenue
+    view quotes to the operator, so the environment disagreeing with it means
+    one of the two is lying about what a customer pays.
+    """
+    return {
+        code: Decimal(price)
+        for code, price in session.execute(
+            select(PlanEntitlement.plan_code,
+                   PlanEntitlement.indicative_price_sar)
+        ).all()
+    }
+
+
+def canonical_sale_plans() -> dict[str, Decimal]:
+    """plan code → the exact price the store must charge, for plans ON SALE.
+
+    Sellability is not a column. Migration 0020 retired `basic` without
+    touching a single row — deleting it would orphan the historical
+    subscriptions that point at it, so «retired» is expressed as ABSENCE from
+    the one table that decides what a product may be wired to:
+    ``scripts/wire_salla_products.PLANS``, the table the wiring tool writes
+    the catalog FROM. Reading it here rather than restating it is the whole
+    point: a hardcoded list in this file would be a fourth copy of a fact
+    that already has three, and the fourth is the one nobody updates.
+
+    Raises RuntimeError when the table cannot be read — an unverifiable
+    check must say so out loud rather than pass by default.
+    """
+    import importlib.util
+
+    path = (Path(__file__).resolve().parents[3] / "scripts"
+            / "wire_salla_products.py")
+    spec = importlib.util.spec_from_file_location("_career_sale_plans", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"canonical plan table unreadable at {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return {str(plan): Decimal(str(price))
+            for plan, price in module.PLANS.values()}
+
+
+def verify_environment(
+    settings: Any,
+    *,
+    approved_prices: dict[str, Decimal],
+    sale_plans: dict[str, Decimal],
+    today: date,
+    warn_days: int = TOKEN_EXPIRY_WARN_DAYS,
+) -> list[EnvProblem]:
+    """Every way the selling environment can contradict the database.
+
+    THE INCIDENT. For twelve days the environment sold product 786318419 as
+    plan `basic` at 149.00 SAR: a plan migration 0020 had retired and a price
+    the store no longer charges. Nothing said a word. The §09 triple match is
+    correct and fails CLOSED, so the first symptom would have been a real
+    buyer paying 199 and being refused with AMOUNT_MISMATCH and a TERMINAL
+    status on his order — the one failure mode this product cannot afford.
+    A boot warning for an EMPTY catalog already existed; a wrong catalog was
+    invisible, which is worse, because it looks configured.
+
+    Pure: it takes the two authorities as arguments so the whole matrix is
+    testable without a database, a store or a clock.
+    """
+    problems: list[EnvProblem] = []
+    catalog = parse_product_catalog(settings.salla_product_catalog)
+    pricing = parse_product_pricing(settings.salla_product_pricing)
+
+    for product_id, plan_code in sorted(catalog.items()):
+        if plan_code not in approved_prices:
+            problems.append(EnvProblem(
+                "SALLA_PRODUCT_CATALOG",
+                f"product {product_id} maps to plan {plan_code!r}, which has "
+                "no row in plan_entitlements — an order for it cannot be "
+                "provisioned",
+                "منتج في الكتالوج مربوط بباقة غير موجودة في قاعدة البيانات",
+            ))
+            continue
+        if plan_code not in sale_plans:
+            problems.append(EnvProblem(
+                "SALLA_PRODUCT_CATALOG",
+                f"product {product_id} maps to plan {plan_code!r}, which is "
+                "RETIRED from sale — a purchase would provision a plan the "
+                "store no longer offers",
+                "منتج في الكتالوج مربوط بباقة متوقفة عن البيع",
+            ))
+        # ح-4 kept: a cataloged product with no price fails closed at §09, so
+        # the coverage hole is still announced at boot, not at refund time.
+        if product_id not in pricing:
+            problems.append(EnvProblem(
+                "SALLA_PRODUCT_PRICING",
+                f"cataloged product {product_id} has no price — its orders "
+                "will FAIL CLOSED to manual review",
+                "منتج في الكتالوج بلا سعر مضبوط — طلباته ستُحوّل للمراجعة "
+                "اليدوية",
+            ))
+            continue
+        amount, currency = pricing[product_id]
+        expected = approved_prices[plan_code]
+        if currency.upper() != "SAR":
+            problems.append(EnvProblem(
+                "SALLA_PRODUCT_PRICING",
+                f"product {product_id} is priced in {currency!r}; the "
+                "approved price is in SAR, so the two cannot be compared",
+                "سعر منتج مضبوط بعملة غير الريال",
+            ))
+        elif amount != expected:
+            problems.append(EnvProblem(
+                "SALLA_PRODUCT_PRICING",
+                f"product {product_id} (plan {plan_code!r}) is priced "
+                f"{amount} SAR; the database approves {expected} SAR — a real "
+                "order will be refused with AMOUNT_MISMATCH",
+                "سعر منتج في الإعدادات لا يطابق السعر المعتمد في قاعدة "
+                "البيانات — الطلب الحقيقي سيُرفض",
+            ))
+
+    # The third copy of the same fact: the wiring table and the database must
+    # agree about what a plan costs, or fixing one of them fixes nothing.
+    for plan_code, price in sorted(sale_plans.items()):
+        if plan_code in approved_prices and approved_prices[plan_code] != price:
+            problems.append(EnvProblem(
+                "SALLA_PRODUCT_PRICING",
+                f"plan {plan_code!r} costs {price} SAR in the canonical sale "
+                f"table but {approved_prices[plan_code]} SAR in "
+                "plan_entitlements — the two authorities disagree",
+                "جدول الأسعار المعتمد وقاعدة البيانات لا يتفقان على سعر باقة",
+            ))
+
+    problems.extend(_token_expiry_problems(settings, today, warn_days))
+
+    if not (settings.salla_store_url or "").strip():
+        # §16: lifecycle.py degrades to a link-less renewal message rather
+        # than printing a broken URL, which is right — and silent. A customer
+        # whose subscription just ended is told to renew with no way to.
+        problems.append(EnvProblem(
+            "SALLA_STORE_URL",
+            "empty — renewal and expiry messages go out with no way for the "
+            "customer to renew",
+            "رابط المتجر غير مضبوط — رسائل التجديد تصل بلا رابط",
+        ))
+    return problems
+
+
+def _token_expiry_problems(
+    settings: Any, today: date, warn_days: int
+) -> list[EnvProblem]:
+    """A Salla token dies quietly: the first symptom is a paid order that
+    provisions nothing. The existing warning lives inside the provisioning
+    path, so it only speaks when an order is already being handled — too late
+    to be a warning. This one speaks at boot, before anyone buys."""
+    raw = (settings.salla_token_expires_at or "").strip()
+    if not raw:
+        return [EnvProblem(
+            "SALLA_TOKEN_EXPIRES_AT",
+            "unset — nothing can tell whether the Salla token is still alive",
+            "تاريخ انتهاء توكن سلة غير مضبوط — لا أحد يعرف إن كان صالحًا",
+        )]
+    try:
+        expires = date.fromisoformat(raw[:10])
+    except ValueError:
+        return [EnvProblem(
+            "SALLA_TOKEN_EXPIRES_AT",
+            f"unparseable date {raw!r} — the expiry watch is silently blind",
+            "تاريخ انتهاء توكن سلة غير مقروء — مراقبة الصلاحية معطّلة",
+        )]
+    days_left = (expires - today).days
+    if days_left < 0:
+        return [EnvProblem(
+            "SALLA_TOKEN_EXPIRES_AT",
+            f"EXPIRED {-days_left} days ago — paid orders will not provision",
+            "توكن سلة منتهي — الطلبات المدفوعة لن تُزوَّد",
+        )]
+    if days_left <= warn_days:
+        return [EnvProblem(
+            "SALLA_TOKEN_EXPIRES_AT",
+            f"expires in {days_left} days — refresh it before it dies",
+            "توكن سلة قارب على الانتهاء",
+        )]
+    return []
+
+
+def format_env_alert(problems: list[EnvProblem]) -> str:
+    """The admin-channel message. Arabic prose and Latin variable names never
+    share a line — mixing them reverses the line in the operator's client."""
+    lines = ["🔴 فحص الإقلاع: الإعدادات تخالف قاعدة البيانات", ""]
+    seen: list[str] = []
+    for problem in problems:
+        if problem.arabic not in seen:
+            seen.append(problem.arabic)
+            lines.append(f"• {problem.arabic}")
+    lines.append("")
+    lines.append("المتغيرات المطلوب تصحيحها:")
+    lines.extend(sorted({problem.key for problem in problems}))
+    return "\n".join(lines)
+
+
+def report_environment(
+    *,
+    settings: Any,
+    session: Session,
+    admin_client: Any,
+    today: date | None = None,
+    alert: bool = True,
+) -> list[EnvProblem]:
+    """Run the boot check and shout — but NEVER stop the process.
+
+    WHY NOTHING HERE IS FATAL. A hard startup failure was the tempting
+    answer, and it is the wrong one twice over. The two processes that host
+    this check are the conversation worker and the nightly run: both exist to
+    serve people who have ALREADY paid. Every condition it detects degrades
+    only the NEW-ORDER path, and every one of them already fails CLOSED
+    downstream — §09 refuses a mismatched order and marks it for manual
+    review rather than provisioning the wrong plan, and a missing store URL
+    drops the renewal link rather than printing a broken one. So refusing to
+    boot would convert «new sales are blocked» into «the product is down for
+    the customers who bought it», which is strictly worse, and it would do so
+    over a value the operator can only fix by hand. A condition that made the
+    process take money wrongly or deliver the wrong thing WOULD be fatal —
+    none of these do.
+
+    WHY THIS WARNING IS NOT THE WARNING NOBODY READ. The old one logged once,
+    only for an empty catalog, and only in the worker. This one is ERROR
+    (the journal harvester forwards ``ERROR:`` lines), it goes to the admin
+    channel the operator actually reads, it fires in BOTH entry points — so
+    the nightly timer re-raises it every single morning until someone edits
+    the file — and it names the variable and the contradiction, not a mood.
+
+    ``alert=False`` keeps the ERROR log and drops the admin message. The
+    worker runs under ``Restart=always``/``RestartSec=5``: a crash loop would
+    put this alert on his phone twelve times a minute, and the far side of
+    «a warning nobody reads» is a warning too loud to read. The daily oneshot
+    owns the Telegram copy — exactly one a day, which is the cadence a stale
+    file deserves.
+    """
+    try:
+        problems = verify_environment(
+            settings,
+            approved_prices=approved_plan_prices(session),
+            sale_plans=canonical_sale_plans(),
+            today=today or datetime.now(UTC).astimezone().date(),
+        )
+    except Exception:  # noqa: BLE001 — a boot check never blocks a boot
+        logger.error("boot environment check could not run", exc_info=True)
+        return []
+    for problem in problems:
+        logger.error("BOOT CHECK %s: %s", problem.key, problem.english)
+    if problems and alert:
+        try:
+            admin_client.send_admin(format_env_alert(problems))
+        except Exception:  # noqa: BLE001 — alerting never breaks the boot
+            logger.warning("boot check alert failed", exc_info=True)
+    return problems
+
+
+class JournalAdmin:
+    """Admin messages → the journal (PII-free by contract, §15.13)."""
+
+    def send_admin(self, text: str) -> str:
+        logger.info("ADMIN: %s", text)
+        return "journal"
+
+
+def admin_client_for(settings: Any) -> Any:
+    """Telegram when it is configured, the journal otherwise. Hoisted out of
+    ``main`` so the boot check can speak BEFORE the run starts."""
+    if settings.telegram_admin_bot_token and settings.telegram_admin_chat_id:
+        from career.telegram.admin import HttpTelegramAdminClient
+
+        return HttpTelegramAdminClient(
+            settings.telegram_admin_bot_token,
+            settings.telegram_admin_chat_id,
+        )
+    return JournalAdmin()
 
 
 def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
@@ -164,9 +587,19 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
     settings = get_settings()
     if not settings.searchapi_api_key:
         logger.error("SEARCHAPI_API_KEY is empty — refusing a blind run")
-        return 2
+        return EXIT_NO_SEARCH_KEY
 
     engine = create_engine(settings.owner_database_url, future=True)
+    admin = admin_client_for(settings)
+
+    # P0-8: the environment against the database, every single morning. The
+    # nightly timer is the only thing on this box that runs daily and has a
+    # human's attention, so it is where stale selling configuration gets
+    # re-reported until someone fixes it. It never stops the run — tonight's
+    # customers have already paid (see report_environment).
+    with Session(engine) as session:
+        report_environment(settings=settings, session=session,
+                           admin_client=admin)
 
     # §05 lifecycle sweep BEFORE the engine: a just-expired subscription
     # must not seed tonight's query families.
@@ -236,22 +669,6 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
 
     summary = summarize(report, codes)
 
-    class _JournalAdmin:
-        def send_admin(self, text: str) -> str:
-            logger.info("ADMIN: %s", text)
-            return "journal"
-
-    def _admin_client() -> Any:
-        if settings.telegram_admin_bot_token and settings.telegram_admin_chat_id:
-            from career.telegram.admin import HttpTelegramAdminClient
-
-            return HttpTelegramAdminClient(
-                settings.telegram_admin_bot_token,
-                settings.telegram_admin_chat_id,
-            )
-        return _JournalAdmin()
-
-    admin = _admin_client()
     if report.status in ("discovery_failed", "partial"):
         try:
             admin.send_admin(
@@ -289,6 +706,17 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
     # that path — the empty final list sees to that.
     delivery_phase_ran = bool(
         args.deliver and settings.whatsapp_access_token and report.per_tenant
+    )
+    # P0-7: name the reason instead of leaving the reader to infer it from a
+    # missing key. A run that never entered the phase used to print no
+    # «delivery» at all, which reads exactly like a run that entered it and
+    # closed nobody.
+    summary["delivery_phase"] = (
+        "ran" if delivery_phase_ran
+        else "skipped:no-deliver" if not args.deliver
+        else "skipped:no-whatsapp-credentials"
+        if not settings.whatsapp_access_token
+        else "skipped:no-tenants"
     )
     if args.digest_only is None and not delivery_phase_ran:
         # ح-3: intended to deliver but the phase never ran (no creds / no
@@ -370,16 +798,27 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
                         )
                     ).all()
                 } if states else {}
-                summary["delivery"] = {
-                    dcodes.get(tid, "TEN-????"): state.state
-                    for tid, state in states.items()
-                }
+                summary.update(summarize_delivery(
+                    tenant_codes={**codes, **dcodes},
+                    intended=list(report.per_tenant),
+                    states={tid: state.state for tid, state in states.items()},
+                ))
                 session.commit()
         finally:
             engine2.dispose()
 
     print(json.dumps(summary, ensure_ascii=False, default=str))
-    return exit_code_for(report.status)
+
+    failed = sorted(
+        code for code, state in summary.get("delivery", {}).items()
+        if state not in HONEST_DAY_STATES
+    )
+    if failed:
+        # The exit code summons the operator; this line tells him WHO, and it
+        # is an ERROR because that is the only level his journal harvester
+        # forwards. Before P0-7 neither existed.
+        logger.error("delivery failed tonight for %s", ", ".join(failed))
+    return exit_code_for(report.status, summary.get("delivery", {}).values())
 
 
 if __name__ == "__main__":  # pragma: no cover

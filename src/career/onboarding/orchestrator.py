@@ -86,6 +86,13 @@ class Deps:
     #: F-INTENT classifier (§15). None → the deterministic keyword classifier
     #: is used alone; understanding degrades, the conversation never breaks.
     intent_classifier: Any = None
+    #: The operator channel, for the escalations a CONVERSATION can raise on
+    #: its own (a customer stuck at a gate — audit 2026-08). The worker owns
+    #: its own admin client for «دعم»; this one is for the branches the worker
+    #: never sees. None → the escalation is still recorded as a support_events
+    #: ticket and the customer is still handed «دعم», which the C4 worker
+    #: pages on for real, so a missing client never costs them the way out.
+    admin_client: Any = None
 
 
 class JourneyNotFound(Exception):
@@ -114,6 +121,12 @@ _READING_CV = "استلمناها 📄 نقرأ سيرتك الآن — ثوان
 _CONSENT_REQUIRED_EXPLAIN = (
     "هذي الموافقة ضرورية لتشغيل الخدمة — بدونها ما نقدر نكمل. "
     "لو عندك سؤال أرسل: دعم"
+)
+#: An acknowledgement («تمام»، «أوك») is answered with a real ask, never with
+#: a silent re-send of the same wall and never with a manufactured grant.
+_CONSENT_ACK_ASK = (
+    "أبشر 👌\n"
+    "بس أحتاج كلمة الموافقة صريحة عشان تنحفظ في سجل موافقاتك"
 )
 _UPLOAD_PROMPT = (
     "ممتاز، خلصنا الأسئلة 👌\n"
@@ -148,6 +161,46 @@ _DELETE_WARNING = (
 _DELETE_DONE = "تم حذف بياناتك الشخصية. سجلاتك المالية محفوظة وفق المتطلبات النظامية."
 _PAUSED = "تم الإيقاف المؤقت. الفترة الحالية لا تتمدد (§ الشروط). للعودة أرسل: استئناف"
 _RESUMED = "تم الاستئناف ✅"
+#: The customer-side half of the same lie the watchtower was just cured of.
+#: pause/resume answered «تم» unconditionally, so a customer whose period had
+#: already ended was told their subscription was paused when nothing moved —
+#: and the state machine says GRACE cannot be paused at all (there is nothing
+#: running to pause: only ACTIVE tenants are enrolled in the nightly search).
+#: These four lines say what actually happened, and each names the way out.
+_PAUSE_ALREADY = (
+    "اشتراكك موقوف مؤقتًا من قبل ✅\n"
+    "للعودة أرسل: استئناف"
+)
+_PAUSE_NOT_ELIGIBLE = (
+    "ما قدرت أوقفه — اشتراكك مو في الحالة اللي تسمح بالإيقاف\n"
+    "أرسل: حالة اشتراكي — تشوف وضعك بالتفصيل\n"
+    "وإذا تبي مساعدة أرسل: دعم"
+)
+_RESUME_NOT_PAUSED = (
+    "اشتراكك مو موقوفًا أصلًا\n"
+    "أرسل: حالة اشتراكي — تشوف وضعك بالتفصيل"
+)
+_NO_SUBSCRIPTION_REPLY = (
+    "ما لقيت اشتراكًا فعّالًا باسمك من هنا\n"
+    "أرسل: دعم — وأحد من الفريق يتابع معك"
+)
+
+#: Exhaustive by construction: privacy.pause_subscription returns one of the
+#: four ActionOutcome members, and a KeyError here would be a new member
+#: nobody answered — which is the failure we want, loudly, in a test rather
+#: than a shrug at the customer.
+_PAUSE_REPLIES = {
+    privacy.ActionOutcome.CHANGED: _PAUSED,
+    privacy.ActionOutcome.ALREADY: _PAUSE_ALREADY,
+    privacy.ActionOutcome.NOT_ELIGIBLE: _PAUSE_NOT_ELIGIBLE,
+    privacy.ActionOutcome.NO_SUBSCRIPTION: _NO_SUBSCRIPTION_REPLY,
+}
+_RESUME_REPLIES = {
+    privacy.ActionOutcome.CHANGED: _RESUMED,
+    privacy.ActionOutcome.ALREADY: _RESUMED,
+    privacy.ActionOutcome.NOT_ELIGIBLE: _RESUME_NOT_PAUSED,
+    privacy.ActionOutcome.NO_SUBSCRIPTION: _NO_SUBSCRIPTION_REPLY,
+}
 _EXPORT_ACK = "📁 هذي نسخة كاملة من بياناتك المحفوظة عندنا (ملف JSON)."
 _NUDGE_REMINDER = "وقفنا عند خطوة بسيطة — نكمل إعداد خدمتك؟ 👇"
 #: §15: after serving an off-topic ask mid-enrichment, tell the customer the
@@ -215,6 +268,107 @@ def _is_courtesy_only(body: str) -> bool:
         return False
     return all(w.strip("،.!?؟") in _COURTESY_WORDS for w in words)
 
+# ── what a consent reply MEANS (the one gate nobody may pass by accident) ────
+#
+# AUDIT 2026-08. Both consent gates compared RAW bytes against «أوافق»: the
+# funnel's was an infinite loop for a customer who had already paid, and this
+# one silently ignored every typed spelling that is not the one with the hamza
+# — which is the spelling most Saudi Android keyboards do NOT produce.
+#
+# The two directions of this decision are NOT symmetric. Missing an agreement
+# costs one more tap; INVENTING one writes a granted consent event, a legal
+# artifact under PDPL, for a customer who never said it. So the reading is
+# deliberately narrow in three ways: whole TOKENS after normalisation (never a
+# substring — «لا أوافق» contains «أوافق»), any negation kills the agreement
+# outright, and a message carrying a single word we do not know is «unclear»
+# rather than generously rounded up.
+
+CONSENT_AGREE = "agree"
+CONSENT_DECLINE = "decline"
+#: An acknowledgement is NOT an agreement. «تمام», «أوك», «ماشي» mean "got it"
+#: at least as often as they mean "yes", and a consent record must be able to
+#: stand on its own in front of a regulator. These get their own clear ask —
+#: the customer is never looped, and never consents by grunt.
+CONSENT_ACK = "ack"
+CONSENT_UNCLEAR = "unclear"
+
+#: Machine ids on the consent buttons. Meta delivers the tapped TITLE to the
+#: worker today, so the labels below carry the flow; the ids are accepted too
+#: because a payload path that carries them already exists (`_button_id_of`)
+#: and the rest of this module has always resolved both.
+CONSENT_AGREE_ID = "consent_agree"
+CONSENT_DECLINE_ID = "consent_decline"
+
+#: A consent verdict is a SHORT message. Anything longer is a sentence with a
+#: condition or a question in it, and those are answered, not obeyed.
+_CONSENT_MAX_WORDS = 6
+
+_AGREE_TOKENS: frozenset[str] = frozenset(normalize_ar(w) for w in (
+    "أوافق", "اوافق", "موافق", "موافقة", "موافقين", "نوافق", "وافقت",
+    "أوافقكم", "نعم", "أيوه", "ايوا", "yes", "agree", "accept",
+))
+#: Deliberately NOT in the set above: «أي/إي» (also "which?") and «ايه» (also
+#: "what?" in the dialects our customers read every day). An ambiguous single
+#: word must never become a grant.
+_ACK_TOKENS: frozenset[str] = frozenset(normalize_ar(w) for w in (
+    "تمام", "أوك", "اوكي", "ماشي", "زين", "طيب", "خلاص", "تم", "أكيد",
+    "طبعًا", "طبعا", "أبشر", "يلا", "ok", "okay", "sure",
+))
+_NEGATION_TOKENS: frozenset[str] = frozenset(normalize_ar(w) for w in (
+    "لا", "ما", "مو", "مب", "مش", "ماني", "أبد", "أبدًا", "لست",
+    "no", "not", "never", "nope",
+))
+_REFUSAL_TOKENS: frozenset[str] = frozenset(normalize_ar(w) for w in (
+    "أرفض", "نرفض", "رفض", "أرفضها", "مرفوض", "refuse", "decline",
+))
+#: Words that may keep an agreement company without changing it. «بس» («but»)
+#: is pointedly absent: it announces a condition, and a conditional yes is not
+#: a yes.
+_CONSENT_FILLER: frozenset[str] = frozenset(normalize_ar(w) for w in (
+    "أنا", "احنا", "يا", "أخوي", "الله", "والله", "حياك", "شكرًا", "شكرا",
+    "مشكور", "تسلم", "يعطيك", "العافية", "أهلا", "مرحبا", "هلا", "السلام",
+    "عليكم", "على", "عليه", "كل", "شي", "الشروط", "بكل",
+))
+
+
+def classify_consent_reply(text: str | None) -> str:
+    """Read a consent reply the way a human would, and never more generously.
+
+    Returns one of CONSENT_AGREE / CONSENT_DECLINE / CONSENT_ACK /
+    CONSENT_UNCLEAR. The caller grants ONLY on CONSENT_AGREE; every other
+    verdict has a reply of its own, so no branch can end in silence.
+    """
+    raw = (text or "").strip()
+    if raw in (CONSENT_AGREE_ID, _CONSENT_YES):
+        return CONSENT_AGREE
+    if raw in (CONSENT_DECLINE_ID, _CONSENT_NO):
+        return CONSENT_DECLINE
+
+    words = normalize_ar(raw).split()
+    if not words or len(words) > _CONSENT_MAX_WORDS:
+        return CONSENT_UNCLEAR
+    tokens = set(words)
+
+    if tokens & _REFUSAL_TOKENS:
+        return CONSENT_DECLINE
+    affirm = tokens & _AGREE_TOKENS
+    if tokens & _NEGATION_TOKENS:
+        # «لا أوافق» / «ما أوافق» / «مو موافق» — the negation wins, always. A
+        # negation we cannot place («ما فهمت») is unclear, NOT a refusal: it
+        # is a request for help, and answering it with the refusal copy would
+        # be putting words in the customer's mouth in the other direction.
+        if affirm or tokens <= (
+            _NEGATION_TOKENS | _AGREE_TOKENS | _ACK_TOKENS | _CONSENT_FILLER
+        ):
+            return CONSENT_DECLINE
+        return CONSENT_UNCLEAR
+    if not tokens <= (_AGREE_TOKENS | _ACK_TOKENS | _CONSENT_FILLER):
+        return CONSENT_UNCLEAR      # one unknown word ⇒ read it, don't assume
+    if affirm:
+        return CONSENT_AGREE
+    return CONSENT_ACK if tokens & _ACK_TOKENS else CONSENT_UNCLEAR
+
+
 _PRIVACY_COMMANDS = {
     "حالة اشتراكي": "status",
     # What Meta's ALREADY-APPROVED renewal and recovery templates actually
@@ -233,6 +387,42 @@ _PRIVACY_COMMANDS = {
     "حذف بياناتي": "delete_warn",
     "أؤكد حذف بياناتي": "delete_execute",
 }
+
+#: The same commands, keyed by their NORMALISED form (hamza seats, taa-marbuta,
+#: dotless yaa, diacritics and punctuation folded) — the same authority the
+#: greetings already use, and the reason «اؤكد حذف بياناتي» and «حالة اشتراكى»
+#: now execute. Extra spellings are listed only where the fold cannot reach
+#: them (a different word, not a different letter).
+_PRIVACY_COMMANDS_NORMALIZED: dict[str, str] = {
+    **{normalize_ar(phrase): command
+       for phrase, command in _PRIVACY_COMMANDS.items()},
+    **{normalize_ar(phrase): command for phrase, command in {
+        "حالة الاشتراك": "status",
+        "إيقاف مؤقت": "pause",
+        "ايقاف مؤقت": "pause",
+        "تصدير بيانات": "export",
+        "احذف بياناتي": "delete_warn",
+    }.items()},
+}
+
+
+def _privacy_command(text: str | None) -> str | None:
+    """Which standing privacy command is this, if any (§05/§12)?
+
+    AUDIT 2026-08: this was ``_PRIVACY_COMMANDS.get(text.strip())`` — raw byte
+    equality — and inbound's ``normalize`` only collapses whitespace, so the
+    deletion the customer is instructed to send VERBATIM did not execute when
+    it arrived with the hamza-less waw their keyboard produces. A PDPL request
+    carries a statutory deadline; failing it in silence is the worst outcome
+    available to us.
+
+    The match stays a WHOLE-STRING one on purpose. It is what keeps the
+    two-step deletion gate exactly as narrow as it was: folding «أؤكد» and
+    «اؤكد» together adds spellings of the same three words and nothing else —
+    no synonym, no bare «نعم», and no substring, so «لا أؤكد حذف بياناتي»
+    still deletes nothing.
+    """
+    return _PRIVACY_COMMANDS_NORMALIZED.get(normalize_ar(text))
 
 
 # ── plumbing ─────────────────────────────────────────────────────────────────
@@ -267,7 +457,7 @@ def handle_standing_command(
     they were only reachable while a journey was incomplete, so an ACTIVE
     customer (the permanent condition) could never pause/export/delete.
     Returns True when the text was a privacy command and was handled."""
-    command = _PRIVACY_COMMANDS.get(text.strip())
+    command = _privacy_command(text)
     if command is None:
         return False
     channel = session.get(CustomerChannel, channel_id)
@@ -866,7 +1056,7 @@ def handle_text(
     body = text.strip()
 
     # Standing commands work at every state (§05/§12).
-    command = _PRIVACY_COMMANDS.get(body)
+    command = _privacy_command(body)
     if command is not None:
         _handle_privacy_command(session, journey.tenant_id, channel, deps,
                                 command, now=now)
@@ -899,7 +1089,11 @@ def _handle_consent_or_question(
     missing = _missing_required(session, tenant_id)
 
     if missing:
-        if body == _CONSENT_YES:
+        # Raw equality against «أوافق» used to decide this. The buttons carry
+        # most customers, but the copy also invites the typed word — and the
+        # typed word is almost never the hamza spelling (audit 2026-08).
+        verdict = classify_consent_reply(body)
+        if verdict == CONSENT_AGREE:
             # one tap → every required purpose granted, each its own event
             # (purpose separation lives in the ledger — CHANGELOG §10)
             for purpose in missing:
@@ -908,11 +1102,15 @@ def _handle_consent_or_question(
                     action="granted",
                 )
             _send(session, deps, channel, _ROADMAP, now=now)
-        elif body == _CONSENT_NO:
+        elif verdict == CONSENT_DECLINE:
             _send(session, deps, channel, _CONSENT_REQUIRED_EXPLAIN, now=now)
             _prompt_current_step(session, journey, channel, deps, now=now)
             return
         else:
+            if verdict == CONSENT_ACK:
+                # «تمام» is an acknowledgement, not a consent — say so plainly
+                # instead of either granting it or bouncing the same wall back
+                _send(session, deps, channel, _CONSENT_ACK_ASK, now=now)
             _prompt_current_step(session, journey, channel, deps, now=now)
             return
         _prompt_current_step(session, journey, channel, deps, now=now)
@@ -1293,11 +1491,11 @@ def _handle_privacy_command(
         )
     elif command == "pause":
         privacy.open_request(session, tenant_id=tenant_id, kind="pause", now=now)
-        privacy.pause_subscription(session, tenant_id=tenant_id)
-        _send(session, deps, channel, _PAUSED, now=now)
+        result = privacy.pause_subscription(session, tenant_id=tenant_id)
+        _send(session, deps, channel, _PAUSE_REPLIES[result.outcome], now=now)
     elif command == "resume":
-        privacy.resume_subscription(session, tenant_id=tenant_id)
-        _send(session, deps, channel, _RESUMED, now=now)
+        result = privacy.resume_subscription(session, tenant_id=tenant_id)
+        _send(session, deps, channel, _RESUME_REPLIES[result.outcome], now=now)
     elif command == "export":
         request = privacy.open_request(session, tenant_id=tenant_id, kind="export", now=now)
         key = privacy.fulfill_export(

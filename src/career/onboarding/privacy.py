@@ -18,9 +18,11 @@ Pause suspends the service without extending the period (§05: وقف مؤقت �
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from enum import StrEnum
 from typing import Any
 
 from sqlalchemy import delete, select
@@ -47,6 +49,8 @@ from career.db.models import (
 from career.salla import subscriptions as sub_states
 from career.salla.subscriptions import transition
 from career.storage import StorageAdapter, tenant_key
+
+logger = logging.getLogger("career.onboarding")
 
 #: Declared fulfillment deadlines per request kind (days) — the «مهلة معلنة».
 DEADLINES_DAYS: dict[str, int] = {
@@ -381,26 +385,70 @@ def execute_deletion(
 # ── pause / resume (لا يمدد) ─────────────────────────────────────────────────
 
 
-def _subscription(session: Session, tenant_id: uuid.UUID) -> Subscription:
-    """THE live subscription. Since renewals (§16) a tenant holds one row per
-    order, so «whichever row came back first» would have shown a renewing
-    customer their old expired period — and pause/resume would have acted on
-    it. The order is explicit in career.salla.renewal."""
+def _live_subscription(
+    session: Session, tenant_id: uuid.UUID
+) -> Subscription | None:
+    """THE live subscription, or None when this tenant holds no row at all.
+
+    Since renewals (§16) a tenant holds one row per order, so «whichever row
+    came back first» would have shown a renewing customer their old expired
+    period — and pause/resume would have acted on it. The order is explicit in
+    career.salla.renewal.
+
+    Absence is a FACT, not an error. This used to raise RequestNotFound — a
+    privacy-REQUEST exception borrowed to mean «no subscription» — and every
+    caller inherited the raise, including «حالة اشتراكي», the single most
+    advertised command in the product: a tenant with no live row (the shells a
+    §04 upgrade leaves behind, an order still being provisioned) asked the one
+    question we tell them to ask and their whole turn died with no reply.
+    """
     from career.salla.renewal import current_subscription
 
-    subscription = current_subscription(session, tenant_id)
-    if subscription is None:
-        raise RequestNotFound("subscription")
-    return subscription
+    return current_subscription(session, tenant_id)
 
 
-#: Pausing is meaningful only from a state that is actually running.
-_PAUSABLE: frozenset[str] = frozenset({
-    sub_states.ACTIVE, sub_states.ONBOARDING, sub_states.GRACE,
-})
+#: Pausing is meaningful only from a state that is actually running — and that
+#: set is the state machine's to define, not ours. Restating it by hand is
+#: what put GRACE in here while `_ALLOWED` had no GRACE→PAUSED edge, turning
+#: the documented «وقف مؤقت» into an InvalidTransition in the customer's face
+#: (career.salla.subscriptions.PAUSABLE_STATES carries the full incident).
+_PAUSABLE: frozenset[str] = sub_states.PAUSABLE_STATES
 
 
-def pause_subscription(session: Session, *, tenant_id: uuid.UUID) -> Subscription:
+class ActionOutcome(StrEnum):
+    """What a pause/resume actually DID — never inferred, always returned."""
+
+    CHANGED = "changed"
+    ALREADY = "already"
+    NOT_ELIGIBLE = "not_eligible"
+    NO_SUBSCRIPTION = "no_subscription"
+
+
+@dataclass(frozen=True)
+class SubscriptionActionResult:
+    """The answer to «what happened?», in a shape a caller cannot ignore.
+
+    Both actions used to return the subscription row UNCHANGED when they
+    declined, so a refusal and a success were the same value and every caller
+    had to re-read the status to tell them apart. One caller did not, and the
+    watchtower printed «✅ استأنفنا الخدمة للعميل» over an account that was
+    never resumed. The row is still here for the callers that want it, and
+    `status` is the status as it stands after the call, but the fact of the
+    matter now travels with it and reads the same to everyone.
+    """
+
+    outcome: ActionOutcome
+    status: str | None
+    subscription: Subscription | None
+
+    @property
+    def changed(self) -> bool:
+        return self.outcome is ActionOutcome.CHANGED
+
+
+def pause_subscription(
+    session: Session, *, tenant_id: uuid.UUID
+) -> SubscriptionActionResult:
     """Suspend delivery WITHOUT touching the period end (§05: لا يمدد).
 
     Idempotent, and never an exception. The unguarded transition raised
@@ -410,29 +458,68 @@ def pause_subscription(session: Session, *, tenant_id: uuid.UUID) -> Subscriptio
     nothing at all. Sending a command twice is not an error, and a customer
     must never be able to break the conversation by repeating themselves.
     """
-    subscription = _subscription(session, tenant_id)
-    if subscription.status not in _PAUSABLE:
-        return subscription
-    return transition(
+    subscription = _live_subscription(session, tenant_id)
+    if subscription is None:
+        return SubscriptionActionResult(
+            ActionOutcome.NO_SUBSCRIPTION, None, None
+        )
+    status = str(subscription.status)
+    if status == sub_states.PAUSED:
+        return SubscriptionActionResult(
+            ActionOutcome.ALREADY, status, subscription
+        )
+    if status not in _PAUSABLE:
+        return SubscriptionActionResult(
+            ActionOutcome.NOT_ELIGIBLE, status, subscription
+        )
+    transition(
         session, subscription, sub_states.PAUSED, event_type="customer_pause"
+    )
+    return SubscriptionActionResult(
+        ActionOutcome.CHANGED, str(subscription.status), subscription
     )
 
 
-def resume_subscription(session: Session, *, tenant_id: uuid.UUID) -> Subscription:
-    subscription = _subscription(session, tenant_id)
+def resume_subscription(
+    session: Session, *, tenant_id: uuid.UUID
+) -> SubscriptionActionResult:
+    """Put a paused customer back in service — and say whether it happened."""
+    subscription = _live_subscription(session, tenant_id)
+    if subscription is None:
+        return SubscriptionActionResult(
+            ActionOutcome.NO_SUBSCRIPTION, None, None
+        )
+    status = str(subscription.status)
+    if status == sub_states.ACTIVE:
+        return SubscriptionActionResult(
+            ActionOutcome.ALREADY, status, subscription
+        )
     # audit fix: resume is only meaningful FROM paused. During onboarding the
     # unconditional transition jumped ONBOARDING→ACTIVE, corrupting the
     # subscription and permanently blocking activation.
-    if subscription.status != sub_states.PAUSED:
-        return subscription
-    return transition(
+    if status != sub_states.PAUSED or not sub_states.can_transition(
+        status, sub_states.ACTIVE
+    ):
+        return SubscriptionActionResult(
+            ActionOutcome.NOT_ELIGIBLE, status, subscription
+        )
+    transition(
         session, subscription, sub_states.ACTIVE, event_type="customer_resume"
+    )
+    return SubscriptionActionResult(
+        ActionOutcome.CHANGED, str(subscription.status), subscription
     )
 
 
 # ── subscription status: an honest Arabic one-liner ──────────────────────────
 
 _STATUS_AR = {
+    # PENDING_PAYMENT was the hole: an unmapped status fell through to the raw
+    # Latin token, so «حالة اشتراكي» answered a real customer with an Arabic
+    # sentence carrying a Latin word in the middle of it — a line Fahad's
+    # client scrambles on delivery (§16) and that means nothing to a reader
+    # either way. Every one of the eleven states of §05 is named here.
+    "PENDING_PAYMENT": "بانتظار الدفع",
     "ACTIVE": "نشط",
     "PAUSED": "موقوف مؤقتًا",
     "ONBOARDING": "قيد الإعداد",
@@ -460,12 +547,40 @@ def _renew_cta(store_url: str | None) -> str:
     return "\nتقدر تجدد من هنا:\n" + url
 
 
+#: No live subscription row to speak for. The customer asked the question we
+#: print in every message; «I have nothing to tell you» is a poor answer but it
+#: is an answer, and the alternative here was a RequestNotFound that killed
+#: their whole turn — no reply, inbound rolled back, event marked failed.
+_NO_SUBSCRIPTION_AR = (
+    "ما لقيت اشتراكًا مسجلًا على رقمك من هنا\n"
+    "إذا كنت دفعت للتو فعطني دقائق وأعد إرسال: حالة اشتراكي\n"
+    "وإذا ما تغير شي أرسل: دعم — وأحد من الفريق يتابعها معك"
+)
+
+#: A status we have no Arabic name for. The operator hears about it in the
+#: journal; the customer hears a sentence in their own language plus the one
+#: step that always works.
+_UNKNOWN_STATUS_AR = (
+    "اشتراكك: حالته غير واضحة عندي الحين\n"
+    "أرسل: دعم — وأحد من الفريق يتابعها معك"
+)
+
+
 def subscription_status_summary(
     session: Session, *, tenant_id: uuid.UUID, now: datetime,
     store_url: str | None = None,
 ) -> str:
-    subscription = _subscription(session, tenant_id)
-    label = _STATUS_AR.get(subscription.status, subscription.status)
+    subscription = _live_subscription(session, tenant_id)
+    if subscription is None:
+        return _NO_SUBSCRIPTION_AR
+    label = _STATUS_AR.get(subscription.status)
+    if label is None:
+        # never leak the raw state name into an Arabic line (§16) — and never
+        # go quiet about it either: an unnamed status is our bug, not theirs.
+        logger.warning(
+            "subscription status has no Arabic label: %s", subscription.status
+        )
+        return _UNKNOWN_STATUS_AR
     if subscription.current_period_end is not None:
         days_left = max(0, (subscription.current_period_end - now).days)
         line = f"اشتراكك: {label} — باقي {days_left} يومًا على نهاية الفترة الحالية."

@@ -4,12 +4,29 @@ A pure Arabic formatter over the same 7-day business data the console shows,
 plus the week's honest day-state tally. The runner sends it to the admin
 channel every Sunday morning; the format function is golden-tested with zero
 I/O.
+
+The plan names come from the console's map and are NOT restated here. This
+file used to keep its own copy, and a copy is how one product ended up with
+three names: the report called ``professional`` «احترافي» while the customer
+card called it «لمّاح», it carried «elite» — a plan code that has never
+existed in the database — and it had no entry for ``executive`` at all, so
+لمّاح+ arrived every Sunday as a raw Latin token inside an Arabic line (a
+missing translation and a bidi break in one, on the one screen the operator
+reads weekly). One authority, imported: a label added on the card is a label
+this report already speaks.
 """
 
 from __future__ import annotations
 
 from datetime import date
 from typing import Any
+
+# The underscore is deliberate and temporary: ``views._plan`` is the authority
+# today, views.py belongs to another change in flight, and inventing a second
+# public name here would be the third copy. The architect note asks for it to
+# be renamed ``views.plan_label`` (or moved whole to ``telegram/plans.py``) —
+# one import line moves with it.
+from career.telegram.views import _plan as _plan_ar
 
 _STATE_AR = {
     "DELIVERED": "سُلّم",
@@ -20,11 +37,6 @@ _STATE_AR = {
     "CV_GENERATION_FAILED": "فشل توليد",
     "DISCOVERY_FAILED": "فشل اكتشاف",
     "LEDGER_FAILED": "فشل سجل",
-}
-
-_PLAN_AR = {
-    "basic": "أساسي", "professional": "احترافي",
-    "elite": "نخبة", "cv_analysis": "تحليل CV",
 }
 
 
@@ -41,7 +53,7 @@ def format_weekly_report(
     subs = business.get("subs_by_plan") or {}
     if subs:
         parts = " · ".join(
-            f"{_PLAN_AR.get(k, k)}: {v}" for k, v in sorted(subs.items())
+            f"{_plan_ar(k)}: {v}" for k, v in sorted(subs.items())
         )
         lines.append(f"💰 اشتراكات جديدة: {parts}")
     else:

@@ -1,6 +1,6 @@
-"""Rehearse the 49-SAR analysis product end to end — purchase to report.
+"""Rehearse the 29-SAR analysis product end to end — purchase to report.
 
-The funnel is the acquisition door: a prospect pays 49 SAR, uploads a CV, and
+The funnel is the acquisition door: a prospect pays 29 SAR, uploads a CV, and
 must receive a real Arabic report within minutes. Every part is covered by
 unit tests, but the WHOLE journey had never been driven in one go, which is
 exactly the shape of gap the 29-July live rehearsal exposed elsewhere.
@@ -28,7 +28,7 @@ def main() -> int:
         print(f"REFUSING: DB_NAME={settings.db_name!r} is not a *_test DB")
         return 3
 
-    print("CV-analysis funnel rehearsal (49-SAR product)")
+    print("CV-analysis funnel rehearsal (29-SAR product)")
     # The E2E journey already exists as a test authority; drive THAT rather
     # than a parallel copy, so the drill can never drift from what CI proves.
     import pytest
@@ -43,7 +43,7 @@ def main() -> int:
         return 1
     print("  ✓ purchase → report landed in one conversation")
     print("  ✓ an upgrade from the same phone inherits the funnel tenant")
-    print("rehearsal passed — the 49-SAR door works end to end")
+    print("rehearsal passed — the 29-SAR door works end to end")
     return 0
 
 

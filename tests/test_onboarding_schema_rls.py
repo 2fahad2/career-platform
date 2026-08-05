@@ -12,9 +12,13 @@ import uuid
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.exc import ProgrammingError
+from sqlalchemy.exc import DBAPIError, ProgrammingError
 
-from career.db.session import app_engine, tenant_session
+from career.db.session import (
+    NO_TENANT_CONTEXT_SQLSTATE,
+    app_engine,
+    tenant_session,
+)
 
 # Minimal valid INSERT per C5 table. :id/:tid are bound per call; tables whose
 # rows need a subscription get :sub bound too.
@@ -92,9 +96,13 @@ def test_c5_table_tenant_isolation(two_tenants: tuple[str, str], table: str) -> 
     assert visible == 0
     assert filtered == 0
 
-    with app_engine.connect() as conn:  # no app.tenant_id bound → NULL GUC
-        count = conn.execute(text(f"SELECT count(*) FROM {table}")).scalar_one()
-    assert count == 0
+    # Migration 0021: with no app.tenant_id bound this used to return 0 and no
+    # error — «fail closed» that read to the caller exactly like «this customer
+    # has nothing». It now refuses. See tests/test_rls_runtime_role.py.
+    with pytest.raises(DBAPIError) as err:
+        with app_engine.begin() as conn:
+            conn.execute(text(f"SELECT count(*) FROM {table}"))
+    assert err.value.orig.sqlstate == NO_TENANT_CONTEXT_SQLSTATE
 
 
 @pytest.mark.parametrize("table", sorted(_C5_INSERTS))

@@ -10,6 +10,8 @@ Usage events roll up into per-tenant/day cost allocations (§14 fuel).
 
 from __future__ import annotations
 
+import ast
+import pathlib
 import uuid
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -142,6 +144,90 @@ def test_ledger_write_failure_is_an_honest_state_not_an_exception(
         assert state.state == "LEDGER_FAILED"
     finally:
         _cleanup(owner_session, tid)
+
+
+def test_opt_out_after_a_real_delivery_never_erases_it(
+    owner_session: Session,
+) -> None:
+    """P1-6. The opt-out close runs AFTER the delivery phase, so this is the
+    ordinary morning of a customer who receives his jobs and then presses
+    «إيقاف»: his DELIVERED day, with its real counts, must survive. It did not
+    — the row was rewritten SKIPPED_OPTED_OUT with delivered: 0 while the
+    suppression ledger still recorded those jobs as sent."""
+    tid = _seed_tenant(owner_session)
+    try:
+        delivered = close.close_tenant_day(
+            owner_session, tenant_id=tid, run_date=DAY, now=NOW,
+            discovery_ok=True, gate_passes=2, cv_resolved=2, cv_failed=0,
+            delivered_groups=["https://a.example/j/1", "https://a.example/j/2"],
+            failed_groups=[],
+        )
+        owner_session.commit()
+        assert delivered.state == "DELIVERED"
+
+        after = close.close_skipped_opted_out(
+            owner_session, tenant_id=tid, run_date=DAY, now=NOW, gate_passes=2,
+        )
+        owner_session.commit()
+        assert after.state == "DELIVERED"
+        assert after.counts["delivered"] == 2
+    finally:
+        _cleanup(owner_session, tid)
+
+
+def test_opt_out_still_records_a_day_that_delivered_nothing(
+    owner_session: Session,
+) -> None:
+    """The other half of the same rule: nothing was received, so the eighth
+    state is the latest truth and must be written."""
+    tid = _seed_tenant(owner_session)
+    try:
+        close.close_tenant_day(
+            owner_session, tenant_id=tid, run_date=DAY, now=NOW,
+            discovery_ok=True, gate_passes=0, cv_resolved=0, cv_failed=0,
+            delivered_groups=[], failed_groups=[],
+        )
+        owner_session.commit()
+        state = close.close_skipped_opted_out(
+            owner_session, tenant_id=tid, run_date=DAY, now=NOW, gate_passes=3,
+        )
+        owner_session.commit()
+        assert state.state == "SKIPPED_OPTED_OUT"
+        assert state.counts["gate_passes"] == 3
+    finally:
+        _cleanup(owner_session, tid)
+
+
+def test_the_day_state_has_exactly_one_writer() -> None:
+    """The rule was correct and merely bypassable, so the second writer that
+    arrived (CHANGELOG §12's opt-out close) bypassed it and cost a real
+    delivery. A ninth state will be written by somebody who never read
+    _outranks — this fails the moment that somebody touches the row directly
+    instead of going through the one door."""
+    tree = ast.parse(
+        pathlib.Path("src/career/cv/close.py").read_text(encoding="utf-8")
+    )
+    writers = set()
+    for func in ast.walk(tree):
+        if not isinstance(func, ast.FunctionDef):
+            continue
+        for node in ast.walk(func):
+            builds = (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "TenantDayState"
+            )
+            mutates = isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Attribute)
+                and target.attr in ("state", "counts", "recorded_at")
+                for target in node.targets
+            )
+            if builds or mutates:
+                writers.add(func.name)
+    assert writers == {"_record_day_state"}, (
+        f"tenant_day_states is written outside the authority by: "
+        f"{sorted(writers - {'_record_day_state'})}"
+    )
 
 
 # ── the admin summary: TEN codes and numbers only ────────────────────────────

@@ -5,6 +5,21 @@ with a single tap: the thank-you page shows a button opening WhatsApp with
 the activation message pre-filled («تفعيل <token>»). The inbound classifier
 recognizes exactly that phrasing, so the link closes the purchase→activation
 loop without the customer ever copying a code by hand.
+
+Everything this module returns is a LIVE CREDENTIAL and belongs to exactly one
+buyer. Holding the link is the whole of the proof: whoever opens it binds
+their own phone to that paid subscription, which is why the database keeps
+only a SHA-256 hash and hands the raw value back exactly once.
+
+Nothing here may be logged, alerted, or posted to a channel with a history.
+That is a contract on the CALLERS, and it has been broken once: provisioning
+sent the link to the admin Telegram channel on every sale, where it sat live
+for seven days per order. Note especially that secret redaction cannot cover
+for a mistake here — the token rides in a ``text=`` query parameter, which
+matches no key name and no provider token shape in logging_filters, so it
+would pass through every layer of the filter unchanged. Treat a link that
+reached a log as burned and rotate it (career.salla.provisioning.
+issue_activation_link retires the old token as it mints the new one).
 """
 
 from __future__ import annotations
