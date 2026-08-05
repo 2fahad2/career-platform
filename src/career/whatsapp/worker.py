@@ -396,7 +396,15 @@ def _handle_message(
             id=uuid.uuid4(), tenant_id=channel.tenant_id, channel_id=channel.id,
             inbound_message_id=inbound.id, kind="support_request", status="open",
         ))
-        admin_client.send_admin(admin_msg.support_request(_ten_code(session, channel.tenant_id)))
+        # Local import, like the other call site in this module: the salla
+        # package imports back into whatsapp at module scope.
+        from career.salla.renewal import current_subscription
+
+        sub = current_subscription(session, channel.tenant_id)
+        admin_client.send_admin(admin_msg.support_request(
+            _ten_code(session, channel.tenant_id),
+            sub.plan_code if sub is not None else None,
+        ))
         # closure audit: «دعم» is the escape hatch printed in every error
         # message and on the store page — and it used to page the operator
         # while answering the CUSTOMER with nothing at all.

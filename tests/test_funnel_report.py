@@ -39,7 +39,14 @@ def test_report_html_is_rtl_arabic_and_complete() -> None:
         assert note in html
     for step in REPORT.next_steps:
         assert step in html
-    assert "career-platform.net" in html          # shareable footer
+    # The footer carries the BRAND, not a domain. It used to assert
+    # «career-platform.net» — a placeholder that was never the store, on the
+    # one document designed to be forwarded. A wrong address on a shared
+    # report is worse than none, so the name stands alone until the real
+    # store URL (SALLA_STORE_URL, already an env var) is threaded through
+    # this pure renderer.
+    assert "لمّاح" in html
+    assert "career-platform" not in html
 
 
 def test_report_pdf_is_one_page_and_deterministic(tmp_path: Path) -> None:

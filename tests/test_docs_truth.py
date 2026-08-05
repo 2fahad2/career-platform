@@ -52,11 +52,29 @@ _SOLD_ENTITLEMENTS: dict[str, tuple[str, ...]] = {
     "queue_priority": ("أولوية في الطابور", "أولوية معالجة"),
     "intro_blurb": ("نبذة تمهيدية", "نبذة تقديم"),
     "weekly_report": ("تقرير أسبوعي",),
+    # Found by a later sweep, all of the same class as the three above and all
+    # missed because the map was written from the three we already knew:
+    "support_sla_hours": ("دعم خلال ٢٤ ساعة",),
+    "banned_companies": ("الشركات اللي ما تبي سيرتك توصلها",),
+    "cover_letter": ("خطاب تقديم", "خطاب التغطية"),
 }
+
+
+#: Columns the grep below finds and must NOT count as implemented, with the
+#: reason. The heuristic — «mentioned outside models.py» — is right for most
+#: entitlements and wrong for these, and a guard that quietly says yes is worse
+#: than no guard: `banned_companies` is written as a hardcoded empty dict at
+#: policy.py and copied by the privacy export, so it is «mentioned» twice and
+#: consulted never. Nothing asks the customer for it and the gate never
+#: receives it. Delete an entry here the day the column genuinely does
+#: something.
+_MENTIONED_BUT_INERT: frozenset[str] = frozenset({"banned_companies"})
 
 
 def _read_by_product(column: str) -> bool:
     """Does any module outside the schema itself consult this entitlement?"""
+    if column in _MENTIONED_BUT_INERT:
+        return False
     root = pathlib.Path("src/career")
     for path in root.rglob("*.py"):
         if path.name == "models.py":
@@ -97,8 +115,13 @@ def test_no_refund_is_promised_as_automatic() -> None:
     machine that does not exist, and the customer it fails is by definition
     one already unhappy enough to ask for their money back."""
     text = pathlib.Path("docs/STORE-PAGES-AR.md").read_text(encoding="utf-8")
+    # The first version of this guard looked only for «استرداد»/«نستردّ» and
+    # passed while the product page still said «فلوسك ترجع كاملة تلقائيًا» —
+    # the same false promise, one synonym away. A guard narrower than the
+    # language it polices is a guard that reports success.
+    money_words = ("استرداد", "نستردّ", "ترجع", "نرجّع", "يرجع", "المبلغ")
     for line in text.splitlines():
-        if "استرداد" in line or "نستردّ" in line:
+        if any(word in line for word in money_words):
             assert "تلقائي" not in line, (
                 f"a refund is promised as automatic, and none is: {line!r}"
             )

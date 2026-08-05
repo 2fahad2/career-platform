@@ -68,7 +68,7 @@ REPORT_TEMPLATE = """<!DOCTYPE html>
     </style>
 </head>
 <body>
-    <div class="brand">Career Platform · مساعد التوظيف الشخصي</div>
+    <div class="brand">لمّاح · مساعد التوظيف الشخصي</div>
     <div class="title">تقرير تحليل السيرة الذاتية</div>
     <div class="date">تاريخ التقييم: {{ report_date }}</div>
 
@@ -117,7 +117,7 @@ REPORT_TEMPLATE = """<!DOCTYPE html>
 
     <div class="footer">
         أُعدّ هذا التقرير آليًا من محتوى سيرتك كما قُرئت — بلا مجاملة وبلا
-        تهويل. · career-platform.net
+        تهويل. · لمّاح
     </div>
 </body>
 </html>
