@@ -397,3 +397,152 @@ def test_quarantine_moves_the_pair_byte_identical(tmp_path: Any) -> None:
     assert storage.get(moved["cv_key"]) == pdf             # byte-identical
     assert storage.get(moved["metadata_key"]) == meta
     assert "tailored_cvs_quarantine/" in moved["cv_key"]
+
+
+# ── quarantine WIRED to the real publish path ────────────────────────────────
+#
+# Until this section existed, quarantine_pair had no caller: a pair that failed
+# binding validation was left exactly where it was, in the live prefix, under
+# the filename this job's URL derives. Nothing else can ever occupy that slot,
+# so every subsequent night listed it, parsed its sidecar, hashed its bytes and
+# refused it again — and because the refusal is silent (select returns None),
+# the visible symptom was a customer getting no CV for a job, night after
+# night, with the evidence sitting untouched and unread.
+
+
+def _tamper(storage: FilesystemStorageAdapter, keys: dict[str, str]) -> None:
+    """The failure this is modelled on is real and is the one the publish order
+    deliberately leaves possible: PDF first, sidecar second, so a crash between
+    the two puts fresh bytes under a stale sidecar. The sha binding turns that
+    into a refusal instead of a false READY — and then nothing collected it."""
+    storage.put(keys["cv_key"], b"%PDF-1.4 different bytes")
+
+
+def test_a_freshly_generated_pair_that_fails_binding_is_quarantined(
+    tmp_path: Any,
+) -> None:
+    storage = FilesystemStorageAdapter(tmp_path)
+
+    def bad_pair() -> dict[str, str]:
+        keys = _publish(storage)
+        _tamper(storage, keys)
+        return keys
+
+    result = _resolver(storage, generator=bad_pair, now=NOW)
+    assert result.status == "validation_blocked"        # unchanged verdict
+    live = list(storage.list_keys(f"tenants/{TENANT}/{publish.TAILORED_PREFIX}"))
+    assert live == [], f"the broken pair is still live: {live}"
+    quarantined = sorted(
+        storage.list_keys(f"tenants/{TENANT}/{publish.QUARANTINE_PREFIX}")
+    )
+    assert len(quarantined) == 2                        # pdf + sidecar
+    assert quarantined[0].endswith(".metadata.json")
+    # evidence, not deletion (§7.7): the tampered bytes are preserved as-is
+    assert storage.get(quarantined[1]) == b"%PDF-1.4 different bytes"
+
+
+def test_the_next_night_no_longer_re_scans_a_pair_it_already_refused(
+    tmp_path: Any,
+) -> None:
+    """The cost this wiring removes. Before: the same corrupt pair was listed,
+    parsed and hashed on every run forever. After: the slot is empty, so the
+    night that finds it can generate a replacement into it."""
+    storage = FilesystemStorageAdapter(tmp_path)
+    keys = _publish(storage)
+    _tamper(storage, keys)
+
+    job = {"apply_link": JOB_URL, "title": "Business Analyst",
+           "company": "Acme"}
+    assert publish.select_tailored_cv(
+        storage, tenant_id=TENANT, job=job, quarantine_broken=True, now=NOW,
+    ) is None
+    assert not storage.exists(keys["cv_key"])
+    assert not storage.exists(keys["metadata_key"])
+
+    # …and the slot is free, so the very next resolve produces a good CV
+    result = _resolver(storage, now=NOW)
+    assert result.status == "generated_valid_cv"
+
+
+def test_selection_does_not_quarantine_another_jobs_cv(tmp_path: Any) -> None:
+    """The counterweight, and the reason this is a slot rule and not a
+    «blocked ⇒ move it» rule. Discovery matches on loose hints — company and
+    title — precisely so a CV can be FOUND by more than its URL; two openings
+    at the same company with the same title are ordinary. The validator then
+    refuses the wrong one with `canonical_identity_mismatch`, which is not a
+    corrupt artifact, it is a perfectly good CV for the other job. Moving it
+    would delete a deliverable the customer paid for."""
+    storage = FilesystemStorageAdapter(tmp_path)
+    keys = _publish(storage)                     # a valid CV for JOB_URL
+    other = {"apply_link": "https://careers.acme.com/jobs/9999",
+             "title": "Business Analyst", "company": "Acme"}
+
+    assert publish.select_tailored_cv(
+        storage, tenant_id=TENANT, job=other, quarantine_broken=True, now=NOW,
+    ) is None
+    assert storage.exists(keys["cv_key"])        # untouched
+    assert storage.exists(keys["metadata_key"])
+
+
+def test_a_missing_file_is_not_quarantined(tmp_path: Any) -> None:
+    """`cv_file_missing` is an absence, not evidence — there is nothing to
+    preserve, and a move would raise inside a nightly run that must not
+    crash. Same for a validator that errored internally: that blocker is
+    transient by construction and moving on it would sweep healthy pairs."""
+    storage = FilesystemStorageAdapter(tmp_path)
+    keys = _publish(storage)
+    storage.delete(keys["cv_key"])               # sidecar left behind
+
+    job = {"apply_link": JOB_URL, "title": "Business Analyst",
+           "company": "Acme"}
+    assert publish.select_tailored_cv(
+        storage, tenant_id=TENANT, job=job, quarantine_broken=True, now=NOW,
+    ) is None
+    assert storage.exists(keys["metadata_key"])  # still there, not moved
+    assert not list(
+        storage.list_keys(f"tenants/{TENANT}/{publish.QUARANTINE_PREFIX}")
+    )
+
+
+def test_the_quarantine_writes_the_audit_row(
+    tmp_path: Any, two_tenants: tuple[str, str]
+) -> None:
+    """DB test, and the only one in this file — because the claim it checks is
+    a database claim. Withdrawing a customer-facing artifact is a §15 security
+    event, it is written under the tenant's own RLS context, and it survives
+    that customer's deletion request by design. A wiring that silently wrote
+    nothing would look identical from the storage side."""
+    from career.audit import ACTION_CV_PAIR_QUARANTINED, recent_audit
+    from career.db.session import tenant_session
+
+    tenant, other = two_tenants
+    storage = FilesystemStorageAdapter(tmp_path)
+    keys = _publish(storage, tenant_id=tenant)
+    _tamper(storage, keys)
+
+    assert publish.select_tailored_cv(
+        storage, tenant_id=tenant,
+        job={"apply_link": JOB_URL}, quarantine_broken=True, now=NOW,
+    ) is None
+
+    with tenant_session(tenant) as s:
+        events = recent_audit(s)
+    assert [e.action for e in events] == [ACTION_CV_PAIR_QUARANTINED]
+    assert events[0].details["blockers"] == ["sha256_mismatch"]
+    assert events[0].resource_type == "tailored_cv"
+    with tenant_session(other) as s:                 # RLS, not care
+        assert recent_audit(s) == []
+
+
+def test_a_dry_run_moves_nothing(tmp_path: Any) -> None:
+    """A dry run is a report, and a report that rearranges storage is not one.
+    `resolve_tailored_cv(dry_run=True)` reaches selection before its own gate,
+    so the flag has to travel down with it."""
+    storage = FilesystemStorageAdapter(tmp_path)
+    keys = _publish(storage)
+    _tamper(storage, keys)
+    assert _resolver(storage, dry_run=True, now=NOW).status == (
+        "dry_run_generation_skipped"
+    )
+    assert storage.exists(keys["cv_key"])
+    assert storage.exists(keys["metadata_key"])

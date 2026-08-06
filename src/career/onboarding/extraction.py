@@ -30,6 +30,7 @@ from typing import Any, Protocol
 
 from sqlalchemy.orm import Session
 
+from career.arabic import AR_DIACRITICS, AR_MARKS, fold_token
 from career.cv.close import LlmMeter, TokenCounter
 from career.db.models import ProfileFact
 from career.onboarding.consents import require_required_consents
@@ -78,29 +79,25 @@ _NAME = "[NAME]"
 # Direction of error, deliberately: over-stripping costs one redacted word in
 # a prompt; under-stripping costs the promise printed on the store page.
 
-#: Arabic combining marks — harakat, tatweel, quranic marks. «فُلان» and
-#: «فلان» are the same name to every human and to no substring matcher.
-_AR_MARKS = "\u064B-\u0652\u0670\u0640\u06D6-\u06ED"
-_AR_DIACRITICS = re.compile(f"[{_AR_MARKS}]")
-#: Hamza forms, alef maqsura and taa marbuta fold — the same normalisation
-#: achievement_render.normalize_ar performs. It is duplicated rather than
-#: imported on purpose: this module is the leaf every model boundary imports
-#: (cv.generate, intent, enrichment, bullet_panel, achievement_render all
-#: import IT), and achievement_render reaches into career.cv.generate at
-#: module level, so importing upwards from here would close a cycle around
-#: the one function that must never fail to load.
-_AR_FOLD = str.maketrans({
-    "أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا",
-    "ى": "ي", "ة": "ه", "ؤ": "و", "ئ": "ي",
-})
-_NON_WORD = re.compile(r"[^\w]", re.UNICODE)
+# The marks (AR_MARKS/AR_DIACRITICS) and the fold (fold_token) come from
+# career.arabic — the leaf that imports nothing from career at all.
+#
+# They used to be COPIED here, with a comment explaining why: the fold lived in
+# achievement_render, which reaches into career.cv.generate at module level,
+# and this module is itself the leaf every model boundary imports (cv.generate,
+# intent, enrichment, bullet_panel and achievement_render all import IT), so
+# importing upwards would have closed a cycle around the one function that must
+# never fail to load. The cycle is gone because the fold moved DOWN instead,
+# and the copy went with it: two copies of the primitive that decides whether
+# «اوافق» is a consent is a divergence waiting to happen, and only one of them
+# would ever get the fix.
 
 #: A word = letters plus Arabic marks, joined by an internal hyphen or
 #: apostrophe, so "Al-Fulani" and "O'Hara" stay ONE token and «فُلان» is not
 #: split at its damma (a mark is not \w, which is exactly how it used to
 #: escape). Placeholders are matched first in _TOKEN so a name that happens to
 #: skeletonise like "EMAIL" can never chew a placeholder apart.
-_LETTER = f"(?:[^\\W\\d_]|[{_AR_MARKS}])"
+_LETTER = f"(?:[^\\W\\d_]|[{AR_MARKS}])"
 _WORD = re.compile(f"{_LETTER}+(?:['’-]{_LETTER}+)*")
 _PLACEHOLDER = re.compile(r"\[[A-Z][A-Z0-9_]*\]")
 _TOKEN = re.compile(f"{_PLACEHOLDER.pattern}|{_WORD.pattern}")
@@ -135,20 +132,12 @@ _PLACE_WORDS: frozenset[str] = frozenset({
 })
 
 
-def _fold(token: str) -> str:
-    """The comparison key for one token: marks dropped, hamza/yaa/taa folded,
-    punctuation removed, lowercased. «الفلانى» and «الفلاني» collapse; so do
-    "Al-Fulani" and "alfulani"."""
-    body = _AR_DIACRITICS.sub("", token).translate(_AR_FOLD)
-    return _NON_WORD.sub("", body).lower()
-
-
 #: Common Saudi given names, FOLDED. This list is a precision device for the
 #: backstop only — never a recall device: nothing depends on a name being in
 #: it (stripping works from the header and the typed name regardless), and a
 #: name missing from it merely means the backstop stays quiet, which is the
 #: failure direction assert_no_pii chooses on purpose.
-_AR_GIVEN_NAMES: frozenset[str] = frozenset(_fold(n) for n in {
+_AR_GIVEN_NAMES: frozenset[str] = frozenset(fold_token(n) for n in {
     "محمد", "احمد", "فهد", "خالد", "سعد", "سلطان", "سعود", "نايف", "تركي",
     "بندر", "ماجد", "ناصر", "مشعل", "يوسف", "ابراهيم", "عمر", "علي", "حسن",
     "حسين", "صالح", "سلمان", "راشد", "طلال", "وليد", "زياد", "فيصل", "منصور",
@@ -221,7 +210,7 @@ class _NameMatcher:
         self._fuzzy: set[str] = set()
         self._cache: dict[str, bool] = {}
         for token in tokens:
-            folded = _fold(token)
+            folded = fold_token(token)
             if len(folded) < _MIN_NAME_TOKEN:
                 continue
             for form in _variants(folded):
@@ -243,7 +232,7 @@ class _NameMatcher:
         return cached
 
     def _match(self, word: str) -> bool:
-        folded = _fold(word)
+        folded = fold_token(word)
         if len(folded) < _MIN_NAME_TOKEN:
             return False
         for form in _variants(folded):
@@ -319,9 +308,9 @@ _HEADING_FILLER: frozenset[str] = frozenset({
 
 #: Folded forms of every word that may sit on a header line without being the
 #: person. Folding matters: «نبذة» stored here compares as «نبذه».
-_SECTION_WORDS: frozenset[str] = frozenset(_fold(w) for w in _HEADER_STOPWORDS)
+_SECTION_WORDS: frozenset[str] = frozenset(fold_token(w) for w in _HEADER_STOPWORDS)
 _NOT_A_NAME: frozenset[str] = _SECTION_WORDS | frozenset(
-    _fold(w) for w in (_ROLE_WORDS | _PLACE_WORDS)
+    fold_token(w) for w in (_ROLE_WORDS | _PLACE_WORDS)
 )
 
 #: How far down the page a name may hide. Past this we are reading the body.
@@ -346,13 +335,13 @@ def _is_name_line(segment: str) -> bool:
     if any(ch in line for ch in ",:;/\\()[]{}<>"):
         return False
     words = [w.strip(".").lower() for w in line.split()]
-    if any(_fold(w) in _SECTION_WORDS for w in words):
+    if any(fold_token(w) in _SECTION_WORDS for w in words):
         return False
     # Arabic marks are not alphabetic to str.isalpha, so «فُلان» fails this
     # test unless the marks come off first — that alone leaked diacritised
     # names past the funnel's inference.
     return all(
-        _AR_DIACRITICS.sub("", w).replace("'", "").replace("-", "").isalpha()
+        AR_DIACRITICS.sub("", w).replace("'", "").replace("-", "").isalpha()
         for w in words
     )
 
@@ -435,7 +424,7 @@ def _heading_lines(text: str) -> set[str]:
         if not line:
             continue
         label = line.split(":", 1)[0] if ":" in line else line
-        words = [_fold(m.group()) for m in _WORD.finditer(label)]
+        words = [fold_token(m.group()) for m in _WORD.finditer(label)]
         if not words or len(words) > _MAX_HEADING_WORDS:
             continue
         headings = {w for w in words if _is_heading_word(w)}
@@ -477,7 +466,7 @@ def _inferred_tokens(candidate: str) -> list[str]:
     header test and only one of them is a human."""
     tokens: list[str] = []
     for match in _WORD.finditer(candidate):
-        folded = _fold(match.group())
+        folded = fold_token(match.group())
         if len(folded) >= _MIN_NAME_TOKEN and folded not in _NOT_A_NAME:
             tokens.append(match.group())
     return tokens
@@ -579,7 +568,7 @@ def _person_shaped(tokens: list[str]) -> bool:
     التواصل», which also has exactly one — that is what
     :func:`_reads_as_a_sentence` is for, and why it runs first."""
     latin = [t for t in tokens if t.isascii()]
-    arabic = [_fold(t) for t in tokens if not t.isascii()]
+    arabic = [fold_token(t) for t in tokens if not t.isascii()]
     if len(latin) >= 2 and all(_title_cased(t) for t in latin):
         return True
     if len(arabic) >= 2:
@@ -596,7 +585,7 @@ def _person_shaped(tokens: list[str]) -> bool:
 #: giveaway, and it is a closed class, so this list cannot rot the way a
 #: vocabulary of content words would. Stored folded, and matched with the
 #: proclitic «و» stripped, because «ثم» and «وثم» are the same word.
-_AR_FUNCTION_WORDS: frozenset[str] = frozenset(_fold(w) for w in {
+_AR_FUNCTION_WORDS: frozenset[str] = frozenset(fold_token(w) for w in {
     "في", "من", "إلى", "الى", "على", "عن", "مع", "ثم", "عند", "لدى", "بعد",
     "قبل", "خلال", "حتى", "بين", "ضمن", "لكن", "أو", "او", "كما", "حيث",
     "التي", "الذي", "هذا", "هذه", "كل", "بدون", "بسبب", "أثناء", "اثناء",
@@ -641,13 +630,13 @@ def _reads_as_a_sentence(candidate: str) -> bool:
     if not words:
         return False
     for word in words:
-        folded = _fold(word)
+        folded = fold_token(word)
         stem = folded[1:] if folded.startswith("و") else folded
         if folded in _AR_FUNCTION_WORDS or stem in _AR_FUNCTION_WORDS:
             return True
     if words[0].isascii():
         return False
-    first = _fold(words[0])
+    first = fold_token(words[0])
     first = first[1:] if first.startswith("و") else first
     return (
         len(first) >= _MIN_VERB_LEN

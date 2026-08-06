@@ -15,7 +15,9 @@
   line of defense); the budget loop annotates, never silently drops.
 - Selection (§7.6) is two-stage: hints (URL, ids, company+title) only
   DISCOVER candidates in a stable order — the validator alone accepts.
-- Quarantine (§7.7) preserves evidence byte-identical; it never deletes.
+- Quarantine (§7.7) preserves evidence byte-identical; it never deletes,
+  and since the 2026-08 dead-code audit it is CALLED rather than merely
+  available — see :func:`_quarantine_if_permanently_broken`.
 
 Deviation note: the LEGACY dual identity regime is NOT ported — this system
 has no legacy artifacts by construction, so any sidecar that is not
@@ -31,7 +33,7 @@ import re
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -243,9 +245,21 @@ def _norm(value: Any) -> str:
 
 
 def select_tailored_cv(
-    storage: StorageAdapter, *, tenant_id: str, job: dict[str, Any]
+    storage: StorageAdapter,
+    *,
+    tenant_id: str,
+    job: dict[str, Any],
+    quarantine_broken: bool = False,
+    now: datetime | None = None,
 ) -> str | None:
-    """The safe PDF key of the CV made FOR this exact job, or None."""
+    """The safe PDF key of the CV made FOR this exact job, or None.
+
+    ``quarantine_broken`` collects the pairs that can never become READY —
+    off by default so this stays a pure read for anyone who only wants an
+    answer; the nightly resolver turns it on. See
+    :func:`_quarantine_if_permanently_broken` for what «can never» means and
+    what it deliberately excludes.
+    """
     job_url = job.get("apply_link") or job.get("url") or ""
     job_url_key = normalize_job_url_v1(job_url)
     job_ids = {
@@ -296,6 +310,12 @@ def select_tailored_cv(
             continue
         if verdict.get("state") == STATE_READY and storage.exists(pdf_key):
             return pdf_key
+        if quarantine_broken:
+            _quarantine_if_permanently_broken(
+                storage, tenant_id=tenant_id, cv_key=pdf_key,
+                metadata_key=meta_key, job_url=str(job_url),
+                blockers=list(verdict.get("blockers") or []), now=now,
+            )
     return None
 
 
@@ -318,11 +338,22 @@ def resolve_tailored_cv(
     dry_run: bool,
     contact: ContactInfo,
     generator: Callable[[], dict[str, str] | None],
+    now: datetime | None = None,
 ) -> ResolveResult:
     """Decides whether a job with no validated CV may get one generated.
-    Never delivers, never writes the ledger, never enables generation."""
+    Never delivers, never writes the ledger, never enables generation.
+
+    ``now`` stamps the quarantine directory. It is optional because the only
+    live caller (cv.daily_run) does not pass one yet and the stamp is a
+    forensic label rather than a business time — but a run should hand its own
+    clock down so the quarantine directory and the run report agree.
+    """
+    # A dry run reports; it does not rearrange storage. The flag is read here
+    # rather than at the gate below because SELECTION happens first, and
+    # selection is where the collection lives.
     existing = select_tailored_cv(
-        storage, tenant_id=tenant_id, job={"apply_link": job_url}
+        storage, tenant_id=tenant_id, job={"apply_link": job_url},
+        quarantine_broken=not dry_run, now=now,
     )
     if existing:
         return ResolveResult("existing_valid_cv", cv_key=existing)
@@ -354,6 +385,17 @@ def resolve_tailored_cv(
             "generated_valid_cv",
             cv_key=keys["cv_key"], metadata_key=keys["metadata_key"],
         )
+    # We built this pair, for this URL, seconds ago, and our own acceptance
+    # authority refuses it. Leaving it under the name this URL derives means
+    # the slot is occupied by something that can never be sent (Constant 6)
+    # and can never be replaced — the generator would publish into the same
+    # two keys and hit the same verdict. The status is unchanged: daily_run's
+    # honest-state table (§15.12) still reads `validation_blocked`.
+    _quarantine_if_permanently_broken(
+        storage, tenant_id=tenant_id, cv_key=keys["cv_key"],
+        metadata_key=keys["metadata_key"], job_url=job_url,
+        blockers=list(verdict.get("blockers") or []), now=now,
+    )
     return ResolveResult("validation_blocked")
 
 
@@ -419,3 +461,118 @@ def quarantine_pair(
     storage.delete(cv_key)
     storage.delete(metadata_key)
     return {"cv_key": dest_pdf, "metadata_key": dest_meta}
+
+
+#: Blockers that describe an artifact which is PERMANENTLY, INTRINSICALLY
+#: unusable — nothing in the system rewrites a sidecar or re-hashes a PDF, so
+#: a pair carrying one of these will get the identical verdict every night for
+#: the rest of the subscription.
+#:
+#: What is deliberately NOT here matters more than what is:
+#:
+#: * ``canonical_identity_mismatch`` / ``canonical_stem_mismatch`` — the pair
+#:   is fine, it simply belongs to a DIFFERENT job. Discovery matches on
+#:   company+title precisely so a CV can be found by more than its URL, and
+#:   two openings at one company with one title are ordinary. Quarantining on
+#:   these would delete a deliverable the customer paid for.
+#: * ``cv_file_missing`` / ``metadata_file_missing`` — an absence is not
+#:   evidence; there is nothing to preserve and ``get`` would raise inside a
+#:   run that must not crash.
+#: * ``validator_error:internal`` — transient by construction. Moving on it
+#:   would let one bad deploy sweep every healthy pair into quarantine.
+_PERMANENT_PAIR_BLOCKERS = frozenset({
+    "sha256_mismatch",                     # sidecar does not describe these bytes
+    "metadata_unparseable",
+    "metadata_not_a_dict",
+    "unknown_identity_version",
+    "metadata_canonical_identity_invalid",
+})
+
+
+def _occupies_this_jobs_slot(cv_key: str, job_url: str) -> bool:
+    """Is this pair sitting under the exact filename THIS job's URL derives?
+
+    Publishing names the pair ``joburl-<hexpart>`` from the canonical identity,
+    so the answer does not depend on the sidecar being readable — which is the
+    point, since an unreadable sidecar is one of the reasons to collect it.
+    Nothing else can ever occupy this slot, so a permanently-broken pair here
+    is not merely broken, it is BLOCKING.
+    """
+    identity = derive_canonical_job_identity(job_url)
+    if identity is None:
+        return False
+    return Path(cv_key).stem == f"joburl-{identity.split(':')[-1]}"
+
+
+def _quarantine_if_permanently_broken(
+    storage: StorageAdapter,
+    *,
+    tenant_id: str,
+    cv_key: str,
+    metadata_key: str,
+    job_url: str,
+    blockers: list[str],
+    now: datetime | None,
+) -> dict[str, str] | None:
+    """Collect a refused pair that can never become READY. Returns the
+    quarantine keys, or None when the pair was left alone.
+
+    Fail-safe in the literal sense: every reason to hesitate leaves the pair
+    where it is. A pair is moved only when ALL of its blockers are permanent
+    properties of the artifact itself, it occupies this job's own slot, and
+    both objects are actually there to move.
+    """
+    if not blockers or not set(blockers) <= _PERMANENT_PAIR_BLOCKERS:
+        return None
+    if not _occupies_this_jobs_slot(cv_key, job_url):
+        return None
+    if not (storage.exists(cv_key) and storage.exists(metadata_key)):
+        return None
+    try:
+        moved = quarantine_pair(
+            storage, cv_key=cv_key, metadata_key=metadata_key,
+            now=now or datetime.now(UTC),
+        )
+    except Exception:  # noqa: BLE001 — a nightly run never dies over cleanup
+        logger.error("quarantine failed for a refused pair — it stays live "
+                     "and will be refused again: %s", blockers, exc_info=True)
+        return None
+    logger.warning("quarantined a refused CV pair: %s", blockers)
+    _record_quarantine_audit(
+        tenant_id=tenant_id, quarantine_key=moved["cv_key"], blockers=blockers
+    )
+    return moved
+
+
+def _record_quarantine_audit(
+    *, tenant_id: str, quarantine_key: str, blockers: list[str]
+) -> None:
+    """Write the §15 audit row for a customer-facing artifact we withdrew.
+
+    Its own transaction, on purpose. The move has already happened and cannot
+    be rolled back, so binding its record to the caller's transaction would
+    mean an unrelated rollback later in the night erases the only record of an
+    irreversible act. It opens a tenant-bound (app-role) session for the same
+    reason every other tenant write should: the row is confined by RLS rather
+    than by our care.
+
+    Failure is loud but never fatal. ERROR because the journal harvester feeds
+    the operator's error screen on that prefix — an audit control that stopped
+    working must not be the quiet kind. Never fatal because refusing to
+    deliver a night's CVs over a missing audit row would be the larger harm.
+    """
+    try:
+        from career.audit import ACTION_CV_PAIR_QUARANTINED, record_audit
+        from career.db.session import tenant_session
+
+        with tenant_session(str(tenant_id)) as session:
+            record_audit(
+                session,
+                tenant_id=tenant_id,
+                actor="nightly",
+                action=ACTION_CV_PAIR_QUARANTINED,
+                resource_type="tailored_cv",
+                details={"blockers": blockers, "quarantine_key": quarantine_key},
+            )
+    except Exception:  # noqa: BLE001 — see the docstring
+        logger.error("quarantine audit row NOT written", exc_info=True)

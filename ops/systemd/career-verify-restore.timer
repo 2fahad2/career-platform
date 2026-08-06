@@ -1,0 +1,26 @@
+# Sunday 05:00 Riyadh — deliberately, on both counts.
+#
+# Sunday is the first working day of the Saudi week and the day the operator's
+# weekly report goes out (06:00–12:00). A probe that runs an hour BEFORE that
+# report means a red result is already on his phone when he sits down to read
+# the week, rather than arriving on a Thursday evening he will not act on.
+#
+# 05:00 is after the 03:30 daily backup, so §8's freshness check reads a
+# snapshot taken ninety minutes earlier: a backup run that failed last night
+# is caught this morning, not next week.
+#
+# Weekly and not daily: nothing here changes hour to hour except the backup
+# age, the threshold on that is two days, and the alert this fires is the
+# operator's phone. The other side of «an alert nobody reads» is an alert too
+# frequent to be read.
+[Unit]
+Description=Weekly restore/health verification at 05:00 Riyadh on Sunday
+
+[Timer]
+OnCalendar=Sun *-*-* 05:00:00 Asia/Riyadh
+# A server that was down on Sunday morning is precisely the one worth
+# checking, so a missed run is caught up rather than skipped.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

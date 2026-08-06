@@ -35,6 +35,13 @@ _RUN_AR = {
 _HOME = ("🏠 الرئيسية", "v1|menu")
 
 
+def state_label(state: str) -> str:
+    """The Arabic word for an honest day state, or the raw token when there
+    is none. Public because the console renders day states inside the
+    guarantee facts too, and two tables of the same eight words would drift."""
+    return _STATE_AR.get(str(state), str(state))
+
+
 def render_menu() -> tuple[str, Keyboard]:
     text = "🏰 برج المراقبة — منصة التوظيف\nاختر شاشة:"
     keyboard: Keyboard = [
@@ -306,6 +313,72 @@ def render_customers(
     return text, keyboard
 
 
+#: The 72-hour start guarantee, in the words of what it means for a customer.
+#: A raw status token would be a Latin run inside an Arabic line, and «MET»
+#: tells the operator nothing about whether he owes anybody money.
+_GUARANTEE_AR = {
+    "WATCHING": "⏳ ضمان الـ٧٢ ساعة: المهلة تمشي",
+    "MET": "🛡️ ضمان الـ٧٢ ساعة: وفينا به",
+    "BREACHED": "🔴 ضمان الـ٧٢ ساعة: انكسر — والعميل يختار استرداده أو تمديده",
+    "SETTLED": "✅ ضمان الـ٧٢ ساعة: انكسر وسُوّي",
+}
+
+#: The لمّاح+ career session — «جلسة مسار واحدة متى طلبتها».
+_SESSION_AR = {
+    "REQUESTED": "📅 جلسة المسار: طلبها ولم يُنسَّق له موعد",
+    "SCHEDULED": "📅 جلسة المسار: تم التنسيق",
+    "COMPLETED": "📅 جلسة المسار: تمت",
+    "CANCELED": "📅 جلسة المسار: ألغاها",
+}
+
+#: What the refund page deducts for a session the customer really received —
+#: «تُخصم قيمة الخدمات البشرية اللي استلمتها فعليًا (جلسة المسار ١٥٠ ريالًا)».
+#: It is printed on the card of a customer who HAS received one, because the
+#: moment that number is needed is the moment somebody is asking for a refund.
+_SESSION_DEDUCTION_AR = "وتُخصم قيمتها من أي استرداد:"
+
+
+def _promise_lines(card: dict[str, Any]) -> list[str]:
+    """The three sold promises, said plainly on the customer's own card.
+
+    They live on the card and not only on their own screen because the
+    question «هل أنا مدين لهذا العميل بشيء؟» is asked while looking at HIM —
+    and a promise the operator has to remember to go and check is a promise
+    that gets remembered late.
+    """
+    lines: list[str] = []
+    guarantee = card.get("guarantee")
+    if guarantee:
+        lines.append(_GUARANTEE_AR.get(
+            str(guarantee.get("status")), str(guarantee.get("status"))
+        ))
+        if guarantee.get("age"):
+            lines.append(str(guarantee["age"]))
+    session = card.get("career_session")
+    if session:
+        lines.append(_SESSION_AR.get(
+            str(session.get("status")), str(session.get("status"))
+        ))
+        if session.get("age"):
+            lines.append(str(session["age"]))
+        if session.get("overdue"):
+            lines.append("⚠️ تجاوز مهلة الرد المعلنة لمشتركي لمّاح+")
+        if str(session.get("status")) == "COMPLETED" and session.get("deduction"):
+            lines.append(_SESSION_DEDUCTION_AR)
+            lines.append(str(session["deduction"]))
+    elif card.get("session_entitled"):
+        lines.append("📅 جلسة المسار: من حقه، ولا طلبها بعد")
+    lock = card.get("price_lock")
+    if lock:
+        # The locked price is a number and a currency — Latin, so its own
+        # line — and it exists on the card because it is what a founder was
+        # promised, and the operator is the only one who can notice if the
+        # store ever starts charging him something else.
+        lines.append("🔒 سعره مقفول عند:")
+        lines.append(str(lock))
+    return lines
+
+
 def render_tenant_card(card: dict[str, Any]) -> tuple[str, Keyboard]:
     """One customer, zero PII: TEN code + plan + states + counters only."""
     code = str(card.get("code"))
@@ -360,6 +433,7 @@ def render_tenant_card(card: dict[str, Any]) -> tuple[str, Keyboard]:
             f"⏱ دقائق دعم: {support_min or 0}"
             f" · 👁 مراجعات بشرية: {review_count or 0}"
         )
+    lines.extend(_promise_lines(card))
     # a held bundle is reported whether or not it can be re-attempted right
     # now — and when it cannot, the card says why instead of hiding the fact
     if card.get("held_bundles"):
@@ -375,6 +449,27 @@ def render_tenant_card(card: dict[str, Any]) -> tuple[str, Keyboard]:
         [("⏱ +5 دقائق دعم", f"v1|log|{code}|support5"),
          ("👁 +مراجعة بشرية", f"v1|log|{code}|review")],
     ]
+    # A broken guarantee gets its remedies on the card itself. The customer
+    # chooses which one — «أنت تختار» — so all three are offered side by side
+    # and none of them is a default the operator can tap past.
+    if str((card.get("guarantee") or {}).get("status")) == "BREACHED":
+        keyboard.append([
+            ("💸 استرداد", f"v1|act|{code}|g_refund"),
+            ("📆 تمديد", f"v1|act|{code}|g_extend"),
+            ("🤝 تنازل", f"v1|act|{code}|g_waive"),
+        ])
+    session_status = str((card.get("career_session") or {}).get("status") or "")
+    if session_status == "REQUESTED":
+        keyboard.append([("📅 تم التنسيق", f"v1|act|{code}|cs_scheduled")])
+    elif session_status == "SCHEDULED":
+        keyboard.append([("✅ تمت الجلسة", f"v1|act|{code}|cs_completed")])
+    elif not session_status and card.get("session_entitled"):
+        # The request itself is recorded by hand, because that is how it
+        # actually arrives: لمّاح+ sells «تكتب لي أنا مباشرة على نفس
+        # المحادثة», so the customer asks a human in a sentence, not a
+        # keyword. The button is what turns that sentence into a record with
+        # a clock on it.
+        keyboard.append([("📅 سجّل طلب جلسة مسار", f"v1|act|{code}|cs_request")])
     # offered ONLY when a held bundle can actually be re-attempted
     if card.get("can_resend"):
         keyboard.append([("📤 إعادة إرسال الحزمة", f"v1|act|{code}|resend")])
@@ -384,6 +479,58 @@ def render_tenant_card(card: dict[str, Any]) -> tuple[str, Keyboard]:
         keyboard.append([("✍️ رد على العميل", f"v1|reply|{code}")])
     keyboard.append([action_button])
     keyboard.append([("👥 القائمة", "v1|customers|0"), _HOME])
+    return "\n".join(lines), keyboard
+
+
+PROMISES_TITLE_AR = "🤝 الوعود المستحقة"
+PROMISES_NONE_AR = "🟢 لا شيء مستحق — الضمانات موفّى بها ولا جلسة معلّقة"
+
+
+def render_promises(
+    breaches: list[dict[str, Any]], sessions: list[dict[str, Any]]
+) -> tuple[str, Keyboard]:
+    """Everything the store has promised and not yet delivered, in one screen.
+
+    Two lists that have nothing technical in common and one thing in common
+    that matters more: each row is a customer who has been told something and
+    is waiting. Ordered oldest-first inside each list by the caller, because
+    age is the only priority a promise has.
+
+    Every row is a TEN code on its own line (§15.13) with its age underneath —
+    the age IS the point, and it was the missing half of both promises: a
+    breach nobody was told about and a request nobody could see waiting.
+    """
+    lines = [PROMISES_TITLE_AR]
+    if not breaches and not sessions:
+        lines.append(PROMISES_NONE_AR)
+    keyboard: Keyboard = []
+    if breaches:
+        lines.append("")
+        lines.append("🛡️ ضمانات مكسورة تنتظر قرارك")
+        for row in breaches:
+            lines.append("")
+            lines.append(str(row["code"]))
+            lines.append(str(row.get("age") or ""))
+            if row.get("first_delivery"):
+                lines.append("ووصلته أول فرصة بعد المهلة")
+            else:
+                lines.append("ولا وصلته أي فرصة إلى الآن")
+            for fact in row.get("fact_lines") or []:
+                lines.append(str(fact))
+            keyboard.append([(f"↪️ {row['code']}", f"v1|tenant|{row['code']}")])
+    if sessions:
+        lines.append("")
+        lines.append("📅 جلسات مسار معلّقة")
+        for row in sessions:
+            lines.append("")
+            lines.append(str(row["code"]))
+            lines.append(_SESSION_AR.get(str(row.get("status")),
+                                         str(row.get("status"))))
+            lines.append(str(row.get("age") or ""))
+            if row.get("overdue"):
+                lines.append("⚠️ تجاوز مهلة الرد المعلنة")
+            keyboard.append([(f"↪️ {row['code']}", f"v1|tenant|{row['code']}")])
+    keyboard.append([("🔄 تحديث", "v1|promises"), _HOME])
     return "\n".join(lines), keyboard
 
 

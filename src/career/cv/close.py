@@ -21,8 +21,15 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from career.db.models import CostAllocation, DeliveryMessage, TenantDayState, UsageEvent
+from career.db.models import (
+    CostAllocation,
+    DeliveryMessage,
+    Subscription,
+    TenantDayState,
+    UsageEvent,
+)
 from career.engine.ranking import record_suppression_by_url
+from career.salla import subscriptions as sub_states
 
 logger = logging.getLogger("career.cv")
 
@@ -240,6 +247,92 @@ def format_admin_summary(
     if not rows:
         lines.append("لا عملاء نشطين اليوم.")
     return "\n".join(lines)
+
+
+# ── revenue: the money that arrived and stayed (§05) ─────────────────────────
+
+#: The subscription statuses that are NOT revenue.
+#:
+#: The business screen used to sum ``amount_sar`` over EVERY row with no status
+#: predicate at all, so the number it showed the operator could only ever be
+#: too big — a refunded order, a cancelled one and a chargeback each stayed in
+#: «الإيراد» forever, and a chargeback is money that left the account twice.
+#: The operator prices the product, decides whether to keep buying search
+#: credits and decides whether لمّاح is worth running off this number.
+#:
+#: DERIVED from the state machine, never restated. ``TERMINAL_STATES`` is
+#: salla.subscriptions' own name for «the money went back» — the three states a
+#: refund, a cancellation and a chargeback land in — so a twelfth state cannot
+#: join the product and count as revenue because nobody remembered this line.
+#: PENDING_PAYMENT is added because it is the opposite failure: money that has
+#: not arrived. Constant §15.4 means no path writes it today (a subscription is
+#: only created on ``payment = paid``), and that is exactly why it belongs
+#: here — the day a path does, the safe default must already be «not counted».
+#:
+#: Everything else — PAID_UNCLAIMED, ONBOARDING, ACTIVE, PAUSED, GRACE,
+#: EXPIRED, SUSPENDED — is money we were paid and did not give back, whatever
+#: the service is doing now. An expired subscription earned its riyals.
+NON_REVENUE_STATUSES: frozenset[str] = (
+    sub_states.TERMINAL_STATES | {sub_states.PENDING_PAYMENT}
+)
+
+
+def _riyals(total: Decimal) -> Decimal:
+    """Halalas kept, and no trailing «٫٠٠» on a whole riyal.
+
+    The old sum was ``revenue += int(amount or 0)``, which truncates toward
+    zero on EVERY row rather than once at the end: at 199.50 a row that is a
+    hundred orders wide loses fifty riyals, silently, and always downward.
+    ``amount_sar`` is ``Numeric(10, 2)`` precisely so halalas survive the
+    database; throwing them away in the reader defeated the column.
+
+    The whole-riyal case is normalised back to an integral Decimal so the
+    screens keep printing «١٩٩ ريال» and not «199.00» — the catalogue prices
+    everything in whole riyals, so that is the shape the operator reads every
+    day, and a formatter change belongs to the renderers, not to the money.
+    """
+    quantized = total.quantize(Decimal("0.01"))
+    whole = quantized.to_integral_value()
+    return whole if quantized == whole else quantized
+
+
+def paid_subscriptions_by_plan(
+    session: Session, *, since: datetime | None = None
+) -> tuple[dict[str, int], Decimal]:
+    """``({plan_code: paid_orders}, riyals)`` — the operator's two money
+    numbers, from one query, with :data:`NON_REVENUE_STATUSES` applied.
+
+    The COUNT is filtered by the same rule as the sum, deliberately. They are
+    read side by side («اشتراكات جديدة» above «الإيراد»), and a plan showing
+    two subscriptions against zero riyals is not a detail the reader is
+    supposed to reconcile in his head — it is the screen contradicting itself.
+
+    A renewal and a pre-activation merge both COUNT BOTH ROWS, and that is
+    correct rather than the double count it looks like. One subscription row is
+    one Salla order (``uq_subscriptions_salla_order_id``) carrying that order's
+    own ``amount_sar``: somebody who buys twice before activating has paid
+    twice, and renewal.merge_prepaid_orders folds the DAYS into one period
+    while retiring the extra row EXPIRED under a ``merged_into_activation``
+    event — it never touches the money, which is the whole point of retiring
+    rather than deleting. Dropping the retired row would under-report by a
+    whole order, which is the same defect pointing the other way.
+    """
+    query = select(
+        Subscription.plan_code,
+        func.count(),
+        func.coalesce(func.sum(Subscription.amount_sar), 0),
+    ).where(Subscription.status.not_in(sorted(NON_REVENUE_STATUSES)))
+    if since is not None:
+        query = query.where(Subscription.created_at >= since)
+
+    by_plan: dict[str, int] = {}
+    total = Decimal("0")
+    for plan_code, count, amount in session.execute(
+        query.group_by(Subscription.plan_code)
+    ).all():
+        by_plan[str(plan_code)] = int(count)
+        total += Decimal(str(amount or 0))
+    return by_plan, _riyals(total)
 
 
 # ── the ONE price table (§14) ────────────────────────────────────────────────
@@ -542,28 +635,81 @@ def _upsert_allocation(
         row.cost_usd = cost_usd
 
 
-def rollup_costs(session: Session, *, tenant_id: uuid.UUID, day: date) -> None:
-    """Recompute the day's per-category rollup from the raw events PLUS the
-    derived WhatsApp template spend — idempotent by construction (SET, not
-    increment), so the whole day's bill lands in one table either way."""
-    aggregated = session.execute(
-        select(
-            UsageEvent.kind,
-            func.count(UsageEvent.id),
-            func.coalesce(func.sum(UsageEvent.cost_usd), 0),
-        )
-        .where(
-            UsageEvent.tenant_id == tenant_id,
-            func.date(UsageEvent.occurred_at) == day,
-        )
-        .group_by(UsageEvent.kind)
-    ).all()
-    for kind, events, cost in aggregated:
-        _upsert_allocation(
-            session, tenant_id=tenant_id, day=day, category=kind,
-            events=int(events), cost_usd=Decimal(cost),
-        )
+def spend_by_kind(
+    session: Session,
+    *,
+    tenant_id: uuid.UUID | None = None,
+    day: date | None = None,
+    since: datetime | None = None,
+) -> dict[str, tuple[int, Decimal]]:
+    """``{kind: (events, usd)}`` — the ONE definition of «what did this cost».
+
+    This function exists because there were two, and they disagreed. The
+    operator's screens computed spend from ``usage_events`` filtered to
+    :data:`SPEND_KINDS` and added the derived WhatsApp half; ``rollup_costs``
+    computed it from ``usage_events`` with NO kind filter at all and added the
+    same WhatsApp half. Two expressions for one number, in two files, is the
+    shape every §14 defect this month has had — and the table the second one
+    wrote is read by nothing, so the disagreement was invisible: the row said
+    one thing, the screen said another, and only the screen was ever looked at.
+    (``tests/test_untested_gaps.py`` even documents ``cost_allocations`` as
+    «what the business screen and the weekly report read». They never have.)
+
+    :data:`MANUAL_KINDS` are deliberately outside this: ``support_minutes`` and
+    ``human_review`` are real cost with no dollar price, so a dollar rollup
+    would carry them as permanent zero-cost categories, and the console reads
+    those two counters straight from ``usage_events`` where they belong.
+
+    The WhatsApp half stays DERIVED from ``delivery_messages`` rather than
+    summed from ``usage_events`` — see :func:`whatsapp_spend` for why.
+    """
+    query = select(
+        UsageEvent.kind,
+        func.count(UsageEvent.id),
+        func.coalesce(func.sum(UsageEvent.cost_usd), 0),
+    ).where(UsageEvent.kind.in_(SPEND_KINDS))
+    if tenant_id is not None:
+        query = query.where(UsageEvent.tenant_id == tenant_id)
+    if day is not None:
+        query = query.where(func.date(UsageEvent.occurred_at) == day)
+    if since is not None:
+        query = query.where(UsageEvent.occurred_at >= since)
+
+    out: dict[str, tuple[int, Decimal]] = {
+        str(kind): (int(events), Decimal(cost))
+        for kind, events, cost in session.execute(
+            query.group_by(UsageEvent.kind)
+        ).all()
+    }
     for kind, (events, cost) in whatsapp_spend(
+        session, tenant_id=tenant_id, day=day, since=since
+    ).items():
+        prior_events, prior_cost = out.get(kind, (0, Decimal("0")))
+        out[kind] = (prior_events + events, prior_cost + cost)
+    return out
+
+
+def rollup_costs(session: Session, *, tenant_id: uuid.UUID, day: date) -> None:
+    """Persist :func:`spend_by_kind` for one tenant-day — idempotent by
+    construction (SET, not increment), so the whole day's bill lands in one
+    table however many call sites reach it.
+
+    ``cost_allocations`` is an ARCHIVE, not an authority. Five call sites write
+    it and nothing reads it: every operator number recomputes from
+    ``usage_events``, which is the right choice and must stay that way. The
+    events table is append-only, carries a real timestamp per row (so it can
+    answer «the last 7 days», which a per-day rollup cannot) and cannot go
+    stale; this rollup is best-effort, written from paths that log-and-swallow
+    their own failures, so a screen reading it would under-report at exactly
+    the moment metering broke — silently, which is the one thing §15.12 exists
+    to forbid.
+
+    So the writes were not deleted (whitepaper §14 names this table, and
+    removing it is a docs-first decision, not a refactor) — the second
+    DEFINITION was. Writer and readers now evaluate the same expression, and
+    the table can no longer disagree with the screen about what money is.
+    """
+    for kind, (events, cost) in spend_by_kind(
         session, tenant_id=tenant_id, day=day
     ).items():
         _upsert_allocation(

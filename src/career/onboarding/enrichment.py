@@ -26,6 +26,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from career.arabic import normalize_ar
 from career.cv.close import LlmMeter
 from career.db.models import (
     ProfileFact,
@@ -34,7 +35,6 @@ from career.db.models import (
 from career.onboarding.achievement_render import (
     AchievementRenderer,
     classify_edit_intent,
-    normalize_ar,
 )
 
 #: re-exported for the orchestrator (enr.classify_edit_intent) — the closed

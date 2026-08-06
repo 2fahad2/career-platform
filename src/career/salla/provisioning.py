@@ -287,23 +287,65 @@ def provision_order(
     exp_amount, exp_currency = expected
     if (order.amount != exp_amount
             or (order.currency or "").upper() != exp_currency.upper()):
-        logger.error("order amount/currency mismatch — not provisioning")
-        # The single highest-cost failure in the system — the buyer paid and
-        # will be refused — was the ONE branch with no alert, while the
-        # uncataloged-product and unusable-phone branches beside it both
-        # shout. The most likely trigger is our own configuration: the store
-        # sells at a price the environment does not expect.
-        _alert(admin_client_hint, (
-            "🔴 طلب مدفوع بمبلغ أو عملة لا تطابق المتوقع — لم يُزوَّد\n"
-            f"معرّف المنتج:\n{order.product_id}\n"
-            f"المبلغ الوارد:\n{order.amount} {order.currency}\n"
-            f"المتوقع:\n{exp_amount} {exp_currency}\n"
-            "الأغلب أن سعر المتجر لا يطابق التسعيرة في الإعدادات — صحّحها "
-            "ثم أعد تشغيل الطلب"
+        # Before refusing: is this a FOUNDER renewing at the price the store
+        # page locked for them? «سعره اليوم مقفول له: لو ارتفعت الأسعار يوم من
+        # الأيام، ما ترتفع عليه — ما دام تجديده مستمر». Until price_locks
+        # existed, the day prices rose was the day every founder renewal died
+        # here — and AMOUNT_MISMATCH marks the webhook `failed`, which is
+        # TERMINAL: they would have paid and received nothing, with the only
+        # trace an alert blaming our own pricing. The guard is relaxed for
+        # exactly one amount belonging to exactly one tenant on exactly one
+        # plan; everything else still fails closed on the line below.
+        from career.promises import price_lock
+        from career.salla.activation_link import normalize_order_phone
+
+        admitted = price_lock.admit_locked_amount(
+            owner_session,
+            order_phone=normalize_order_phone(order.customer_phone),
+            plan_code=plan_code, amount=order.amount, currency=order.currency,
+            expected_amount=exp_amount, expected_currency=exp_currency,
+            now=now or datetime.now(UTC),
+        )
+        if not admitted.admitted:
+            logger.error("order amount/currency mismatch — not provisioning")
+            # The single highest-cost failure in the system — the buyer paid
+            # and will be refused — was the ONE branch with no alert, while
+            # the uncataloged-product and unusable-phone branches beside it
+            # both shout. The most likely trigger is our own configuration:
+            # the store sells at a price the environment does not expect.
+            reason = (
+                # The one refusal that is NOT a misconfiguration, and the
+                # operator must not be sent to «correct» a price that is
+                # already correct: this customer's lock died with their gap.
+                "سبب الرفض: انقطع تجديده أكثر من المهلة فسقط قفل سعره — "
+                "يرجع بسعر اليوم"
+                if admitted.reason == "lapsed" else
+                "الأغلب أن سعر المتجر لا يطابق التسعيرة في الإعدادات — "
+                "صحّحها ثم أعد تشغيل الطلب"
+            )
+            _alert(admin_client_hint, (
+                "🔴 طلب مدفوع بمبلغ أو عملة لا تطابق المتوقع — لم يُزوَّد\n"
+                f"معرّف المنتج:\n{order.product_id}\n"
+                f"المبلغ الوارد:\n{order.amount} {order.currency}\n"
+                f"المتوقع:\n{exp_amount} {exp_currency}\n"
+                + reason
+            ))
+            _mark_webhook(owner_session, webhook_event, "failed")
+            owner_session.commit()
+            return ProvisionResult(ProvisionStatus.AMOUNT_MISMATCH)
+        # Provisioning at less than today's price is exactly the shape of a
+        # mispriced order, so the operator hears it the moment it happens —
+        # otherwise he either investigates a promise as a fault, or discovers
+        # the difference in an accounting month with no explanation attached.
+        _alert(admin_client_hint, price_lock.LOCK_HONOURED_ADMIN_AR.format(
+            # admitted ⟹ a tenant was resolved; the fallback exists so a
+            # future refactor cannot turn a missing code into a crash on the
+            # one path that has already accepted somebody's money.
+            code=(_code_of(owner_session, admitted.tenant_id)
+                  if admitted.tenant_id is not None else "?"),
+            paid=f"{order.amount} {order.currency}",
+            today=f"{exp_amount} {exp_currency}",
         ))
-        _mark_webhook(owner_session, webhook_event, "failed")
-        owner_session.commit()
-        return ProvisionResult(ProvisionStatus.AMOUNT_MISMATCH)
 
     from career.salla.activation_link import normalize_order_phone
 
@@ -329,6 +371,7 @@ def provision_order(
     # CHANGELOG §16 — is this the same human paying again? Decided BEFORE
     # anything is created: a renewal must not mint a second tenant, a second
     # founding seat, or a token that dies unclaimed.
+    from career.promises import price_lock as price_locks
     from career.salla import renewal as renewals
 
     target = renewals.find_renewal(
@@ -353,6 +396,17 @@ def provision_order(
         )
         owner_session.add(renewed)
         owner_session.flush()
+        # A renewal onto a pass this customer has never held is their FIRST
+        # purchase of that pass, so it is where its lock is born (an upgrade
+        # from لمّاح to لمّاح+ locks لمّاح+ at what they actually paid). A
+        # renewal on the same pass finds the lock already there and captures
+        # nothing — including the renewal that was just admitted BY that lock,
+        # which must never re-record itself as a new price.
+        price_locks.capture(
+            owner_session, tenant_id=target.tenant_id, plan_code=plan_code,
+            amount=order.amount, currency=order.currency,
+            subscription_id=renewed.id, now=now or datetime.now(UTC),
+        )
         # a renewal on a different pass must actually change the service
         renewals.resync_policy_limit(
             owner_session, tenant_id=target.tenant_id, plan_code=plan_code,
@@ -396,6 +450,15 @@ def provision_order(
     )
     owner_session.add(subscription)
     owner_session.flush()
+
+    # «سعره اليوم مقفول له» — this IS «سعره اليوم», recorded at the only
+    # moment it is unambiguous and only after the triple match above has
+    # already confirmed the amount is the store's real price.
+    price_locks.capture(
+        owner_session, tenant_id=tenant.id, plan_code=plan_code,
+        amount=order.amount, currency=order.currency,
+        subscription_id=subscription.id, now=now or datetime.now(UTC),
+    )
 
     owner_session.add(
         SubscriptionEvent(

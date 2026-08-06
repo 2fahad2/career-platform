@@ -21,6 +21,7 @@ from __future__ import annotations
 import re
 from typing import Any, Protocol
 
+from career.arabic import normalize_ar
 from career.cv.close import LlmMeter, TokenCounter, metered
 from career.cv.generate import _CERT_RE, _KNOWN_FRAMEWORKS
 from career.cv.validate import _ARABIC_RE
@@ -146,25 +147,20 @@ EDIT_INTENTS: dict[str, str] = {
     "rephrase": "Rephrase it differently with the same meaning.",
 }
 
-#: Arabic normalisation, shared by every text comparison in the feature: a
-#: customer types «مضبوط ✅» or «مضبوط» or «مضبووط», «أقوى» or «اقوي» — all
-#: must compare equal. Diacritics/tatweel go, hamza forms and taa-marbuta
-#: fold, punctuation and emoji drop, Latin lowercases.
-_DIACRITICS = re.compile(r"[\u064B-\u0652\u0670\u0640\u06D6-\u06ED]")
-_AR_FOLD = str.maketrans({
-    "أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا",
-    "ى": "ي", "ة": "ه", "ؤ": "و", "ئ": "ي",
-})
-_NON_WORD = re.compile(r"[^\w\s]", re.UNICODE)
-
-
-def normalize_ar(text: str | None) -> str:
-    r"""Fold an Arabic reply to a comparable form. Arabic-Indic digits survive
-    (they are ``\w``) — the grounding guard still needs to see them."""
-    body = _DIACRITICS.sub("", str(text or ""))
-    body = body.translate(_AR_FOLD)
-    body = _NON_WORD.sub(" ", body)
-    return " ".join(body.lower().split())
+# ── normalize_ar lives in career.arabic now, and is re-exported here ────────
+#
+# Arabic normalisation is shared by every text comparison in this feature: a
+# customer types «مضبوط ✅» or «مضبوط» or «مضبووط», «أقوى» or «اقوي» — all must
+# compare equal.
+#
+# The fold was DEFINED here, and this module reaches into career.cv.generate at
+# import time, so every caller that only wanted to compare two Arabic strings —
+# the pure inbound classifier, the PII stripper — had to choose between
+# dragging the whole CV stack in behind it and keeping a second copy of a
+# compliance primitive. Both happened. career.arabic is a leaf that imports
+# nothing from career, and the import at the top of this file re-exports the
+# name so the callers that already reach for it here keep working, while a
+# future reader still finds exactly ONE authority.
 
 
 #: Saudi-colloquial cues → intent, in NORMALISED form (so no duplicate hamza

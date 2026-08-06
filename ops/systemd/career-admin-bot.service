@@ -6,6 +6,19 @@ Wants=network-online.target
 After=network-online.target docker.service
 OnFailure=career-alert@%n.service
 
+# AUDIT 2026-08-06 — the same unreachable-OnFailure defect as
+# career-worker.service; the reasoning is written out there in full. Short
+# version: Restart=always with RestartSec=5 against the default
+# StartLimitIntervalSec=10s/StartLimitBurst=5 can never exhaust the limit, so
+# the unit never reaches `failed` and this line never fires.
+#
+# The asymmetry worth naming: when the WORKER is wedged, customers stop being
+# answered and someone eventually notices. When the WATCHTOWER is down, the
+# operator's own screen goes quiet — and a quiet screen is exactly what a
+# healthy day looks like, so this is the unit whose death hides best.
+StartLimitIntervalSec=600
+StartLimitBurst=20
+
 [Service]
 Type=simple
 WorkingDirectory=/root/career
@@ -14,6 +27,13 @@ EnvironmentFile=/root/career/.env.staging
 ExecStart=/usr/bin/env DB_HOST=127.0.0.1 DB_PORT=5433 REDIS_HOST=127.0.0.1 REDIS_PORT=6380 STORAGE_ROOT=/root/career/data /root/career/.venv/bin/python /root/career/scripts/run_admin_bot.py
 Restart=always
 RestartSec=5
+
+# The wedge case is uncovered here too, and needs the same heartbeat in
+# scripts/run_admin_bot.py: notify("READY=1") after startup, then
+# notify("WATCHDOG=1") after each completed long-poll cycle, and only then
+# Type=notify + WatchdogSec here. Pick the watchdog interval from the poll
+# timeout the bot actually uses — a long-poll that legitimately blocks for 30s
+# must not be read as a wedge. See career-worker.service for the full note.
 
 [Install]
 WantedBy=multi-user.target

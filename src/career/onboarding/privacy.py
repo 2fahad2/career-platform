@@ -366,9 +366,21 @@ _PERSONAL_DELETION_ORDER: tuple[type, ...] = (
 )
 
 #: Survive deletion by design (§12) — regulatory/security retention.
+#:
+#: The last three are the store's own promises, and they sit here for the same
+#: reason `subscriptions` does: each is a money record, and none of them holds
+#: a word about the human. `delivery_guarantees` says what the 72-hour
+#: guarantee owed and which remedy was applied; `career_sessions` is what the
+#: refund page's «تُخصم … جلسة المسار ١٥٠ ريالًا» is computed from;
+#: `price_locks` is the price a founder was promised. They are declared rather
+#: than merely surviving by accident of the FK, because this tuple is what the
+#: customer is TOLD is kept — «تبقى السجلات المالية وسجل الموافقات لمتطلبات
+#: نظامية» — and a list that omits a table it keeps is the wrong kind of
+#: quiet.
 RETAINED_TABLES: tuple[str, ...] = (
     "subscriptions", "subscription_events", "consent_events", "audit_events",
     "privacy_requests", "tenants",
+    "delivery_guarantees", "career_sessions", "price_locks",
 )
 
 #: Survive as a row, not as content. `webhook_events` is the only member and

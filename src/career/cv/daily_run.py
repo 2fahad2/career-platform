@@ -566,6 +566,45 @@ def expire_stale_held_deliveries(
     return closed
 
 
+def sweep_promises(
+    session: Session, *, deps: DailyDeps, now: datetime
+) -> dict[str, int]:
+    """The two store promises whose clocks do not observe our delivery week.
+
+    The 72-hour start guarantee is written in flat hours («خلال ٧٢ ساعة من
+    تفعيل اشتراكك») and the لمّاح+ session SLA in flat hours too («والرد خلال
+    ٢٤ ساعة»), while §08 delivers Sunday–Thursday. So both are swept from HERE
+    — above the weekend early return in :func:`run_daily_delivery` — because a
+    guarantee that runs out on a Friday has to be noticed on Friday, not found
+    on Sunday with the operator two days late to a conversation about money.
+
+    They ride the nightly orchestrator rather than a timer of their own for
+    the reason 0023's weekly-report marker exists: another systemd unit is
+    another thing that can be down without anybody noticing, and this one
+    already runs, already has an admin client, and already fails loudly when
+    it does not.
+
+    Best-effort by construction: a promise sweep must never be the reason a
+    paying customer's delivery day does not run. It commits its own work so a
+    later tenant's rollback cannot erase a breach record.
+    """
+    counts: dict[str, int] = {}
+    try:
+        from career.promises import career_session, guarantee
+
+        counts.update(guarantee.sweep_delivery_guarantee(
+            session, now=now, admin_client=deps.admin_client,
+        ))
+        counts.update(career_session.escalate_overdue(
+            session, now=now, admin_client=deps.admin_client,
+        ))
+        session.commit()
+    except Exception:  # noqa: BLE001 — never blocks the delivery day
+        logger.error("promise sweep failed", exc_info=True)
+        session.rollback()
+    return counts
+
+
 def run_daily_delivery(
     session: Session,
     *,
@@ -596,6 +635,13 @@ def run_daily_delivery(
     and fails the night on either; see :func:`expire_stale_held_deliveries` for
     the four live nights that exited 0 while this channel did not exist.
     """
+    # FIRST, before any of the night's own work exists in this session. The
+    # promise sweep rolls its session back if it fails (it must never be the
+    # reason a delivery day does not run), and a rollback after the stale-
+    # bundle expiry below would silently discard day states that had already
+    # been closed.
+    sweep_promises(session, deps=deps, now=now)
+
     expired = expire_stale_held_deliveries(session, suppressor=suppressor, now=now)
     if expired_out is not None:
         expired_out.extend(expired)

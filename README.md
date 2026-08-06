@@ -24,10 +24,10 @@ SQLAlchemy + Alembic · Docker Compose · pytest · Anthropic API only for LLM.
 | | |
 |---|---|
 | 🧪 Test suite | `pytest -q` prints the count — **do not restate it from memory** (see [Testing](#testing)); disposable `career_test` DB only, enforced by a hard guard |
-| 🗄️ Schema | migration head — `alembic heads`; deployed — `SELECT version_num FROM alembic_version` (**`0020`** on staging, 36 tables, 30 with RLS enabled), live-verified drift-free (host **and** deployed container) |
-| 🔍 Last full audit | 2026-07-23, 42-agent adversarial sweep — all 5 critical + 20/23 major findings **fixed** (see `docs/AUDIT-2026-07-23.md`) |
+| 🗄️ Schema | authored head — `alembic heads`; deployed — `SELECT version_num FROM alembic_version`. **These two do not match today**: staging still reads `0020` while the tree has moved past it, so the code in this checkout expects columns staging does not have. Do not deploy before the gap is closed and re-measured |
+| 🔍 Last full audit | 2026-08-05, five-lens sweep — 16 P0 + 5 P1 fixed (`docs/CHANGELOG-v1.1.md` §24), then **three adversarial rounds** aimed at the fixes themselves, each of which found real regressions in the round before it. The 42-agent sweep of 2026-07-23 is closed (`docs/AUDIT-2026-07-23.md`) |
 | 🚀 Live | worker loop, admin watchtower bot, nightly engine timer (11:00 Riyadh) — real customer journey completed end-to-end incl. first real CV delivery |
-| 🏗️ Phases | C1–C8 **code**-complete · C3 and C4 exit conditions are NOT met (no real riyal purchase yet; two templates the code sends do not exist at Meta) · C9 gated on the store go-live |
+| 🏗️ Phases | C1–C8 **code**-complete; C4 closed live on 2026-07-17 (activation bound an order to a number, adaptive delivery ran both ways, Meta receipts returned) · **C3 is the one open exit condition** — no riyal has been paid yet, no live refund tested, and the Salla token has been expired since 2026-07-29 · C9 gated on the store go-live |
 
 ## System overview
 
@@ -39,7 +39,7 @@ SQLAlchemy + Alembic · Docker Compose · pytest · Anthropic API only for LLM.
                           ▼
                  ┌─────────────────┐
                  │  PostgreSQL 16  │  Row-Level Security (FORCE)
-                 │  webhook_events │  29 tenant-isolated tables
+                 │  webhook_events │  every tenant table FORCEd
                  └────┬───────┬────┘
         polls         │       │          reads/writes
   ┌───────────────────┘       └───────────────────────┐
@@ -188,7 +188,7 @@ absent from the raw Arabic → the customer confirms (English + Arabic gloss)
 | `window.py` | 24-hour window calculus + the operator evening-nudge predicate. |
 | `adaptive.py` | Delivery planning: open → direct, closed → template-then-hold, opted-out → nothing. |
 | `delivery.py` | Grouped-bundle execution with per-job failure isolation and honest statuses. |
-| `templates.py` | Approved-template registry. |
+| `templates.py` | The template registry with its Meta CATEGORY (utility vs marketing — they are priced ~2.4× apart). Submitted is not approved: the nightly asks the live account which names are actually APPROVED and takes the cheapest, so a name PENDING at Meta degrades rather than silently billing at the marketing rate. |
 | `inbound.py` | Inbound classification (activation / STOP / support / other). |
 | `activation.py` + `activation_flow.py` | Token → tenant binding; checks **before** any mutation; the funnel-inheritance exception. |
 | `worker.py` | Conversation worker: idempotency, DB-verified ownership, routing, outcome buttons, receipts. |
@@ -289,6 +289,13 @@ absent from the raw Arabic → the customer confirms (English + Arabic gloss)
 | `0018` | `outbox_events` FORCE RLS (caught by the RLS meta-test). |
 | `0019` | `usage_events` prompt-cache token columns (§14 cost coverage). |
 | `0020` | لمّاح pricing: one pass at 199, `basic` retired from sale (kept — subscriptions point at it). |
+| `0021` | RLS fails closed + a named cross-tenant sweep capability (FORCE was decorative while every long-running process opened an owner engine). |
+| `0022` | `webhook_events` retry budget + dead letter for the WhatsApp worker (any exception used to be terminal, and nothing ever selects `failed`). |
+| `0023` | `admin_bot_state.weekly_report_sent_for` — the owed week, durable; it was a process local, so a Sunday restart re-sent the report and an outage lost the week. |
+| `0024` | `webhook_events` tenant subject + raw-body redaction date — the table had no tenant column, so raw bodies carrying names and message text were in no §12 deletion, export or pruning path. |
+
+Anything past `0024` was authored after this table was last measured — run
+`alembic heads` rather than trusting the last row here.
 
 ### `scripts/` — live runners
 
@@ -341,14 +348,16 @@ absent from the raw Arabic → the customer confirms (English + Arabic gloss)
 9. Job descriptions are untrusted input — the analysis model has no tools, secrets, or control.
 10. RLS enabled + FORCE; adversarial cross-tenant tests in CI.
 11. Workers re-verify ownership from the DB — never trust queue payloads.
-12. One honest state of seven per customer/day — no silent success.
+12. One honest state per customer/day — no silent success. Seven computational
+    states, plus the event-driven eighth (`SKIPPED_OPTED_OUT`, CHANGELOG §12).
+    `career.cv.close.DAILY_STATES` is the vocabulary; nothing restates it.
 13. No PII in logs or the admin channel — TEN codes only; secret filters everywhere.
 14. Backups encrypted, off-server, restore-tested periodically.
 15. **The whitepaper precedes the code.**
 
 ## Security model
 
-- **Tenant isolation** — every table carrying `tenant_id` (29 today) under
+- **Tenant isolation** — every table carrying `tenant_id` under
   `ENABLE + FORCE` RLS with a fail-closed transaction-local GUC; adversarial
   tests (forged writes, cross-reads, no-context) run in CI. The count is not
   maintained by hand — `tests/test_rls_meta.py` derives the table list from the
@@ -415,7 +424,7 @@ ls tests/test_*.py | wc -l                               # test files
 Zero skips with a full environment: adversarial RLS (plus a
 catalog **meta-test** enforcing ENABLE+FORCE+policy on every tenant table),
 webhook
-idempotency, upload attack files, CV binding/quarantine, the seven-state
+idempotency, upload attack files, CV binding/quarantine, the honest-state
 failure matrix, delivery failure isolation, golden Arabic renderers,
 byte-verbatim template/prompt guards, full journey E2Es from raw Meta
 payloads. CI: ruff → strict mypy → alembic upgrade + drift check → pytest

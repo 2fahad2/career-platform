@@ -1,0 +1,39 @@
+# The nine post-restore checks, run WEEKLY as a health probe.
+#
+# scripts/verify_restore.sh was written as the last step of the disaster
+# runbook and had no unit, no timer and no caller — so every check in it only
+# ever ran when a human remembered to type it, which on this server was once.
+# That is a strange place to leave it, because most of what it asks is not a
+# question about a restore, it is a question about TODAY:
+#
+#   §8  is the newest backup less than two days old (Constant 14 — the
+#       backup chain stopping looks exactly like a healthy one until the day
+#       it is needed);
+#   §9  does fontconfig still hand back the families we render with (a font
+#       package dropped by an apt upgrade silently redraws every CV and every
+#       Arabic report in a fallback face — nothing else notices);
+#   §4  is RLS still ENABLEd and FORCEd on every tenant table (Constant 10);
+#   §3  is the database at the repo's migration head;
+#   §6  are the two always-on units and the three timers actually enabled,
+#       active and scheduled — which is also the only coverage the wedge case
+#       has today (see career-worker.service on the heartbeat that is owed).
+#
+# Read-only by contract: the script inspects and never starts, stops, migrates
+# or writes. It exits 1 if any check failed, which is what makes OnFailure
+# below reachable — a oneshot has no Restart=, so the start-limit problem the
+# always-on units have does not exist here.
+[Unit]
+Description=Career platform weekly restore/health verification (9 checks)
+Wants=network-online.target
+After=network-online.target docker.service caddy.service
+OnFailure=career-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/career
+ExecStart=/root/career/scripts/verify_restore.sh
+# The B2 snapshot listing in §8 goes over the network and restic is not quick
+# about it; the whole run is otherwise seconds. A probe that times out reports
+# a failure that is not there, which is the fastest way to teach an operator
+# to ignore this alert.
+TimeoutStartSec=600

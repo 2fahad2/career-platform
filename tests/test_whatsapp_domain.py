@@ -8,8 +8,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+from career.salla.activation_link import activation_message, build_activation_link
 from career.tokens import hash_token, new_activation_token
-from career.whatsapp.activation import activation_link, activation_message
 from career.whatsapp.adaptive import DeliveryAction, plan_delivery
 from career.whatsapp.inbound import (
     InboundKind,
@@ -326,14 +326,38 @@ class TestAdaptivePlanner:
 
 
 class TestActivationLinkAndToken:
+    """`career.whatsapp.activation` is GONE (DEVIATIONS D25). It was a
+    byte-different copy of `career.salla.activation_link`: same prefix, same
+    message, and a number sanitizer that only stripped a leading «+» where the
+    live one strips every non-digit. wa.me takes digits and nothing else, so
+    the copy produced a dead link for any number carrying a space, a dash or
+    parentheses — the shapes an operator types.
+
+    These cases are what the deleted module was covering; they are asserted
+    against the surviving one so the deletion loses no coverage.
+    """
+
     def test_activation_message_shape(self) -> None:
         assert activation_message("abc123") == "تفعيل abc123"
 
     def test_link_uses_number_without_plus_and_encodes_text(self) -> None:
-        link = activation_link("+966500000000", "TOK123456")
+        link = build_activation_link(
+            whatsapp_number_e164="+966500000000", token="TOK123456")
         assert link.startswith("https://wa.me/966500000000?text=")
         assert "TOK123456" in link
         assert "+" not in link.split("?")[0]  # number has no leading +
+
+    def test_the_survivor_covers_every_shape_the_deleted_copy_did(self) -> None:
+        """The «prove it covers every case» half of the deletion. `lstrip("+")`
+        is a strict subset of «keep the digits»: identical on a clean E164,
+        and correct where the copy was not."""
+        token = "TOK123456"
+        clean = build_activation_link(
+            whatsapp_number_e164="+966500000000", token=token)
+        for messy in ("+966 50 000 0000", "966-50-000-0000",
+                      " +966500000000 ", "(966) 500000000"):
+            assert build_activation_link(
+                whatsapp_number_e164=messy, token=token) == clean, messy
 
     def test_hash_is_stable_and_matches_authority(self) -> None:
         raw = new_activation_token()

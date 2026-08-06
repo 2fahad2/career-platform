@@ -11,6 +11,14 @@
 # or writes anything. Exit 0 = every check passed. Exit 1 = at least one failed.
 #
 #   scripts/verify_restore.sh
+#
+# Since 2026-08-06 it also runs WEEKLY, unattended, from
+# career-verify-restore.timer (Sunday 05:00 Riyadh) — because most of what it
+# asks is a question about today rather than about a restore: is the backup
+# chain still producing snapshots, are the render fonts still installed, is RLS
+# still forced, is the database at head, are the units and timers still armed.
+# The exit code is the whole interface: a non-zero exit puts the unit in
+# `failed` and OnFailure pages the operator.
 set -uo pipefail
 
 REPO_ROOT="${REPO_ROOT:-/root/career}"
@@ -142,7 +150,8 @@ for unit in career-worker.service career-admin-bot.service; do
     bad "$unit: $enabled/$active — expected enabled/active"
   fi
 done
-for unit in career-backup.timer career-engine-nightly.timer career-restore-test.timer; do
+for unit in career-backup.timer career-engine-nightly.timer \
+            career-restore-test.timer career-verify-restore.timer; do
   enabled=$(systemctl is-enabled "$unit" 2>/dev/null || echo missing)
   active=$(systemctl is-active "$unit" 2>/dev/null || echo inactive)
   next=$(systemctl show "$unit" -p NextElapseUSecRealtime --value 2>/dev/null)
@@ -167,6 +176,48 @@ if [[ -f /etc/systemd/system/career-alert@.service ]]; then
 else
   bad "career-alert@.service missing — failures will be silent"
 fi
+
+# Installed is not the same as REACHABLE, and for eleven months it was not.
+# A unit with Restart=always only ever enters `failed` — the one state that
+# triggers OnFailure — by exhausting its start rate limit. systemd's defaults
+# (StartLimitIntervalSec=10s, StartLimitBurst=5) against RestartSec=5 allow
+# two starts per window, so the limit could not be hit and the two always-on
+# services restarted forever in silence however hopeless the cause. The unit
+# files now widen the window; this asserts the arithmetic still works, because
+# the failure mode of the fix is someone restoring an old unit file and every
+# other check on this page still passing.
+to_usec() {
+  # systemd prints durations as "10s", "1min 30s", "500ms", "0", "infinity".
+  local spec="$1" total=0 num unit tok
+  [[ "$spec" == "infinity" ]] && { printf '%s' "-1"; return; }
+  for tok in $spec; do
+    num="${tok%%[a-zμ]*}"
+    unit="${tok#"$num"}"
+    [[ -n "$num" ]] || continue
+    case "$unit" in
+      us | μs) total=$((total + num)) ;;
+      ms) total=$((total + num * 1000)) ;;
+      s | "") total=$((total + num * 1000000)) ;;
+      min | m) total=$((total + num * 60000000)) ;;
+      h) total=$((total + num * 3600000000)) ;;
+      d) total=$((total + num * 86400000000)) ;;
+      *) ;;
+    esac
+  done
+  printf '%s' "$total"
+}
+for unit in career-worker.service career-admin-bot.service; do
+  burst=$(systemctl show "$unit" -p StartLimitBurst --value 2>/dev/null)
+  window=$(to_usec "$(systemctl show "$unit" -p StartLimitIntervalUSec --value 2>/dev/null)")
+  gap=$(to_usec "$(systemctl show "$unit" -p RestartUSec --value 2>/dev/null)")
+  if [[ -z "$burst" || "$burst" -le 1 || "$window" -le 0 ]]; then
+    bad "$unit: cannot read the start limit — OnFailure reachability unknown"
+  elif [[ $((gap * (burst - 1))) -lt "$window" ]]; then
+    pass "$unit: start limit reachable ($burst starts / $((window / 1000000))s at ${gap}us apart) — OnFailure can fire"
+  else
+    bad "$unit: OnFailure is UNREACHABLE — $burst restarts ${gap}us apart cannot exhaust a $((window / 1000000))s window, so this service can die forever in silence"
+  fi
+done
 
 section "7. gateway and health"
 caddy_state=$(systemctl is-active caddy 2>/dev/null || echo inactive)

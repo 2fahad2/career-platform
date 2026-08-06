@@ -1194,6 +1194,181 @@ class RoleEnrichment(Base):
     )
 
 
+class DeliveryGuarantee(Base):
+    """The 72-hour start guarantee, per customer (store §١.٣ / §٤).
+
+    «ما وصلتك أول فرصة خلال ٧٢ ساعة من تفعيل اشتراكك؟ استرداد كامل أو تمديد
+    الاشتراك — أنت تختار» was sold with nothing behind it: no clock, no state,
+    no signal to the operator when it broke. One row per tenant, because it is
+    a START guarantee — «ضمان البداية» — and a customer starts once.
+
+    ``activated_at`` is copied from ``onboarding_sessions.completed_at`` (the
+    §05 anchor) rather than referenced, so the deadline stays fixed even if a
+    later journey column is ever rewritten; ``facts`` is the PII-free packet
+    the operator judges the breach with (day states inside the window, whether
+    the customer had paused or opted out, how many weekend days it spanned).
+    ``remedy`` records what he applied — the choice is the customer's and the
+    money is his to move, so nothing here decides it.
+    """
+
+    __tablename__ = "delivery_guarantees"
+    __table_args__ = (
+        UniqueConstraint("tenant_id", name="uq_delivery_guarantees_tenant_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    subscription_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("subscriptions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    activated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    deadline_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    #: WATCHING | MET | BREACHED | SETTLED
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    first_delivery_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    breached_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    #: When the operator was paged. Present ⟹ never page again for this row.
+    alerted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    #: refund | extension | waived — the customer's choice, his hand.
+    remedy: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    remedy_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    facts: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class CareerSession(Base):
+    """The لمّاح+ career session — «جلسة مسار واحدة متى طلبتها».
+
+    The ledger for a promise whose delivery is entirely human: who asked, when,
+    whether they were answered inside the tier's own «الرد خلال ٢٤ ساعة», and
+    whether the session actually happened. That last column is not
+    bookkeeping — the refund page deducts «جلسة المسار ١٥٠ ريالًا» for a
+    session the customer really received, and before this table there was
+    nowhere that fact was written down.
+
+    One live row per ``subscription_id``, which is «واحدة» per period without
+    any date arithmetic: since §16 every renewal is its own subscription row.
+    A CANCELED row does not consume the entitlement, which is enforced by a
+    partial unique index rather than by everyone remembering to filter.
+    """
+
+    __tablename__ = "career_sessions"
+    __table_args__ = (
+        Index("ix_career_sessions_tenant_id", "tenant_id"),
+        # «واحدة» enforced in the catalog: a second live request for the same
+        # period cannot be inserted, whatever a caller forgets to check.
+        Index(
+            "uq_career_sessions_live_per_subscription", "subscription_id",
+            unique=True, postgresql_where=text("status <> 'CANCELED'"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    subscription_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("subscriptions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    #: REQUESTED | SCHEDULED | COMPLETED | CANCELED
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    #: customer | operator — who put this row here (see career_session.request)
+    source: Mapped[str] = mapped_column(String(16), nullable=False)
+    requested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    scheduled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    #: When an unanswered request was raised as a support ticket. Present ⟹
+    #: never raise a second one for the same request.
+    escalated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class PriceLock(Base):
+    """The founding-seat price lock — «سعره اليوم مقفول له».
+
+    The price and currency this customer bought a pass at, captured the first
+    time they buy it and only after the §09 triple match has already agreed
+    the amount is the real one. Renewal consults it so a founder paying the
+    old amount after a price rise is provisioned instead of being refused with
+    a TERMINAL ``AMOUNT_MISMATCH`` — which is what the promise turned into
+    while this table did not exist.
+
+    One live lock per (tenant, plan): the promise is about the price of the
+    thing they bought, so moving to another pass locks that pass at its own
+    price. ``lapsed_at`` is stamped when a renewal arrives after the published
+    continuity window («تجدد قبل نهاية اشتراكك أو خلال ٧ أيام بعده») — the
+    lock is not deleted, because «why did his price change?» must stay
+    answerable afterwards.
+    """
+
+    __tablename__ = "price_locks"
+    __table_args__ = (
+        Index("ix_price_locks_tenant_id", "tenant_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    plan_code: Mapped[str] = mapped_column(
+        String(32), ForeignKey("plan_entitlements.plan_code"), nullable=False
+    )
+    amount_sar: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
+    currency: Mapped[str] = mapped_column(String(8), nullable=False)
+    locked_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    source_subscription_id: Mapped[uuid.UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("subscriptions.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    lapsed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class BreakGlassLog(Base):
     """Every deliberate crossing of the tenant boundary, and why.
 

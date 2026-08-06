@@ -362,3 +362,187 @@ def test_the_fingerprint_changes_when_the_source_changes(tmp_path) -> None:  # t
     (tmp_path / "__pycache__").mkdir()
     (tmp_path / "__pycache__" / "junk.py").write_text("q = 9\n", encoding="utf-8")
     assert source_fingerprint(tmp_path) == edited
+
+
+# ── the whitepaper vs the changelog that supersedes it ───────────────────────
+#
+# CLAUDE.md names WHITEPAPER.html the FIRST source of truth and
+# CHANGELOG-v1.1.md the second, «تَفوق ما يخالفها» — the changelog wins on any
+# conflict. That governance rule had no enforcement at all: nothing in this
+# suite read the whitepaper, so it drifted for a month into contradicting the
+# shipped product in four places at once (a three-tier catalogue at retired
+# prices, an entitlements table selling four columns no code reads, a renewal
+# that «extends 30 days» while the code writes one row per order, and a C9 exit
+# criterion requiring three plans the approved catalogue reduced to two).
+#
+# The fix is NOT to rewrite the whitepaper — its retired numbers are the
+# argument the later decision was built on, and deleting them hides the WHY.
+# It is to mark each contradicting point in place, pointing at the entry that
+# overrides it. This section is what makes the marker mandatory: a superseded
+# passage that loses its marker, or cites an entry that does not exist, or
+# survives a rewrite of the entry it depends on, fails here.
+
+_WHITEPAPER = pathlib.Path("docs/WHITEPAPER.html")
+_CHANGELOG = pathlib.Path("docs/CHANGELOG-v1.1.md")
+
+#: A superseded-by banner. Matched on the CSS class rather than on wording:
+#: the class is what makes it visible to a reader as «this is no longer true»,
+#: and a marker nobody can see is not a marker.
+_SUP_OPEN = re.compile(r"<(div|span) class=\"sup\">")
+_ANY_TAG = re.compile(r"</?(div|span)\b[^>]*>")
+
+
+def _sup_blocks(html: str) -> list[str]:
+    """Every superseded-by banner, whole.
+
+    A non-greedy regex to the first `</div>` was the obvious way to do this and
+    it silently truncated the §04 marker at the inline price list it contains —
+    so the test read a marker that had lost its own citation and reported the
+    whitepaper as unmarked. Tag depth is counted instead: these blocks nest
+    one level and the count is what says where the banner ends.
+    """
+    blocks: list[str] = []
+    for opening in _SUP_OPEN.finditer(html):
+        depth = 0
+        for tag in _ANY_TAG.finditer(html, opening.start()):
+            depth += -1 if tag.group(0).startswith("</") else 1
+            if depth == 0:
+                blocks.append(html[opening.start():tag.end()])
+                break
+    return blocks
+
+#: Each passage of the whitepaper the changelog overrides:
+#:   section id → (a literal fragment proving the passage is still there,
+#:                 the changelog entry number that governs it,
+#:                 what the reader would otherwise act on)
+#:
+#: The fragment is asserted PRESENT on purpose. Without it the test would pass
+#: by deletion — and deleting a superseded decision is exactly what the
+#: governance rule forbids, because the history is the reason.
+_SUPERSEDED: dict[str, tuple[str, str, str]] = {
+    "s4": ("~149", "19",
+           "a three-tier catalogue at 149/279 — retired on 2 August"),
+    "s5": ("الدفع يمدد 30 يومًا", "16",
+           "renewal described as extending one row; the code writes one row "
+           "per Salla order and retires the previous one"),
+    "s13": ("باقات الاشتراك الثلاث", "19",
+            "a C9 exit criterion that can never be met — the third plan is "
+            "deliberately retired from sale"),
+}
+
+
+def _sections() -> dict[str, str]:
+    """The whitepaper split by its own section ids."""
+    text = _WHITEPAPER.read_text(encoding="utf-8")
+    parts = re.split(r'<section id="(s\d+)">', text)
+    return dict(zip(parts[1::2], parts[2::2], strict=True))
+
+
+def _changelog_entry(number: str) -> str | None:
+    """The body of one numbered changelog entry, or None if there is none."""
+    text = _CHANGELOG.read_text(encoding="utf-8")
+    match = re.search(rf"^{number}\. \*\*(.*?)(?=^\d+\. \*\*|\Z)",
+                      text, re.DOTALL | re.MULTILINE)
+    return match.group(0) if match else None
+
+
+def test_every_superseded_passage_carries_a_visible_marker() -> None:
+    """A contradiction between the whitepaper and the changelog fails HERE.
+
+    Nothing guarded the whitepaper at all before this, which is how the first
+    source of truth came to describe a product we do not sell. Each entry below
+    is a passage that is still correct as HISTORY and wrong as INSTRUCTION, and
+    the only thing separating those two readings is the marker.
+    """
+    sections = _sections()
+    for section_id, (fragment, entry, why) in _SUPERSEDED.items():
+        body = sections.get(section_id)
+        assert body is not None, f"the whitepaper no longer has §{section_id}"
+        assert fragment in body, (
+            f"§{section_id} no longer contains {fragment!r}. If the passage was "
+            f"REWRITTEN, that is a whitepaper decision and needs its own "
+            f"`docs: whitepaper vX.Y` commit; if it was DELETED, the history "
+            f"that explains «{why}» went with it."
+        )
+        markers = _sup_blocks(body)
+        assert markers, (
+            f"§{section_id} contradicts the changelog ({why}) and carries no "
+            "superseded-by marker — a reader acts on it as current truth"
+        )
+        assert any(f"§{entry}" in marker for marker in markers), (
+            f"§{section_id}'s marker does not name CHANGELOG-v1.1.md §{entry}, "
+            "which is the entry that actually overrides it"
+        )
+
+
+def test_every_marker_points_at_a_changelog_entry_that_exists() -> None:
+    """A citation to nothing is worse than no citation: it reads as governance
+    while resolving to a section number a later edit renumbered away."""
+    for _, (_, entry, _) in _SUPERSEDED.items():
+        assert _changelog_entry(entry) is not None, (
+            f"the whitepaper defers to CHANGELOG-v1.1.md §{entry} and no such "
+            "numbered entry exists"
+        )
+
+
+def test_the_marked_catalogue_quotes_the_prices_actually_on_sale() -> None:
+    """The §04 marker is what a reader sees INSTEAD of the retired tiers, so it
+    has to carry the live catalogue — otherwise it says «this is wrong» and
+    leaves the reader with nowhere to go, which is how the products sheet came
+    to hold two price sets with nothing declaring which was real."""
+    section = _sections()["s4"]
+    marker = "\n".join(_sup_blocks(section))
+    for price, product in APPROVED.items():
+        assert price in marker, (
+            f"the live price of {product} ({price}) is missing from the §04 "
+            "superseded-by marker"
+        )
+
+
+def test_the_whitepaper_never_sells_an_entitlement_no_code_reads() -> None:
+    """The same structural rule the store pages get, for the document the store
+    pages are WRITTEN FROM.
+
+    The 449 tier's entitlements table survived unmarked for a month after the
+    store copy was corrected: `human_review_monthly`, `queue_priority`,
+    `intro_blurb` and `cover_letter` are columns nothing reads, and this is the
+    file a future author would have rebuilt the sales page from. Naming the
+    column inside a marker is enough — that is precisely the reader being told
+    it is not sold — and implementing the feature lifts the requirement
+    automatically, exactly as it does for the store pages.
+    """
+    text = _WHITEPAPER.read_text(encoding="utf-8")
+    marked = "\n".join(_sup_blocks(text))
+    for column in _SOLD_ENTITLEMENTS:
+        if _read_by_product(column) or column not in text:
+            continue
+        assert column in marked, (
+            f"the whitepaper sells {column} and nothing outside models.py "
+            "reads it — mark the row superseded or implement the feature"
+        )
+
+
+def test_the_whitepaper_states_one_version_number() -> None:
+    """The tab said v1.1 while the header and the footer said 1.2.
+
+    The v1.2 entry itself ends «الرقم يُدار في مكان واحد من الآن» — written
+    after the header and footer had drifted apart the previous time. They had,
+    and the `<title>` was the place nobody looked, because it is the one copy
+    of the number that never appears on the page.
+    """
+    text = _WHITEPAPER.read_text(encoding="utf-8")
+    # the three places the page states its OWN version: the tab, the header
+    # eyebrow and the footer. The dated list in §17 is history and is not one
+    # of them — every past number legitimately appears there.
+    places = {
+        "<title>": re.search(r"<title>[^<]*·\s*v([12]\.\d)</title>", text),
+        'class="eyebrow"': re.search(r'class="eyebrow">[^<]*النسخة ([12]\.\d)', text),
+        "<footer>": re.search(r"<footer[^>]*>\s*[^<]*النسخة ([12]\.\d)", text),
+    }
+    missing = [where for where, found in places.items() if found is None]
+    assert not missing, f"the whitepaper states no version in: {missing}"
+    declared = {where: found.group(1) for where, found in places.items()
+                if found is not None}
+    assert len(set(declared.values())) == 1, (
+        f"the whitepaper declares more than one current version: {declared}"
+    )

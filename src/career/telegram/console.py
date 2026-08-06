@@ -184,11 +184,70 @@ LINK_NO_ORDER_AR = (
 #: from the subscription — see :func:`_run_subscription_action`. The second
 #: element of an entry whose runner composes its own answer (resend,
 #: issue_link) is the REFUSAL, never a tick: nothing here may inherit a ✅.
+#: ── the two sold promises the operator has to be able to ACT on ────────────
+#: Detection is the machine's; both of these are decisions. The 72-hour
+#: guarantee's remedy moves money and the store page hands the choice to the
+#: customer — «استرداد كامل أو تمديد الاشتراك — أنت تختار» — so nothing
+#: refunds or extends on a timer; the operator records what the customer
+#: chose and this applies the half a machine can apply. The career session is
+#: a human appointment start to finish: what these buttons keep is the
+#: ledger, and the ledger is what the refund page's «تُخصم … جلسة المسار ١٥٠
+#: ريالًا» is computed from.
+GUARANTEE_REFUND_AR = (
+    "✅ سجّلنا اختياره: استرداد كامل\n{code}\n"
+    "نفّذ الاسترداد من سلة بنفس وسيلة دفعه — ما حرّكنا أي مبلغ من هنا\n"
+    "وأول ما يوصلنا إشعار الاسترداد تتوقف خدمته تلقائيًا"
+)
+GUARANTEE_EXTEND_AR = (
+    "✅ مددنا اشتراكه بعدد الأيام اللي راحت عليه\n{code}\n"
+    "الأيام:\n{days}\n"
+    "وينتهي اشتراكه الآن في:\n{end}"
+)
+GUARANTEE_WAIVE_AR = (
+    "✅ سجّلنا أن العميل ما طلب استردادًا ولا تمديدًا\n{code}"
+)
+#: Refusals. Each one names what is actually true, because «تم» on an action
+#: that changed nothing is the failure this file keeps re-learning.
+GUARANTEE_NOT_BREACHED_AR = (
+    "⚪ لا يوجد ضمان مكسور لهذا العميل — لم نغيّر شيئًا\n{code}"
+)
+GUARANTEE_NO_PERIOD_AR = (
+    "⚪ ما عنده مدة اشتراك قابلة للتمديد — لم نغيّر شيئًا\n"
+    "سجّل الاسترداد أو التنازل بدلًا عنه\n{code}"
+)
+SESSION_LOGGED_AR = (
+    "✅ سجّلنا طلب جلسة المسار\n{code}\n"
+    "والمهلة المعلنة للرد أربع وعشرون ساعة"
+)
+SESSION_ALREADY_OPEN_AR = (
+    "ℹ️ عنده طلب جلسة مفتوح أصلًا — ما سجّلنا طلبًا ثانيًا\n{code}"
+)
+SESSION_ALREADY_USED_AR = (
+    "⚪ استلم جلسته لهذه الفترة — واحدة لكل اشتراك\n{code}"
+)
+SESSION_NOT_ENTITLED_AR = (
+    "⚪ جلسة المسار غير مشمولة في خطته — ما سجّلنا شيئًا\n{code}"
+)
+SESSION_SCHEDULED_AR = "✅ سجّلنا أنكم اتفقتم على موعد\n{code}"
+SESSION_COMPLETED_AR = (
+    "✅ سجّلنا أن الجلسة تمت\n{code}\n"
+    "وتُخصم قيمتها المعلنة من أي استرداد لاحق"
+)
+SESSION_NO_REQUEST_AR = (
+    "⚪ لا يوجد طلب جلسة لهذا العميل — لم نغيّر شيئًا\n{code}"
+)
+
 _ACTIONS = {
     "pause": ("⏸️ إيقاف مؤقت", "✅ أوقفنا الخدمة مؤقتًا للعميل\n{code}"),
     "resume": ("▶️ استئناف", "✅ استأنفنا الخدمة للعميل\n{code}"),
     "resend": ("📤 إعادة إرسال الحزمة", RESEND_NOTHING_AR),
     "issue_link": ("🔑 إصدار رابط تفعيل", LINK_NO_ORDER_AR),
+    "g_refund": ("💸 استرداد كامل (ضمان ٧٢ ساعة)", GUARANTEE_NOT_BREACHED_AR),
+    "g_extend": ("📆 تمديد المدة (ضمان ٧٢ ساعة)", GUARANTEE_NOT_BREACHED_AR),
+    "g_waive": ("🤝 تنازل العميل (ضمان ٧٢ ساعة)", GUARANTEE_NOT_BREACHED_AR),
+    "cs_request": ("📅 تسجيل طلب جلسة مسار", SESSION_NOT_ENTITLED_AR),
+    "cs_scheduled": ("📅 تم التنسيق للجلسة", SESSION_NO_REQUEST_AR),
+    "cs_completed": ("✅ تمت جلسة المسار", SESSION_NO_REQUEST_AR),
 }
 
 #: ── open support tickets ────────────────────────────────────────────────────
@@ -319,6 +378,8 @@ def _screen(
         return _menu_screen()
     if name == "tickets":
         return _tickets_screen(session, now=now)
+    if name == "promises":
+        return _promises_screen(session, now=now)
     if name == "tclose":
         # v1|tclose|<ticket uuid> → the confirm card carrying a one-shot nonce
         return _ticket_close_card(session, ticket_id=arg, now=now)
@@ -420,7 +481,16 @@ def _menu_screen() -> tuple[str, Keyboard]:
     was.
     """
     text, keyboard = views.render_menu()
-    return text, [*keyboard, [("🎫 التذاكر المفتوحة", "v1|tickets")]]
+    return text, [
+        *keyboard,
+        [("🎫 التذاكر المفتوحة", "v1|tickets"),
+         # The two sold promises with a customer waiting behind them. It sits
+         # on the menu, not behind a customer's card, because the question it
+         # answers — «هل عليّ شيء لأحد؟» — is not asked about anyone in
+         # particular, and a promise you have to go looking for is a promise
+         # that is answered late.
+         ("🤝 الوعود المستحقة", "v1|promises")],
+    ]
 
 
 def _tenant_screen(card: dict[str, Any]) -> tuple[str, Keyboard]:
@@ -515,6 +585,65 @@ def _tickets_screen(
     ]
     keyboard.append([("🔄 تحديث", "v1|tickets"), ("🏠 الرئيسية", "v1|menu")])
     return "\n".join(lines), keyboard
+
+
+#: How a breach's facts are said out loud. The packet the sweep stores is
+#: PII-free and machine-shaped; these are the two lines that change what the
+#: operator DOES — an empty market is a conversation about extending, our own
+#: failures are a conversation about refunding before he is asked.
+def _fact_lines_ar(facts: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    day_states = facts.get("day_states") or {}
+    for state, count in sorted(day_states.items()):
+        label = views.state_label(str(state))
+        # a translated state is pure Arabic and safe inline; an unknown one is
+        # a raw Latin token and gets its own line
+        if label == str(state):
+            lines.append(str(state))
+            lines.append(f"x{_ar_digits(count)}")
+        else:
+            lines.append(f"{label} × {_ar_digits(count)}")
+    if facts.get("weekend_days"):
+        lines.append("ومرت المهلة على عطلة نهاية الأسبوع")
+    if facts.get("paused"):
+        lines.append("وكان موقوفًا مؤقتًا بطلبه")
+    if facts.get("opted_out"):
+        lines.append("وكان موقفًا للرسائل")
+    return lines
+
+
+def _promises_screen(
+    session: Session, *, now: datetime
+) -> tuple[str, Keyboard]:
+    """Every promise with a customer still waiting behind it.
+
+    The 72-hour guarantee and the لمّاح+ career session were both sold with
+    no reader: a breach nobody was told about and a request nobody could see
+    ageing. This screen is the reader. It shows age above all else, because
+    age is the only priority either promise has, and it carries no PII — TEN
+    codes on their own lines, exactly like every other screen (§15.13).
+    """
+    from career.promises import career_session, guarantee
+
+    breaches = [
+        {
+            "code": row.code,
+            "age": _age_ar(row.deadline_at, now),
+            "first_delivery": row.first_delivery_at is not None,
+            "fact_lines": _fact_lines_ar(row.facts),
+        }
+        for row in guarantee.open_breaches(session)
+    ]
+    sessions = [
+        {
+            "code": row.code,
+            "status": row.status,
+            "age": _age_ar(row.requested_at, now),
+            "overdue": row.overdue,
+        }
+        for row in career_session.open_sessions(session, now=now)
+    ]
+    return views.render_promises(breaches, sessions)
 
 
 def _ticket_close_card(
@@ -696,6 +825,68 @@ def _customers_data(
     return rows, page, total
 
 
+def _promise_facts(
+    session: Session, *, tenant_id: Any, now: datetime
+) -> dict[str, Any]:
+    """The three sold promises, as this customer's card sees them.
+
+    Read here rather than in the view for the usual reason — views are pure —
+    but gathered as ONE dict because they are one question: «هل عليّ شيء لهذا
+    العميل؟». All three are PII-free by construction: a status, an age, a
+    price.
+    """
+    from career.db.models import DeliveryGuarantee, PriceLock
+    from career.promises import career_session
+
+    guarantee_row = session.execute(
+        select(DeliveryGuarantee)
+        .where(DeliveryGuarantee.tenant_id == tenant_id)
+    ).scalars().first()
+    guarantee_card: dict[str, Any] | None = None
+    if guarantee_row is not None:
+        anchor = (
+            guarantee_row.deadline_at
+            if guarantee_row.status in ("BREACHED", "SETTLED")
+            else guarantee_row.activated_at
+        )
+        guarantee_card = {
+            "status": guarantee_row.status,
+            "age": _age_ar(anchor, now),
+        }
+
+    session_row = career_session.current_session(session, tenant_id=tenant_id)
+    session_card: dict[str, Any] | None = None
+    if session_row is not None:
+        session_card = {
+            "status": session_row.status,
+            "age": _age_ar(session_row.requested_at, now),
+            "overdue": bool(
+                session_row.status == career_session.REQUESTED
+                and now >= session_row.requested_at + timedelta(
+                    hours=career_session.RESPONSE_SLA_HOURS
+                )
+            ),
+            # The published deduction, computed rather than remembered — the
+            # refund page promises «ونعرض عليك الأرقام قبل موافقتك».
+            "deduction": (
+                f"{career_session.SESSION_VALUE_SAR} SAR"
+                if session_row.status == career_session.COMPLETED else None
+            ),
+        }
+
+    lock = session.execute(
+        select(PriceLock.amount_sar, PriceLock.currency)
+        .where(PriceLock.tenant_id == tenant_id, PriceLock.lapsed_at.is_(None))
+        .order_by(PriceLock.locked_at.desc())
+    ).first()
+    return {
+        "guarantee": guarantee_card,
+        "career_session": session_card,
+        "session_entitled": career_session.entitled(session, tenant_id),
+        "price_lock": f"{lock[0]} {lock[1]}" if lock else None,
+    }
+
+
 def _tenant_card(
     session: Session, *, code: str, now: datetime,
     whatsapp_client: WhatsAppClient | None = None,
@@ -757,7 +948,9 @@ def _tenant_card(
         )
     ).scalar_one()
     window = _window_of(channel[0], channel[1], now) if channel else None
+    promises = _promise_facts(session, tenant_id=tenant.id, now=now)
     return {
+        **promises,
         "support_minutes": int(support_minutes or 0),
         "review_count": int(review_count),
         "code": code,
@@ -1114,6 +1307,95 @@ def _refused_ar(action: str) -> str:
     return PAUSE_REFUSED_AR if action == "pause" else RESUME_NOT_PAUSED_AR
 
 
+def _run_guarantee_remedy(
+    session: Session, *, tenant_id: Any, code: str, action: str,
+    now: datetime,
+) -> str:
+    """Apply the remedy the CUSTOMER chose for a broken 72-hour guarantee.
+
+    The refund half deliberately moves no money: the store page says the money
+    returns «بنفس وسيلة دفعك عبر سلة», and when the operator makes it there,
+    the `order.refunded` webhook is what stops the service. Recording REFUNDED
+    from here would race that authority and could switch off a customer who is
+    still owed the days he paid for.
+
+    The extension half is applied, because adding days is something only this
+    system can do correctly — and it is applied through a `subscription_events`
+    row, so a paid period never changes without a trail.
+    """
+    from career.promises import guarantee
+
+    remedy = {
+        "g_refund": guarantee.REMEDY_REFUND,
+        "g_extend": guarantee.REMEDY_EXTENSION,
+        "g_waive": guarantee.REMEDY_WAIVED,
+    }[action]
+    result = guarantee.apply_remedy(
+        session, tenant_id=tenant_id, remedy=remedy, now=now,
+    )
+    if result.outcome == "no_period":
+        session.rollback()
+        return GUARANTEE_NO_PERIOD_AR.format(code=code)
+    if result.outcome != "applied":
+        session.rollback()
+        return GUARANTEE_NOT_BREACHED_AR.format(code=code)
+    session.commit()
+    if remedy == guarantee.REMEDY_REFUND:
+        return GUARANTEE_REFUND_AR.format(code=code)
+    if remedy == guarantee.REMEDY_WAIVED:
+        return GUARANTEE_WAIVE_AR.format(code=code)
+    end = result.new_period_end
+    # the date stands alone: a Latin date inside an Arabic line is scrambled
+    return GUARANTEE_EXTEND_AR.format(
+        code=code, days=result.days,
+        end=end.astimezone(_RIYADH).date().isoformat() if end else "؟",
+    )
+
+
+def _run_career_session(
+    session: Session, *, tenant_id: Any, code: str, action: str,
+    now: datetime,
+) -> str:
+    """Record a career session's one honest step: asked, arranged, or held.
+
+    Every branch answers with what the LEDGER says afterwards, never with the
+    fact that a function returned — the same rule pause/resume had to learn
+    the hard way. «Already asked» and «already had one this period» are
+    different sentences to a customer, so they are different sentences here.
+    """
+    from career.promises import career_session
+
+    if action == "cs_request":
+        result = career_session.request_session(
+            session, tenant_id=tenant_id, now=now, source="operator",
+        )
+        if result.outcome == "created":
+            session.commit()
+            return SESSION_LOGGED_AR.format(code=code)
+        session.rollback()
+        if result.outcome == "already_open":
+            return SESSION_ALREADY_OPEN_AR.format(code=code)
+        if result.outcome == "already_used":
+            return SESSION_ALREADY_USED_AR.format(code=code)
+        return SESSION_NOT_ENTITLED_AR.format(code=code)
+
+    if action == "cs_scheduled":
+        outcome, _row = career_session.mark_scheduled(
+            session, tenant_id=tenant_id, now=now
+        )
+        done = SESSION_SCHEDULED_AR
+    else:
+        outcome, _row = career_session.mark_completed(
+            session, tenant_id=tenant_id, now=now
+        )
+        done = SESSION_COMPLETED_AR
+    if outcome != "applied":
+        session.rollback()
+        return SESSION_NO_REQUEST_AR.format(code=code)
+    session.commit()
+    return done.format(code=code)
+
+
 def _run_issue_link(session: Session, *, code: str, now: datetime) -> str:
     """Mint one activation link for a waiting order and hand it back.
 
@@ -1172,6 +1454,14 @@ def _run_action(
     if action in ("pause", "resume"):
         return code, _run_subscription_action(
             session, tenant_id=tenant.id, action=action, code=code
+        )
+    if action in ("g_refund", "g_extend", "g_waive"):
+        return code, _run_guarantee_remedy(
+            session, tenant_id=tenant.id, code=code, action=action, now=now,
+        )
+    if action in ("cs_request", "cs_scheduled", "cs_completed"):
+        return code, _run_career_session(
+            session, tenant_id=tenant.id, code=code, action=action, now=now,
         )
     if action == "issue_link":
         return code, _run_issue_link(session, code=code, now=now)

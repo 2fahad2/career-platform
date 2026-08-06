@@ -45,13 +45,13 @@ from collections.abc import Iterable
 from enum import StrEnum
 
 #: The one Arabic normaliser in the codebase, imported rather than copied.
-#: Checked for a cycle before wiring it: nothing on its import chain
-#: (career.cv.close / generate / validate → db.models, engine.ranking) reaches
-#: back into career.whatsapp, and the only importers of THIS module are the
-#: worker and a comment in salla.activation_link — so the edge is one-way.
-#: extraction.py duplicates the same fold on purpose and says why (it is the
-#: leaf every model boundary imports); this module is not in that position.
-from career.onboarding.achievement_render import normalize_ar
+#: It used to be imported from onboarding.achievement_render, and that import
+#: was acyclic but not free: achievement_render reaches into career.cv.generate
+#: at module level, so this module — documented on its first line as PURE —
+#: pulled in career.cv.*, career.db.models and all of SQLAlchemy in order to
+#: fold a string. The fold now lives in career.arabic, a leaf that imports
+#: nothing from career at all, so the word "pure" above is true again.
+from career.arabic import normalize_ar
 
 
 class InboundKind(StrEnum):

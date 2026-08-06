@@ -8,6 +8,12 @@ through Jinja with AUTOESCAPE ON (deliberately safer than legacy: summaries
 and skills pass through an LLM/bank — markup in them must never execute) and
 WeasyPrint to a real PDF verified §1.10-style: exactly one A4 page, sections
 in order, dates via fmt_month.
+
+The cover-letter RENDERER is gone (DEVIATIONS D23) — we do not sell a letter.
+The byte-verbatim guard on the cover-letter TEMPLATE constant stays, because
+the constant does: `career/cv/template.py` belongs to another owner, and an
+unguarded verbatim constant is how drift starts. Both should be deleted in
+the same change, and this test with them.
 """
 
 from __future__ import annotations
@@ -178,22 +184,14 @@ def test_pdf_renders_exactly_one_page(tmp_path: Path) -> None:
     assert "Mar 2021 - Present" in text
 
 
-def test_cover_letter_renders_paragraphs(tmp_path: Path) -> None:
-    from pypdf import PdfReader
-
-    out = tmp_path / "cover_letter_check.pdf"
-    cv_render.render_cover_letter_pdf(
-        _demo_cv(),
-        letter_text="First paragraph.\n\nSecond paragraph.",
-        current_date="16 July 2026",
-        output_path=out,
-    )
-    reader = PdfReader(str(out))
-    text = reader.pages[0].extract_text()
-    assert "First paragraph." in text
-    assert "Second paragraph." in text
-    assert "16 July 2026" in text
-    assert "Demo Employer" in text
+def test_the_renderer_offers_nothing_we_do_not_sell(tmp_path: Path) -> None:
+    """DEVIATIONS D23. The letter renderer worked, was tested, and had no
+    caller — and the whitepaper's plan table still lists «خطاب تقديم كامل» on
+    the تنفيذي tier, so a reader had every reason to believe it shipped. The
+    deletion is the product decision; this asserts it stayed deleted rather
+    than being restored by someone who found the template and assumed."""
+    assert not hasattr(cv_render, "render_cover_letter_pdf")
+    assert not hasattr(cv_render, "render_cover_letter_html")
 
 
 def test_pdf_render_is_deterministic_for_identical_input(tmp_path: Path) -> None:

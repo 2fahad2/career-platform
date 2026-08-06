@@ -21,7 +21,7 @@
 9. وصف الوظيفة بيانات غير موثوقة دائمًا: نموذج التقييم بلا أدوات وبلا أسرار، مخرجات مهيكلة، ولا يتحكم في إرسال أو قاعدة.
 10. RLS مفعّلة وكل استعلام مقيد بالـtenant + اختبارات cross-tenant هجومية في CI.
 11. الـWorker يعيد التحقق من ملكية العميل من القاعدة — لا يثق بحمولة الطابور.
-12. لكل عميل/يوم حالة صادقة واحدة من: DELIVERED / NO_MATCHES / PARTIAL_DELIVERY / DISCOVERY_FAILED / CV_GENERATION_FAILED / WHATSAPP_FAILED / LEDGER_FAILED — لا نجاح صامت.
+12. لكل عميل/يوم حالة صادقة واحدة من ثمانٍ: DELIVERED / NO_MATCHES / PARTIAL_DELIVERY / DISCOVERY_FAILED / CV_GENERATION_FAILED / WHATSAPP_FAILED / LEDGER_FAILED / SKIPPED_OPTED_OUT — لا نجاح صامت، ورموز الخروج تعكس الحقيقة.
 13. لا PII في السجلات ولا القناة الإدارية (رموز TEN-#### فقط) + فلاتر أسرار على كل logger.
 14. النسخ الاحتياطية مشفرة، خارج السيرفر، وتُختبر بالاسترجاع دوريًا.
 15. الورقة تسبق الكود.

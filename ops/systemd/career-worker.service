@@ -6,6 +6,26 @@ Wants=network-online.target
 After=network-online.target docker.service
 OnFailure=career-alert@%n.service
 
+# AUDIT 2026-08-06: this OnFailure line was UNREACHABLE, so the whole alerting
+# path for the customer-facing worker was decoration. A unit only reaches
+# `failed` under Restart=always when it exhausts the start rate limit, and the
+# defaults are StartLimitIntervalSec=10s with StartLimitBurst=5 — against
+# RestartSec=5 that allows at most two starts per window, so the limit can
+# never be hit and the unit restarts forever, silently, however hopeless the
+# cause. career-alert@.service's own comment described a state that could not
+# occur: "a unit that exhausted its restarts and STAYED down".
+#
+# 20 starts per 10 minutes trips in roughly 100 seconds of a hard crash loop
+# and cannot be reached by ordinary blips. The accepted cost is deliberate:
+# once the limit trips systemd stops restarting, and recovery is manual
+# (`systemctl reset-failed career-worker && systemctl start career-worker`).
+# That is the right trade for what actually makes THIS process exit — an empty
+# WHATSAPP_ACCESS_TOKEN, the single-instance lock held by a second copy, an
+# import error after a bad deploy. Every one of them recurs identically on the
+# next start, so «keep restarting quietly» buys nothing and costs the alert.
+StartLimitIntervalSec=600
+StartLimitBurst=20
+
 [Service]
 Type=simple
 WorkingDirectory=/root/career
@@ -14,6 +34,32 @@ EnvironmentFile=/root/career/.env.staging
 ExecStart=/usr/bin/env DB_HOST=127.0.0.1 DB_PORT=5433 REDIS_HOST=127.0.0.1 REDIS_PORT=6380 STORAGE_ROOT=/root/career/data /root/career/.venv/bin/python /root/career/scripts/run_worker_loop.py
 Restart=always
 RestartSec=5
+
+# WHAT THE ABOVE STILL DOES NOT COVER, stated plainly so nobody reads the
+# alert as complete cover. The failure this unit cannot see is the WEDGE: the
+# loop in run_worker_loop.py catches every exception and continues (`except
+# Exception: logger.error(...)` around the whole cycle), so a database that
+# never comes back, a Meta token that expired, or a poll that blocks forever
+# leaves the process ALIVE and the unit ACTIVE while nothing is processed.
+# systemd is watching the process, and the process is fine.
+#
+# Closing it needs a heartbeat, which needs code in a file this unit's author
+# does not own. The exact change, for the architect:
+#
+#   1. scripts/run_worker_loop.py — add `Type=notify`-compatible signalling:
+#      `from systemd.daemon import notify` (or a 40-line sd_notify writing
+#      NOTIFY_SOCKET directly, no dependency), call `notify("READY=1")` once
+#      after the boot checks, and `notify("WATCHDOG=1")` at the END of each
+#      loop iteration — after process_pending_whatsapp returns, never in a
+#      `finally`, or a wedged cycle would keep petting the dog.
+#   2. Then, and only then, add here:  Type=notify  and  WatchdogSec=120
+#      (40× the 3s poll — generous enough for a slow Claude call inside a
+#      cycle). systemd restarts a unit that misses its deadline, and the
+#      restart counts toward the start limit above, so a persistent wedge
+#      escalates to the alert on its own.
+#
+# Do NOT add Type=notify before step 1: systemd would wait for a READY=1 that
+# never arrives and kill the worker at start.
 
 [Install]
 WantedBy=multi-user.target

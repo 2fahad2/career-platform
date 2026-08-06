@@ -40,6 +40,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from career.arabic import normalize_ar
 from career.db.models import (
     CareerPathAssessment,
     CustomerChannel,
@@ -49,7 +50,6 @@ from career.db.models import (
     SearchPolicy,
 )
 from career.onboarding import collection, confirmation, consents, fsm, paths, policy, privacy
-from career.onboarding.achievement_render import normalize_ar
 from career.onboarding.consents import ConsentMissing
 from career.onboarding.extraction import (
     ExtractionFailed,

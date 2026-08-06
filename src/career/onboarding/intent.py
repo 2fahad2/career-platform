@@ -27,8 +27,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Protocol
 
+from career.arabic import normalize_ar
 from career.cv.close import LlmMeter, TokenCounter, metered
-from career.onboarding.achievement_render import normalize_ar
 
 logger = logging.getLogger("career.enrichment")
 

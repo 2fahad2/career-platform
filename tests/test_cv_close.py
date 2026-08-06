@@ -22,6 +22,7 @@ from sqlalchemy import text as sql_text
 from sqlalchemy.orm import Session
 
 from career.cv import close
+from career.salla import subscriptions as sub_states
 
 NOW = datetime(2026, 7, 17, 6, 0, tzinfo=UTC)
 DAY = date(2026, 7, 17)
@@ -589,6 +590,11 @@ def test_usage_rolls_up_into_cost_allocations(owner_session: Session) -> None:
                 input_tokens=1000, output_tokens=400,
                 cost_usd=Decimal(cost), now=NOW,
             )
+        # a kind outside SPEND_KINDS is NOT a spend category. This test used
+        # to assert the opposite — that «jd_enrichment», a kind no call site in
+        # src/ has ever recorded, earns a zero-dollar row — which is precisely
+        # the rollup counting a different universe from every screen that
+        # reports the bill. One expression now, and it is SPEND_KINDS.
         close.record_usage(
             owner_session, tenant_id=tid, kind="jd_enrichment",
             cost_usd=None, now=NOW,
@@ -602,10 +608,8 @@ def test_usage_rolls_up_into_cost_allocations(owner_session: Session) -> None:
                      "WHERE tenant_id = :t ORDER BY category"),
             {"t": str(tid)},
         ).all()
-        assert [(r.category, r.events) for r in rows] == [
-            ("jd_enrichment", 1), ("llm_generation", 2),
-        ]
-        assert rows[1].cost_usd == Decimal("0.025000")
+        assert [(r.category, r.events) for r in rows] == [("llm_generation", 2)]
+        assert rows[0].cost_usd == Decimal("0.025000")
     finally:
         _cleanup(owner_session, tid)
 
@@ -624,5 +628,204 @@ def test_usage_budget_guard(owner_session: Session) -> None:
         owner_session.commit()
         allowed, reason = budget.allow()
         assert allowed is False and reason == "budget_cap_reached:llm_generation"
+    finally:
+        _cleanup(owner_session, tid)
+
+
+# ── revenue: the money that arrived and stayed (§05) ─────────────────────────
+
+
+def _sub(
+    session: Session, tenant_id: uuid.UUID, *, plan: str, status: str,
+    amount: Decimal,
+) -> None:
+    session.execute(
+        sql_text(
+            "INSERT INTO subscriptions (id, tenant_id, plan_code, status,"
+            " salla_order_id, amount_sar, currency)"
+            " VALUES (:i, :t, :p, :s, :o, :a, 'SAR')"
+        ),
+        {"i": str(uuid.uuid4()), "t": str(tenant_id), "p": plan, "s": status,
+         "o": f"O-{uuid.uuid4()}", "a": amount},
+    )
+
+
+def _revenue(session: Session) -> tuple[dict[str, int], Decimal]:
+    """The console's own call, un-scoped exactly as the business screen makes
+    it — so these tests exercise the query the operator actually reads."""
+    return close.paid_subscriptions_by_plan(session)
+
+
+def test_the_non_revenue_rule_is_derived_from_the_state_machine() -> None:
+    """The rule, stated once: money that went back, plus money not yet here.
+
+    Asserted against ``salla.subscriptions`` rather than against a literal set,
+    because a hand-copied list is how the console's plan labels drifted three
+    ways. A twelfth state added to the product must be a deliberate decision
+    here, not an omission that quietly lands in «الإيراد».
+    """
+    assert close.NON_REVENUE_STATUSES == frozenset({
+        sub_states.CANCELED, sub_states.REFUNDED, sub_states.CHARGEBACK,
+        sub_states.PENDING_PAYMENT,
+    })
+    assert sub_states.TERMINAL_STATES <= close.NON_REVENUE_STATUSES
+    # everything else is money we were paid and did not give back
+    assert sub_states.ALL_STATES - close.NON_REVENUE_STATUSES == frozenset({
+        sub_states.PAID_UNCLAIMED, sub_states.ONBOARDING, sub_states.ACTIVE,
+        sub_states.PAUSED, sub_states.GRACE, sub_states.EXPIRED,
+        sub_states.SUSPENDED,
+    })
+
+
+def test_reversed_money_is_not_revenue(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """A refund, a cancellation and a chargeback each left the account.
+
+    The business screen summed every row with no status predicate, so all
+    three sat in «الإيراد» forever — and the operator prices the product off
+    that number. The number could only ever be too big.
+    """
+    tid = _seed_tenant(owner_session)
+    base_plans, base_riyals = _revenue(owner_session)
+    _sub(owner_session, tid, plan="professional", status="ACTIVE",
+         amount=Decimal("199"))
+    _sub(owner_session, tid, plan="professional", status="REFUNDED",
+         amount=Decimal("199"))
+    _sub(owner_session, tid, plan="executive", status="CANCELED",
+         amount=Decimal("449"))
+    _sub(owner_session, tid, plan="executive", status="CHARGEBACK",
+         amount=Decimal("449"))
+    _sub(owner_session, tid, plan="basic", status="PENDING_PAYMENT",
+         amount=Decimal("149"))
+    owner_session.commit()
+
+    plans, riyals = _revenue(owner_session)
+    assert riyals - base_riyals == Decimal("199"), (
+        "only the ACTIVE order was money we kept"
+    )
+    # and the COUNT is filtered by the same rule — a plan showing subscriptions
+    # against zero riyals is the screen contradicting itself
+    assert plans.get("professional", 0) - base_plans.get("professional", 0) == 1
+    assert "executive" not in plans and "basic" not in plans
+
+
+def test_an_expired_or_paused_order_keeps_its_riyals(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """Service being off is not the money coming back. A lapsed customer
+    earned every riyal of the period he paid for, and the operator's revenue
+    for July must not shrink because August arrived."""
+    tid = _seed_tenant(owner_session)
+    _, base = _revenue(owner_session)
+    _sub(owner_session, tid, plan="professional", status="EXPIRED",
+         amount=Decimal("199"))
+    _sub(owner_session, tid, plan="professional", status="PAUSED",
+         amount=Decimal("199"))
+    _sub(owner_session, tid, plan="professional", status="SUSPENDED",
+         amount=Decimal("199"))
+    owner_session.commit()
+    _, riyals = _revenue(owner_session)
+    assert riyals - base == Decimal("597")
+
+
+def test_halalas_are_not_truncated_away(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """``revenue += int(amount or 0)`` truncated toward zero on EVERY row.
+
+    ``amount_sar`` is Numeric(10, 2) so halalas survive the database; the
+    reader threw them away per row, which at a hundred orders of 199.50 loses
+    fifty riyals — always downward, and never visible.
+    """
+    tid = _seed_tenant(owner_session)
+    _, base = _revenue(owner_session)
+    for _ in range(4):
+        _sub(owner_session, tid, plan="professional", status="ACTIVE",
+             amount=Decimal("199.50"))
+    owner_session.commit()
+    _, riyals = _revenue(owner_session)
+    assert riyals - base == Decimal("798.00")
+    # a whole-riyal total still prints as «١٩٩ ريال», not «199.00»
+    assert str(close._riyals(Decimal("199.00"))) == "199"
+    assert str(close._riyals(Decimal("199.50"))) == "199.50"
+
+
+def test_a_merged_prepaid_renewal_counts_both_orders(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """Two orders, two payments, two rows — and that is not a double count.
+
+    Somebody who buys twice before activating has paid for sixty days.
+    ``renewal.merge_prepaid_orders`` folds the DAYS into one period and
+    retires the extra row EXPIRED under ``merged_into_activation`` — it
+    retires rather than deletes precisely so the money trail survives, and
+    dropping that row from revenue would under-report by a whole order.
+    """
+    from career.salla.renewal import merge_prepaid_orders
+
+    tid = _seed_tenant(owner_session)
+    _, base = _revenue(owner_session)
+    for _ in range(2):
+        _sub(owner_session, tid, plan="professional", status="PAID_UNCLAIMED",
+             amount=Decimal("199"))
+    owner_session.commit()
+
+    from career.db.models import Subscription
+
+    subs = owner_session.execute(
+        sql_text("SELECT id FROM subscriptions WHERE tenant_id = :t ORDER BY id"),
+        {"t": str(tid)},
+    ).all()
+    activated = owner_session.get(Subscription, uuid.UUID(str(subs[0].id)))
+    assert activated is not None
+    activated.status = "ONBOARDING"
+    activated.current_period_end = NOW
+    owner_session.flush()
+    assert merge_prepaid_orders(
+        owner_session, tenant_id=tid, activated=activated, now=NOW
+    ) == 1
+    owner_session.commit()
+
+    # one row is now EXPIRED (merged) and one ONBOARDING — both still money
+    _, riyals = _revenue(owner_session)
+    assert riyals - base == Decimal("398")
+
+
+# ── one definition of «what did this cost» (§14) ─────────────────────────────
+
+
+def test_the_rollup_and_the_screens_count_the_same_kinds(
+    owner_session: Session
+) -> None:
+    """``cost_allocations`` used to be written with NO kind filter while every
+    operator number reads :data:`close.SPEND_KINDS` — two expressions for one
+    number, and the table nobody reads was the one that could not be caught
+    disagreeing. There is one expression now, so it cannot."""
+    tid = _seed_tenant(owner_session)
+    try:
+        close.record_usage(owner_session, tenant_id=tid, kind="llm_generation",
+                           cost_usd=Decimal("0.011"), now=NOW)
+        close.record_usage(owner_session, tenant_id=tid, kind="search_api",
+                           cost_usd=Decimal("0.004"), now=NOW)
+        # a manual counter: real cost, no dollar price — never a spend category
+        close.record_usage(owner_session, tenant_id=tid, kind="support_minutes",
+                           cost_usd=None, now=NOW)
+        owner_session.commit()
+        close.rollup_costs(owner_session, tenant_id=tid, day=DAY)
+        owner_session.commit()
+
+        derived = close.spend_by_kind(owner_session, tenant_id=tid, day=DAY)
+        stored = {
+            str(r.category): (int(r.events), Decimal(r.cost_usd))
+            for r in owner_session.execute(
+                sql_text("SELECT category, events, cost_usd FROM cost_allocations"
+                         " WHERE tenant_id = :t"),
+                {"t": str(tid)},
+            ).all()
+        }
+        assert stored == derived
+        assert set(stored) == {"llm_generation", "search_api"}
+        assert "support_minutes" not in stored
     finally:
         _cleanup(owner_session, tid)
