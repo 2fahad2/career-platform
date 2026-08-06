@@ -2311,3 +2311,165 @@ def test_weekly_report_carries_no_second_plan_map() -> None:
     assert [v for v in vars(wr).values()
             if isinstance(v, dict) and "professional" in v] == []
     assert wr._plan_ar is views._plan
+
+
+# ── the Sunday report remembers the week, not the process (0023) ────────────
+
+
+def test_the_two_day_state_maps_differ_in_words_and_never_in_keys() -> None:
+    """The wording difference between the console's map and the report's is
+    deliberate — one state per line with a traffic light in front of it, versus
+    eight of them joined by « · » on the line the operator scans on a Sunday —
+    and it is documented in place. The KEYS are a different matter entirely: a
+    state one screen knows and the other does not renders as a raw Latin token
+    inside an Arabic line, which Fahad's client scrambles. That is the defect
+    that already cost this file its plan map, and it is now impossible to
+    reintroduce on either side without failing here."""
+    from career.cv.close import DAILY_STATES
+    from career.telegram.weekly_report import _STATE_AR as report_states
+
+    assert set(report_states) == set(views._STATE_AR)
+    assert set(DAILY_STATES) <= set(report_states)
+    assert set(DAILY_STATES) <= set(views._STATE_AR)
+    # and the difference is real, not an accident nobody noticed
+    assert report_states != views._STATE_AR
+
+
+def test_the_owed_week_is_answerable_at_any_moment() -> None:
+    """«Is it Sunday between 06:00 and noon» was the only memory the report
+    had, which is why being outside the window meant both «already sent» and
+    «never going to happen». «Which week is owed» has an answer on a Wednesday
+    too, and that is what makes a late report possible instead of a lost one."""
+    from datetime import date as _date
+    from zoneinfo import ZoneInfo
+
+    from career.telegram.weekly_report import due_week_ending
+
+    riyadh = ZoneInfo("Asia/Riyadh")
+    sunday = _date(2026, 8, 2)
+    # Sunday 06:00 — the week that just ended
+    assert due_week_ending(
+        datetime(2026, 8, 2, 6, 0, tzinfo=riyadh)) == sunday
+    # Sunday 05:59 — still LAST week's report that is owed, not this one's
+    assert due_week_ending(
+        datetime(2026, 8, 2, 5, 59, tzinfo=riyadh)) == sunday - timedelta(days=7)
+    # Wednesday — an outage that swallowed Sunday still owes Sunday's report
+    assert due_week_ending(
+        datetime(2026, 8, 5, 14, 0, tzinfo=riyadh)) == sunday
+    # the following Sunday is a new debt
+    assert due_week_ending(
+        datetime(2026, 8, 9, 7, 0, tzinfo=riyadh)) == sunday + timedelta(days=7)
+
+
+def _marker(session: Session) -> Any:
+    return session.execute(sql_text(
+        "SELECT weekly_report_sent_for FROM admin_bot_state WHERE id = 1"
+    )).scalar_one()
+
+
+def test_a_restart_inside_the_sunday_window_never_resends_the_week(
+    owner_session: Session
+) -> None:
+    """The incident: `last_weekly_report` was a local of the worker loop's
+    main(), and the unit is Restart=always — so a deploy with three restarts
+    between 06:00 and noon put three identical weekly reports on the operator's
+    phone. The claim is a conditional UPDATE, so the second caller loses
+    whether it is a restart, the next hourly sweep, or a systemd timer running
+    beside the loop."""
+    from datetime import date as _date
+
+    from career.telegram.weekly_report import claim_weekly_report
+
+    before = _marker(owner_session)
+    try:
+        week = _date(2026, 8, 2)
+        assert claim_weekly_report(owner_session, week_ending=week) is True
+        assert claim_weekly_report(owner_session, week_ending=week) is False
+        assert claim_weekly_report(owner_session, week_ending=week) is False
+        assert _marker(owner_session) == week
+        # and the next week is owed again — the marker gates a week, not a send
+        assert claim_weekly_report(
+            owner_session, week_ending=week + timedelta(days=7)) is True
+    finally:
+        owner_session.execute(sql_text(
+            "UPDATE admin_bot_state SET weekly_report_sent_for = :d WHERE id = 1"),
+            {"d": before})
+        owner_session.commit()
+
+
+def test_an_outage_across_sunday_owes_the_week_it_missed(
+    owner_session: Session
+) -> None:
+    """The silent half of the same bug. With the guard living in the process,
+    an outage spanning the six-hour window dropped the week and nothing
+    anywhere remembered it was owed. A marker that is a WEEK rather than a
+    window is claimable on the Monday, late and honest."""
+    from zoneinfo import ZoneInfo
+
+    from career.telegram.weekly_report import claim_weekly_report, due_week_ending
+
+    before = _marker(owner_session)
+    try:
+        riyadh = ZoneInfo("Asia/Riyadh")
+        owner_session.execute(sql_text(
+            "UPDATE admin_bot_state SET weekly_report_sent_for = :d WHERE id = 1"),
+            {"d": due_week_ending(datetime(2026, 7, 26, 7, 0, tzinfo=riyadh))})
+        owner_session.commit()
+        # the worker was down all Sunday and comes back on Monday afternoon
+        monday = datetime(2026, 8, 3, 15, 0, tzinfo=riyadh)
+        owed = due_week_ending(monday)
+        assert claim_weekly_report(owner_session, week_ending=owed) is True
+    finally:
+        owner_session.execute(sql_text(
+            "UPDATE admin_bot_state SET weekly_report_sent_for = :d WHERE id = 1"),
+            {"d": before})
+        owner_session.commit()
+
+
+def test_a_week_that_was_claimed_but_never_sent_is_given_back(
+    owner_session: Session
+) -> None:
+    """Claiming before sending is what stops the duplicate storm, and this is
+    the price it must pay: a Telegram refusal after the claim would otherwise
+    spend the week on a report nobody received."""
+    from datetime import date as _date
+
+    from career.telegram.weekly_report import (
+        claim_weekly_report,
+        release_weekly_report,
+        weekly_report_marker,
+    )
+
+    before = _marker(owner_session)
+    try:
+        week = _date(2026, 8, 2)
+        owner_session.execute(sql_text(
+            "UPDATE admin_bot_state SET weekly_report_sent_for = NULL WHERE id = 1"))
+        owner_session.commit()
+        previous = weekly_report_marker(owner_session)
+        assert claim_weekly_report(owner_session, week_ending=week) is True
+        release_weekly_report(owner_session, restore_to=previous)
+        assert _marker(owner_session) is None
+        assert claim_weekly_report(owner_session, week_ending=week) is True
+    finally:
+        owner_session.execute(sql_text(
+            "UPDATE admin_bot_state SET weekly_report_sent_for = :d WHERE id = 1"),
+            {"d": before})
+        owner_session.commit()
+
+
+def test_a_late_report_says_which_day_its_numbers_end_on() -> None:
+    """A catch-up report is headed «حتى الأحد» while carrying Wednesday's
+    seven-day numbers, and the reader has no way of noticing. The date sits on
+    its own line — a digit inside an Arabic line is scrambled."""
+    from datetime import date as _date
+
+    from career.telegram.weekly_report import format_weekly_report
+
+    on_time = format_weekly_report(_date(2026, 8, 2), {}, {})
+    assert "متأخر" not in on_time
+
+    late = format_weekly_report(
+        _date(2026, 8, 2), {}, {}, covering_through=_date(2026, 8, 5))
+    assert "متأخر" in late
+    assert "2026-08-05" in late.split("\n")

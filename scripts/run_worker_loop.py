@@ -193,7 +193,6 @@ def main() -> None:  # pragma: no cover — the C7.8 live runner
         )
     last_reminder_sweep = 0.0
     last_window_nudge: date | None = None
-    last_weekly_report: date | None = None
 
     while True:
         try:
@@ -268,22 +267,44 @@ def main() -> None:  # pragma: no cover — the C7.8 live runner
                             "بكرة — أرسل أي رسالة لرقم الخدمة الآن عشان "
                             "توصلك الفرص مباشرة"
                         )
-                # weekly report — Sunday morning (Riyadh), once per week
+                # Weekly report — the week is claimed in the DATABASE, not in
+                # this process. `last_weekly_report` was a local of main(), and
+                # this unit is Restart=always: every restart inside the old
+                # Sunday 06:00–12:00 window reset it and sent the whole report
+                # again (a deploy with three restarts sent three), while an
+                # outage across that window dropped the week in total silence
+                # because nothing outside the process remembered it was owed.
+                # The claim is idempotent per week, so a future
+                # career-weekly-report.timer can call the same code path and
+                # only one of the two will ever send.
                 riyadh_now = now.astimezone(_RIYADH)
-                if (riyadh_now.weekday() == 6 and 6 <= riyadh_now.hour < 12
-                        and last_weekly_report != today):
-                    last_weekly_report = today
+                from career.telegram import weekly_report as weekly
+
+                week_ending = weekly.due_week_ending(riyadh_now)
+                with Session(engine) as session:
+                    previous = weekly.weekly_report_marker(session)
+                    claimed = weekly.claim_weekly_report(
+                        session, week_ending=week_ending)
+                if claimed:
                     from career.telegram.console import (
                         business_data,
                         week_day_states,
                     )
-                    from career.telegram.weekly_report import format_weekly_report
                     with Session(engine) as session:
                         biz = business_data(session, "7", now=now)
                         states_week = week_day_states(session, now=now)
-                    admin.send_admin(format_weekly_report(
-                        riyadh_now.date(), biz, states_week
-                    ))
+                    try:
+                        admin.send_admin(weekly.format_weekly_report(
+                            week_ending, biz, states_week,
+                            covering_through=riyadh_now.date(),
+                        ))
+                    except Exception:  # noqa: BLE001 — an unsent week is owed
+                        logger.error("weekly report send failed — releasing "
+                                     "the claim for the next sweep",
+                                     exc_info=True)
+                        with Session(engine) as session:
+                            weekly.release_weekly_report(
+                                session, restore_to=previous)
         except Exception:  # noqa: BLE001 — the loop must survive anything
             logger.error("worker cycle failed", exc_info=True)
         time.sleep(POLL_SECONDS)

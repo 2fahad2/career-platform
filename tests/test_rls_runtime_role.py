@@ -61,6 +61,14 @@ _OWNER_ENGINE_ALLOWED: frozenset[str] = frozenset(
         "scripts/run_worker_loop.py",
         "scripts/run_admin_bot.py",
         "src/career/engine/cli.py",
+        # The nightly. It contains no DB code at all — six lines, `from
+        # career.engine.cli import main`, `sys.exit(main())` — and every name
+        # this file scans for is one import away, inside `cli.main`. It was
+        # therefore invisible to the first version of this ratchet while being
+        # the process that runs the entire nightly as the superuser: the whole
+        # of `_owner_reaching_modules` below exists because of this entry.
+        # It is not a new grant. It is an old one, finally visible.
+        "scripts/run_nightly.py",
         # Operator one-shots: a human runs these by hand, for the whole estate.
         # They are the honest home of owner access and stay there (D20, stage 4).
         "scripts/replay_lost_events.py",
@@ -78,7 +86,15 @@ _LIBRARY_ROOT = "src/career"
 
 
 def _production_python_files() -> list[Path]:
-    roots = [_REPO / "src" / "career", _REPO / "scripts"]
+    """Everything importable that is not a test.
+
+    The root is `src`, not `src/career`: `src/career_core` was outside the
+    first version of this scan entirely. It has no database surface today —
+    `test_career_core_stays_out_of_the_database` below proves that rather than
+    assuming it — but «has none today» is not a property a scan should rely on
+    for a package it cannot see at all.
+    """
+    roots = [_REPO / "src", _REPO / "scripts"]
     files: list[Path] = []
     for root in roots:
         files.extend(p for p in root.rglob("*.py") if "__pycache__" not in p.parts)
@@ -89,51 +105,171 @@ def _production_python_files() -> list[Path]:
 #: Alembic needs it — and holding it is not the same as dialling it.
 _OWNER_DSN_DEFINITION = "src/career/config.py"
 
+#: Attribute names that read the owner's credentials off `Settings`.
+#: `db_owner_password` was absent from the first version, and so was `_dsn` —
+#: which is the whole of the bypass, because `config.py` exposes the DSN
+#: builder itself: `create_engine(settings._dsn("career_owner",
+#: settings.db_owner_password))` never touches `owner_database_url` and never
+#: touches `db_owner_user`. It read clean.
+_OWNER_ATTRIBUTES = frozenset(
+    {"owner_database_url", "db_owner_user", "db_owner_password", "_dsn"}
+)
 
-def _reaches_for_owner_dsn(path: Path) -> bool:
-    """True if the module READS the owner credentials off Settings.
+#: Strings that name the owner without going through Settings at all —
+#: `scripts/ci_create_app_role.py` does exactly this with raw psycopg. The
+#: role name itself is here because a hand-assembled DSN spells it out.
+_OWNER_LITERALS = frozenset({"DB_OWNER_USER", "DB_OWNER_PASSWORD", "career_owner"})
 
-    Three shapes, because the owner can be reached three ways and a scan that
-    knows only the first calls the other two clean:
-    ``settings.owner_database_url``, ``settings.db_owner_user`` (raw psycopg),
-    and ``os.environ["DB_OWNER_USER"]`` — which is how
-    `scripts/ci_create_app_role.py` does it, bypassing Settings entirely.
+#: Markers that make a string a CONNECTION STRING rather than a sentence about
+#: one. The role name is checked inside these and nowhere else, because the
+#: docstring of `career.db.session` names ``career_owner`` in prose on purpose:
+#: describing the hole is how the next reader learns why this file exists, and
+#: a guard that punishes the explanation gets the explanation deleted.
+_DSN_MARKERS = ("://", "dbname=", "user=")
+
+#: The one DSN a new module may hand to `create_engine`. Anything else — a
+#: local variable, an f-string, `settings._dsn(...)` — is a module assembling
+#: its own connection, which is the act this ratchet is about. Matching on the
+#: ATTRIBUTE rather than on the whole expression keeps `_settings.` and
+#: `settings.` and `get_settings().` all working.
+_APPROVED_ENGINE_DSN = "app_database_url"
+
+
+def _owner_signals(path: Path) -> set[str]:
+    """Why this module is (or is not) an owner-engine call site.
 
     Prose that discusses the problem — this file, and the docstring of
     `career.db.session` — is not the problem, so attribute access is read from
     the AST rather than grepped. A precise «is this passed to create_engine?»
     check is walked around by one local variable, and a ratchet is only useful
-    if it is hard to trip over by accident.
+    if it is hard to trip over by accident. So there are two independent
+    detectors and either one is enough:
+
+    * the module NAMES the owner (an attribute or a literal above), or
+    * it calls `create_engine` with anything other than `app_database_url`.
+
+    The second exists because the first is a list of names and a list of names
+    is always one rename behind. It cannot resolve what a local variable holds,
+    so it treats an unrecognised argument as an offence and makes the author
+    say so out loud.
     """
-    source = path.read_text(encoding="utf-8")
-    tree = ast.parse(source, filename=str(path))
+    signals: set[str] = set()
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute) and node.attr in {
-            "owner_database_url",
-            "db_owner_user",
-        }:
-            return True
-        if isinstance(node, ast.Constant) and node.value in {
-            "DB_OWNER_USER",
-            "DB_OWNER_PASSWORD",
-        }:
-            return True
-    return False
+        if isinstance(node, ast.Attribute) and node.attr in _OWNER_ATTRIBUTES:
+            signals.add(f"names settings.{node.attr}")
+        if isinstance(node, ast.Constant) and node.value in _OWNER_LITERALS:
+            signals.add(f"names the literal {node.value!r}")
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and "career_owner" in node.value
+            and any(marker in node.value for marker in _DSN_MARKERS)
+        ):
+            signals.add("hand-builds a DSN for the owner role")
+        if (
+            isinstance(node, ast.Call)
+            and getattr(node.func, "id", getattr(node.func, "attr", None))
+            == "create_engine"
+        ):
+            first = node.args[0] if node.args else None
+            approved = (
+                isinstance(first, ast.Attribute)
+                and first.attr == _APPROVED_ENGINE_DSN
+            )
+            if not approved:
+                signals.add(
+                    f"create_engine with a DSN that is not .{_APPROVED_ENGINE_DSN}"
+                )
+    return signals
+
+
+def _module_name(path: Path) -> str | None:
+    """The dotted name another module would import this file by."""
+    try:
+        rel = path.relative_to(_REPO / "src")
+    except ValueError:
+        return None
+    parts = list(rel.with_suffix("").parts)
+    if parts[-1] == "__init__":
+        parts.pop()
+    return ".".join(parts)
+
+
+def _imported_modules(path: Path) -> set[str]:
+    """Dotted names this file imports, absolute and relative both resolved."""
+    out: set[str] = set()
+    package = (_module_name(path) or "").rsplit(".", 1)
+    base = package[0] if len(package) > 1 else ""
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            out.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            root = node.module or ""
+            if node.level:  # `from . import x` inside the package
+                prefix = base.rsplit(".", node.level - 1)[0] if node.level > 1 else base
+                root = f"{prefix}.{root}" if root else prefix
+            out.add(root)
+            out.update(f"{root}.{alias.name}" for alias in node.names)
+    return out
+
+
+def _owner_reaching_modules() -> dict[str, str]:
+    """Direct offenders, plus everything that reaches one through an import.
+
+    `scripts/run_nightly.py` is six lines long, contains no database code, and
+    runs the entire nightly as the superuser:
+
+        from career.engine.cli import main
+        sys.exit(main())
+
+    A scanner that looks for names finds nothing in it — the names are one
+    import away. That is not an exotic evasion; it is the ordinary shape of a
+    systemd shim, and it means «which files name the owner» was never the
+    question. «Which processes end up connected as the owner» is, and an
+    import edge is the cheapest honest approximation of it available to a
+    static test.
+    """
+    files = _production_python_files()
+    by_module = {m: p for p in files if (m := _module_name(p))}
+    reaching = {
+        str(p.relative_to(_REPO)): "; ".join(sorted(signals))
+        for p in files
+        if str(p.relative_to(_REPO)) != _OWNER_DSN_DEFINITION
+        and (signals := _owner_signals(p))
+    }
+    # Transitive closure over intra-repo imports. Small graph, so the naive
+    # fixpoint is clearer than anything cleverer.
+    changed = True
+    while changed:
+        changed = False
+        for path in files:
+            rel = str(path.relative_to(_REPO))
+            if rel in reaching or rel == _OWNER_DSN_DEFINITION:
+                continue
+            for dotted in _imported_modules(path):
+                target = by_module.get(dotted)
+                if target is None:
+                    continue
+                hit = str(target.relative_to(_REPO))
+                if hit in reaching:
+                    reaching[rel] = f"imports {hit}, which reaches the owner"
+                    changed = True
+                    break
+    return reaching
 
 
 def test_no_new_production_module_builds_an_owner_engine() -> None:
     """The regression guard that did not exist. It is a ratchet, not a snapshot."""
-    offenders = sorted(
-        str(p.relative_to(_REPO))
-        for p in _production_python_files()
-        if str(p.relative_to(_REPO)) != _OWNER_DSN_DEFINITION
-        and _reaches_for_owner_dsn(p)
-    )
+    reaching = _owner_reaching_modules()
+    offenders = sorted(reaching)
     unexpected = [p for p in offenders if p not in _OWNER_ENGINE_ALLOWED]
     assert not unexpected, (
         "these modules connect as the RLS-bypassing owner role and are not on "
-        f"the D20 migration list: {unexpected}. If this is deliberate, it needs "
-        "a DEVIATIONS entry and an explicit addition here — not a silent one."
+        f"the D20 migration list: {[(p, reaching[p]) for p in unexpected]}. If this is "
+        "deliberate, it needs a DEVIATIONS entry and an explicit addition "
+        "here — not a silent one."
     )
     # And the other direction: an entry that no longer offends must be removed,
     # or the list stops meaning anything.
@@ -153,8 +289,132 @@ def test_the_session_module_itself_has_no_owner_engine() -> None:
     not on what the prose says.
     """
     path = _REPO / _LIBRARY_ROOT / "db" / "session.py"
-    assert not _reaches_for_owner_dsn(path)
+    assert not _owner_signals(path)
     assert "app_database_url" in path.read_text(encoding="utf-8")
+
+
+#: Every way found so far of reaching the owner without tripping the FIRST
+#: version of this scan. Each one is written the way a real author would write
+#: it, and each is asserted to be seen — because a ratchet nobody has tried to
+#: walk past is a ratchet nobody has tested.
+_OWNER_BYPASS_SHAPES: tuple[tuple[str, str], ...] = (
+    (
+        "the DSN builder config.py already exposes",
+        "from sqlalchemy import create_engine\n"
+        "from career.config import get_settings\n"
+        "settings = get_settings()\n"
+        "engine = create_engine(\n"
+        "    settings._dsn('career_owner', settings.db_owner_password))\n",
+    ),
+    (
+        "the password attribute the first scan did not know",
+        "from career.config import get_settings\n"
+        "dsn = f'postgresql+psycopg://x:{get_settings().db_owner_password}@h/d'\n",
+    ),
+    (
+        "the role name spelled out in a hand-built DSN",
+        "PASSWORD = 'unused'\n"
+        "DSN = 'postgresql+psycopg://career_owner:%s@127.0.0.1:5432/career'\n",
+    ),
+    (
+        "a DSN laundered through a local variable",
+        "from sqlalchemy import create_engine\n"
+        "def build(url: str):\n"
+        "    return create_engine(url, future=True)\n",
+    ),
+)
+
+
+@pytest.mark.parametrize(("label", "source"), _OWNER_BYPASS_SHAPES, ids=lambda v: v[:40])
+def test_each_known_owner_bypass_is_seen(
+    tmp_path: Path, label: str, source: str
+) -> None:
+    module = tmp_path / "new_service.py"
+    module.write_text(source, encoding="utf-8")
+    assert _owner_signals(module), f"the owner ratchet does not see: {label}"
+
+
+def test_the_ratchet_leaves_an_ordinary_app_module_alone() -> None:
+    """`career.db.session` is the shape every migrated call site should have,
+    and it must read clean or the ratchet is noise people learn to ignore."""
+    assert not _owner_signals(_REPO / "src" / "career" / "db" / "session.py")
+
+
+def test_an_import_shim_cannot_hide_the_owner_behind_one_line(tmp_path: Path) -> None:
+    """The `run_nightly.py` shape, proven rather than asserted in prose.
+
+    Written against a throwaway pair of files: the module that dials the owner
+    and the six-line shim that runs it. The shim names nothing this scan looks
+    for; the import edge is the only thing that connects it to a superuser
+    connection, and it is what the closure follows.
+    """
+    inner = tmp_path / "src" / "career" / "engine"
+    inner.mkdir(parents=True)
+    (inner / "cli.py").write_text(
+        "from sqlalchemy import create_engine\n"
+        "from career.config import get_settings\n"
+        "def main():\n"
+        "    return create_engine(get_settings().owner_database_url)\n",
+        encoding="utf-8",
+    )
+    shim = tmp_path / "scripts"
+    shim.mkdir()
+    (shim / "run_nightly.py").write_text(
+        "import sys\nfrom career.engine.cli import main\nsys.exit(main())\n",
+        encoding="utf-8",
+    )
+    assert not _owner_signals(shim / "run_nightly.py"), (
+        "the shim must be invisible to the NAME scan — that is the premise"
+    )
+    assert "career.engine.cli" in _imported_modules(shim / "run_nightly.py")
+
+
+def test_career_core_stays_out_of_the_database() -> None:
+    """The directory the first scan could not see, checked rather than assumed.
+
+    `src/career_core` is pure by charter — «no network, no LLM, no database» —
+    and is now inside the scan roots. This says the charter is still true, so
+    the day somebody gives it a session the scan above is already watching and
+    this line says why that is a decision, not a detail.
+    """
+    root = _REPO / "src" / "career_core"
+    assert root.is_dir(), "career_core moved — update the scan roots too"
+    offenders: list[str] = []
+    for path in sorted(root.rglob("*.py")):
+        if "__pycache__" in path.parts:
+            continue
+        for dotted in _imported_modules(path):
+            if dotted.split(".")[0] in {"sqlalchemy", "psycopg", "psycopg2"} or (
+                dotted.startswith("career.db")
+            ):
+                offenders.append(f"{path.relative_to(_REPO)} imports {dotted}")
+    assert not offenders, (
+        f"career_core grew a database surface: {offenders} — it is imported by "
+        "the gate and by pure-function tests precisely because it has none"
+    )
+
+
+def test_what_this_file_cannot_prove_is_written_down() -> None:
+    """The honest limit, kept where the next reader will trip over it.
+
+    A name-based AST scan can only see the names in front of it. It cannot
+    resolve `getattr(settings, "owner_" + "database_url")`, a DSN read out of a
+    file or a vault at runtime, a psycopg connection built from four separate
+    `os.environ` reads with no recognisable literal, or a library the app
+    imports that dials the database itself. The `create_engine` argument check
+    narrows the first three to «an unrecognised expression», which is a
+    warning, not proof.
+
+    The guard that would actually close this is a RUNTIME one, and it belongs
+    in the source, not here: a single factory in `career/db/session.py` that
+    every engine is built through, which parses the URL it was handed and
+    raises unless the username is the app or the sweep role — with one
+    explicitly-named escape for Alembic and the operator one-shots. Then the
+    process cannot start as the owner rather than merely being unlikely to.
+    That is a change to `src/`, which this pass does not make; this test exists
+    so the sentence survives until somebody does.
+    """
+    assert _OWNER_ENGINE_ALLOWED, "the ratchet is empty — read the docstring"
 
 
 def test_runtime_role_is_not_superuser_and_cannot_bypass_rls(

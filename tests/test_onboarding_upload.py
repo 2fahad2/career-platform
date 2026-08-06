@@ -218,34 +218,82 @@ def _recv_exact(conn: socket.socket, n: int, pending: bytearray) -> bytes:
     return out
 
 
-def _drain_request(conn: socket.socket) -> None:
-    """Speak clamd's side of the wire properly: the command is NUL-terminated,
-    and INSTREAM is length-prefixed chunks ending in a zero length. Sniffing
-    for four zero bytes would misread a PDF that happens to contain them."""
+def _drain_request(conn: socket.socket) -> bytes | None:
+    """Speak clamd's side of the wire properly and KEEP what was streamed.
+
+    The command is NUL-terminated, and INSTREAM is length-prefixed chunks
+    ending in a zero length. Sniffing for four zero bytes would misread a PDF
+    that happens to contain them.
+
+    Returns the reassembled payload for an INSTREAM, or None for any other
+    command (a PING streams nothing, and «nothing» is the right answer for it,
+    not an empty scan).
+
+    It used to return nothing at all: the chunks were read off the socket and
+    dropped. That made this harness answer «clean» to a scanner that opened the
+    stream, sent the terminator and NO FILE BYTES — which is exactly the shape
+    of the stand-in that shipped, and a real clamd answers `stream: OK` to an
+    empty stream, so such a client reads green in production while stamping
+    every `cv_uploads` row `clean`. The whole argument for running a real
+    socket server instead of a mock (see the module docstring) is that an
+    interface being called is not the same as the file being scanned — and the
+    harness was proving only that the interface was called.
+    """
     pending = bytearray()
     cmd = bytearray()
     while b"\x00" not in cmd:
         byte = _recv_exact(conn, 1, pending)
         if not byte:
-            return
+            return None
         cmd.extend(byte)
     if not bytes(cmd).startswith(b"zINSTREAM"):
-        return
+        return None
+    streamed = bytearray()
     while True:
         header = _recv_exact(conn, 4, pending)
         if len(header) < 4:
-            return
+            return bytes(streamed)
         size = struct.unpack("!I", header)[0]
         if size == 0:
-            return
-        _recv_exact(conn, size, pending)
+            return bytes(streamed)
+        streamed.extend(_recv_exact(conn, size, pending))
+
+
+class _FakeClamd:
+    """The stand-in daemon, plus what it was actually sent.
+
+    `streamed` holds one entry per INSTREAM the client opened, in order. A test
+    that never reads it is a test that only proves the socket was dialled.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.streamed: list[bytes] = []
+
+    def assert_received(self, data: bytes) -> None:
+        """The bytes on the wire were the file — the assertion that was missing.
+
+        Deliberately not a length check: a client that streams the right NUMBER
+        of bytes from the wrong buffer is a bug this harness should be able to
+        see, and `len(a) == len(b)` cannot.
+        """
+        assert self.streamed, (
+            "the scanner never opened an INSTREAM — nothing was scanned, and a "
+            "clean verdict would be a guess"
+        )
+        assert self.streamed[-1] == data, (
+            "the scanner streamed "
+            f"{len(self.streamed[-1])} bytes, the file is {len(data)} — clamd "
+            "answers OK to whatever it is given, including nothing"
+        )
 
 
 @contextlib.contextmanager
-def _fake_clamd(reply: bytes, *, delay: float = 0.0) -> Iterator[str]:
-    """A clamd stand-in on a real unix socket. Yields the socket path."""
+def _fake_clamd(reply: bytes, *, delay: float = 0.0) -> Iterator[_FakeClamd]:
+    """A clamd stand-in on a real unix socket. Yields the server handle."""
     directory = tempfile.mkdtemp()  # short path: AF_UNIX caps at ~107 bytes
     path = os.path.join(directory, "clamd.sock")
+    fake = _FakeClamd(path)
     stop = threading.Event()
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(path)
@@ -261,7 +309,9 @@ def _fake_clamd(reply: bytes, *, delay: float = 0.0) -> Iterator[str]:
             with conn:
                 conn.settimeout(3.0)
                 try:
-                    _drain_request(conn)
+                    streamed = _drain_request(conn)
+                    if streamed is not None:
+                        fake.streamed.append(streamed)
                     if delay:
                         time.sleep(delay)
                     conn.sendall(reply)
@@ -271,7 +321,7 @@ def _fake_clamd(reply: bytes, *, delay: float = 0.0) -> Iterator[str]:
     thread = threading.Thread(target=_serve, daemon=True)
     thread.start()
     try:
-        yield path
+        yield fake
     finally:
         stop.set()
         thread.join(timeout=5)
@@ -281,33 +331,96 @@ def _fake_clamd(reply: bytes, *, delay: float = 0.0) -> Iterator[str]:
 
 
 def test_clamd_reports_a_clean_file() -> None:
-    with _fake_clamd(b"stream: OK\x00") as path:
-        assert upload.ClamdScanner(path, timeout_s=3.0).scan(_pdf_with_text()) is None
+    data = _pdf_with_text()
+    with _fake_clamd(b"stream: OK\x00") as server:
+        assert upload.ClamdScanner(server.path, timeout_s=3.0).scan(data) is None
+    # «no finding» only means «clean» if the engine saw the file.
+    server.assert_received(data)
 
 
 def test_clamd_detection_becomes_a_malware_finding() -> None:
-    with _fake_clamd(b"stream: Win.Test.EICAR_HDB-1 FOUND\x00") as path:
+    data = _pdf_with_text()
+    with _fake_clamd(b"stream: Win.Test.EICAR_HDB-1 FOUND\x00") as server:
         report = upload.validate_upload(
-            _pdf_with_text(),
-            scanner=upload.ClamdScanner(path, timeout_s=3.0),
+            data,
+            scanner=upload.ClamdScanner(server.path, timeout_s=3.0),
             limits=LIMITS,
         )
     assert not report.ok
     assert "malware_detected:Win.Test.EICAR_HDB-1" in report.findings
     assert report.scanned
+    server.assert_received(data)
+
+
+def test_the_whole_file_reaches_the_engine_in_chunks() -> None:
+    """A file bigger than one INSTREAM chunk must arrive whole and in order.
+
+    The reassembled payload is compared byte for byte, so a client that drops
+    the tail, reorders chunks, or streams a truncated copy is visible — a
+    scanner that shows clamd the first kilobyte of a CV and calls the answer
+    clean is scanning a header, not a document.
+    """
+    data = _blank_pdf(pages=4) + b"%tail-marker-" + os.urandom(64)
+    with _fake_clamd(b"stream: OK\x00") as server:
+        assert upload.ClamdScanner(server.path, timeout_s=5.0).scan(data) is None
+    server.assert_received(data)
+
+
+class _EmptyStreamScanner:
+    """The stand-in that would read green everywhere else.
+
+    It speaks the protocol correctly — connect, `zINSTREAM`, terminating zero
+    length, read the reply — and sends no file bytes. A real clamd answers
+    `stream: OK` to an empty stream, so this returns «no finding», the row is
+    stamped `clean`, `report.scanned` is True, and the health probe is a PING
+    that passes. Nothing anywhere in the product can tell it from a scanner.
+    """
+
+    def __init__(self, socket_path: str) -> None:
+        self.socket_path = socket_path
+
+    def scan(self, data: bytes) -> str | None:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(3.0)
+            sock.connect(self.socket_path)
+            sock.sendall(b"zINSTREAM\x00" + struct.pack("!I", 0))
+            reply = sock.recv(1024).split(b"\x00", 1)[0].decode()
+        return None if reply.strip().endswith("OK") else reply
+
+
+def test_the_harness_notices_a_scanner_that_streams_nothing() -> None:
+    """The bypass, walked on purpose.
+
+    Every assertion the old harness made about this scanner passes: it returns
+    None, `validate_upload` reports ok and `scanned`, and the file is accepted.
+    The only thing that separates it from a real scan is what arrived on the
+    wire, which is why that is now asserted everywhere the harness is used.
+    """
+    data = _pdf_with_text()
+    with _fake_clamd(b"stream: OK\x00") as server:
+        scanner = _EmptyStreamScanner(server.path)
+        report = upload.validate_upload(data, scanner=scanner, limits=LIMITS)
+
+    assert report.ok and report.scanned          # indistinguishable, upstream
+    assert server.streamed == [b""]              # and unmistakable, here
+    with pytest.raises(AssertionError, match="clamd answers OK"):
+        server.assert_received(data)
 
 
 def test_clamd_ping_is_the_ready_light() -> None:
-    with _fake_clamd(b"PONG\x00") as path:
-        health = upload.scanner_health(upload.ClamdScanner(path, timeout_s=3.0))
+    with _fake_clamd(b"PONG\x00") as server:
+        health = upload.scanner_health(upload.ClamdScanner(server.path, timeout_s=3.0))
     assert health.state == upload.SCANNER_READY
     assert health.ok and health.engine == "clamd"
+    # a readiness probe must never send a customer's bytes anywhere (§15.13)
+    assert server.streamed == []
 
 
 def test_engine_timeout_is_a_declared_rejection_not_a_pass() -> None:
     """The hang is the dangerous one: an engine that never answers used to be
     indistinguishable from an engine that said OK."""
-    with _fake_clamd(b"stream: OK\x00", delay=3.0) as path:
+    with _fake_clamd(b"stream: OK\x00", delay=3.0) as server:
+        path = server.path
         scanner = upload.ClamdScanner(path, timeout_s=0.4)
         with pytest.raises(upload.ScannerUnavailable) as err:
             scanner.scan(_pdf_with_text())
@@ -558,16 +671,20 @@ def test_a_scanned_clean_upload_still_says_clean(
     a, _ = two_tenants
     tid = uuid.UUID(a)
     storage = FilesystemStorageAdapter(tmp_path)
-    with _fake_clamd(b"stream: OK\x00") as path, tenant_session(a) as s:
+    data = _pdf_with_text("Hello CV")
+    with _fake_clamd(b"stream: OK\x00") as server, tenant_session(a) as s:
         _grant_required(s, tid)
         row = upload.process_cv_upload(
-            s, tenant_id=tid, data=_pdf_with_text("Hello CV"),
+            s, tenant_id=tid, data=data,
             original_filename="cv.pdf",
-            scanner=upload.ClamdScanner(path, timeout_s=3.0),
+            scanner=upload.ClamdScanner(server.path, timeout_s=3.0),
             storage=storage, limits=LIMITS,
         )
         assert row.scan_status == "clean"
         assert "unscanned" not in row.scan_findings
+    # end to end: the row says `clean` AND the engine was shown the file the
+    # customer sent — the two facts the shipped stand-in decoupled.
+    server.assert_received(data)
 
 
 def test_malicious_pdf_is_rejected_and_nothing_is_stored(

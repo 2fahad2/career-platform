@@ -8,16 +8,27 @@ tenants). For each received webhook_events row it parses the Meta payload and:
 
 Per-message idempotency is by wa_message_id (inbound_messages unique); a
 redelivered message is a no-op.
+
+A failure is not a verdict on the event. Since 0022 this module distinguishes
+a TRANSIENT failure — Claude timed out, Meta answered 503, the database blinked
+— which is deferred behind a clock and tried again up to :data:`MAX_ATTEMPTS`,
+from an event that is genuinely POISONED, which is terminal and paged. The
+model, and deliberately the vocabulary, are `salla/provisioning.py`'s. The one
+thing neither retry nor budget may do is repeat something the customer already
+received, and :class:`_SendLedger` is what makes that answerable rather than
+assumed.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import logging
+import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from career.db.models import (
@@ -37,7 +48,7 @@ from career.whatsapp.activation_flow import (
     activate,
     activate_by_order_phone,
 )
-from career.whatsapp.client import WhatsAppClient
+from career.whatsapp.client import WhatsAppClient, WhatsAppSendError
 from career.whatsapp.delivery import descend_pending_delivery
 from career.whatsapp.inbound import (
     InboundKind,
@@ -766,6 +777,309 @@ def _handle_status(session: Session, st: dict[str, Any], *, now: datetime) -> No
         dm.status_updated_at = now
 
 
+#: How many times ONE event may be attempted before the worker stops trying.
+#: Five is the first attempt plus the whole ladder below: a Meta 5xx or a
+#: Claude timeout still failing forty minutes later is not a blip, and going on
+#: past that spends real Claude calls reliving the same failure.
+MAX_ATTEMPTS = 5
+
+#: The wait before attempts 2, 3, 4 and 5. The first step is far longer than
+#: the loop's 3-second poll on purpose: a lone failing event left 'received'
+#: with no clock comes straight back to the front of the queue, and twenty
+#: attempts a minute — each possibly an LLM turn — is exactly the retry storm
+#: that made `failed` terminal in the first place. The last step is only half
+#: an hour so a renewed token or a recovered Meta is picked up on its own,
+#: without the operator doing anything.
+_BACKOFF_SECONDS = (30, 120, 600, 1800)
+
+def _retryable_http(status: int) -> bool:
+    """The statuses Meta or Anthropic return that mean «ask again later».
+
+    408, 409, 425 and 429 are the Anthropic SDK's own retry set and mean the
+    same thing at Meta; anything 5xx is their side of the wire. Everything
+    else — 400, 401, 403, 404 — is a statement about the REQUEST, and asking
+    again with the same request gets the same answer, five times, on a clock.
+    """
+    return status in (408, 409, 425, 429) or status >= 500
+
+
+def _graph_http_status(exc: BaseException) -> int | None:
+    """The HTTP status inside a :class:`WhatsAppSendError`, if it carries one.
+
+    The client flattens Meta's answer into the exception TEXT («graph HTTP 503
+    (code 131026)») and keeps no attribute, so reading it back out of the
+    string is the only way to tell a 503 from a 400 without editing a module
+    this change does not own. The word boundary matters: Meta's own numeric
+    error code sits in the same string and is five or six digits long, so it
+    can never be mistaken for a status. A message with no status at all —
+    «no storage wired for document refs» — returns None and is treated as
+    poison, which is right: that is a wiring bug, not weather.
+    """
+    match = re.search(r"\b([1-5]\d\d)\b", str(exc))
+    return int(match.group(1)) if match else None
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """Would attempting this event again plausibly succeed?
+
+    The two-tier model is `salla/provisioning.py`'s and the vocabulary is
+    deliberately the same one: a TRANSIENT failure is the world being briefly
+    unavailable and the event is fine, so it is deferred and tried again; a
+    POISONED event is one we could actually look at and could not process, so
+    it is terminal and the operator hears about it. What differs from Salla is
+    which side is the safe default, and here it is POISON.
+
+    Salla's default is «retry, never destroy a paid order»: an order dropped
+    on the floor is money taken for a service never provisioned, and a Salla
+    retry re-reads an API and writes idempotently — it cannot embarrass anyone.
+    An inbound WhatsApp turn is the opposite trade. A retry re-runs a
+    conversation: it can re-answer a customer, re-ask a question they already
+    answered, and pay for another Claude call to do it. And a message that is
+    never re-driven is not lost the way an order is — the customer is a live
+    human in an open 24h window who writes again, and the operator is told the
+    same minute. So an exception type we have not thought about lands as
+    poison, and only a named, argued list is retried:
+
+    * `WhatsAppSendError` carrying a 429 or a 5xx — Meta refused the send
+      itself, so nothing reached the customer and repeating it is honest.
+      Carrying a 4xx (a bad template name, an expired token) it is poison.
+    * Anything from the `anthropic` SDK with no status (a connection reset, a
+      timeout) or with a retryable one. A `RateLimitError` at 06:00 during the
+      daily fan-out is the single likeliest transient failure this worker has.
+    * `sqlalchemy` `OperationalError` / `InterfaceError` — the connection died
+      or the server restarted. `IntegrityError`, `ProgrammingError` and
+      `DataError` are deterministic: the same rows and the same SQL fail the
+      same way forever.
+    * `OSError`, which in this codebase means the transport layer: the builtin
+      `TimeoutError` and `ConnectionError` are subclasses of it, and so is
+      every `requests` transport exception.
+
+    `AttributeError`, `KeyError`, `TypeError`, `ValueError` — the shapes a
+    malformed Meta payload and a bug in our own routing both take — are poison
+    by falling off the end, which is the behaviour the 2026-07-19 row and
+    `test_poisoned_event_is_isolated_not_retried_forever` already expect.
+
+    This function is called from an `except` block and must never raise: a
+    classifier that throws would turn one lost message into a wedged queue.
+    """
+    try:
+        if isinstance(exc, WhatsAppSendError):
+            status = _graph_http_status(exc)
+            return status is not None and _retryable_http(status)
+
+        module = (type(exc).__module__ or "").split(".")[0]
+        if module == "anthropic":
+            # The SDK raises APIConnectionError / APITimeoutError with no
+            # status and APIStatusError subclasses with one; both are honest
+            # about which they are, so neither needs importing to be read.
+            status = getattr(exc, "status_code", None)
+            if not isinstance(status, int):
+                return True
+            return _retryable_http(status)
+
+        # `retryable` is SallaApiError's own word for exactly this question —
+        # the fallback text path reads the subscription through the salla
+        # package, so its errors can surface here.
+        retryable = getattr(exc, "retryable", None)
+        if isinstance(retryable, bool):
+            return retryable
+
+        from sqlalchemy.exc import InterfaceError, OperationalError
+
+        if isinstance(exc, OperationalError | InterfaceError):
+            return True
+        return isinstance(exc, OSError)
+    except Exception:  # noqa: BLE001 — an unclassifiable failure is poison
+        logger.warning("failure classification failed", exc_info=True)
+        return False
+
+
+def _failure_detail(exc: BaseException) -> str:
+    """The exception's CLASS name, and never `str(exc)`.
+
+    This value is written to a row the operator reads. Exception messages in
+    this codebase routinely carry a phone number, a Meta id or a fragment of
+    what the customer typed, and constant 13 admits neither to a log nor to
+    the admin channel. A class name is a fact about our code, not about them.
+    """
+    cls = type(exc)
+    module = (cls.__module__ or "").split(".")[0]
+    return f"{module}.{cls.__name__}"[:64]
+
+
+class _SendLedger:
+    """Has this attempt already said something the retry would say again?
+
+    THE constraint on retrying an inbound turn: a second attempt re-runs the
+    payload from the top, and `_handle_message` skips a message only when its
+    `inbound_messages` row is on disk (`_inbound_exists`). Everything a failed
+    attempt did to the database is rolled back — everything it said to the
+    customer is not. So the question that decides whether a retry is allowed
+    is not «what kind of exception» but «did we already speak, with nothing
+    committed to prove it».
+
+    It is answered by counting rather than by listing paths, because a list of
+    safe paths is a list that rots the first time a branch grows a send. Every
+    `send*` call on the wrapped client is counted, and the count is reset at
+    the start of each message: sends made for an EARLIER message in the same
+    event do not block the retry, because that message committed its inbound
+    row and the retry will skip it entirely.
+
+    A send that raised is counted only when delivery is genuinely unknowable.
+    A `WhatsAppSendError` carrying an HTTP status is Meta's complete refusal —
+    the message was never accepted, so retrying it duplicates nothing, and
+    that is precisely the Meta-5xx case this whole change exists to retry. A
+    timeout or a dropped connection is the opposite: the send may well have
+    landed, and we do not repeat what we cannot rule out.
+
+    ``unrecorded`` is the sticky half. A path that speaks WITHOUT writing an
+    inbound row — the «أرسل رمز التفعيل» reply to an unknown number, a
+    samples reply, an activation that sent a welcome before it could commit —
+    leaves nothing for the retry to skip on, so from that point the whole
+    event is unsafe even if a later message fails cleanly.
+    """
+
+    def __init__(self, inner: WhatsAppClient) -> None:
+        self._inner = inner
+        self._message_sends = 0
+        self._unrecorded = False
+
+    def start_event(self) -> None:
+        self._message_sends = 0
+        self._unrecorded = False
+
+    def start_message(self) -> None:
+        self._message_sends = 0
+
+    def note_unrecorded(self) -> None:
+        self._unrecorded = True
+
+    @property
+    def spoke(self) -> bool:
+        """Did the message being handled right now already send something?"""
+        return self._message_sends > 0
+
+    @property
+    def would_repeat(self) -> bool:
+        """Would a retry of this event put a message in front of a customer
+        that the failed attempt already put there?"""
+        return self._unrecorded or self._message_sends > 0
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("_"):           # never proxy our own internals
+            raise AttributeError(name)
+        attr = getattr(self._inner, name)
+        if not name.startswith("send") or not callable(attr):
+            return attr                    # download_media and friends: pass
+
+        def _counted(*args: Any, **kwargs: Any) -> Any:
+            try:
+                result = attr(*args, **kwargs)
+            except Exception as exc:  # noqa: BLE001 — re-raised untouched
+                refused = (isinstance(exc, WhatsAppSendError)
+                           and _graph_http_status(exc) is not None)
+                if not refused:
+                    self._message_sends += 1   # delivery unknowable
+                raise
+            self._message_sends += 1
+            return result
+
+        return _counted
+
+
+def _defer_event(ev: WebhookEvent, *, attempts: int, now: datetime,
+                 exc: BaseException) -> None:
+    """Leave the event exactly where it is, behind a clock.
+
+    The counterpart of :func:`_dead_letter`, and `salla/provisioning.py`'s
+    `_defer_webhook` with the one thing that file does not need: a time.
+    Salla defers WHOLESALE — the condition it retries on (Salla unreachable)
+    applies to every waiting order at once, so it breaks the batch and sleeps
+    the process. A WhatsApp event fails alone while every other event around
+    it is healthy, so «still 'received'» without «not before» is a three-second
+    retry loop. `processing_status` stays 'received' — the only status the
+    query below selects — and `processed_at` stays NULL, because it was not.
+    """
+    ev.attempt_count = attempts
+    ev.next_attempt_at = now + timedelta(
+        seconds=_BACKOFF_SECONDS[min(attempts - 1, len(_BACKOFF_SECONDS) - 1)]
+    )
+    ev.failure_kind = "transient"
+    ev.failure_detail = _failure_detail(exc)
+
+
+def _dead_letter(session: Session, ev: WebhookEvent, admin_client: Any, *,
+                 kind: str, attempts: int, exc: BaseException) -> None:
+    """Stop trying, say so out loud, and leave the row able to explain itself.
+
+    Terminal is still `processing_status = 'failed'`: it is the status
+    `scripts/replay_lost_events.py` selects and the status its safety rule is
+    written against (it refuses to re-drive a `failed` MESSAGES event, on the
+    reasoning this class implements — the worker may already have answered the
+    customer). Inventing a second terminal name would make every existing
+    reader blind to half the dead. The reason lives in `failure_kind` instead:
+
+    `poison`        — an event we could look at and could not process.
+    `exhausted`     — retryable, retried, still failing after MAX_ATTEMPTS.
+    `already_spoke` — retryable, but this attempt had already sent something
+                      to the customer, so a retry would say it twice.
+
+    «Visible» means three things, because a status nobody reads is what the
+    2026-07-19 row proves: an ERROR line (the watchtower's error screen
+    harvests our own ERROR lines out of journalctl — a WARNING would not
+    arrive), a Telegram notice naming WHOSE turn was lost by TEN code, and the
+    row itself, which :func:`dead_letter_summary` reads for a console screen.
+    """
+    session.rollback()
+    ev.processing_status = "failed"
+    ev.attempt_count = attempts
+    ev.processed_at = func.now()
+    ev.next_attempt_at = None          # nothing is waiting on a clock any more
+    ev.failure_kind = kind
+    ev.failure_detail = _failure_detail(exc)
+    logger.error(
+        "whatsapp event dead-lettered (%s, attempt %d): %s",
+        kind, attempts, _failure_detail(exc), exc_info=True,
+    )
+    reason = {
+        "poison": "الحدث نفسه ما نقدر نعالجه",
+        "exhausted": "جرّبنا كل المحاولات وما نجحت",
+        "already_spoke": "رددنا على العميل قبل الفشل، وما نعيد عشان ما نرسل مرتين",
+    }.get(kind, "توقفنا عن المحاولة")
+    try:
+        # WHOSE turn was lost. The unnamed notice made the operator read the
+        # journal to find out, and «راجع السجل» is not an instruction anyone
+        # can act on at 6am. The TEN codes sit on their own line: a Latin code
+        # inside an Arabic sentence is scrambled by his client (§16).
+        admin_client.send_admin(
+            "⚠️ رسالة واتساب واردة توقّفنا عن معالجتها\n"
+            f"{_event_ten_codes(session, ev.payload or {})}\n"
+            f"السبب: {reason}"
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning("admin note failed", exc_info=True)
+
+
+def dead_letter_summary(session: Session, *, provider: str = "whatsapp",
+                        ) -> dict[str, int]:
+    """The dead letter queue, counted by reason — PII-free by construction.
+
+    Written for the watchtower: the console owns no screen for this yet, and
+    a dead letter nobody can list is the failure this change exists to end.
+    Returns `{failure_kind: count}` plus `total`, so a screen is a render
+    away and an operator with a psql prompt has the same answer.
+    """
+    rows = session.execute(
+        select(WebhookEvent.failure_kind, func.count(WebhookEvent.id))
+        .where(WebhookEvent.provider == provider,
+               WebhookEvent.processing_status == "failed")
+        .group_by(WebhookEvent.failure_kind)
+    ).all()
+    summary = {str(kind or "unknown"): int(count) for kind, count in rows}
+    summary["total"] = sum(summary.values())
+    return summary
+
+
 def process_pending_whatsapp(
     owner_session: Session, *,
     whatsapp_client: WhatsAppClient, admin_client: TelegramAdminClient,
@@ -775,48 +1089,88 @@ def process_pending_whatsapp(
     events = list(owner_session.execute(
         select(WebhookEvent)
         .where(WebhookEvent.provider == "whatsapp",
-               WebhookEvent.processing_status == "received")
+               WebhookEvent.processing_status == "received",
+               # a deferred event is invisible until its clock runs out, so a
+               # backing-off row can never hold the head of the queue (the
+               # batch is ordered by received_at and `limit` is what it fills)
+               or_(WebhookEvent.next_attempt_at.is_(None),
+                   WebhookEvent.next_attempt_at <= now))
         .order_by(WebhookEvent.received_at)
         .limit(limit)
     ).scalars().all())
 
-    counts = {"messages": 0, "statuses": 0, "failed": 0}
+    # Every send this worker can cause goes through the ledger — including the
+    # conversation's own, which is the majority of them: the orchestrator and
+    # the funnel send through `Deps.whatsapp_client`, so handing them the raw
+    # client would have left the LLM branches, the ones that actually time
+    # out, invisible to the retry-safety check.
+    ledger = _SendLedger(whatsapp_client)
+    deps = (None if onboarding is None
+            else dataclasses.replace(onboarding, whatsapp_client=ledger))
+
+    counts = {"messages": 0, "statuses": 0, "failed": 0, "deferred": 0}
     for ev in events:
         # audit fix: one poisoned event must never wedge the whole queue —
         # without this isolation a single raise left the event 'received'
         # and every later customer frozen behind an infinite retry.
+        ledger.start_event()
         try:
             payload: dict[str, Any] = ev.payload or {}
             for entry in payload.get("entry", []) or []:
                 for change in entry.get("changes", []) or []:
                     value = change.get("value", {}) or {}
                     for msg in value.get("messages", []) or []:
+                        ledger.start_message()
                         _handle_message(owner_session, msg,
-                                        whatsapp_client=whatsapp_client,
+                                        whatsapp_client=ledger,
                                         admin_client=admin_client, now=now,
-                                        onboarding=onboarding)
+                                        onboarding=deps)
                         counts["messages"] += 1
+                        if ledger.spoke and not _inbound_exists(
+                                owner_session, str(msg.get("id") or "")):
+                            # it answered and recorded nothing, so a retry has
+                            # nothing to skip on — the whole event is now
+                            # unsafe to repeat, however the next one fails
+                            ledger.note_unrecorded()
                     for st in value.get("statuses", []) or []:
                         _handle_status(owner_session, st, now=now)
                         counts["statuses"] += 1
             ev.processing_status = "processed"
-        except Exception:  # noqa: BLE001 — isolate, record, move on
-            logger.error("whatsapp event processing failed", exc_info=True)
-            owner_session.rollback()
-            ev.processing_status = "failed"       # honest, no silent retry loop
-            counts["failed"] += 1
-            try:
-                # WHOSE turn was lost. The unnamed notice made the operator
-                # read the journal to find out, and «راجع السجل» is not an
-                # instruction anyone can act on at 6am.
-                admin_client.send_admin(
-                    "⚠️ رسالة واتساب واردة فشلت معالجتها وعُزلت "
-                    f"{_event_ten_codes(owner_session, ev.payload or {})} "
-                    "— راجع السجل"
+            ev.processed_at = func.now()
+            ev.attempt_count = ev.attempt_count + 1
+            ev.next_attempt_at = None
+            # failure_kind is deliberately NOT cleared: a row that succeeded on
+            # its third attempt should still say what it survived.
+        except Exception as exc:  # noqa: BLE001 — classify, record, move on
+            attempts = ev.attempt_count + 1
+            if not _is_transient(exc):
+                _dead_letter(owner_session, ev, admin_client,
+                             kind="poison", attempts=attempts, exc=exc)
+                counts["failed"] += 1
+            elif ledger.would_repeat:
+                # The one refusal that is not about the exception at all. This
+                # is the same rule `replay_lost_events.py` applies by hand to
+                # a `failed` messages event — «the worker already sent, then
+                # rolled back; a replay would message the customer twice» —
+                # except that here the worker KNOWS, so it does not have to
+                # assume the worst about every event of that shape.
+                _dead_letter(owner_session, ev, admin_client,
+                             kind="already_spoke", attempts=attempts, exc=exc)
+                counts["failed"] += 1
+            elif attempts >= MAX_ATTEMPTS:
+                _dead_letter(owner_session, ev, admin_client,
+                             kind="exhausted", attempts=attempts, exc=exc)
+                counts["failed"] += 1
+            else:
+                # The world is briefly broken and this event is fine. Nothing
+                # terminal, nothing thrown away, nobody paged — the operator
+                # does not need to know that Meta was slow for thirty seconds.
+                owner_session.rollback()
+                _defer_event(ev, attempts=attempts, now=now, exc=exc)
+                counts["deferred"] += 1
+                logger.warning(
+                    "whatsapp event deferred (attempt %d): %s",
+                    attempts, _failure_detail(exc), exc_info=True,
                 )
-            except Exception:  # noqa: BLE001
-                logger.warning("admin note failed", exc_info=True)
-        ev.processed_at = func.now()
-        ev.attempt_count = ev.attempt_count + 1
         owner_session.commit()
     return counts

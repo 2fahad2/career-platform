@@ -23,8 +23,26 @@ each one would have done to a host built from it:
 
 Hand-checking that list is what produced it in the first place. So the list is
 not the deliverable — this file is: the required set is DERIVED from the
-`Settings` fields, the compose interpolations and the ops scripts, and drift in
-either direction fails here.
+`Settings` fields and from the compose interpolations, and drift in either
+direction fails here.
+
+Two corrections, 2026-08-06, both to this file rather than to the templates:
+
+* The derivation read `{field.alias for … if field.alias}`. Every field
+  happens to declare an alias today, so the set looked complete — but
+  pydantic-settings populates an ALIAS-LESS field from its own name uppercased,
+  with no alias anywhere to collect. The next `foo: str = ""` written without
+  `Field(alias=...)` would have been read from `FOO` in production, absent from
+  all three templates, and green here: verbatim the failure the file exists to
+  prevent, arriving through the one door it was not watching.
+  `test_an_alias_less_field_is_still_an_environment_variable` proves the fix
+  against pydantic itself rather than against a belief about pydantic.
+* The docstring above used to say the required set was derived from «the ops
+  scripts» too. It was not, and it cannot honestly be: the shell in `ops/` and
+  `scripts/` is full of `$WORK`, `$TABLES`, `$RESTORED` — local variables that
+  have nothing to do with the secrets file. `_UNREAD_BUT_REQUIRED` below is a
+  hand-written list and now says so, with a guard that keeps every entry
+  honest: the day a key there acquires a real reader, it must leave.
 """
 
 from __future__ import annotations
@@ -40,10 +58,15 @@ TEMPLATES = (
     ".env.production.example",
 )
 
-#: Keys no `Settings` field reads, which the templates must still carry.
-#: Each is a real thing a rebuilt host needs; the value is WHY, and the test
-#: below insists that the why is written next to the key in the file too — an
-#: unexplained key that nothing reads is a key the next person deletes.
+#: Keys no `Settings` field reads and no compose file interpolates, which the
+#: templates must still carry. HAND-WRITTEN, deliberately and unavoidably:
+#: there is no artefact in this repository to derive them from, because their
+#: reader is either docker itself or a human with the runbook open. Each is a
+#: real thing a rebuilt host needs; the value is WHY, and the tests below
+#: insist that the why is written next to the key in the file too — an
+#: unexplained key that nothing reads is a key the next person deletes — and
+#: that the key really does have no reader, so an entry cannot quietly become
+#: a duplicate of a `Settings` field nobody noticed.
 _UNREAD_BUT_REQUIRED = {
     # docker compose itself reads this from --env-file: it names the project
     # whose volumes hold the database and every customer's files. Wrong value,
@@ -76,12 +99,22 @@ def _entries(path: str) -> dict[str, str]:
     return out
 
 
-def _settings_aliases() -> set[str]:
-    """Every environment variable a `Settings` field reads — the authority."""
-    from career.config import Settings
+def _settings_env_names(model: type = None) -> set[str]:  # type: ignore[assignment]
+    """Every environment variable a settings field reads — the authority.
 
+    An alias when there is one, and the field's own name uppercased when there
+    is not. That second half is the whole point: pydantic-settings does not
+    require an alias to read the environment, so «has an alias» was never the
+    same question as «is read from the environment», and the first version of
+    this function asked the wrong one.
+    """
+    if model is None:
+        from career.config import Settings
+
+        model = Settings
     return {
-        field.alias for field in Settings.model_fields.values() if field.alias
+        field.alias or name.upper()
+        for name, field in model.model_fields.items()  # type: ignore[attr-defined]
     }
 
 
@@ -98,7 +131,80 @@ def _compose_variables() -> set[str]:
 
 
 def _required_keys() -> set[str]:
-    return _settings_aliases() | _compose_variables() | set(_UNREAD_BUT_REQUIRED)
+    return _settings_env_names() | _compose_variables() | set(_UNREAD_BUT_REQUIRED)
+
+
+# ── the derivation itself, checked against pydantic rather than against faith ─
+
+
+def test_an_alias_less_field_is_still_an_environment_variable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The hole the collector had, closed and then walked into on purpose.
+
+    Two things are asserted, and only together do they mean anything: that
+    pydantic-settings really does populate a field with no alias from its own
+    name uppercased (so the derivation is a fact about the library, not a
+    guess), and that the collector now returns that name. Assert only the
+    second and the guard is a mirror; assert only the first and nothing
+    connects it to the templates.
+    """
+    from pydantic import Field
+    from pydantic_settings import BaseSettings, SettingsConfigDict
+
+    class Drifting(BaseSettings):
+        model_config = SettingsConfigDict(env_file=None, extra="ignore")
+
+        aliased: str = Field(default="", alias="ALIASED_KEY")
+        # written by the next person in a hurry — no Field(), no alias
+        forgotten_key: str = ""
+
+    monkeypatch.setenv("FORGOTTEN_KEY", "it-was-read-all-along")
+    assert Drifting().forgotten_key == "it-was-read-all-along"
+    assert _settings_env_names(Drifting) == {"ALIASED_KEY", "FORGOTTEN_KEY"}
+
+
+@pytest.mark.parametrize("template", TEMPLATES)
+def test_the_drift_check_would_catch_an_alias_less_field(template: str) -> None:
+    """And the collector's answer reaches the assertion.
+
+    A settings field is added, no alias, nobody touches the templates: the
+    missing-key computation the three tests below run must name it. This is
+    the failure that was green.
+    """
+    invented = "A_FIELD_NOBODY_ADDED_TO_THE_TEMPLATES"
+    required = _required_keys() | {invented}
+    assert invented in required - set(_entries(template))
+
+
+def test_the_derivation_assumes_no_env_prefix() -> None:
+    """`NAME.upper()` is the right env name only while there is no prefix.
+
+    Setting `env_prefix` would rename every alias-less field's variable at once
+    and this collector would go back to being confidently wrong — so the
+    assumption is asserted instead of remembered.
+    """
+    from career.config import Settings
+
+    assert not Settings.model_config.get("env_prefix"), (
+        "Settings grew an env_prefix — _settings_env_names must prepend it"
+    )
+
+
+def test_every_unread_key_really_has_no_reader() -> None:
+    """The hand-written list has to stay hand-written for a stated reason.
+
+    An entry that acquires a `Settings` field or a compose interpolation is no
+    longer «a key nothing reads»; leaving it here would keep a false reason in
+    front of the next reader and would hide the fact that the code now depends
+    on it. Move it out — the derived sets already carry it.
+    """
+    derived = _settings_env_names() | _compose_variables()
+    overlap = sorted(set(_UNREAD_BUT_REQUIRED) & derived)
+    assert not overlap, (
+        f"these are listed as read by nothing but are now derived: {overlap} — "
+        "delete them from _UNREAD_BUT_REQUIRED, the reason beside them is stale"
+    )
 
 
 # ── the drift itself ─────────────────────────────────────────────────────────

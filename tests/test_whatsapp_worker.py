@@ -1173,3 +1173,309 @@ def test_the_skip_notice_survives_a_dead_socket_too() -> None:
     precisely the case the bargain was made for."""
     runner = _admin_runner()
     runner._skip_poisoned_update(_FlakyTelegram(fail_on=1))   # must not raise
+
+
+# ── transient failure vs poisoned event (0022) ──────────────────────────────
+# Theme: `failed` was written on ANY exception and `failed` is terminal —
+# nothing in this codebase re-selects it. One row from 2026-07-19 is still
+# sitting in staging because Claude, or Meta, or the database, was briefly
+# unavailable. A retryable failure now waits behind a clock; only an event we
+# could look at and could not process, an exhausted budget, or an attempt that
+# had already answered the customer is allowed to be terminal.
+
+
+class _MetaRefusingWithStatus(FakeWhatsAppClient):
+    """Meta answering 503: a COMPLETE HTTP answer, so the send was refused
+    outright and the customer received nothing."""
+
+    def send_text(self, to_phone: str, body: str) -> str:
+        from career.whatsapp.client import WhatsAppSendError
+
+        raise WhatsAppSendError("graph HTTP 503 (code 131026)")
+
+
+class _MetaTimingOut(FakeWhatsAppClient):
+    """The other shape entirely: the request never came back, so whether the
+    customer got the message is unknowable — and unknowable is not retryable."""
+
+    def send_text(self, to_phone: str, body: str) -> str:
+        raise TimeoutError("read timed out")
+
+
+class _RefusingAfterFirstSend(FakeWhatsAppClient):
+    """The first send lands; every later one is refused with a status."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    def send_text(self, to_phone: str, body: str) -> str:
+        from career.whatsapp.client import WhatsAppSendError
+
+        self.calls += 1
+        if self.calls > 1:
+            raise WhatsAppSendError("graph HTTP 503 (code 131026)")
+        return super().send_text(to_phone, body)
+
+
+def _wa_event(owner_session: Session, msgs: list[dict[str, Any]]) -> uuid.UUID:
+    ev = WebhookEvent(
+        id=uuid.uuid4(), provider="whatsapp", event_type="messages",
+        event_fingerprint=f"wa:{uuid.uuid4()}", signature_valid=True,
+        payload=_payload(msgs), processing_status="received",
+    )
+    owner_session.add(ev)
+    owner_session.commit()
+    return ev.id
+
+
+def _ev_row(owner_engine: Engine, ev_id: uuid.UUID) -> Any:
+    with Session(owner_engine) as s:
+        return s.execute(select(WebhookEvent).where(
+            WebhookEvent.id == ev_id)).scalar_one()
+
+
+def test_a_meta_5xx_leaves_the_message_alive_behind_a_clock(
+    owner_session: Session, owner_engine: Engine, clean_billing: None
+) -> None:
+    """The 2026-07-19 row, replayed. An unknown number gets the «أرسل رمز
+    التفعيل» reply; Meta answers 503. Nothing about that event is wrong, and
+    marking it `failed` — the status nothing re-selects — threw the customer's
+    first message away over thirty seconds of Meta being unwell."""
+    admin = FakeTelegramAdminClient()
+    ev_id = _wa_event(owner_session, [
+        _text_msg(f"wamid-{uuid.uuid4()}", _phone(), "السلام عليكم")])
+
+    counts = _run(owner_session, _MetaRefusingWithStatus(), admin)
+
+    assert counts == {"messages": 0, "statuses": 0, "failed": 0, "deferred": 1}
+    row = _ev_row(owner_engine, ev_id)
+    assert row.processing_status == "received"   # still the worker's to do
+    assert row.attempt_count == 1
+    assert row.failure_kind == "transient"
+    assert row.failure_detail == "career.WhatsAppSendError"
+    assert row.next_attempt_at == NOW + timedelta(seconds=30)
+    assert row.processed_at is None              # because it was not
+    assert admin.messages == []                 # a blip is not an incident
+
+
+def test_a_deferred_event_is_invisible_until_its_clock_runs_out(
+    owner_session: Session, owner_engine: Engine, clean_billing: None
+) -> None:
+    """The clock is the whole difference between a retry and a retry storm:
+    the loop polls every three seconds, so an event left «received» with no
+    next-attempt time comes straight back to the front of the queue and is
+    tried twenty times a minute — which is exactly why `failed` was made
+    terminal in the first place."""
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    ev_id = _wa_event(owner_session, [
+        _text_msg(f"wamid-{uuid.uuid4()}", _phone(), "السلام عليكم")])
+    _run(owner_session, _MetaRefusingWithStatus(), admin)
+
+    early = _run(owner_session, wa, admin, now=NOW + timedelta(seconds=29))
+    assert early == {"messages": 0, "statuses": 0, "failed": 0, "deferred": 0}
+    assert wa.sent == []                         # not even looked at
+
+    late = _run(owner_session, wa, admin, now=NOW + timedelta(seconds=31))
+    assert late["messages"] == 1
+    row = _ev_row(owner_engine, ev_id)
+    assert row.processing_status == "processed"
+    assert row.attempt_count == 2
+    assert row.next_attempt_at is None
+    assert len(wa.sent) == 1                     # the reply it owed, once
+
+
+def test_a_retry_never_repeats_what_the_customer_may_already_have(
+    owner_session: Session, owner_engine: Engine, clean_billing: None
+) -> None:
+    """THE constraint. A timeout is retryable weather by every rule in
+    `_is_transient`, and it is still not retried here: the request never came
+    back, so the reply may well have landed, and the retry would send it a
+    second time. Refused, named, and handed to the operator instead."""
+    admin = FakeTelegramAdminClient()
+    phone = _phone()
+    ev_id = _wa_event(owner_session, [
+        _text_msg(f"wamid-{uuid.uuid4()}", phone, "السلام عليكم")])
+
+    counts = _run(owner_session, _MetaTimingOut(), admin)
+
+    assert counts["failed"] == 1 and counts["deferred"] == 0
+    row = _ev_row(owner_engine, ev_id)
+    assert row.processing_status == "failed"
+    assert row.failure_kind == "already_spoke"
+    assert row.failure_detail == "builtins.TimeoutError"
+    assert row.next_attempt_at is None
+    # the operator hears about it, by TEN code, never by phone (§15.13)
+    assert len(admin.messages) == 1
+    assert phone not in admin.messages[0]
+    assert phone.lstrip("+") not in admin.messages[0]
+
+
+def test_a_reply_that_recorded_nothing_makes_the_whole_event_unsafe(
+    owner_session: Session, owner_engine: Engine, clean_billing: None
+) -> None:
+    """The sticky half of the ledger. The «أرسل رمز التفعيل» reply to an
+    unknown number writes no inbound row, so there is nothing for a retry to
+    skip on: once one message in an event has answered a customer off the
+    record, a later failure cannot be retried either, however cleanly it
+    failed."""
+    admin = FakeTelegramAdminClient()
+    ev_id = _wa_event(owner_session, [
+        _text_msg(f"wamid-{uuid.uuid4()}", _phone(), "السلام عليكم"),
+        _text_msg(f"wamid-{uuid.uuid4()}", _phone(), "وعليكم السلام"),
+    ])
+
+    counts = _run(owner_session, _RefusingAfterFirstSend(), admin)
+
+    assert counts["failed"] == 1
+    row = _ev_row(owner_engine, ev_id)
+    assert row.processing_status == "failed"
+    assert row.failure_kind == "already_spoke"
+
+
+def test_a_recorded_sibling_does_not_block_the_retry(
+    owner_session: Session, owner_engine: Engine, clean_billing: None
+) -> None:
+    """And the mirror, which is what makes the rule usable at all. The STOP in
+    the same event committed its inbound row BEFORE it spoke, so the retry
+    skips it (`_inbound_exists`) and cannot repeat its confirmation — the
+    second message is therefore free to be deferred like any other."""
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    phone = _activate_phone(owner_session, wa, admin)
+    ev_id = _wa_event(owner_session, [
+        _text_msg(f"wamid-{uuid.uuid4()}", phone, "إيقاف الرسائل"),
+        _text_msg(f"wamid-{uuid.uuid4()}", _phone(), "السلام عليكم"),
+    ])
+
+    counts = _run(owner_session, _RefusingAfterFirstSend(), admin)
+
+    assert counts["deferred"] == 1 and counts["failed"] == 0
+    row = _ev_row(owner_engine, ev_id)
+    assert row.processing_status == "received"
+    assert row.failure_kind == "transient"
+    with Session(owner_engine) as s:
+        opt_out = s.execute(text(
+            "SELECT opt_out_at FROM customer_channels WHERE phone_e164 = :p"),
+            {"p": phone}).scalar_one()
+    assert opt_out is not None       # committed before the sibling failed
+
+
+def test_the_attempt_budget_is_bounded(
+    owner_session: Session, owner_engine: Engine, clean_billing: None
+) -> None:
+    """A retry that never gives up is a slower version of the retry storm: it
+    holds a batch slot forever and, on the conversation paths, pays for a
+    Claude call every time round. Five attempts across roughly forty minutes,
+    then it stops and says so."""
+    from career.whatsapp.worker import _BACKOFF_SECONDS, MAX_ATTEMPTS
+
+    admin = FakeTelegramAdminClient()
+    ev_id = _wa_event(owner_session, [
+        _text_msg(f"wamid-{uuid.uuid4()}", _phone(), "السلام عليكم")])
+
+    at = NOW
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        counts = _run(owner_session, _MetaRefusingWithStatus(), admin, now=at)
+        row = _ev_row(owner_engine, ev_id)
+        assert row.attempt_count == attempt
+        if attempt < MAX_ATTEMPTS:
+            assert counts["deferred"] == 1
+            assert row.processing_status == "received"
+            at = row.next_attempt_at
+        else:
+            assert counts["failed"] == 1
+            assert row.processing_status == "failed"
+            assert row.failure_kind == "exhausted"
+            assert row.next_attempt_at is None
+    assert at == NOW + timedelta(seconds=sum(_BACKOFF_SECONDS))
+    assert len(admin.messages) == 1  # one notice at the end, not five
+
+
+def test_a_poisoned_event_is_terminal_on_its_first_attempt(
+    owner_session: Session, owner_engine: Engine, clean_billing: None
+) -> None:
+    """Nothing about the budget applies to an event we can read and cannot
+    process: `text: None` crashes `_text_of` the same way five times, and
+    spending forty minutes proving it would only delay the operator's notice."""
+    admin = FakeTelegramAdminClient()
+    ev_id = _wa_event(owner_session, [
+        {"id": f"wamid-{uuid.uuid4()}", "from": _phone(),
+         "type": "text", "text": None}])
+
+    counts = _run(owner_session, FakeWhatsAppClient(), admin)
+
+    assert counts["failed"] == 1
+    row = _ev_row(owner_engine, ev_id)
+    assert row.processing_status == "failed"
+    assert row.failure_kind == "poison"
+    assert row.failure_detail == "builtins.AttributeError"
+    assert row.attempt_count == 1
+    assert len(admin.messages) == 1
+
+
+def test_the_dead_letter_can_be_listed_not_just_logged(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """A status nobody reads is what the 2026-07-19 row proves, so the reasons
+    are countable from the database and not only from journalctl."""
+    from career.whatsapp.worker import dead_letter_summary
+
+    before = dead_letter_summary(owner_session)
+    _wa_event(owner_session, [
+        {"id": f"wamid-{uuid.uuid4()}", "from": _phone(),
+         "type": "text", "text": None}])
+    _run(owner_session, FakeWhatsAppClient(), FakeTelegramAdminClient())
+
+    after = dead_letter_summary(owner_session)
+    assert after["poison"] == before.get("poison", 0) + 1
+    assert after["total"] == before["total"] + 1
+
+
+def test_the_classifier_defaults_to_the_side_that_cannot_double_send() -> None:
+    """Salla's default is «retry, never destroy a paid order»; this worker's
+    is the opposite, and the asymmetry is the argument. A Salla retry re-reads
+    an API and writes idempotently — it cannot embarrass anyone. A WhatsApp
+    retry re-runs a CONVERSATION, so an exception nobody has thought about
+    must not be handed a licence to answer a customer twice."""
+    from sqlalchemy.exc import IntegrityError, OperationalError
+
+    from career.salla.client import SallaApiError
+    from career.whatsapp.client import WhatsAppSendError
+    from career.whatsapp.worker import _is_transient
+
+    class _Anthropicish(Exception):
+        __module__ = "anthropic"
+        status_code: int | None = None
+
+    def _anthropic(status: int | None) -> Exception:
+        exc = _Anthropicish("boom")
+        exc.status_code = status
+        return exc
+
+    retryable: list[BaseException] = [
+        WhatsAppSendError("graph HTTP 503 (code 131026)"),
+        WhatsAppSendError("graph HTTP 429 (code 130429)"),
+        _anthropic(None),                       # connection reset / timeout
+        _anthropic(429),                        # the 06:00 fan-out's own risk
+        _anthropic(529),
+        OperationalError("SELECT 1", {}, Exception("server closed")),
+        TimeoutError("read timed out"),
+        ConnectionResetError("peer went away"),
+        SallaApiError("token", retryable=True),
+    ]
+    terminal: list[BaseException] = [
+        WhatsAppSendError("graph HTTP 400 (code 131047)"),
+        WhatsAppSendError("no storage wired for document refs"),
+        _anthropic(400),
+        IntegrityError("INSERT", {}, Exception("duplicate key")),
+        SallaApiError("bad order", retryable=False),
+        AttributeError("'NoneType' object has no attribute 'get'"),
+        KeyError("messages"),
+        TypeError("unhashable"),
+        ValueError("not a uuid"),
+        RuntimeError("something new nobody has classified"),
+    ]
+    for exc in retryable:
+        assert _is_transient(exc) is True, type(exc).__name__
+    for exc in terminal:
+        assert _is_transient(exc) is False, f"{type(exc).__name__}: {exc}"

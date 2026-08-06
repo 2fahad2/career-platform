@@ -333,6 +333,19 @@ class WebhookEvent(Base):
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     processing_status: Mapped[str] = mapped_column(String(32), nullable=False)
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    #: 0022: when this row becomes eligible again. NULL means «due now», which
+    #: is what the intake writes and what every row predating the retry budget
+    #: is — a backoff clock only ever exists for a row that has already failed
+    #: a retryable way.
+    next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    #: 0022: the worker's verdict on the last failure, one PII-free slug
+    #: (see ``whatsapp.worker``: transient / poison / exhausted / already_spoke).
+    failure_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    #: 0022: the exception's CLASS name and nothing else. Never str(exc) —
+    #: those strings carry phone numbers and customer text (constant 13).
+    failure_detail: Mapped[str | None] = mapped_column(String(64), nullable=True)
     received_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -1104,6 +1117,13 @@ class AdminBotState(Base):
     id: Mapped[int] = mapped_column(SmallInteger, primary_key=True, default=1)
     update_offset: Mapped[int] = mapped_column(
         BigInteger, nullable=False, default=0, server_default="0"
+    )
+    #: 0023: the week-ending Sunday (Riyadh) of the last weekly report actually
+    #: sent. The guard used to be a variable inside the worker loop's main(),
+    #: so every restart inside the Sunday window sent the report again and an
+    #: outage across it dropped the week in silence. NULL = never sent.
+    weekly_report_sent_for: Mapped[date | None] = mapped_column(
+        Date, nullable=True
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
