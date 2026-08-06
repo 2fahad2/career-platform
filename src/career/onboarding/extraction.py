@@ -565,7 +565,19 @@ def _person_shaped(tokens: list[str]) -> bool:
     Arabic — carries a given name we know, or the «اسم + اللقب» shape where
     the family name takes the definite article and the given name does not.
     Arabic has no letter case, so this is the only signal available without
-    guessing."""
+    guessing.
+
+    AUDIT 2026-08-06. The article branch used to ask only whether the FIRST
+    token lacked «ال» and the LAST one carried it, and half the Arabic
+    language answers yes to that: «درست العملاء المتوقعين» is a customer
+    describing their own work and it passed. A Saudi name is «اسم + لقب» —
+    exactly ONE of its tokens takes the article, and it is the family name at
+    the end. A verb phrase sprays the article over every noun in it. Counting
+    the article-bearing tokens instead of looking at the two ends separates
+    the two populations for free: «فلان الفلاني» has one, «درست العملاء
+    المتوقعين» has two. What this branch alone cannot separate is «طورت خطة
+    التواصل», which also has exactly one — that is what
+    :func:`_reads_as_a_sentence` is for, and why it runs first."""
     latin = [t for t in tokens if t.isascii()]
     arabic = [_fold(t) for t in tokens if not t.isascii()]
     if len(latin) >= 2 and all(_title_cased(t) for t in latin):
@@ -573,9 +585,75 @@ def _person_shaped(tokens: list[str]) -> bool:
     if len(arabic) >= 2:
         if any(f in _AR_GIVEN_NAMES or f.startswith("عبدال") for f in arabic):
             return True
-        if not arabic[0].startswith("ال") and arabic[-1].startswith("ال"):
+        articled = [f for f in arabic if f.startswith("ال")]
+        if len(articled) == 1 and arabic[-1].startswith("ال"):
             return True
     return False
+
+
+#: Arabic function words a name line cannot contain. A person is «فلان
+#: الفلاني»; a sentence is «عملت في شركة الاتصالات» — the preposition is the
+#: giveaway, and it is a closed class, so this list cannot rot the way a
+#: vocabulary of content words would. Stored folded, and matched with the
+#: proclitic «و» stripped, because «ثم» and «وثم» are the same word.
+_AR_FUNCTION_WORDS: frozenset[str] = frozenset(_fold(w) for w in {
+    "في", "من", "إلى", "الى", "على", "عن", "مع", "ثم", "عند", "لدى", "بعد",
+    "قبل", "خلال", "حتى", "بين", "ضمن", "لكن", "أو", "او", "كما", "حيث",
+    "التي", "الذي", "هذا", "هذه", "كل", "بدون", "بسبب", "أثناء", "اثناء",
+})
+#: The shortest word this rule will call a first-person past verb. «بنت» and
+#: «بيت» are three letters; «عملت», «درست», «طورت», «حققت» are four.
+_MIN_VERB_LEN = 4
+
+
+def _reads_as_a_sentence(candidate: str) -> bool:
+    """Is this short line a fragment of prose rather than a person's name?
+
+    AUDIT 2026-08-06, and the half of the backstop that was destroying
+    answers. ``_residual_name`` reads the top lines of anything
+    :func:`_document_shaped` accepts, and a customer describing their career
+    on WhatsApp writes exactly the shape ``_is_name_line`` was built to
+    recognise: two to four alphabetic words, no digits, no punctuation.
+    «عملت في شركة الاتصالات» and «درست العملاء المتوقعين» both arrived as
+    "names", assert_no_pii raised PiiLeak, and enrichment.handle_answer turns
+    any exception into a soft_fail — so the customer's own achievement was
+    dropped in silence, which is the precise asymmetry that function's
+    docstring says must not happen.
+
+    Two signals, both structural and both closed-class, so neither can be
+    outgrown by vocabulary:
+
+    * a function word — a name line never contains a preposition or a
+      conjunction, and a sentence about your work almost always does;
+    * a leading first-person past verb: «فعلتُ» is written «فعلت», and an
+      Arabic answer to «وش سويت؟» opens with one nearly every time. Applied
+      to the FIRST token only, and only in Arabic.
+
+    The cost is that a name whose first token ends in «ت» — «ثابت الفلاني» —
+    is invisible to the BACKSTOP. That is the direction this function is
+    allowed to be wrong in: strip_pii does not consult it (it reads the
+    header through ``_inferred_tokens``, which is unchanged), so recall is
+    where it always was and only precision moved. Latin needs no equivalent
+    rule: ``_person_shaped`` already demands that every Latin token be Title
+    Case, and prose is not.
+    """
+    words = [m.group() for m in _WORD.finditer(candidate)]
+    if not words:
+        return False
+    for word in words:
+        folded = _fold(word)
+        stem = folded[1:] if folded.startswith("و") else folded
+        if folded in _AR_FUNCTION_WORDS or stem in _AR_FUNCTION_WORDS:
+            return True
+    if words[0].isascii():
+        return False
+    first = _fold(words[0])
+    first = first[1:] if first.startswith("و") else first
+    return (
+        len(first) >= _MIN_VERB_LEN
+        and first.endswith("ت")
+        and first not in _AR_GIVEN_NAMES
+    )
 
 
 def _title_cased(token: str) -> bool:
@@ -613,19 +691,48 @@ def _document_shaped(text: str) -> bool:
     vocabulary knows nothing about and that no edit to that vocabulary can
     move: dates, bullets, and contact details that were already redacted.
     ``_looks_like_cv`` is one route in, never the only one — the union is what
-    makes the coverage independent. It stays strict enough to leave a typed
-    answer alone, because a false alarm here is a customer's achievement
-    silently dropped (see :func:`assert_no_pii`)."""
+    makes the coverage independent.
+
+    AUDIT 2026-08-06 — and the sentence above («strict enough to leave a typed
+    answer alone») was simply not true of the evidence as it was weighted.
+    Years and bullets each admitted a document ON THEIR OWN, gated on nothing
+    but four non-blank lines, and those are the two things a person describing
+    their career on WhatsApp writes:
+
+        «عملت في شركة الاتصالات / من 2018 إلى 2022 / …»   → two years
+        «- درست العملاء المتوقعين / - طورت خطة التواصل / …» → four bullets
+
+    Both were read as documents, both then produced a "residual name", and
+    enrichment.handle_answer turned the resulting PiiLeak into a soft_fail —
+    the customer's achievement dropped without a word. So the evidence is now
+    weighted by how document-SPECIFIC it is, which is the honest reading of
+    each signal:
+
+    * STRONG, sufficient alone. A redacted contact means the text carried an
+      email or a phone number, which prose does not; recognised section
+      headings mean lines whose whole content is a heading, which prose does
+      not have either. Between them these cover effectively every real CV,
+      because strip_pii runs first and every CV prints a way to reach its
+      author.
+    * WEAK, never sufficient alone. Two years is a date range and a sentence
+      can hold one; three bullets is a WhatsApp list. Together they are a
+      layout, and a layout is a file — so the pair still admits a document,
+      which is what keeps a heading-less, contact-less CV from walking past.
+
+    A false alarm here is a customer's achievement silently dropped (see
+    :func:`assert_no_pii`), and that is why the weak signals had to lose their
+    standing rather than merely be raised: no threshold on years or bullets
+    separates a CV from a person listing what they did."""
     lines = [ln for ln in text.splitlines() if ln.strip()]
     if len(lines) < _MIN_DOC_LINES:
         return False
-    if _looks_like_cv(text):
+    if _looks_like_cv(text) or _CONTACT_PLACEHOLDER.search(text):
         return True
-    if _CONTACT_PLACEHOLDER.search(text):
-        return True
-    if len(set(_YEAR.findall(text))) >= 2:
-        return True
-    return len(_BULLET_LINE.findall(text)) >= _MIN_DOC_BULLETS
+    weak = (
+        len(set(_YEAR.findall(text))) >= 2,
+        len(_BULLET_LINE.findall(text)) >= _MIN_DOC_BULLETS,
+    )
+    return all(weak)
 
 
 def _residual_name(text: str) -> str | None:
@@ -635,6 +742,12 @@ def _residual_name(text: str) -> str | None:
     if not _document_shaped(text):
         return None
     for candidate in _header_name_lines(text, max_lines=_HEADER_LINES, max_hits=2):
+        # Prose first, and on the RAW candidate rather than its surviving
+        # tokens: the preposition that gives «عملت في شركة الاتصالات» away is
+        # two letters long, so `_inferred_tokens` throws away the evidence
+        # (audit 2026-08-06).
+        if _reads_as_a_sentence(candidate):
+            continue
         tokens = _inferred_tokens(candidate)
         if len(tokens) >= 2 and _person_shaped(tokens):
             return candidate

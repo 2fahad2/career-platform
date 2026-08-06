@@ -180,7 +180,17 @@ _COMMAND_MAX_WORDS = 5
 #: message, before the fold — ``normalize_ar`` turns every one of these marks
 #: into a space, so by the time we have tokens the sentence structure is gone
 #: and «لا تراسلوني، إلغاء الاشتراك» is an indistinguishable bag of words.
-_CLAUSE_SPLIT = re.compile(r"[،؛,;.!؟?\n\r]+|\s+-\s+")
+#:
+#: AUDIT 2026-08-06: the first version knew a comma, a full stop and a spaced
+#: ASCII hyphen, and nothing else — so «لا تراسلوني — إلغاء الاشتراك» (an em
+#: dash, which is what a phone keyboard offers), «ملاحظة: إلغاء الاشتراك» and
+#: «لا تراسلوني/إلغاء الاشتراك» were all still one clause with a negation in
+#: it, i.e. still a silently-missed opt-out. The colon, the slash, the
+#: ellipsis and the dash family are added here, and the dash no longer needs
+#: surrounding spaces. Widening this set can only ever ADD a STOP reading
+#: (SUPPORT no longer splits at all, and RESUME never did), which is the
+#: direction the compliance surface wants.
+_CLAUSE_SPLIT = re.compile(r"[،؛,;:.!؟?/…\n\r]+|\s*[-–—]+\s*")
 
 # Activation deep link prefills "تفعيل <token>" (or "activate <token>").
 _ACTIVATION_RE = re.compile(r"^(?:تفعيل|activate)\s+([A-Za-z0-9_\-]{20,})$", re.IGNORECASE)
@@ -279,8 +289,28 @@ def _clauses(text: str) -> list[str]:
     scopes ONE clause as if it scoped the message. «ما أبي إلغاء الاشتراك» —
     a customer refusing to cancel — is a single clause and must still be
     vetoed, and it still is: a clause is only obeyed when the clause ITSELF
-    is a whole command with no negation in it. Splitting can therefore only
-    find a command inside a sentence that already contained one outright.
+    is a whole command with no negation in it.
+
+    AUDIT 2026-08-06 — what this function does NOT do, and the claim that
+    used to stand here. It said: "splitting can therefore only find a command
+    inside a sentence that already contained one outright". That is false, and
+    it was false the day it was written. A comma does not only separate
+    clauses; it separates LIST ITEMS, and «تسويق، دعم، مبيعات» — three career
+    fields, an ordinary answer to our own gap question «وش أبرز خبرة عملية
+    عندك؟» — contains no command outright and yet has «دعم» sitting alone as
+    an item. Split, each item is a bare word, and a bare word from the
+    vocabulary is a whole command. That re-opened, through a comma, the exact
+    hole the same commit closed by taking «خدمة العملاء» out of
+    ``_SUPPORT_PHRASES``: the answer discarded, a ticket raised against a
+    customer who asked for nothing, the question asked again.
+
+    The reason the fix is NOT here is that the two callers do not want the
+    same thing. Weakening the split (demanding a "substantial" clause) would
+    break «ما أبغى رسائل، إيقاف», where the matched clause is one bare word
+    and the message is a real opt-out; the list SHAPE cannot be recognised
+    either, since «أعمل في مجال المبيعات، دعم» is not list-shaped at all. So
+    the split stays exactly as generous as it is, and the choice of who reads
+    clauses moved to :func:`classify_inbound` — STOP does, SUPPORT does not.
     """
     return [
         folded for folded in
@@ -307,7 +337,16 @@ def classify_inbound(text: str | None) -> tuple[InboundKind, str | None]:
     2026-08-05 that bias is real rather than asserted — the reading is per
     CLAUSE (:func:`_clauses`), because a whole-message negation veto turned
     «لا تراسلوني، إلغاء الاشتراك» into OTHER and this paragraph described a
-    generosity the code did not have.
+    generosity the code did not have. The bias is bounded, and 2026-08-06 is
+    where the bound got written down instead of glossed over: it holds inside
+    a closed vocabulary and a known set of clause marks, so «خلاص إلغاء
+    الاشتراك» is OTHER (one unknown word) and always will be, by the same
+    rule that keeps «متى ينتهي الاشتراك» from cancelling anything. What we
+    can honestly claim is narrower than "biased toward detecting STOP": no
+    punctuation a customer types between a negation and an opt-out will hide
+    the opt-out, and no wrapper of known courtesy words will either. A
+    customer who says it in words we were never taught is not heard, and the
+    operator is not told — that residue is real and is not fixed here.
 
     RESUME — bias toward NOT detecting it, the one set that is deliberately
     narrower than its neighbours: the WHOLE message, never a clause, and no
@@ -322,17 +361,35 @@ def classify_inbound(text: str | None) -> tuple[InboundKind, str | None]:
     fold it IS «أبدًا», and a guess that reads «never» as «start» is this
     error in its worst form.
 
-    SUPPORT — bias toward DETECTING it, most generously of the three. «دعم»
-    is the escape hatch printed in every error message, in the onboarding
-    copy and on the store page; a customer reaching for it and getting the
-    generic flow is the worst experience this product can produce, and it is
-    the exact live miss «مساعده» caused. The false positive is nearly free:
-    an operator glances at one ticket, and the customer is told a human is
-    coming. The accepted cost is that a bare «دعم» typed as an ANSWER (it is
-    a real career field) escalates instead of being recorded — one ticket
-    against a customer who cannot reach a human, which is not a close call.
-    It IS a close call for a phrase we never taught, though, which is why
-    «خدمة العملاء» is no longer in the set above.
+    SUPPORT — bias toward detecting it, but over the WHOLE message only,
+    never a clause. «دعم» is the escape hatch printed in every error message,
+    in the onboarding copy and on the store page; a customer reaching for it
+    and getting the generic flow is the worst experience this product can
+    produce, and it is the exact live miss «مساعده» caused. So the word still
+    arrives wrapped in courtesy («أبي مساعدة لو سمحت») and still counts. The
+    accepted cost is that a bare «دعم» typed as an ANSWER (it is a real
+    career field) escalates instead of being recorded — one ticket against a
+    customer who can at least reach a human.
+
+    AUDIT 2026-08-06 — why SUPPORT does not share STOP's clause rule, and the
+    sentence above that used to read "most generously of the three". Clause
+    splitting was applied to both sets, and a comma is how a person writes a
+    LIST: «تسويق، دعم، مبيعات» and «أعمل في مجال المبيعات، دعم» became
+    SUPPORT, when both are answers to our own gap question. The worker
+    resolves SUPPORT before it routes anything into onboarding, so that
+    answer is thrown away, a ticket is opened against the customer, and the
+    question comes back — the same incident «خدمة العملاء» was removed to
+    prevent, arriving through a comma instead of a phrase list.
+
+    The costs point in opposite directions, so the two sets must not share
+    one rule. A missed opt-out is a compliance breach that nobody sees; a
+    false opt-out is loud, reversible in one word and paged — so STOP reads
+    every clause and accepts the false positives that come with it. A missed
+    SUPPORT costs a customer one retyped word, since «دعم» on its own line
+    still reaches a human and every error message prints it; a false SUPPORT
+    destroys a paying customer's answer. So SUPPORT gives up the clause
+    reading entirely. Nothing that clause splitting was built for is lost:
+    it was built for «لا تراسلوني، إلغاء الاشتراك», and that is STOP.
 
     Activation is extracted from the whitespace-normalised text and never the
     folded one: the token is case-sensitive and carries «-» and «_», all of
@@ -358,11 +415,11 @@ def classify_inbound(text: str | None) -> tuple[InboundKind, str | None]:
         return (InboundKind.STOP, None)
     if folded in _RESUME_PHRASES:
         return (InboundKind.RESUME, None)
-    if any(
-        clause in _SUPPORT_PHRASES or _is_command(
-            clause.split(), core=_SUPPORT_CORE, filler=_REQUEST_FILLER,
-        )
-        for clause in clauses
+    # the WHOLE message, never a clause: a comma is how a customer writes a
+    # list of career fields, and «تسويق، دعم، مبيعات» is an answer, not a
+    # request for a human. See the SUPPORT paragraph above.
+    if folded in _SUPPORT_PHRASES or _is_command(
+        folded.split(), core=_SUPPORT_CORE, filler=_REQUEST_FILLER,
     ):
         return (InboundKind.SUPPORT, None)
     return (InboundKind.OTHER, None)

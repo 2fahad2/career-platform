@@ -163,6 +163,77 @@ class TestWhatTheFoldCostUs:
             assert kind is InboundKind.SUPPORT, phrase
 
 
+class TestTheClauseSplitterMustNotReadAListAsACommand:
+    """AUDIT 2026-08-06. Clause splitting exists for «لا تراسلوني، إلغاء
+    الاشتراك», and it was applied to SUPPORT as well as STOP — but a comma is
+    not only a clause boundary, it is how a person writes a LIST. So the same
+    commit that took «خدمة العملاء» out of the phrase set to stop discarding
+    answers re-opened the identical hole through punctuation, and the docstring
+    that claimed splitting "can only find a command inside a sentence that
+    already contained one outright" was describing something the code did not
+    do.
+    """
+
+    def test_a_comma_separated_list_of_career_fields_is_not_a_call_for_help(
+        self,
+    ) -> None:
+        """These are answers to our own gap question «وش أبرز خبرة عملية
+        عندك؟». The worker resolves SUPPORT before it routes anything into
+        onboarding — it writes the ticket, pages the operator, acks and
+        returns — so reading one of these as SUPPORT throws the customer's
+        answer away, opens a ticket against them, and asks again."""
+        for phrase in ("تسويق، دعم، مبيعات", "sales, support, marketing",
+                       "أعمل في مجال المبيعات، دعم"):
+            kind, _ = classify_inbound(phrase)
+            assert kind is InboundKind.OTHER, phrase
+
+    def test_the_escape_hatch_is_untouched_by_that_fix(self) -> None:
+        """The counterweight. «دعم» is printed in every error message, in the
+        onboarding copy and on the store page; SUPPORT giving up clause
+        reading may not cost the word itself, wrapped or bare."""
+        for phrase in ("دعم", "الدعم", "مساعده", "support", "help",
+                       "ابي مساعده لو سمحت", "يا اخوي ساعدني", "ممكن مساعدة"):
+            kind, _ = classify_inbound(phrase)
+            assert kind is InboundKind.SUPPORT, phrase
+
+    def test_the_opt_out_keeps_the_clause_reading_it_was_built_for(
+        self,
+    ) -> None:
+        """The other counterweight, and the reason this is not a revert. A
+        missed opt-out is a Meta compliance breach that fails in silence; a
+        false SUPPORT ticket destroys a paying customer's answer. The two
+        costs point opposite ways, so the two sets no longer share one rule —
+        STOP still reads every clause."""
+        for phrase in ("لا تراسلوني، إلغاء الاشتراك", "ما أبغى رسائل، إيقاف",
+                       "ما عاد أبيكم. إلغاء الاشتراك",
+                       "لا تتصلون علي\nإيقاف الرسائل"):
+            kind, _ = classify_inbound(phrase)
+            assert kind is InboundKind.STOP, phrase
+
+    def test_the_clause_marks_a_real_phone_keyboard_produces(self) -> None:
+        """The splitter knew a comma, a full stop and a SPACED ascii hyphen.
+        A phone keyboard offers an em dash, an ellipsis and a slash, and a
+        customer types a colon — so «لا تراسلوني — إلغاء الاشتراك» stayed one
+        clause with a negation in it, which is a silently-missed opt-out."""
+        for phrase in ("لا تراسلوني — إلغاء الاشتراك",
+                       "لا تراسلوني…إلغاء الاشتراك",
+                       "لا تراسلوني/إلغاء الاشتراك",
+                       "ملاحظة: إلغاء الاشتراك",
+                       "لا تراسلوني-إلغاء الاشتراك"):
+            kind, _ = classify_inbound(phrase)
+            assert kind is InboundKind.STOP, phrase
+
+    def test_what_the_stop_bias_still_does_not_reach(self) -> None:
+        """Honesty about the bound, since the docstring now claims it rather
+        than the unqualified "biased toward detecting STOP". The reading is a
+        CLOSED vocabulary: one word we were never taught and the message is a
+        sentence for the conversation to answer. «خلاص إلغاء الاشتراك» is a
+        real opt-out and we do not hear it — the same rule that keeps «متى
+        ينتهي الاشتراك» from cancelling anything."""
+        kind, _ = classify_inbound("خلاص إلغاء الاشتراك")
+        assert kind is InboundKind.OTHER
+
+
 class TestCommandsInsideARequest:
     """STOP and SUPPORT tolerate the words a Saudi customer wraps a request
     in; RESUME deliberately does not (a false resume re-opens messaging to

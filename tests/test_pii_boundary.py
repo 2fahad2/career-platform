@@ -392,6 +392,103 @@ def test_an_answer_full_of_career_words_is_not_shredded_into_placeholders(
         assert_no_pii(stripped.text, known_name=None)   # and it is not a leak
 
 
+# ── the backstop turned on the people it protects (audit 2026-08-06) ────────
+#
+# _document_shaped accepted ">=2 distinct years" and ">=3 bullet lines" as
+# document evidence ON THEIR OWN, gated on nothing but four non-blank lines —
+# and a person describing their career on WhatsApp writes exactly that.
+# _residual_name then read whole Arabic verb-phrases as person-shaped. Both
+# answers below raised PiiLeak, and enrichment.handle_answer turns any
+# exception into a soft_fail: the achievement the customer had just typed was
+# dropped without a word, which is the one asymmetry assert_no_pii's own
+# docstring says must not happen. bullet_panel.py raises on the same text and
+# funnel/flow.py answers a document upload with «تعذر قراءة الملف».
+
+ANSWER_WITH_A_DATE_RANGE = (
+    "عملت في شركة الاتصالات\nمن 2018 إلى 2022\n"
+    "وحققت زيادة في المبيعات\nثم انتقلت لجهة ثانية"
+)
+ANSWER_IN_BULLETS = (
+    "- درست العملاء المتوقعين\n- طورت خطة التواصل\n"
+    "- حققت نتائج ممتازة\n- ورفعت الرضا"
+)
+#: Bullets AND dates at once — document-shaped ON PURPOSE, so nothing about
+#: this text is protected by the evidence rule. It isolates the second half of
+#: the fix: a verb phrase is not a name.
+ANSWER_BULLETED_WITH_DATES = (
+    "- عملت في شركة الاتصالات من 2018 إلى 2022\n- طورت خطة التواصل\n"
+    "- حققت نتائج ممتازة\n- ورفعت رضا العملاء"
+)
+
+
+def test_an_ordinary_typed_answer_is_not_a_document() -> None:
+    """Two years is a date range; four dashes is a WhatsApp list. Neither is
+    evidence of a FILE, and treating them as such put the backstop in the way
+    of the customer it exists to protect."""
+    import career.onboarding.extraction as extraction
+
+    for answer in (ANSWER_WITH_A_DATE_RANGE, ANSWER_IN_BULLETS):
+        assert not extraction._document_shaped(answer)
+        assert strip_pii(answer, known_name=None).text == answer
+        assert_no_pii(answer, known_name=None)
+
+
+def test_an_arabic_verb_phrase_is_never_read_as_a_name() -> None:
+    """The other half, isolated. «عملت في شركة الاتصالات» and «طورت خطة
+    التواصل» are two-to-four alphabetic words with no digits and no
+    punctuation — precisely the shape the header heuristic calls a name. This
+    fixture is document-shaped on purpose, so the evidence rule protects
+    nothing here and only the sentence test can keep it clean."""
+    import career.onboarding.extraction as extraction
+
+    assert extraction._document_shaped(ANSWER_BULLETED_WITH_DATES), (
+        "the fixture must be a document, or it proves nothing about the "
+        "residual-name half"
+    )
+    assert extraction._residual_name(ANSWER_BULLETED_WITH_DATES) is None
+    assert_no_pii(ANSWER_BULLETED_WITH_DATES, known_name=None)
+
+
+#: A CV with no recognisable headings and no contact details left in it: the
+#: weak signals are all that remain, which is why they still admit a document
+#: TOGETHER. Removing them outright would have traded one failure for its
+#: opposite.
+CV_LAYOUT_ONLY = """فلان الفلاني
+مشرف عمليات فرع في شركة المثال التجارية
+- قاد برنامج جودة الخدمة في أربعة فروع
+- رفع رضا العملاء خلال 2019
+- خفض زمن الانتظار في 2022
+"""
+
+
+def test_the_backstop_still_refuses_the_documents_it_was_built_for() -> None:
+    """The counterweight to both halves at once, and the properties the fix
+    was not allowed to spend:
+
+    * the ordinary Arabic headings «الخبرة العملية» / «المؤهل الدراسي» still
+      make a document, and its header name is still stripped and still
+      refused if it survives;
+    * a layout with no headings and no contacts left — nothing but dates and
+      bullets — is still a document, because together they are a file;
+    * «فلان الفلاني» is still person-shaped through the «اسم + اللقب» article
+      pattern, with no given name in any list.
+    """
+    import career.onboarding.extraction as extraction
+
+    safe = strip_pii(CV_ORDINARY_ARABIC_HEADINGS, known_name=None).text
+    assert "فلان" not in safe and "الفلاني" not in safe
+    with pytest.raises(PiiLeak):                       # if it ever survived
+        assert_no_pii(CV_ORDINARY_ARABIC_HEADINGS, known_name=None)
+
+    assert not extraction._looks_like_cv(CV_LAYOUT_ONLY), (
+        "the fixture must reach _document_shaped through the weak pair, or "
+        "it proves nothing about them still counting"
+    )
+    assert extraction._document_shaped(CV_LAYOUT_ONLY)
+    with pytest.raises(PiiLeak):
+        assert_no_pii(CV_LAYOUT_ONLY, known_name=None)
+
+
 # ── the fail-closed backstop must be able to fail ────────────────────────────
 
 
