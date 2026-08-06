@@ -11,6 +11,16 @@ Object-storage bytes cannot be deleted inside a DB transaction, so the report
 returns the exact keys to purge — the caller deletes them via StorageAdapter
 right after commit.
 
+One table is neither deleted nor kept whole. `webhook_events` holds the
+provider's body verbatim — the buyer's name, mobile and email from Salla, the
+customer's phone, profile name and typed text from Meta — and had no tenant
+column at all until 0024, so it was in no list here: not deleted, not
+exported, not pruned, and carried in the nightly backup for months. It is now
+REDACTED on request rather than deleted, because the row is the idempotency
+record and a forgotten fingerprint would let a replayed webhook provision the
+same customer twice (career.webhooks.intake owns that argument, and the
+thirty-day expiry that catches the bodies this path cannot attribute).
+
 Pause suspends the service without extending the period (§05: وقف مؤقت لا
 يمدد) — the period end stays where it was.
 """
@@ -20,7 +30,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Any
@@ -45,10 +55,12 @@ from career.db.models import (
     ProfileFact,
     SearchPolicy,
     Subscription,
+    WebhookEvent,
 )
 from career.salla import subscriptions as sub_states
 from career.salla.subscriptions import transition
 from career.storage import StorageAdapter, tenant_key
+from career.webhooks import intake
 
 logger = logging.getLogger("career.onboarding")
 
@@ -156,6 +168,13 @@ def export_bundle(session: Session, *, tenant_id: uuid.UUID) -> dict[str, object
     funnels = session.execute(
         select(FunnelSession).where(FunnelSession.tenant_id == tenant_id)
         .order_by(FunnelSession.created_at)
+    ).scalars().all()
+    # 0024: the raw provider bodies that are about this customer. They were
+    # outside every part of §12 until the subject link existed — no tenant
+    # column meant no export, no deletion and no expiry.
+    webhooks = session.execute(
+        select(WebhookEvent).where(WebhookEvent.subject_tenant_id == tenant_id)
+        .order_by(WebhookEvent.received_at)
     ).scalars().all()
 
     return {
@@ -265,6 +284,23 @@ def export_bundle(session: Session, *, tenant_id: uuid.UUID) -> dict[str, object
              "status": x.status}
             for x in assessments
         ],
+        # The FACT of each provider event, never the body. §12 grants a copy
+        # of everything personal we hold about this customer — and a single
+        # Meta POST can carry two customers' messages, so handing one of them
+        # the raw body would answer their right by breaking the other's. What
+        # they typed is already exported in full under `messages_you_sent`,
+        # which is the parsed, per-customer copy of the same words; this
+        # section tells them the wire record exists and when it expires.
+        "provider_events": [
+            {"provider": w.provider, "event_type": w.event_type,
+             "received_at": str(w.received_at),
+             "processing_status": w.processing_status,
+             "raw_body_still_held": w.payload_redacted_at is None,
+             "raw_body_erased_at": (
+                 str(w.payload_redacted_at) if w.payload_redacted_at else None
+             )}
+            for w in webhooks
+        ],
         "subscription": {
             "plan_code": subscription.plan_code if subscription else None,
             "status": subscription.status if subscription else None,
@@ -304,6 +340,12 @@ class DeletionReport:
     deleted: dict[str, int]
     retained: tuple[str, ...]
     storage_keys_to_purge: tuple[str, ...]
+    #: Tables where the ROW survives and its personal content does not. Only
+    #: webhook_events so far: the row is the idempotency record and losing a
+    #: fingerprint would let a replayed Salla webhook provision the same
+    #: customer twice, so the body goes and the fingerprint stays. Defaulted
+    #: because it arrived after the callers did (0024).
+    redacted: dict[str, int] = field(default_factory=dict)
 
 
 #: Deleted in FK-safe order. Everything here is personal by content (§12).
@@ -328,6 +370,13 @@ RETAINED_TABLES: tuple[str, ...] = (
     "subscriptions", "subscription_events", "consent_events", "audit_events",
     "privacy_requests", "tenants",
 )
+
+#: Survive as a row, not as content. `webhook_events` is the only member and
+#: the reason is the same one that keeps subscriptions: the row carries an
+#: obligation that outlives the data in it. Here the obligation is idempotency
+#: — `event_fingerprint` is what makes a replayed Salla webhook a no-op — so
+#: the body is replaced by a PII-free skeleton and the fingerprint stays.
+REDACTED_TABLES: tuple[str, ...] = ("webhook_events",)
 
 
 def execute_deletion(
@@ -371,14 +420,31 @@ def execute_deletion(
         )
         deleted[model.__tablename__] = result.rowcount or 0  # type: ignore[attr-defined]
 
+    # The raw provider bodies. Redacted rather than deleted — the row is the
+    # idempotency record (webhooks.intake carries the argument) — and reaching
+    # only the events that resolved to exactly one tenant. A body that named
+    # two customers at once, or none we could recognise, is not erased here;
+    # it expires on RAW_PAYLOAD_RETENTION_DAYS instead. That gap is reported
+    # rather than papered over: attributing an ambiguous batch to whoever
+    # asked first would erase the other customer's record on this one's
+    # request, which is a worse answer than «thirty days».
+    redacted = {
+        "webhook_events": intake.redact_for_tenant(
+            session, tenant_id=tenant_id, now=now
+        )
+    }
+
     request.status = "fulfilled"
     request.fulfilled_at = now
-    request.details = {"deleted": deleted, "storage_keys": keys}
+    request.details = {
+        "deleted": deleted, "redacted": redacted, "storage_keys": keys,
+    }
     session.flush()
     return DeletionReport(
         deleted=deleted,
         retained=RETAINED_TABLES,
         storage_keys_to_purge=tuple(keys),
+        redacted=redacted,
     )
 
 

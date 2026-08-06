@@ -35,6 +35,14 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+# Imported for its import-time side effect, not for a name: `career.db.session`
+# installs the process-wide role guard when it loads. The three D20 services do
+# not import that module — they build their own engine and go straight to the
+# models — so without this line the guard would be installed in the API process
+# and absent from precisely the three processes it was written for. Every
+# process that touches the database imports this file; that is the only edge
+# all of them share.
+from career.db import session as _install_role_guard  # noqa: F401
 from career.db.base import Base
 
 
@@ -315,7 +323,17 @@ class ActivationToken(Base):
 
 class WebhookEvent(Base):
     """System-level intake of provider webhooks (no RLS — an order arrives before
-    the customer/tenant is known). event_fingerprint is unique → idempotency."""
+    the customer/tenant is known). event_fingerprint is unique → idempotency.
+
+    The payload is the provider's body verbatim, which means it is personal:
+    the buyer's name, mobile and email from Salla; the customer's phone,
+    profile name and typed text from Meta. Until 0024 that put it outside the
+    reach of «حذف بياناتي» entirely — no tenant column, so no deletion list, no
+    export, no pruning. `subject_tenant_id` is the link that gives an erasure
+    request something to aim at, and `payload_redacted_at` is the record that
+    the body has already been replaced by a PII-free skeleton. The row itself
+    is never deleted: it is the idempotency record, and a webhook whose
+    fingerprint we forgot would provision the same customer twice."""
 
     __tablename__ = "webhook_events"
     __table_args__ = (
@@ -346,6 +364,21 @@ class WebhookEvent(Base):
     #: 0022: the exception's CLASS name and nothing else. Never str(exc) —
     #: those strings carry phone numbers and customer text (constant 13).
     failure_detail: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    #: 0024: the tenant this body is ABOUT, resolved at intake where it can be
+    #: and by the nightly late-link pass where it becomes resolvable later.
+    #: NOT named tenant_id: this table is outside RLS on purpose and the RLS
+    #: meta-test keys on that exact name (same reasoning as
+    #: break_glass_log.target_tenant_id). NULL is a real answer — an install
+    #: hook is about a store, an order webhook can arrive before its tenant
+    #: exists, and one Meta POST can carry two customers.
+    subject_tenant_id: Mapped[uuid.UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), nullable=True
+    )
+    #: 0024: when the raw body was replaced by a PII-free skeleton — by the
+    #: retention prune, or immediately by a customer's deletion request.
+    payload_redacted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     received_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

@@ -565,3 +565,322 @@ def test_every_state_has_an_arabic_name_and_no_line_mixes_directions():
                 raise AssertionError(
                     f"{name}: mixed-direction line would scramble: {line!r}"
                 )
+
+
+# ── webhook_events: the table a deletion request could not reach ─────────────
+#
+# The oldest unclosed compliance item (closed 6 أغسطس, migration 0024). The
+# raw provider body carries the buyer's name, mobile and email from Salla and
+# the customer's phone, profile name and typed text from Meta, and the table
+# had no tenant column at all — so it was in no deletion list, no export and
+# no pruning, and the nightly backup carried it for months. These tests are
+# the four halves of the fix: the link, the erasure, the expiry, and the
+# guarantee the erasure must not break.
+
+
+@pytest.fixture()
+def purge_webhooks(owner_engine):
+    """Delete whatever webhook_events rows a test creates.
+
+    webhook_events deliberately has no foreign key to tenants — an order
+    arrives before its tenant exists — so the two_tenants fixture's cascade
+    does not reach these rows and career_test would accumulate them.
+    """
+    from sqlalchemy.orm import Session as _Session
+
+    def _ids() -> set[str]:
+        with _Session(owner_engine) as s:
+            return {str(r[0]) for r in s.execute(
+                sql_text("SELECT id::text FROM webhook_events"))}
+
+    before = _ids()
+    yield
+    new = _ids() - before
+    if new:
+        with _Session(owner_engine) as s:
+            s.execute(sql_text("DELETE FROM webhook_events WHERE id::text = ANY(:i)"),
+                      {"i": list(new)})
+            s.commit()
+
+
+def _wa_body(*phones: str) -> dict:
+    """A Meta POST shaped the way Meta actually sends one — note that `entry`
+    is a list, which is how one body comes to carry two customers."""
+    return {
+        "object": "whatsapp_business_account",
+        "entry": [
+            {"id": "WABA", "changes": [{"value": {
+                "contacts": [{"wa_id": p.lstrip("+"), "profile": {"name": "فهد"}}],
+                "messages": [{"from": p.lstrip("+"), "id": f"wamid.{p}",
+                              "type": "text", "text": {"body": "وش الأخبار"}},
+                             ],
+            }}]}
+            for p in phones
+        ],
+    }
+
+
+def _seed_channel(session, tenant_id: uuid.UUID, phone: str) -> None:
+    session.execute(
+        sql_text("INSERT INTO customer_channels (id, tenant_id, provider, phone_e164)"
+                 " VALUES (:id, :tid, 'whatsapp', :p)"),
+        {"id": str(uuid.uuid4()), "tid": str(tenant_id), "p": phone},
+    )
+
+
+def test_intake_links_a_whatsapp_body_to_the_customer_it_is_about(
+    two_tenants: tuple[str, str], purge_webhooks
+) -> None:
+    from career.db.session import SessionLocal
+    from career.webhooks import intake
+
+    a, _ = two_tenants
+    phone = f"+96650{uuid.uuid4().int % 10_000_000:07d}"
+    with tenant_session(a) as s:
+        _seed_channel(s, uuid.UUID(a), phone)
+
+    with SessionLocal() as s:   # the unscoped app session main.py uses
+        event_id = intake.persist_deduped_event(
+            s, provider="whatsapp", event_type="messages",
+            fingerprint=f"wa:{uuid.uuid4()}", payload=_wa_body(phone),
+        )
+        subject = s.execute(
+            sql_text("SELECT subject_tenant_id::text FROM webhook_events WHERE id = :i"),
+            {"i": event_id},
+        ).scalar_one()
+    assert subject == a
+
+
+def test_a_batch_that_names_two_customers_is_attributed_to_neither(
+    two_tenants: tuple[str, str], purge_webhooks
+) -> None:
+    """One Meta POST can carry two people's messages, and stamping it with one
+    of them would be wrong in both directions at once: her deletion request
+    would erase his forensic record, and her data export would point at a body
+    containing his message. Ambiguity stays NULL and expires on the clock."""
+    from career.db.session import SessionLocal
+    from career.webhooks import intake
+
+    a, b = two_tenants
+    phone_a = f"+96650{uuid.uuid4().int % 10_000_000:07d}"
+    phone_b = f"+96650{uuid.uuid4().int % 10_000_000:07d}"
+    with tenant_session(a) as s:
+        _seed_channel(s, uuid.UUID(a), phone_a)
+    with tenant_session(b) as s:
+        _seed_channel(s, uuid.UUID(b), phone_b)
+
+    with SessionLocal() as s:
+        assert intake.resolve_subject_tenant(
+            s, provider="whatsapp", payload=_wa_body(phone_a, phone_b)
+        ) is None
+        assert intake.resolve_subject_tenant(
+            s, provider="whatsapp", payload=_wa_body(phone_a)
+        ) == a
+
+
+def test_intake_still_records_the_event_when_the_link_cannot_be_resolved(
+    two_tenants: tuple[str, str], purge_webhooks, monkeypatch
+) -> None:
+    """The 200 is worth more than the link. A database at an older migration
+    has no app.tenant_for_phone at all, and an exception there would poison
+    the transaction and lose the event — so resolution runs in a SAVEPOINT."""
+    from career.db.session import SessionLocal
+    from career.webhooks import intake
+
+    def _explode(*_a, **_k):
+        raise RuntimeError("function app.tenant_for_phone(text) does not exist")
+
+    monkeypatch.setattr(intake, "tenant_for_phone", _explode)
+    with SessionLocal() as s:
+        event_id = intake.persist_deduped_event(
+            s, provider="whatsapp", event_type="messages",
+            fingerprint=f"wa:{uuid.uuid4()}", payload=_wa_body("+966500000001"),
+        )
+        assert event_id is not None
+        assert s.execute(
+            sql_text("SELECT subject_tenant_id FROM webhook_events WHERE id = :i"),
+            {"i": event_id},
+        ).scalar_one() is None
+    assert two_tenants
+
+
+def test_deletion_erases_the_raw_bodies_and_keeps_the_fingerprint(
+    two_tenants: tuple[str, str], purge_webhooks
+) -> None:
+    """«حذف بياناتي» now reaches the wire record. The row survives redacted —
+    it is the idempotency record — and the customer's own words are gone."""
+    from career.webhooks import intake
+
+    a, _ = two_tenants
+    tid = uuid.UUID(a)
+    phone = f"+96650{uuid.uuid4().int % 10_000_000:07d}"
+    fingerprint = f"wa:{uuid.uuid4()}"
+    with tenant_session(a) as s:
+        _seed_personal_data(s, tid)
+        _seed_channel(s, tid, phone)
+    with tenant_session(a) as s:
+        intake.persist_deduped_event(
+            s, provider="whatsapp", event_type="messages",
+            fingerprint=fingerprint, payload=_wa_body(phone),
+        )
+
+    with tenant_session(a) as s:
+        req = privacy.open_request(s, tenant_id=tid, kind="delete", now=NOW)
+        report = privacy.execute_deletion(s, tenant_id=tid, request_id=req.id, now=NOW)
+        row = s.execute(
+            sql_text("SELECT payload::text, event_fingerprint, payload_redacted_at "
+                     "FROM webhook_events WHERE event_fingerprint = :f"),
+            {"f": fingerprint},
+        ).one()
+    assert report.redacted["webhook_events"] == 1
+    assert "webhook_events" in privacy.REDACTED_TABLES
+    assert row.event_fingerprint == fingerprint, "the idempotency record must survive"
+    assert row.payload_redacted_at is not None
+    assert "وش الأخبار" not in row[0] and phone.lstrip("+") not in row[0]
+    assert "_redacted" in row[0]
+
+
+def test_a_replayed_webhook_is_still_a_no_op_after_its_body_was_erased(
+    two_tenants: tuple[str, str], purge_webhooks
+) -> None:
+    """Why redaction and not deletion. Salla retries; a webhook whose
+    fingerprint we had thrown away would provision the same customer twice."""
+    from career.db.session import SessionLocal
+    from career.webhooks import intake
+
+    a, _ = two_tenants
+    phone = f"+96650{uuid.uuid4().int % 10_000_000:07d}"
+    fingerprint = f"wa:{uuid.uuid4()}"
+    with tenant_session(a) as s:
+        _seed_channel(s, uuid.UUID(a), phone)
+    with SessionLocal() as s:
+        first = intake.persist_deduped_event(
+            s, provider="whatsapp", event_type="messages",
+            fingerprint=fingerprint, payload=_wa_body(phone),
+        )
+        intake.redact_for_tenant(s, tenant_id=uuid.UUID(a), now=NOW)
+        s.commit()
+        replay = intake.persist_deduped_event(
+            s, provider="whatsapp", event_type="messages",
+            fingerprint=fingerprint, payload=_wa_body(phone),
+        )
+    assert first is not None
+    assert replay is None, "the replay was accepted as a fresh event"
+
+
+def test_the_nightly_prune_expires_bodies_and_links_what_became_linkable(
+    two_tenants: tuple[str, str], purge_webhooks
+) -> None:
+    """Both halves of the sweep, in the order it runs them.
+
+    The late link is not decoration: the order that pays for a subscription
+    arrives BEFORE the tenant it creates, so at intake there was nothing to
+    resolve against. Linking before redacting is what makes the count in a
+    deletion report honest for the customer who signed up last month.
+    """
+    from career.db.session import SessionLocal
+    from career.webhooks import intake
+
+    a, _ = two_tenants
+    tid = uuid.UUID(a)
+    order_id = f"O-{uuid.uuid4()}"
+    old = NOW - timedelta(days=intake.RAW_PAYLOAD_RETENTION_DAYS + 1)
+    fresh_fp, old_fp = f"wa:{uuid.uuid4()}", f"sl:{uuid.uuid4()}"
+
+    with tenant_session(a) as s:
+        # the order webhook lands first; the subscription that names it is
+        # created afterwards, exactly as provisioning does it
+        s.execute(
+            sql_text("INSERT INTO webhook_events (id, provider, event_type, "
+                     "event_fingerprint, signature_valid, salla_order_id, payload, "
+                     "processing_status, received_at) VALUES (gen_random_uuid(), "
+                     "'salla', 'order.created', :f, true, :o, "
+                     "'{\"data\": {\"customer\": {\"mobile\": \"0501234567\"}}}'::jsonb,"
+                     " 'processed', :t)"),
+            {"f": old_fp, "o": order_id, "t": old},
+        )
+        s.execute(
+            sql_text("INSERT INTO webhook_events (id, provider, event_type, "
+                     "event_fingerprint, signature_valid, payload, "
+                     "processing_status, received_at) VALUES (gen_random_uuid(), "
+                     "'whatsapp', 'messages', :f, true, '{}'::jsonb, 'processed', :t)"),
+            {"f": fresh_fp, "t": NOW},
+        )
+        s.execute(
+            sql_text("INSERT INTO subscriptions (id, tenant_id, plan_code, status,"
+                     " salla_order_id, amount_sar, currency) VALUES (:id, :tid,"
+                     " 'basic', 'ACTIVE', :o, 149, 'SAR')"),
+            {"id": str(uuid.uuid4()), "tid": str(tid), "o": order_id},
+        )
+
+    with SessionLocal() as s:
+        counts = intake.prune_webhook_payloads(s, now=NOW)
+        s.commit()
+        old_row = s.execute(
+            sql_text("SELECT subject_tenant_id::text, payload::text, "
+                     "payload_redacted_at FROM webhook_events "
+                     "WHERE event_fingerprint = :f"), {"f": old_fp}).one()
+        fresh_row = s.execute(
+            sql_text("SELECT payload_redacted_at FROM webhook_events "
+                     "WHERE event_fingerprint = :f"), {"f": fresh_fp}).one()
+    assert counts["linked"] >= 1 and counts["redacted"] >= 1
+    assert old_row[0] == a, "the late link never happened"
+    assert "0501234567" not in old_row[1] and old_row[2] is not None
+    assert fresh_row[0] is None, "a body inside the window was expired early"
+
+
+def test_the_export_names_the_wire_record_without_handing_over_the_body(
+    two_tenants: tuple[str, str], purge_webhooks
+) -> None:
+    """§12 grants a copy of everything personal we hold — and one Meta POST can
+    hold two customers, so the body itself is not what is handed over. What
+    they typed is already exported in full under `messages_you_sent`."""
+    from career.webhooks import intake
+
+    a, _ = two_tenants
+    tid = uuid.UUID(a)
+    phone = f"+96650{uuid.uuid4().int % 10_000_000:07d}"
+    with tenant_session(a) as s:
+        _seed_personal_data(s, tid)
+        _seed_channel(s, tid, phone)
+    with tenant_session(a) as s:
+        intake.persist_deduped_event(
+            s, provider="whatsapp", event_type="messages",
+            fingerprint=f"wa:{uuid.uuid4()}", payload=_wa_body(phone),
+        )
+    with tenant_session(a) as s:
+        bundle = privacy.export_bundle(s, tenant_id=tid)
+    events = bundle["provider_events"]
+    assert [e["provider"] for e in events] == ["whatsapp"]
+    assert events[0]["raw_body_still_held"] is True
+    assert "وش الأخبار" not in json.dumps(bundle, ensure_ascii=False)
+
+
+def test_a_real_postgres_error_in_the_link_does_not_poison_the_intake(
+    two_tenants: tuple[str, str], purge_webhooks, monkeypatch
+) -> None:
+    """The staging shape, with a real aborted transaction rather than a stub.
+
+    staging is at migration 0020 as this ships, so `app.tenant_for_phone` does
+    not exist there yet. A missing function is not a Python error that can be
+    caught and shrugged off — it aborts the Postgres transaction, and every
+    statement after it fails too. Without the SAVEPOINT the INSERT that follows
+    would fail as well and the webhook would be lost, which is the one outcome
+    intake exists to prevent.
+    """
+    from career.db.session import SessionLocal
+    from career.webhooks import intake
+
+    def _missing_function(session, _phone):
+        return session.execute(
+            sql_text("SELECT app.a_function_this_database_does_not_have()")
+        ).scalar_one()
+
+    monkeypatch.setattr(intake, "tenant_for_phone", _missing_function)
+    with SessionLocal() as s:
+        event_id = intake.persist_deduped_event(
+            s, provider="whatsapp", event_type="messages",
+            fingerprint=f"wa:{uuid.uuid4()}", payload=_wa_body("+966500000002"),
+        )
+        assert event_id is not None, "the event was lost to a failed lookup"
+    assert two_tenants

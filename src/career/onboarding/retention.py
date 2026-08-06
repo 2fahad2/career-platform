@@ -122,6 +122,25 @@ def sweep_retention(
     counts = {"swept": 0, "skipped_empty": 0, "storage_keys": 0,
               # kept past 90 days because a live label outlived its period
               "stale_live": 0}
+
+    # The raw provider bodies (0024) run on their own, much shorter clock and
+    # on every event rather than on departed customers, so they are pruned
+    # here rather than inside the per-tenant loop below. This is the job that
+    # already owns «a published retention promise with something behind it»,
+    # it already holds an owner session that spans tenants, and it already
+    # runs nightly — a second timer for a second sweep would be a second thing
+    # to notice had stopped.
+    try:
+        from career.webhooks.intake import prune_webhook_payloads
+
+        counts.update(
+            {f"webhook_{k}": v
+             for k, v in prune_webhook_payloads(session, now=now).items()}
+        )
+    except Exception:  # noqa: BLE001 — the §12 deletion below is the promise
+        # with the deadline on it; a failure to prune raw bodies must not stop
+        # it, and the bodies are still reached by tomorrow's pass.
+        logger.error("webhook payload prune failed", exc_info=True)
     stale = stale_live_tenants(session, now=now)
     counts["stale_live"] = len(stale)
 

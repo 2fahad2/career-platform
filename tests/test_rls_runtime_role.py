@@ -127,12 +127,16 @@ _OWNER_LITERALS = frozenset({"DB_OWNER_USER", "DB_OWNER_PASSWORD", "career_owner
 #: a guard that punishes the explanation gets the explanation deleted.
 _DSN_MARKERS = ("://", "dbname=", "user=")
 
-#: The one DSN a new module may hand to `create_engine`. Anything else — a
-#: local variable, an f-string, `settings._dsn(...)` — is a module assembling
-#: its own connection, which is the act this ratchet is about. Matching on the
-#: ATTRIBUTE rather than on the whole expression keeps `_settings.` and
-#: `settings.` and `get_settings().` all working.
-_APPROVED_ENGINE_DSN = "app_database_url"
+#: The single engine factory (`career.db.session.engine_for`) and the file it
+#: lives in. Since 6 أغسطس this test no longer carries a copy of the rule about
+#: which DSN is acceptable — the rule is enforced in the source, at engine
+#: construction and again at connect, and duplicating it here would mean two
+#: rules that drift. What is left for a static scan is the structural half:
+#: **`create_engine` is called in exactly one place, and everything else asks
+#: that place.** A module that builds its own engine is an offender whatever
+#: DSN it passes, because the guard cannot vet an engine it never sees.
+_ENGINE_FACTORY_MODULE = "src/career/db/session.py"
+_ENGINE_FACTORY_CALLABLE = "engine_for"
 
 
 def _owner_signals(path: Path) -> set[str]:
@@ -146,13 +150,17 @@ def _owner_signals(path: Path) -> set[str]:
     detectors and either one is enough:
 
     * the module NAMES the owner (an attribute or a literal above), or
-    * it calls `create_engine` with anything other than `app_database_url`.
+    * it calls `create_engine` at all, anywhere other than the factory.
 
     The second exists because the first is a list of names and a list of names
-    is always one rename behind. It cannot resolve what a local variable holds,
-    so it treats an unrecognised argument as an offence and makes the author
-    say so out loud.
+    is always one rename behind. It used to make an exception for
+    `app_database_url`, which meant this file held a second copy of the
+    product's rule about acceptable DSNs; now it holds none. Bypassing the
+    factory is the offence, and the reason it is worth calling one is that
+    `engine_for` sees the URL a local variable is hiding and this scan never
+    will.
     """
+    is_factory = path.resolve() == (_REPO / _ENGINE_FACTORY_MODULE).resolve()
     signals: set[str] = set()
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     for node in ast.walk(tree):
@@ -171,16 +179,12 @@ def _owner_signals(path: Path) -> set[str]:
             isinstance(node, ast.Call)
             and getattr(node.func, "id", getattr(node.func, "attr", None))
             == "create_engine"
+            and not is_factory
         ):
-            first = node.args[0] if node.args else None
-            approved = (
-                isinstance(first, ast.Attribute)
-                and first.attr == _APPROVED_ENGINE_DSN
+            signals.add(
+                "calls create_engine directly instead of "
+                f"career.db.session.{_ENGINE_FACTORY_CALLABLE}"
             )
-            if not approved:
-                signals.add(
-                    f"create_engine with a DSN that is not .{_APPROVED_ENGINE_DSN}"
-                )
     return signals
 
 
@@ -394,27 +398,76 @@ def test_career_core_stays_out_of_the_database() -> None:
     )
 
 
-def test_what_this_file_cannot_prove_is_written_down() -> None:
-    """The honest limit, kept where the next reader will trip over it.
+def test_what_this_file_cannot_prove_is_proven_at_runtime_instead() -> None:
+    """The honest limit of a name scan, and the thing that now closes it.
 
     A name-based AST scan can only see the names in front of it. It cannot
     resolve `getattr(settings, "owner_" + "database_url")`, a DSN read out of a
     file or a vault at runtime, a psycopg connection built from four separate
     `os.environ` reads with no recognisable literal, or a library the app
-    imports that dials the database itself. The `create_engine` argument check
-    narrows the first three to «an unrecognised expression», which is a
-    warning, not proof.
+    imports that dials the database itself. This test used to say so and stop,
+    because the pass that wrote it owned only test files.
 
-    The guard that would actually close this is a RUNTIME one, and it belongs
-    in the source, not here: a single factory in `career/db/session.py` that
-    every engine is built through, which parses the URL it was handed and
-    raises unless the username is the app or the sweep role — with one
-    explicitly-named escape for Alembic and the operator one-shots. Then the
-    process cannot start as the owner rather than merely being unlikely to.
-    That is a change to `src/`, which this pass does not make; this test exists
-    so the sentence survives until somebody does.
+    It is closed now, in the source where it belongs: `career.db.session`
+    checks the role at engine construction and again on every DBAPI connection
+    in the process, so the four shapes above fail at the point where they are
+    no longer disguised — the username on its way to libpq. What is asserted
+    here is only that the seam still exists and still refuses; how it behaves
+    is `tests/test_db_engine_guard.py`.
     """
+    from career.db.session import ForbiddenDatabaseRole, engine_for
+
+    with pytest.raises(ForbiddenDatabaseRole):
+        engine_for("postgresql+psycopg://a_role_nobody_declared:x@127.0.0.1/career")
     assert _OWNER_ENGINE_ALLOWED, "the ratchet is empty — read the docstring"
+
+
+def test_the_two_allow_lists_cannot_drift_apart() -> None:
+    """This file's list of scripts and the guard's list of processes are one list.
+
+    They are written in two places because they are enforced in two ways — a
+    static scan of source and a runtime check of a username — and two lists of
+    the same thing is exactly how a script gets removed from one and quietly
+    keeps its owner rights through the other. So they are compared instead of
+    trusted.
+    """
+    from career.db.session import (
+        _D20_LEGACY_ENTRYPOINTS,
+        _OPERATOR_ONE_SHOT_ENTRYPOINTS,
+    )
+
+    guard_names = set(_D20_LEGACY_ENTRYPOINTS) | set(_OPERATOR_ONE_SHOT_ENTRYPOINTS)
+    scanned_scripts = {
+        Path(p).name for p in _OWNER_ENGINE_ALLOWED if p.startswith("scripts/")
+    }
+    assert scanned_scripts == guard_names, (
+        "the AST allow-list and the runtime escape lists disagree: only in the "
+        f"scan {sorted(scanned_scripts - guard_names)}, only in the guard "
+        f"{sorted(guard_names - scanned_scripts)}"
+    )
+
+
+def test_the_factory_is_the_only_place_that_builds_an_engine() -> None:
+    """The structural half of the guard, which the runtime half cannot check.
+
+    `engine_for` can only vet an engine it is asked to build. A module that
+    calls `create_engine` itself is still caught — by the connect listener, at
+    its first connection — but that is a failure at 04:30 rather than at
+    review, so the scan keeps saying it earlier and louder.
+    """
+    builders = sorted(
+        rel
+        for path in _production_python_files()
+        if (rel := str(path.relative_to(_REPO))) != _ENGINE_FACTORY_MODULE
+        and any(
+            "create_engine" in signal for signal in _owner_signals(path)
+        )
+    )
+    unexpected = [b for b in builders if b not in _OWNER_ENGINE_ALLOWED]
+    assert not unexpected, (
+        f"these build their own engine instead of calling {_ENGINE_FACTORY_CALLABLE}: "
+        f"{unexpected}"
+    )
 
 
 def test_runtime_role_is_not_superuser_and_cannot_bypass_rls(
