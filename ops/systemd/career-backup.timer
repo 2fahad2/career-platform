@@ -1,3 +1,36 @@
+# 03:30 Riyadh, daily. Both halves derived, neither inherited.
+#
+# WHY DAILY — this period IS the RPO. Nothing else copies this database off
+# the server, so the worst case is «everything the customer said and everything
+# we built for him since the last snapshot», up to 24 hours of it. There is no
+# published promise to divide that into: §12 promises the data is KEPT, not a
+# recovery point. So the number is chosen against what a day actually holds —
+# a conversation, an achievements bank the customer typed by hand, a delivery
+# ledger. Losing a day means asking a paying customer to say it all again,
+# which is survivable; losing a week is not, and hourly would buy a smaller
+# worst case at the price of restic runs during the hours customers are
+# writing to us. Constant 14 asks for encrypted, off-server and periodically
+# restore-tested; it does not ask for continuous.
+#
+# WHY 03:30 — two constraints, and they agree.
+#   * The quietest hour we have. Saudi customers are asleep, the 11:00
+#     delivery run has not started, and the conversation worker is idle — so
+#     the snapshot is taken when the least is in flight and the restic pass
+#     competes with nothing.
+#   * Ninety minutes BEFORE career-verify-restore.timer at 05:00, whose §8
+#     asks how old the newest snapshot is. That ordering is what makes a
+#     backup that failed last night visible this morning rather than a whole
+#     probe-period later, and it is asserted in tests/test_ops_watchdogs.py
+#     rather than left to these two files agreeing by memory.
+#
+# Persistent=true — a machine that was off at 03:30 is precisely the machine
+# whose last snapshot is now a day older than anyone thinks, and a caught-up
+# run costs one extra incremental.
+#
+# A run that FAILS is loud on its own: career-backup.service carries
+# OnFailure=career-alert@%n.service. The failure this schedule cannot see is a
+# chain that stops SILENTLY — a disabled timer, a repository that stopped
+# accepting — which is exactly what the 05:00 probe is for.
 [Unit]
 Description=Daily career backup at 03:30 Riyadh (before the daily run)
 

@@ -44,7 +44,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from career.db.models import (
@@ -66,6 +66,36 @@ SESSION_PLANS: frozenset[str] = frozenset({"executive"})
 #: «والرد خلال ٢٤ ساعة» — the tier's own promise, and therefore the age at
 #: which an unanswered request stops being a queue and becomes a broken word.
 RESPONSE_SLA_HOURS = 24
+
+#: How often a scheduled caller runs :func:`escalate_overdue`, and therefore
+#: the worst-case lateness of the entire measurement — nothing else in this
+#: system looks at the clock on a career-session request. One hour is 4% of
+#: the promise; the nightly-only cadence it replaced on 2026-08-07 was 96%,
+#: which is a 24-hour promise very nearly measured after it had expired.
+#: :func:`escalate_overdue_and_commit` argues the number.
+SLA_SWEEP_INTERVAL_SECONDS = 3600.0
+
+#: One pass at a time, across PROCESSES. Two scheduled callers now exist (the
+#: hourly worker and the nightly backstop) and they can land in the same
+#: second; the PASS — not the row — is the unit of work, so a whole-sweep
+#: advisory lock is the honest claim rather than a per-row ``FOR UPDATE …
+#: SKIP LOCKED`` (that pattern fits a QUEUE, where two workers taking
+#: different rows is progress; here the second pass would only redo the first,
+#: never extend it). Transaction-scoped, so the caller's commit or rollback
+#: releases it and a crash cannot leave it held.
+#:
+#: DELIBERATELY NOT `guarantee._SWEEP_LOCK_KEY` (72_000_072), and the two must
+#: never be merged into one «promises sweep» lock. They measure different
+#: promises against different tables with not one row in common, and both are
+#: driven from the SAME two schedules — the worker's hourly block and
+#: `cv.daily_run.sweep_promises` — so a shared key would make each pass able
+#: to silence the other for a reason that has nothing to do with it: a slow
+#: 72-hour sweep in the worker would stand the nightly's 24-hour pass down,
+#: and the backstop that exists precisely for the hour the worker is wrong
+#: would decline to run BECAUSE the worker was running. Standing down is only
+#: free when the pass holding the lock is doing this pass's work; the whole
+#: value of the claim is that it means exactly that.
+_SLA_SWEEP_LOCK_KEY = 24_000_024
 
 #: «تُخصم قيمة الخدمات البشرية اللي استلمتها فعليًا (جلسة المسار ١٥٠ ريالًا)».
 #: Published on the refund page, so it belongs in the record the operator
@@ -364,23 +394,56 @@ def escalate_overdue(
     customer decides on their own that the human half of what they paid 449
     riyals for is not real. So it escalates into `support_events`, where it
     joins the queue the operator already works, and stamps ``escalated_at``
-    so the ticket is raised once and not once per night.
+    so the ticket is raised once and not once per sweep.
 
-    The once-a-day cadence is the honest limit of this, and the HOUR is not
-    the one this docstring named until 2026-08-07. There is no timer of its
-    own: the caller is ``cv.daily_run.sweep_promises``, which rides the
-    delivery day (``engine.cli`` → ``cv.daily_run.run_daily_delivery``) on
-    ``ops/systemd/career-engine-nightly.timer`` — **11:00 Riyadh**, and has
-    been since 2 August, when the run was pulled into the customer's open
-    24-hour WhatsApp window (the timer file carries the reasoning). This said
-    «04:30 … escalated the following night», which was true of the hour before
-    that move and describes nothing now: a request that crosses 24 hours at
-    noon waits until 11:00 the NEXT day. That is a longer wait than the retired
-    sentence promised, which is exactly why a stale number is worse here than
-    no number. The ledger's own age is exact and the console reads it live, so
-    the delay is in the ALERT, never in the record.
+    Swept HOURLY since 2026-08-07, through :func:`escalate_overdue_and_commit`
+    — from the conversation worker's housekeeping block, and from
+    ``cv.daily_run.sweep_promises`` as a backstop. That second caller is the
+    one this function had for its whole life, and it rides the delivery day
+    (``engine.cli`` → ``cv.daily_run.run_daily_delivery``) on
+    ``ops/systemd/career-engine-nightly.timer`` — **11:00 Riyadh** — so it was
+    the whole schedule of a 24-hour promise measured once a day. A request
+    that crossed the SLA at 12:05 was escalated at 11:00 the next morning:
+    ~23 hours late on a promise 24 hours long, which is a promise very nearly
+    measured after it has already expired. The cadence argument, and why the
+    nightly is kept anyway, are in :func:`escalate_overdue_and_commit`.
+
+    Idempotent at ANY frequency, and by the row rather than by the schedule:
+    the select takes only ``REQUESTED`` rows with ``escalated_at IS NULL``,
+    both branches below stamp it, and nothing ever clears it — so it is a
+    one-way edge that behaves the same on the twenty-fourth pass of a day as
+    on the first. There is no date arithmetic anywhere in this function and
+    no per-day counter: :func:`_is_overdue` compares flat hours, and the
+    returned counters describe THIS PASS, never a day. What that gate does
+    NOT cover is two passes in flight at the same instant, which was
+    impossible with one caller and is not with two — hence the advisory lock
+    the pass opens with.
+
+    The ledger's own age is exact and the console reads it live, so the delay
+    was always in the ALERT and never in the record.
+
+    ── WHAT THIS STILL DOES NOT MEASURE ─────────────────────────────────────
+    «الرد خلال ٢٤ ساعة» is a promise about the OPERATOR'S REPLY, and the only
+    thing here that stops the clock is :func:`mark_scheduled` — a button he
+    taps. So this measures «we noticed nobody had tapped», an hour after the
+    fact instead of a day, and nothing measures whether he then answered: the
+    ticket's own age is the entire signal, and it is swept to ``released``
+    after 48h by `telegram.console.release_forgotten_tickets` without anyone
+    having answered anything. Closing that needs a product decision, not a
+    faster sweep — see :func:`escalate_overdue_and_commit`.
     """
     counts = {"escalated": 0, "unticketed": 0}
+    if not session.execute(
+        select(func.pg_try_advisory_xact_lock(_SLA_SWEEP_LOCK_KEY))
+    ).scalar_one():
+        # Another process is mid-pass over the same rows. Standing down loses
+        # nothing — the pass holding the lock is looking at exactly this work,
+        # and this caller returns within SLA_SWEEP_INTERVAL_SECONDS. Logged
+        # rather than counted, because the counters describe WORK and none was
+        # done; a zero here means «nobody was escalated», which is true.
+        logger.info("career session SLA sweep already in flight — this pass "
+                    "stands down")
+        return counts
     rows = session.execute(
         select(CareerSession).where(CareerSession.status == REQUESTED,
                                     CareerSession.escalated_at.is_(None))
@@ -430,6 +493,160 @@ def escalate_overdue(
                 "وعدنا مشتركي لمّاح+ بالرد خلال أربع وعشرين ساعة")
     session.flush()
     return counts
+
+
+def escalate_overdue_and_commit(
+    session: Session, *, now: datetime, admin_client: Any = None,
+) -> dict[str, int]:
+    """The entry point every SCHEDULED caller uses — both of them, checked:
+    the worker's hourly housekeeping block and `cv.daily_run.sweep_promises`
+    as the nightly backstop. It said «should use» while the nightly still
+    re-implemented the contract with a hand-rolled try/except and a bare
+    rollback that could escape; that is fixed, so the word is now «uses».
+    Sweep, commit, never
+    raise.
+
+    ── WHY AN HOUR ─────────────────────────────────────────────────────────
+    Until 2026-08-07 :func:`escalate_overdue` had exactly one caller,
+    ``cv.daily_run.sweep_promises``, on the 11:00 Riyadh delivery timer. On a
+    72-hour guarantee a daily read is 32% late; on a **24-hour** promise it is
+    96%, and the arithmetic is the whole point: a request that crossed the SLA
+    at 12:05 was noticed at 11:00 the next day, by which time the promise had
+    not merely been broken, it had been broken for almost as long as it had
+    existed. The store sells «الرد خلال ٢٤ ساعة» and the measurement arrived
+    at hour forty-seven.
+
+    An hour is the right grain, and the finer ones were considered and are
+    the same three the 72-hour sweep weighed (`promises.guarantee
+    .sweep_and_commit`). Reused rather than re-derived, because the shape is
+    identical — a poll, a human at the far end, one process already awake —
+    with one number changed and one argument that lands HARDER here:
+
+    * **Every minute** buys 59 minutes of paper precision. What sits at the
+      far end of this alert is a person opening a WhatsApp conversation and
+      writing to a customer; nothing about that changes between 12:05 and
+      13:00, and an operator who is asleep is not woken 59 minutes sooner in
+      any sense that reaches the customer. The cost is a full pass over every
+      open request sixty times an hour, forever.
+    * **A job armed at each request's own deadline** sounds exact and is the
+      most fragile version. A schedule that is LOST — a process that died
+      between arming and firing, a row written while the scheduler was down —
+      is a promise that is never measured at all, with nothing anywhere to
+      notice the silence. That is the exact failure mode this whole module was
+      written against, rebuilt one layer up. A poll is self-healing by
+      construction: the next pass finds whatever the last one missed.
+    * **Four-hourly** would still be coarser than the operator's own reaction
+      time and saves nothing real — the process that runs this is already
+      awake and already sweeping on the hour.
+
+    And the argument that lands harder: on a 24-hour promise, an hour of
+    lateness is 4% and a day is 96%. The hour is not a refinement of the
+    nightly here; it is the difference between measuring the promise and
+    measuring its epitaph.
+
+    ── WHERE IT RUNS, and why not a timer of its own ────────────────────────
+    In ``scripts/run_worker_loop.py``'s hourly housekeeping block, beside the
+    enrichment sweep, the outcome questions, the 72-hour guarantee, the weekly
+    report and the forgotten-ticket release. That process is up permanently
+    under a systemd watchdog, it already holds the operator's Telegram client
+    and a session factory, and it is the one that is awake at 03:00.
+
+    A dedicated unit was rejected for the reason the guarantee rejected it,
+    and the reason is not «consistency»: a unit has to be INSTALLED by hand
+    before the measurement improves at all, ``scripts/verify_restore.sh`` §6
+    checks a fixed list of units it would not be on, and so the failure mode
+    of the fix is that the fix is silently absent. An uninstalled timer
+    improves nothing while looking like it does.
+
+    ── WHY THE NIGHTLY STILL CALLS IT ───────────────────────────────────────
+    Kept on purpose, as the backstop for the hour the worker is not there (a
+    wedged cycle, a deploy, a host that came back without it). It cannot
+    double-escalate, and that is a property of the ROW, not of the schedule:
+    ``escalate_overdue`` selects only ``REQUESTED`` rows whose
+    ``escalated_at`` is NULL, both of its branches stamp it before returning,
+    and nothing in this module or the console ever clears it. One ticket, one
+    page, one stamp — at one pass a day or at twenty-five.
+
+    The one thing that gate does not cover is two passes in flight at the SAME
+    INSTANT: both read the same unstamped row before either commits, and both
+    insert a ticket and page the operator. Impossible with one caller,
+    possible with two — so the pass takes ``pg_try_advisory_xact_lock`` on a
+    key of its own and the loser stands down. Its own key, and NOT the
+    guarantee's: see :data:`_SLA_SWEEP_LOCK_KEY` for why the two promises must
+    not be able to silence each other.
+
+    ── THE CONTRACT ─────────────────────────────────────────────────────────
+    Commits its own work and NEVER raises. The worker's hourly block is a
+    barrier — an escape from it costs that cycle its watchdog pet, and in the
+    nightly it would cost a paying customer's delivery day. A failed pass
+    rolls back whole: the ticket and the ``escalated_at`` stamp are in one
+    transaction, so a crash re-escalates on the next pass rather than leaving
+    a stamped request with no ticket behind it.
+
+    ── WHAT AN HOURLY SWEEP STILL DOES NOT BUY ──────────────────────────────
+    Stated here because it is the honest limit and it must not be mistaken for
+    fixed. The ticket is now opened up to 23 hours sooner — and NOTHING in
+    this system measures whether the operator then answered within the 24
+    hours we sold. «الرد خلال ٢٤ ساعة» is a promise about HIS REPLY; what is
+    measured is our noticing. Concretely:
+
+    * the SLA clock is stopped by :func:`mark_scheduled`, which is a BUTTON.
+      A customer answered on WhatsApp in ten minutes by an operator who never
+      tapped it still escalates; a request the operator tapped and never wrote
+      to reads as answered. The ledger measures taps, not replies.
+    * once the ticket exists, its age is the only signal there is, and it is
+      not a measurement of anything — nothing reports «he replied in 3h», and
+      after 48h ``telegram.console.release_forgotten_tickets`` moves the
+      ticket to ``released`` without a human having answered a thing.
+
+    What WOULD measure the real promise is a stop-clock read from the
+    CONVERSATION instead of from a button: an ``answered_at`` on this row,
+    stamped from the first outbound message this customer received after
+    ``requested_at``, and the promise reported as ``answered_at -
+    requested_at <= 24h`` per request rather than as «a ticket exists».
+    `delivery_messages` already carries one row per send, per tenant, with a
+    ``kind`` and a timestamp, so the query is small.
+
+    The reason it is not written here is that it rests on a PRODUCT decision
+    about what counts as «رد», and every available answer is wrong in a
+    different direction:
+
+    * **Any outbound.** Cheapest and false: today's opportunity bundle went
+      out at 11:00 to every ACTIVE customer, and it answers nothing he asked.
+      Every request would score as answered inside the first delivery day.
+    * **Only ``kind == 'operator_reply'``** — the console's own reply box,
+      the one send in this system a human types (`telegram.console._run_reply`
+      writes it). Honest about intent and blind in the case the tier is SOLD
+      on: «تلقاني على نفس المحادثة» invites Fahad to answer from WhatsApp on
+      his phone, which writes no row here at all. He would answer in four
+      minutes and the report would say he never answered — a metric that
+      punishes the promised behaviour is worse than no metric.
+    * **Ask the customer**, or have the operator close the request himself,
+      which is what :func:`mark_scheduled` already is.
+
+    So the honest options are: make the console reply box the only supported
+    way to answer a لمّاح+ request (a workflow constraint on Fahad, not a
+    schema change), or ingest his own outbound from the WhatsApp Business
+    account so a reply typed on his phone lands in `delivery_messages` too
+    (a Meta webhook subscription, and a decision about storing his message
+    bodies beside the customer's). Until one of those is chosen,
+    ``answered_at`` would be a column that looks like the promise and measures
+    something else — so this pass makes the NOTICING an hour late instead of a
+    day late, and does not pretend to have measured the reply.
+    """
+    zero = {"escalated": 0, "unticketed": 0}
+    try:
+        counts = escalate_overdue(session, now=now, admin_client=admin_client)
+        session.commit()
+        return counts
+    except Exception:  # noqa: BLE001 — a sweep never wedges its caller
+        logger.error("career session SLA sweep failed — no overdue request "
+                     "was ticketed or paged in this pass", exc_info=True)
+        try:
+            session.rollback()
+        except Exception:  # noqa: BLE001 — a dead session must not loop either
+            logger.error("career session SLA rollback failed", exc_info=True)
+        return zero
 
 
 # ── the OTHER human promise on the same 449 pass: the direct line ───────────

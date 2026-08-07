@@ -1,25 +1,75 @@
-# Sunday 05:00 Riyadh — deliberately, on both counts.
+# 05:00 Riyadh, DAILY — the hour is inherited and argued; the period was
+# weekly until 2026-08-08 and is derived now.
 #
-# Sunday is the first working day of the Saudi week and the day the operator's
-# weekly report goes out (06:00–12:00). A probe that runs an hour BEFORE that
-# report means a red result is already on his phone when he sits down to read
-# the week, rather than arriving on a Thursday evening he will not act on.
+# WHY 05:00, unchanged. It is after the 03:30 daily backup, so §8's freshness
+# check reads a snapshot taken ninety minutes earlier: a backup run that failed
+# last night is caught this morning. And Sunday's firing still lands an hour
+# before the operator's weekly report (06:00–12:00) — the first working day of
+# the Saudi week — so a red result is already on his phone when he sits down to
+# read the week.
 #
-# 05:00 is after the 03:30 daily backup, so §8's freshness check reads a
-# snapshot taken ninety minutes earlier: a backup run that failed last night
-# is caught this morning, not next week.
+# WHY DAILY, and why weekly was wrong. The old note here said, in as many
+# words, that «nothing here changes hour to hour except the backup age, the
+# threshold on that is two days» — and then sampled it every seven. A
+# two-day threshold read on a seven-day period is not a threshold, it is a
+# decoration: a chain that stops the hour after Sunday's probe is «fine» for
+# five days in which nothing at all is looking, and the answer «the newest
+# backup is one day old» is one the operator believes because we told him.
 #
-# Weekly and not daily: nothing here changes hour to hour except the backup
-# age, the threshold on that is two days, and the alert this fires is the
-# operator's phone. The other side of «an alert nobody reads» is an alert too
-# frequent to be read.
+#   * The probe's period IS the detection latency for this failure. A backup
+#     that FAILS pages him on its own — career-backup.service carries
+#     OnFailure= — so what §8 exists for is the silent shape: a timer that
+#     stopped firing, a repository that quietly stopped receiving snapshots, a
+#     unit disabled by a half-finished deploy. None of those produce a failed
+#     unit, so none of them produce an alert of any kind, and nothing else on
+#     this host reads a backup's age unattended (the watchtower's health screen
+#     reads it only when the operator taps, which releases fastest for the
+#     operator who is already watching).
+#   * The arithmetic. Weekly: the chain stops after a probe and is reported
+#     seven days later. Daily: age 1d and 2d still pass, 3d fails — so the
+#     worst case falls from seven days to three, and «two days» becomes a
+#     number that means something.
+#
+# WHAT THE EXTRA FREQUENCY COSTS. Seven runs a week instead of one, of a
+# script that is read-only by contract. Eight of the nine checks are local and
+# take milliseconds (fontconfig, the RLS catalog, the migration head, five
+# `systemctl show`s). The ninth lists snapshots over the network — one restic
+# metadata call, six more B2 class-B transactions a week, which is not a
+# rounding error, it is below one. Nothing here restores anything: the
+# expensive proof-by-restore is career-restore-test.timer and it stays monthly.
+#
+# AND WHAT STOPS IT BECOMING NOISE, because a probe that fires more often is
+# an ALERT that fires more often, and the other side of «an alert nobody
+# reads» is an alert too frequent to be read. Three things:
+#
+#   * every one of the nine checks is a structural fault that does NOT
+#     self-heal — backups stopped, RLS dropped, fonts gone, the database off
+#     the migration head, a unit not enabled. There is no blip in this set. A
+#     daily reminder of an unrepaired fault is escalation, not repetition;
+#   * the volume it can reach is one message a day. This repository already
+#     treats one an HOUR as the acceptable ceiling for a permanently wedged
+#     worker (REPEAT_S=3600 in scripts/alert_unit_failure.sh, 24 a day against
+#     an untreated 283), so this is a twenty-fourth of a rate that was already
+#     argued down to «reminders, not repetitions»;
+#   * the failing verdict carries WHICH of the nine checks failed, so two
+#     consecutive days are not two identical messages.
+#
+#   The residual, stated rather than hidden: alert_unit_failure.sh keys
+#   «still broken» versus «broke again» on INCIDENT_GAP_S=900, a number
+#   derived from the always-on units' 305s kill cadence. Every scheduled
+#   oneshot on this host — this probe, the backup, the nightly run — fails
+#   further apart than that, so a second consecutive red is announced as
+#   «تعطلت من جديد بعد فترة سلامة» when nothing recovered. That is a
+#   pre-existing defect of the notifier and not of this schedule (it already
+#   misreports career-backup and career-engine-nightly, both daily); this
+#   timer adds one more unit to the class rather than creating it.
 [Unit]
-Description=Weekly restore/health verification at 05:00 Riyadh on Sunday
+Description=Daily restore/health verification at 05:00 Riyadh (9 checks)
 
 [Timer]
-OnCalendar=Sun *-*-* 05:00:00 Asia/Riyadh
-# A server that was down on Sunday morning is precisely the one worth
-# checking, so a missed run is caught up rather than skipped.
+OnCalendar=*-*-* 05:00:00 Asia/Riyadh
+# A server that was down this morning is precisely the one worth checking, so
+# a missed run is caught up rather than skipped.
 Persistent=true
 
 [Install]

@@ -941,3 +941,79 @@ def test_the_expiry_notice_does_not_reverse_for_the_operator() -> None:
     assert not hits, "mixed-direction operator line(s) — " + " ; ".join(
         f"L{n}: {line.replace(SLOT, '{…}')!r}" for n, line in hits
     )
+
+
+def test_the_nightly_promise_sweep_uses_the_entry_points_it_documents() -> None:
+    """Two files in one wave disagreeing about how a sold promise is measured.
+
+    `sweep_promises` said the لمّاح+ session SLA «still has this caller only,
+    and still carries the same ~23h worst case», while
+    `promises.career_session.escalate_overdue`'s own docstring said — and the
+    worker's housekeeping block did — that it is swept hourly with this call
+    as the backstop. Both cannot be true, and the false one was in the file a
+    reader opens to find out how the nightly measures a promise the store
+    sells in hours.
+
+    The strong half of this test is structural, because prose is what drifted:
+    `sweep_promises` must reach both promises through their own
+    `*_and_commit` entry points and through nothing else. That is what makes
+    «each half commits its own work and never raises» a property of the tree
+    rather than a sentence in a docstring — the raw `escalate_overdue` call it
+    used to make came with a hand-rolled commit/rollback that did NOT hold the
+    contract (`tests/test_promises.py` drives the difference at the commit).
+
+    The prose half is deliberately NOT a search for the retired sentence.
+    That was the first version of this test and it failed on the fix: the new
+    docstring quotes the false claim in order to say it was false, and a
+    tripwire that cannot tell a quotation from a claim teaches its next reader
+    to delete the quotation instead of the defect. What is asserted instead is
+    the fact that made the sentence false — an hourly caller for BOTH promises
+    exists in `scripts/run_worker_loop.py` — plus the requirement that this
+    docstring names both entry points, so the two halves cannot be described
+    asymmetrically again while the code treats them the same.
+    """
+    import ast
+    import pathlib
+
+    repo = pathlib.Path(__file__).resolve().parents[1]
+    source = (repo / "src/career/cv/daily_run.py").read_text(encoding="utf-8")
+    func = next(
+        node for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef) and node.name == "sweep_promises"
+    )
+    called = {
+        node.func.attr for node in ast.walk(func)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert "sweep_and_commit" in called
+    assert "escalate_overdue_and_commit" in called, (
+        "the nightly no longer goes through escalate_overdue_and_commit — "
+        "«the entry point every SCHEDULED caller should use», and this is a "
+        "scheduled caller. Whatever stands here now owns the commit, the "
+        "rollback that must not raise, and the counters the night reports"
+    )
+    assert "escalate_overdue" not in called, (
+        "the nightly calls the raw sweep again, so the commit/rollback "
+        "contract is re-implemented here — that copy is what let a rollback "
+        "failure escape into the delivery day"
+    )
+    assert "commit" not in called and "rollback" not in called, (
+        "sweep_promises is doing its own transaction management again"
+    )
+
+    # The fact the retired sentence got wrong: this is NOT the only caller,
+    # and it is not the only caller of EITHER promise.
+    worker = (repo / "scripts/run_worker_loop.py").read_text(encoding="utf-8")
+    for entry in ("sweep_and_commit", "escalate_overdue_and_commit"):
+        assert f"{entry}(" in worker, (
+            f"{entry} is no longer called from the conversation worker, so "
+            "the nightly IS the whole schedule again — and this docstring "
+            "calls itself a backstop, which is then the false sentence back"
+        )
+
+    doc = ast.get_docstring(func) or ""
+    assert "sweep_and_commit" in doc and "escalate_overdue_and_commit" in doc
+    assert "backstop" in doc.lower(), (
+        "this docstring no longer says what these two calls are. «Backstop» "
+        "is the whole claim: the schedule is hourly and lives in the worker"
+    )

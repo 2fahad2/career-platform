@@ -602,30 +602,55 @@ def sweep_promises(
     guarantee that runs out on a Friday has to be noticed on Friday, not found
     on Sunday with the operator two days late to a conversation about money.
 
-    They ride the nightly orchestrator rather than a timer of their own for
-    the reason 0023's weekly-report marker exists: another systemd unit is
-    another thing that can be down without anybody noticing, and this one
-    already runs, already has an admin client, and already fails loudly when
-    it does not.
+    Riding the nightly rather than a timer of their own was chosen for the
+    reason 0023's weekly-report marker exists: another systemd unit is another
+    thing that can be down without anybody noticing, and this one already
+    runs, already has an admin client, and already fails loudly when it does
+    not. That reasoning is still right about the UNIT and was wrong about the
+    HOUR, which nothing here stated: this run fires at 11:00 Riyadh, so a
+    promise breaking at 12:05 waited until 11:00 the next morning — a day of
+    lateness on clocks written in hours.
+
+    BOTH halves therefore run HOURLY now, from the conversation worker's
+    housekeeping block, and BOTH of these calls are the BACKSTOP rather than
+    the schedule — for the hour the worker is not there (a wedged cycle, a
+    deploy, a host that came back without it). The cadence arguments, and why
+    two callers can never double-apply or double-page, are written out in
+    :func:`career.promises.guarantee.sweep_and_commit` and
+    :func:`career.promises.career_session.escalate_overdue_and_commit`.
+
+    (This docstring said until 2026-08-08 that «the session SLA still has this
+    caller only, and still carries the same ~23h worst case». It was false the
+    moment it was written — the same wave wired the hourly caller, and
+    `escalate_overdue`'s own docstring said so — and it was false about a
+    number the store SELLS, in the file a reader checks to find out how the
+    promise is measured. Both promises are measured the same way, and both are
+    described that way here.)
 
     Best-effort by construction: a promise sweep must never be the reason a
-    paying customer's delivery day does not run. It commits its own work so a
-    later tenant's rollback cannot erase a breach record.
-    """
-    counts: dict[str, int] = {}
-    try:
-        from career.promises import career_session, guarantee
+    paying customer's delivery day does not run. Each half goes through its own
+    ``*_and_commit`` entry point — «the entry point every SCHEDULED caller
+    uses», and this is a scheduled caller — which commits its own work and
+    never raises. So a failure in one cannot roll back what the other has
+    already written, and neither can escape into the delivery day.
 
-        counts.update(guarantee.sweep_delivery_guarantee(
-            session, now=now, admin_client=deps.admin_client,
-        ))
-        counts.update(career_session.escalate_overdue(
-            session, now=now, admin_client=deps.admin_client,
-        ))
-        session.commit()
-    except Exception:  # noqa: BLE001 — never blocks the delivery day
-        logger.error("promise sweep failed", exc_info=True)
-        session.rollback()
+    That contract used to be re-implemented HERE for the SLA half, with a
+    try/except and a bare ``session.rollback()``, and the copy was the weaker
+    one: a rollback that itself raised — a connection already gone, which is
+    the very way the commit above it fails — went straight up into
+    :func:`run_daily_delivery`, which calls this FIRST, before any of the
+    night's work exists. The entry point guards its own rollback. One contract,
+    in one place, tested there.
+    """
+    from career.promises import career_session, guarantee
+
+    counts: dict[str, int] = {}
+    counts.update(guarantee.sweep_and_commit(   # commits; never raises
+        session, now=now, admin_client=deps.admin_client,
+    ))
+    counts.update(career_session.escalate_overdue_and_commit(   # ditto
+        session, now=now, admin_client=deps.admin_client,
+    ))
     return counts
 
 

@@ -5,6 +5,81 @@ source of the wording/variables so rendering and submission stay in sync. The
 daily template is provided in TWO wordings so its Utility-vs-Marketing
 classification can be tested and the economics built on the approved one.
 
+**A CATEGORY IS META'S ANSWER, NOT OUR CLAIM** (audit 2026-08-08). This module
+used to carry one field, ``category``, and every reader in the tree — the daily
+chooser, the WhatsApp bill in `cv/close.whatsapp_spend`, the nightly journal
+line — read it as a statement of fact about the live account. It was not. It
+was the category we ASKED for at submission, and a read-only
+``GET /{waba}/message_templates?fields=name,status,category,previous_category``
+run on 2026-08-08 showed the two diverging on FIVE of the eight live templates,
+each of them carrying ``previous_category: UTILITY``:
+
+===============================  ==========  =================================
+name                             at Meta     previously
+===============================  ==========  =================================
+subscription_daily_report        UTILITY     — (held)
+daily_service_update             MARKETING   UTILITY
+daily_opportunities_utility      MARKETING   UTILITY
+welcome_activation               MARKETING   UTILITY
+onboarding_reminder              MARKETING   UTILITY
+renewal_reminder                 MARKETING   UTILITY
+daily_opportunities_marketing    MARKETING   — (asked for, got it)
+recovery                         MARKETING   — (asked for, got it)
+===============================  ==========  =================================
+
+``previous_category`` is the load-bearing column: Meta ACCEPTED these as
+UTILITY and moved them to MARKETING **after approval**, without us touching
+them. So the failure is not «somebody typed the wrong constant» — a hand-typed
+constant CANNOT be right, because the value it names is edited by somebody
+else, later, silently. ``daily_opportunities_utility`` is the extreme case: a
+name that asserts a category Meta had already taken away.
+
+The field is therefore split in two, and neither half pretends to be the other:
+
+* :attr:`TemplateSpec.requested_category` — what we submit. Ours, permanent,
+  and never evidence of anything about the live account.
+* :data:`META_CATEGORY_OBSERVED` — what Meta answered, dated, with the query
+  that produced it written down. Refreshed by the nightly probe, which already
+  calls this endpoint; :func:`category_divergences` is what makes a drift loud
+  instead of a thing discovered in an invoice.
+
+WHAT META'S RULE ACTUALLY IS, checked against the live documentation on
+2026-08-08 rather than remembered (developers.facebook.com → business-messaging
+→ whatsapp → templates/template-categorization). UTILITY needs BOTH halves:
+«must be non-promotional, not containing any promotional or persuasive intent»
+AND «specific to or requested by the user» or «essential or critical to the
+user». Having already paid does NOT make a message utility — Meta's own two
+examples are a subscription pair: *«Reminder: Your monthly payment for
+{{service}} will be billed on {{date}}»* is UTILITY, and *«Your subscription
+will expire on {{date}}! Renew today to save {{discount}}»* is MARKETING, filed
+under retargeting. Persuasion decides, not entitlement. «Mixed content» and
+«contents are unclear» both fall to MARKETING by rule.
+
+The three consequences, which are separate risks and only one of them is money:
+
+1. **Price.** Saudi Arabia, Meta's live card on 2026-08-08: marketing $0.0501
+   per delivered message, utility $0.0107 — ~4.7×, not the ~2.4× the older
+   comments in this tree assumed (KSA's marketing rate rose 2026-04-01).
+   Utility has volume tiers down to $0.0080; marketing has none. Since
+   2025-07-01 a UTILITY template delivered inside an open 24h customer service
+   window is FREE; a marketing one never is.
+2. **Throughput.** Messaging limits are portfolio-wide and CATEGORY-NEUTRAL
+   (they count unique recipients reached outside a service window), and quality
+   rating is per TEMPLATE, not per category — so the category does not change
+   the throttle directly. What it changes is the feedback: marketing content is
+   what draws the blocks and low read-rates that drive a rating down into
+   template pausing (132015) and permanent disabling (132016).
+3. **DELIVERABILITY, which is the one that is not about billing.** A recipient
+   who has switched «Offers and announcements» off for this business does not
+   receive a MARKETING template at all: «the API will process the request but
+   not send the message» — HTTP 200, error 131050 on the status webhook only,
+   and Meta's own advice is «do not retry». The per-user marketing cap (131049)
+   is a second such path and is active in Saudi Arabia. A customer who paid for
+   a daily service and does not receive it because it was filed as an
+   advertisement is a product failure, not a billing error. That is why
+   :data:`FALLBACK_DAILY` and :func:`preferred_daily_template` prefer a
+   measured-UTILITY template over a cheaper-looking name.
+
 Free-form service messages inside an open window need no template.
 
 **A button label is a routing decision, not decoration.** A tap arrives as an
@@ -27,8 +102,13 @@ today, since these two are not approved yet.
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from datetime import date
 from enum import StrEnum
+
+logger = logging.getLogger("career.whatsapp")
 
 
 class TemplateCategory(StrEnum):
@@ -40,74 +120,124 @@ class TemplateCategory(StrEnum):
 class TemplateSpec:
     name: str
     language: str
-    category: TemplateCategory
+    #: The category we ASK Meta for when the template is submitted. It is a
+    #: request, never a fact: Meta decides at review and — as five of these
+    #: prove — may decide again after approval. Nothing that costs money or
+    #: decides deliverability may read this field; read
+    #: :func:`observed_category` or :func:`billed_category` instead.
+    requested_category: TemplateCategory
     body: str
     buttons: tuple[str, ...] = ()
     variables: tuple[str, ...] = field(default_factory=tuple)
 
+    @property
+    def category(self) -> TemplateCategory:
+        """COMPATIBILITY SHIM — Meta's category when we have measured it.
 
-#: Strictly transactional wording — and the ONE that held UTILITY through
-#: review. `daily_service_update` was accepted as UTILITY on submission and
-#: Meta's reviewer moved it to MARKETING while pending; the difference between
-#: the two bodies is that this one never mentions «الفرص». Their classifier
-#: reads a message that announces opportunities as promotion, no matter what
-#: the customer paid for. So this says only what is transactionally true: the
-#: report you subscribe to is ready, and your files are with it.
+        Two log lines in ``engine/cli.py`` (a module this change does not own)
+        still read ``spec.category``, and leaving them reading the REQUESTED
+        value would keep the nightly journal printing «utility» about a
+        template Meta bills as marketing — the exact sentence that made this
+        wrong for weeks. So the shim resolves to the observed category first
+        and only falls back to the request when Meta has never been asked.
+
+        Delete it together with the two-line `engine/cli.py` patch in the
+        report; new code reads :func:`observed_category` (which can answer
+        «I do not know») or :func:`billed_category` (which errs expensive).
+        """
+        return observed_category(self.name) or self.requested_category
+
+
+#: Strictly transactional wording — and, on 2026-08-08, THE ONLY ONE OF THE
+#: EIGHT THAT IS UTILITY AT META. `daily_service_update` was accepted as
+#: UTILITY too and was later moved to MARKETING (it still carries
+#: ``previous_category: UTILITY``); the difference between the two bodies is
+#: that this one never mentions «الفرص». Their classifier reads a message that
+#: announces opportunities as promotion, no matter what the customer paid for.
+#: So this says only what is transactionally true: the report you subscribe to
+#: is ready, and your files are with it.
+#:
+#: It is young — approved 2026-08-05 — and «held UTILITY» is a claim with a
+#: date on it, not a property. The nightly divergence check is what will say
+#: whether it keeps holding.
 SUBSCRIPTION_DAILY_REPORT = TemplateSpec(
     name="subscription_daily_report",
     language="ar",
-    category=TemplateCategory.UTILITY,
+    requested_category=TemplateCategory.UTILITY,
     body=("تحديث اشتراكك: تقريرك اليومي جاهز، ومعه ملفاتك بصيغة PDF. "
           "اضغط لاستلامه."),
     buttons=("استلام",),
 )
 
-#: The daily template Meta actually classified as UTILITY (2 August).
+#: Submitted 2 August as the UTILITY-shaped replacement for
+#: `daily_opportunities_utility`, accepted as UTILITY — **and MARKETING at Meta
+#: today** (``previous_category: UTILITY``). It is the second template on this
+#: account to be accepted as utility and re-categorised afterwards, which is
+#: the evidence that «Meta accepted the wording» is not a durable result.
 #:
-#: `daily_opportunities_utility` was approved but classified MARKETING despite
-#: its name, and Meta refuses to re-categorise an APPROVED template — the API
-#: answers «You cannot update an approved template category». Category is
-#: decided from CONTENT, so this one is written as what it truly is: a status
-#: update on a service the customer is PAYING for, with no offer, no
-#: enticement and no promotional punctuation. Meta accepted it as UTILITY on
-#: submission, which is roughly a third of the marketing price per message —
-#: and marketing templates are also subject to per-user marketing limits, so
-#: a paying customer could have missed their own delivery.
+#: The wording is still right and is kept: no offer, no enticement, no
+#: promotional punctuation, tied to «اشتراكك». What changed is the conclusion
+#: drawn from it — a body can earn UTILITY at review and lose it later, so the
+#: only honest reading of a category is a measured one.
 DAILY_SERVICE_UPDATE = TemplateSpec(
     name="daily_service_update",
     language="ar",
-    category=TemplateCategory.UTILITY,
+    requested_category=TemplateCategory.UTILITY,
     body=("تحديث خدمتك اليومي: اكتمل بحث اليوم على اشتراكك، وجهّزنا سيرتك "
           "الذاتية للفرص المختارة. اضغط للاطلاع على التفاصيل."),
     buttons=("عرض التفاصيل",),
 )
 
 # Daily opportunity template — two wordings for the classification test (§08).
+
+#: **THE NAME IS A LIE AND CANNOT BE FIXED.** `daily_opportunities_utility` is
+#: MARKETING at Meta (``previous_category: UTILITY``) and a template name is
+#: immutable once created, so the string that goes on the wire will say
+#: «utility» for as long as this template exists. The Python symbol is left
+#: alone for the same reason a rename would be theatre — `cv/daily_run.py`
+#: imports it and the wire name would not change anyway. What is fixed is that
+#: nothing in the tree now DERIVES anything from the word: the category comes
+#: from :data:`META_CATEGORY_OBSERVED`, and the test suite pins this name to
+#: MARKETING so a reader who trusts the name is contradicted immediately.
 DAILY_UTILITY = TemplateSpec(
     name="daily_opportunities_utility",
     language="ar",
-    category=TemplateCategory.UTILITY,
+    # Historical: this IS what was asked for, and Meta said no.
+    requested_category=TemplateCategory.UTILITY,
     body="لديك اليوم فرصتان مطابقتان لمسارك، وسيرتك الذاتية جاهزة. اضغط لعرضها.",
     buttons=("عرض الفرص",),
 )
+#: Honest on both counts: promotional wording, asked for MARKETING, got it, and
+#: it is the ONE daily template whose name, request and live category agree.
 DAILY_MARKETING = TemplateSpec(
     name="daily_opportunities_marketing",
     language="ar",
-    category=TemplateCategory.MARKETING,
+    requested_category=TemplateCategory.MARKETING,
     body="🎯 لقينا لك اليوم فرصتين متوافقتين مع مسارك والـCVs جاهزة — اعرض الفرص الآن!",
     buttons=("عرض الفرص",),
 )
 
+#: THE FIRST MESSAGE A PAYING BUYER EVER RECEIVES (zero-touch activation,
+#: `salla/provisioning._announce_provision`), and MARKETING at Meta today. It
+#: is the send with the least margin for a category error in the whole
+#: product: the buyer's REPLY to it is what claims the subscription, so a
+#: message that does not arrive is a paid order that never activates and a
+#: customer who is never onboarded — with no error anywhere, because a
+#: message a recipient's settings suppress is not a send failure.
 WELCOME_ACTIVATION = TemplateSpec(
     name="welcome_activation",
     language="ar",
-    category=TemplateCategory.UTILITY,
+    requested_category=TemplateCategory.UTILITY,
     body="أهلًا بك في مساعد التوظيف. لنبدأ إعداد خدمتك — ردّ بأي رسالة للمتابعة.",
 )
+#: Sent only to a customer who has ALREADY PAID and stalled mid-setup
+#: (`onboarding/orchestrator.send_due_reminders`), and only when the 24h window
+#: is shut — so this template is the only way to reach him at all. MARKETING at
+#: Meta today.
 ONBOARDING_REMINDER = TemplateSpec(
     name="onboarding_reminder",
     language="ar",
-    category=TemplateCategory.UTILITY,
+    requested_category=TemplateCategory.UTILITY,
     body="لم تكمل إعداد خدمتك بعد. أكمله الآن لنبدأ البحث لك يوميًا.",
 )
 #: The one label the inbound router resolves to a real answer about billing
@@ -116,24 +246,37 @@ ONBOARDING_REMINDER = TemplateSpec(
 #: it, so no nudge can end in the generic fallback again.
 RENEW_BUTTON_AR = "حالة اشتراكي"
 
+#: Goes to a LIVE, PAYING customer three days before his period ends
+#: (`salla/lifecycle`), and MARKETING at Meta today. Its body — «جدّد الآن»,
+#: an instruction to buy — is the one of the three that a reviewer can
+#: reasonably read as promotion, and it is also the one whose non-arrival is
+#: least catastrophic: the customer stays served until the period ends.
 RENEWAL_REMINDER = TemplateSpec(
     name="renewal_reminder",
     language="ar",
-    category=TemplateCategory.UTILITY,
+    requested_category=TemplateCategory.UTILITY,
     body="اشتراكك ينتهي قريبًا. جدّد الآن لمواصلة استقبال الفرص اليومية.",
     buttons=(RENEW_BUTTON_AR,),
 )
+#: Honestly marketing and always was: re-engagement of a customer whose
+#: subscription expired seven days ago. He is not owed this message, and a
+#: recipient who has switched marketing off is entitled not to get it.
 RECOVERY = TemplateSpec(
     name="recovery",
     language="ar",
-    category=TemplateCategory.MARKETING,  # marketing → opt-in list only
+    requested_category=TemplateCategory.MARKETING,  # opt-in list only
     body="نفتقدك! عد إلى مساعد التوظيف وواصل رحلتك نحو الفرصة المناسبة.",
     buttons=(RENEW_BUTTON_AR,),
 )
+#: NEVER SUBMITTED TO META AND NEVER SENT — it has no call site anywhere in the
+#: tree and does not appear in the live template list. It is kept as approved
+#: WORDING for the zero-match day; sending it today would be rejected outright.
+#: Its absence from :data:`META_CATEGORY_OBSERVED` is the machine-readable form
+#: of that sentence, and is pinned by a test.
 ZERO_DAY_REPORT = TemplateSpec(
     name="zero_day_report",
     language="ar",
-    category=TemplateCategory.UTILITY,
+    requested_category=TemplateCategory.UTILITY,
     body="لا فرص مطابقة اليوم. قد توسيع معاييرك يفتح فرصًا أكثر — اضغط للمراجعة.",
     buttons=("مراجعة المعايير",),
 )
@@ -147,29 +290,152 @@ REGISTRY: dict[str, TemplateSpec] = {
     )
 }
 
-#: The daily template the delivery run should use, best first. The UTILITY one
-#: costs roughly a third of the marketing rate and is not subject to Meta's
-#: per-user marketing limits — a paying customer must never miss their own
-#: delivery because a promotional cap was hit. Falling back is deliberate: a
-#: template awaiting Meta's review would otherwise stop the day entirely.
+#: ── WHAT META SAYS ──────────────────────────────────────────────────────────
+#:
+#: Measured, not asserted. Source, reproducible with a read-only GET and no
+#: side effects (never a POST — a category change at Meta is Fahad's to make):
+#:
+#:     GET https://graph.facebook.com/v21.0/{WABA_ID}/message_templates
+#:         ?fields=name,status,category,previous_category&limit=100
+#:
+#: Observed 2026-08-08. All eight are APPROVED; the three `jaspers_market_*`
+#: and `hello_world` samples Meta ships with a new account are deliberately
+#: absent — they are not ours and we never send them.
+META_CATEGORY_OBSERVED_AT = date(2026, 8, 8)
+META_CATEGORY_OBSERVED: dict[str, TemplateCategory] = {
+    "subscription_daily_report": TemplateCategory.UTILITY,
+    "daily_service_update": TemplateCategory.MARKETING,       # was UTILITY
+    "daily_opportunities_utility": TemplateCategory.MARKETING,  # was UTILITY
+    "daily_opportunities_marketing": TemplateCategory.MARKETING,
+    "welcome_activation": TemplateCategory.MARKETING,         # was UTILITY
+    "onboarding_reminder": TemplateCategory.MARKETING,        # was UTILITY
+    "renewal_reminder": TemplateCategory.MARKETING,           # was UTILITY
+    "recovery": TemplateCategory.MARKETING,
+}
+
+
+def observed_category(name: str) -> TemplateCategory | None:
+    """Meta's category for ``name``, or None when we have never measured it.
+
+    None is a real answer and callers must handle it. It is what a hand-typed
+    ``category`` field could never say, and saying it is most of the fix.
+    """
+    return META_CATEGORY_OBSERVED.get(name)
+
+
+def billed_category(name: str) -> TemplateCategory:
+    """The category the WhatsApp bill must assume for ``name``.
+
+    Observed when we have it, MARKETING when we do not — the same rule
+    `cv/close._wa_kind_of` already applied to unrecognised template names, for
+    the same reason: **an unverified category must never make a bill look
+    smaller than it is.** Every one of the five templates that quietly moved to
+    MARKETING had been billed at the utility rate until this existed. On Meta's
+    live Saudi Arabia rate card (verified 2026-08-08: utility $0.0107,
+    marketing $0.0501 per delivered message) that is **21% of the true price**,
+    on what `salla/lifecycle._live_channel` documents as the MAJORITY of this
+    account's billed template traffic.
+
+    KNOWN OVERSTATEMENT, in the other direction and much smaller: since
+    2025-07-01 Meta delivers UTILITY templates free inside an open 24-hour
+    customer service window. `salla/lifecycle._send_template` does not check
+    the window, so a lifecycle template that lands inside one is billed here at
+    a price Meta did not charge. It cannot be netted out without recording the
+    window state on the ledger row, and over-reporting is the safe direction.
+    """
+    return observed_category(name) or TemplateCategory.MARKETING
+
+
+def category_divergences(
+    live: Mapping[str, str],
+) -> dict[str, tuple[str, str]]:
+    """``{name: (recorded, live)}`` for every template whose category at Meta
+    is not the one recorded above — the check that makes this snapshot a
+    measurement instead of a stale constant.
+
+    Meta re-categorises APPROVED templates without asking (five of eight here),
+    so a snapshot with no re-check is exactly the defect it replaced, one week
+    older. The nightly probe already fetches this list; comparing it costs one
+    dict lookup per row and turns «found out from the invoice» into a log line
+    the operator's ERROR harvester forwards the same night.
+
+    Names Meta reports that we have never recorded are NOT divergences — the
+    account carries Meta's own sample templates — but a name we record and Meta
+    does not is, and it reads as ``(recorded, "absent")``: a template we would
+    happily try to send and that no longer exists.
+    """
+    out: dict[str, tuple[str, str]] = {}
+    for name, recorded in META_CATEGORY_OBSERVED.items():
+        actual = str(live.get(name, "absent")).lower()
+        if actual != str(recorded):
+            out[name] = (str(recorded), actual)
+    return out
+
+
+#: The daily template the delivery run should use, best first. A UTILITY
+#: template is cheaper per message AND — the part that is not about money — is
+#: not subject to Meta's marketing controls, so it reaches a recipient who has
+#: switched marketing messages off. A paying customer must never miss the
+#: delivery he bought because it was filed as an advertisement. Falling back is
+#: deliberate: a template awaiting Meta's review would otherwise stop the day.
 DAILY_PREFERENCE: tuple[TemplateSpec, ...] = (
     SUBSCRIPTION_DAILY_REPORT, DAILY_SERVICE_UPDATE, DAILY_UTILITY,
     DAILY_MARKETING,
 )
 
+#: Where the day goes when Meta cannot be asked. It was `DAILY_UTILITY` on the
+#: reasoning «the only name we have ever seen Meta accept» — true when written,
+#: false since: `subscription_daily_report` is APPROVED (verified 2026-08-08)
+#: and is the ONLY daily template that is UTILITY at Meta. Both names are
+#: equally approved, so the fallback now costs the utility rate instead of the
+#: marketing one and is not exposed to marketing suppression — on the one path
+#: where nobody is watching, which is precisely where the cheap-and-deliverable
+#: option belongs.
+FALLBACK_DAILY: TemplateSpec = SUBSCRIPTION_DAILY_REPORT
+
 
 def preferred_daily_template(
-    approved_names: set[str] | None,
+    approved: Mapping[str, str] | Iterable[str] | None,
 ) -> TemplateSpec:
-    """The cheapest daily template Meta has actually approved.
+    """The cheapest, most deliverable daily template Meta has actually approved.
 
-    ``approved_names`` is what the live account reports; None means we could
-    not ask (no credentials, or Meta unreachable), and then we keep using the
-    long-standing one rather than gambling the day on an unverified name.
+    ``approved`` is what the live account reports, and its TYPE says how much
+    the caller managed to find out:
+
+    * ``Mapping[name, category]`` — status *and* category came back. The choice
+      is then made on Meta's own answer: any approved candidate Meta calls
+      utility beats every candidate it calls marketing, whatever our names or
+      our submissions claim. This is the only form that cannot be wrong.
+    * an iterable of names — approved, category unknown (the old contract, kept
+      so a caller that has not been updated still works). Falls back to the
+      hand-ordered preference, which is a guess about categories.
+    * ``None`` — we could not ask at all (no credentials, or Meta unreachable),
+      so we do not gamble the day on an unverified name: :data:`FALLBACK_DAILY`.
     """
-    if approved_names is None:
-        return DAILY_UTILITY
-    for spec in DAILY_PREFERENCE:
-        if spec.name in approved_names:
-            return spec
-    return DAILY_UTILITY
+    if approved is None:
+        return FALLBACK_DAILY
+    live: dict[str, str] = {}
+    if isinstance(approved, Mapping):
+        live = {str(k): str(v).lower() for k, v in approved.items()}
+        names = set(live)
+    else:
+        names = {str(n) for n in approved}
+    candidates = [spec for spec in DAILY_PREFERENCE if spec.name in names]
+    if not candidates:
+        return FALLBACK_DAILY
+    if live:
+        utility = [
+            spec for spec in candidates
+            if live.get(spec.name) == TemplateCategory.UTILITY
+        ]
+        if utility:
+            return utility[0]
+        # Every approved candidate is marketing today. Say so: the day still
+        # runs, but it runs at the marketing rate and can be suppressed for a
+        # customer who has turned marketing off, and that is not a silent fact.
+        logger.error(
+            "no daily template is UTILITY at Meta — sending %s at the "
+            "marketing rate, which a recipient's marketing settings may "
+            "suppress entirely", candidates[0].name,
+        )
+    return candidates[0]

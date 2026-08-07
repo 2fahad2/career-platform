@@ -296,6 +296,42 @@ def test_a_correct_environment_is_silent() -> None:
     assert _check() == []
 
 
+def test_a_configured_whatsapp_token_is_not_the_same_as_a_LIVE_one() -> None:
+    """The gap this check was blind to, in one assertion.
+
+    Both calls below pass the identical settings — a non-empty
+    ``WHATSAPP_ACCESS_TOKEN`` and a non-empty phone number id — and the first
+    is silent, because a string in a file is all it ever looked at. That is
+    precisely the shape of the 2026-07-29 outage: `SALLA_TOKEN_EXPIRES_AT`
+    stayed exactly as somebody had typed it while the credential it described
+    was dead, and paid orders failed to provision for nine days.
+
+    The second passes Meta's own answer about the token that EXISTS, and that
+    answer is «revoked». Full facts, ladder and cadence live in
+    `tests/test_whatsapp_token_watch.py`; what belongs HERE is that the boot
+    check consumes them at all.
+    """
+    from career.whatsapp.client import TokenHealth, TokenVerdict
+
+    assert _check() == []
+    problems = cli.verify_environment(
+        _settings(), approved_prices=APPROVED, sale_plans=ON_SALE, today=TODAY,
+        token_health=TokenHealth(TokenVerdict.INVALID, error_code=190),
+    )
+    assert [p.key for p in problems] == ["WHATSAPP_ACCESS_TOKEN"]
+    assert "META REFUSES IT" in problems[0].english
+
+
+def test_an_empty_token_is_still_reported_without_asking_meta() -> None:
+    """The emptiness check keeps its own rung. There is nothing to inspect, so
+    a live answer would be a network call spent to learn what the file already
+    says — and the message a human needs is different: «put a token in the
+    file», not «your token was revoked»."""
+    problems = _check(whatsapp_access_token="")
+    assert [p.key for p in problems] == ["WHATSAPP_ACCESS_TOKEN"]
+    assert "empty" in problems[0].english
+
+
 def test_the_live_environment_of_5_august_is_caught_whole() -> None:
     """The exact stale file: a retired plan, a retired price, a token that
     died a week ago and no store URL — four faults, twelve days, no word."""

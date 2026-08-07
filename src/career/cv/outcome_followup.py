@@ -38,7 +38,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from career.arabic import normalize_ar
@@ -70,6 +70,11 @@ INTERVIEW = "interview"
 NO_REPLY = "no_reply"
 REJECTED = "rejected"
 GAVE_UP = "unanswered"
+
+#: The four stages that CLOSE a job's thread. Written once because three
+#: functions in this file ask the same question of the same column, and a set
+#: spelled out four times is a set that eventually differs in one of them.
+TERMINAL: frozenset[str] = frozenset({INTERVIEW, NO_REPLY, REJECTED, GAVE_UP})
 
 _ANSWERS: dict[str, str] = {
     "oc_interview": INTERVIEW,
@@ -215,18 +220,59 @@ def pending_job_ref(
     the job is resolved here: the most recently asked application that has no
     answer yet. Asking about one job at a time is what makes that safe, and
     the sweep enforces it.
+
+    ONE query, and the count matters because of WHERE this is called from.
+    Since it was wired into `whatsapp.worker`'s message path it runs on every
+    inbound message, and it used to walk every ASKED row calling
+    :func:`_stages` per row — returning early only when a question IS open, so
+    the common case (nothing pending, which is most messages) was the
+    expensive one and paid 1+N. A customer a year in with a hundred
+    applications cost about a hundred and one queries for every «شكرًا» he
+    typed. The ledger is append-only and never pruned, so that number only
+    grows.
+
+    The grouping reproduces the walk exactly, and the two places it would be
+    easy to get subtly wrong are the two that cost a §20 datum that can never
+    be collected again:
+
+    * **Closed is closed regardless of ORDER.** The condition is «this job has
+      no terminal row», counted over the whole group — not «the latest row is
+      not terminal». `outcome_events` is a ledger with a supplied
+      ``occurred_at``, and an answer recorded with an earlier timestamp than
+      the question (a replayed webhook, a backfill) must still close the
+      thread. Reading it the other way re-asks a question the customer already
+      answered.
+    * **The order is the ASKED row's own time**, not the job's latest
+      activity: the MAX is taken over a CASE that is NULL on every row that is
+      not a question, so it is the newest ASKED stamp and nothing else —
+      exactly where the walk's ``ORDER BY occurred_at DESC`` over ASKED rows
+      put it. An «applied» row added later must not promote its job over a
+      question asked afterwards.
+
+    Ties add a deterministic ``job_ref`` tie-break the walk did not have: with
+    two questions asked in the same instant the walk returned whichever row
+    Postgres handed back first. Only one question is ever open at a time
+    (:func:`sweep_outcome_questions` enforces it), so this decides nothing
+    real — it just stops the answer moving between two calls.
     """
-    asked = session.execute(
-        select(OutcomeEvent.job_ref, OutcomeEvent.occurred_at).where(
-            OutcomeEvent.tenant_id == tenant_id,
-            OutcomeEvent.outcome == ASKED,
-        ).order_by(OutcomeEvent.occurred_at.desc())
-    ).all()
-    for job_ref, _ in asked:
-        stages = _stages(session, tenant_id, job_ref)
-        if not (stages & {INTERVIEW, NO_REPLY, REJECTED, GAVE_UP}):
-            return str(job_ref)
-    return None
+    #: The time this job's question was asked; NULL for a job never asked.
+    asked_at = case(
+        (OutcomeEvent.outcome == ASKED, OutcomeEvent.occurred_at)
+    )
+    #: How many terminal stages this job has — zero means still open.
+    closed = func.count(
+        case((OutcomeEvent.outcome.in_(TERMINAL), 1))
+    )
+    job_ref = session.execute(
+        select(OutcomeEvent.job_ref)
+        .where(OutcomeEvent.tenant_id == tenant_id)
+        .group_by(OutcomeEvent.job_ref)
+        .having(func.max(asked_at).is_not(None))
+        .having(closed == 0)
+        .order_by(func.max(asked_at).desc(), OutcomeEvent.job_ref)
+        .limit(1)
+    ).scalars().first()
+    return None if job_ref is None else str(job_ref)
 
 
 def record_answer(
@@ -264,8 +310,7 @@ def stale_asked(
     ).all()
     out: list[tuple[uuid.UUID, str]] = []
     for tenant_id, job_ref in rows:
-        if not (_stages(session, tenant_id, job_ref)
-                & {INTERVIEW, NO_REPLY, REJECTED, GAVE_UP}):
+        if not _stages(session, tenant_id, job_ref) & TERMINAL:
             out.append((tenant_id, str(job_ref)))
     return out
 
@@ -289,8 +334,7 @@ def due_applications(
     ).all()
     out: list[tuple[uuid.UUID, str, datetime]] = []
     for tenant_id, job_ref, applied_at in rows:
-        stages = _stages(session, tenant_id, job_ref)
-        if stages & {ASKED, INTERVIEW, NO_REPLY, REJECTED, GAVE_UP}:
+        if _stages(session, tenant_id, job_ref) & (TERMINAL | {ASKED}):
             continue          # already asked, already answered, or closed
         out.append((tenant_id, job_ref, applied_at))
     return out

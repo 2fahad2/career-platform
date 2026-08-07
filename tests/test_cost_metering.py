@@ -584,14 +584,19 @@ def test_whatsapp_templates_are_priced_per_category(
     owner_session: Session,
 ) -> None:
     """Meta bills marketing at multiples of utility — one «messages» number
-    would hide the expensive half of the bill."""
+    would hide the expensive half of the bill.
+
+    The utility fixture is `subscription_daily_report` because, as of the
+    2026-08-08 measurement, it is the ONLY one of the eight live templates Meta
+    actually categorises as UTILITY.
+    """
     tid = _seed_tenant(owner_session)
     try:
         cid = _seed_channel(owner_session, tid)
         _seed_message(owner_session, tid, cid, kind="template",
-                      template_name="daily_opportunities_utility")
+                      template_name="subscription_daily_report")
         _seed_message(owner_session, tid, cid, kind="template",
-                      template_name="daily_opportunities_utility")
+                      template_name="subscription_daily_report")
         _seed_message(owner_session, tid, cid, kind="template",
                       template_name="recovery")
         owner_session.commit()
@@ -599,6 +604,41 @@ def test_whatsapp_templates_are_priced_per_category(
         spend = close.whatsapp_spend(owner_session, tenant_id=tid, day=DAY)
         assert spend["wa_utility"] == (2, Decimal("0.0314"))
         assert spend["wa_marketing"] == (1, Decimal("0.0384"))
+    finally:
+        _cleanup(owner_session, tid)
+
+
+def test_the_bill_follows_metas_category_not_the_templates_name(
+    owner_session: Session,
+) -> None:
+    """AUDIT 2026-08-08 — the regression this file could not previously catch.
+
+    `daily_opportunities_utility` is APPROVED at Meta as **MARKETING**
+    (``previous_category: UTILITY`` — Meta re-categorised it after approving
+    it), and so are `welcome_activation`, `onboarding_reminder`,
+    `renewal_reminder` and `daily_service_update`. The bill used to read the
+    category we SUBMITTED them under and charged all five at the utility rate,
+    on the majority of the account's template traffic. Against Meta's live
+    Saudi Arabia card (utility $0.0107, marketing $0.0501, verified the same
+    day) that recorded 21% of what Meta charges. A name is not evidence.
+
+    The Decimals below are the CONFIGURED rates, not Meta's — the settings are
+    themselves stale (see `close._wa_price`), and this test is about which
+    bucket a send lands in, not about what the operator has typed into `.env`.
+    """
+    tid = _seed_tenant(owner_session)
+    try:
+        cid = _seed_channel(owner_session, tid)
+        for name in ("daily_opportunities_utility", "daily_service_update",
+                     "welcome_activation", "onboarding_reminder",
+                     "renewal_reminder"):
+            _seed_message(owner_session, tid, cid, kind="template",
+                          template_name=name)
+        owner_session.commit()
+
+        spend = close.whatsapp_spend(owner_session, tenant_id=tid, day=DAY)
+        assert "wa_utility" not in spend, spend
+        assert spend["wa_marketing"] == (5, Decimal("0.1920"))
     finally:
         _cleanup(owner_session, tid)
 
@@ -646,7 +686,7 @@ def test_rollup_folds_whatsapp_in_and_stays_idempotent(
     try:
         cid = _seed_channel(owner_session, tid)
         _seed_message(owner_session, tid, cid, kind="template",
-                      template_name="daily_opportunities_utility")
+                      template_name="subscription_daily_report")
         close.record_usage(
             owner_session, tenant_id=tid, kind="llm_render", now=NOW,
             input_tokens=1000, output_tokens=100, cost_usd=Decimal("0.0075"),
@@ -687,7 +727,7 @@ def test_business_data_covers_every_category_and_names_the_top_spender(
     try:
         cid = _seed_channel(owner_session, tid)
         _seed_message(owner_session, tid, cid, kind="template",
-                      template_name="daily_opportunities_utility")
+                      template_name="subscription_daily_report")
         for kind, cost in (("llm_render", "0.0300"), ("llm_judge", "0.0100"),
                            ("llm_intent", "0.0010"), ("search_api", "0.0160")):
             close.record_usage(

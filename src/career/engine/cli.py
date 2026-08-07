@@ -42,6 +42,12 @@ from career.engine.run import RunReport, run_nightly
 from career.engine.sources import HttpSearchApiClient, PythonJobSpyClient
 from career.logging_filters import install_secret_redaction
 from career.salla.provisioning import TOKEN_EXPIRY_WARN_DAYS
+from career.whatsapp.client import (
+    TokenHealth,
+    TokenVerdict,
+    inspect_token,
+    token_problems,
+)
 
 logger = logging.getLogger("career.engine.cli")
 
@@ -550,6 +556,7 @@ def verify_environment(
     today: date,
     warn_days: int = TOKEN_EXPIRY_WARN_DAYS,
     token_life: TokenLife | None = None,
+    token_health: TokenHealth | None = None,
 ) -> list[EnvProblem]:
     """Every way the selling environment can contradict the database.
 
@@ -657,6 +664,13 @@ def verify_environment(
             "delivery attempt fails at Meta",
             "رقم واتساب المرسِل غير مضبوط — كل محاولة إرسال سترفضها ميتا",
         ))
+    else:
+        # CONFIGURED is not ALIVE. Everything above this line asks whether
+        # somebody typed something into a file — the exact question that was
+        # being asked about `SALLA_TOKEN_EXPIRES_AT` on 29 July while the
+        # credential it described was already dead. `token_health` is Meta's
+        # own answer about the token that EXISTS, read on this run.
+        problems.extend(whatsapp_token_problems(token_health, warn_days))
 
     if not (settings.salla_store_url or "").strip():
         # §16: lifecycle.py degrades to a link-less renewal message rather
@@ -821,6 +835,42 @@ def _stored_token_problems(
     return []
 
 
+def whatsapp_token_problems(
+    health: TokenHealth | None, warn_days: int = TOKEN_EXPIRY_WARN_DAYS,
+) -> list[EnvProblem]:
+    """Meta's live answer about the delivery credential, as boot-check rows.
+
+    THE LADDER ITSELF LIVES IN ``career.whatsapp.client`` and not here, for a
+    reason that is structural rather than aesthetic: the scheduled observer
+    (``scripts/check_whatsapp_token.py``) has to log the same English
+    sentences, and importing THIS module to get them would put that script on
+    the wrong side of the D20 owner-role ratchet — `cli` builds an
+    RLS-bypassing engine, `tests/test_rls_runtime_role.py` closes over import
+    edges, and a credential watchdog that touches no database must not inherit
+    superuser reach for four strings. So the wording lives at the Graph
+    boundary, where the facts come from, and this is the adapter that turns it
+    into the type the boot check speaks.
+
+    WHAT IT WATCHES AND WHAT IT DELIBERATELY DOES NOT. The live credential is a
+    Meta **System User** token: `/debug_token` reports ``expires_at: 0`` and
+    ``data_access_expires_at: 0`` — it cannot expire, and there is no refresh
+    endpoint for it, so NOTHING in this repository tries to renew it. What is
+    watched is what can still take it away without warning: revocation, a
+    withdrawn scope, a phone number unassigned from the System User, and the
+    regression of somebody pasting a temporary token over the permanent one.
+
+    ``None`` and UNREADABLE both return nothing. The first means the caller
+    chose not to spend a network call (the worker's boot check — see
+    :func:`read_token_health`); the second means Meta could not be reached,
+    and putting Meta's uptime on the operator's phone is how the channel that
+    must carry «the token is revoked» gets muted.
+    """
+    return [
+        EnvProblem(problem.key, problem.english, problem.arabic)
+        for problem in token_problems(health, warn_days)
+    ]
+
+
 def format_env_alert(problems: list[EnvProblem]) -> str:
     """The admin-channel message. Arabic prose and Latin variable names never
     share a line — mixing them reverses the line in the operator's client."""
@@ -873,6 +923,36 @@ def read_token_life() -> TokenLife:
         return TokenLife.unreadable()
 
 
+def read_token_health(settings: Any) -> TokenHealth:
+    """Ask META what the delivery credential is — one read-only GET.
+
+    OPT-IN, and that is the one place this diverges from
+    :func:`read_token_life`. That one reads a file on this disk, so calling it
+    unconditionally costs nothing and it is wired into every caller. This one
+    goes to Graph, and one of the two processes that runs the boot check is
+    the conversation worker under ``Restart=always``/``RestartSec=5``: a crash
+    loop would put twelve Graph calls a minute on a credential-inspection
+    endpoint and add Meta's latency to every restart of a worker that is
+    already failing. So ``report_environment`` does not call this by default;
+    the daily oneshot (:func:`main`) does, and the dedicated timer
+    (``scripts/check_whatsapp_token.py``) does. A boot check must never make a
+    boot depend on someone else's uptime.
+    """
+    if "pytest" in sys.modules:
+        # Same rule and same reason as read_token_life: a unit test must never
+        # reach the operator's live credential, and a suite whose colour
+        # depends on Meta's uptime proves nothing about either.
+        return TokenHealth(TokenVerdict.UNREADABLE)
+    try:
+        return inspect_token(
+            getattr(settings, "whatsapp_access_token", "") or "",
+            getattr(settings, "whatsapp_phone_number_id", "") or "",
+        )
+    except Exception:  # noqa: BLE001 — an unreachable Meta is not a boot fault
+        logger.info("could not inspect the WhatsApp credential", exc_info=True)
+        return TokenHealth(TokenVerdict.UNREADABLE)
+
+
 def report_environment(
     *,
     settings: Any,
@@ -881,6 +961,7 @@ def report_environment(
     today: date | None = None,
     alert: bool = True,
     token_life: TokenLife | None = None,
+    token_health: TokenHealth | None = None,
 ) -> list[EnvProblem]:
     """Run the boot check and shout — but NEVER stop the process.
 
@@ -919,6 +1000,8 @@ def report_environment(
             sale_plans=canonical_sale_plans(),
             today=today or datetime.now(UTC).astimezone().date(),
             token_life=token_life if token_life is not None else read_token_life(),
+            # NOT defaulted to a live fetch — see :func:`read_token_health`.
+            token_health=token_health,
         )
     except Exception:  # noqa: BLE001 — a boot check never blocks a boot
         logger.error("boot environment check could not run", exc_info=True)
@@ -1167,9 +1250,15 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
     # human's attention, so it is where stale selling configuration gets
     # re-reported until someone fixes it. It never stops the run — tonight's
     # customers have already paid (see report_environment).
+    #
+    # The WhatsApp credential is inspected LIVE here and only here among the
+    # boot checks: this is a daily oneshot, so it is one Graph call a day, and
+    # it is the second independent witness — after the 08:30 timer — on the
+    # morning of the run whose customers the credential would fail.
     with Session(engine) as session:
         report_environment(settings=settings, session=session,
-                           admin_client=admin)
+                           admin_client=admin,
+                           token_health=read_token_health(settings))
 
     # §05 lifecycle sweep BEFORE the engine: a just-expired subscription
     # must not seed tonight's query families.

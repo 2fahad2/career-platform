@@ -2060,3 +2060,137 @@ def test_no_alert_from_this_worker_reverses_on_the_operator_screen() -> None:
     assert not hits, "mixed-direction operator line(s) — " + " ; ".join(
         f"L{n}: {line.replace(SLOT, '{…}')!r}" for n, line in hits
     )
+
+
+# ── the «+» boundary, which this file has already been bitten by ────────────
+
+
+def test_a_customers_own_number_is_not_a_stranger_because_of_a_plus(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """`_channel_for_phone` compared the phone EXACTLY while the two functions
+    that resolve the same fact out of the same payload — `_event_ten_codes`,
+    thirty lines above it in this very file, and
+    `activation_flow._channel_for_phone`, one import away — both go through
+    `phone_variants`.
+
+    Latent when it was found, and the honest reason is worth writing down: the
+    only writer of `customer_channels.phone_e164` in the tree is
+    `activation_flow._activate_with_token`, which stores Meta's own ``from``,
+    and Meta always delivers it without the ``+``. So today's rows and today's
+    lookups happen to be the same shape. One row written the human way — a
+    restore, a backfill, an operator linking a number by hand, a second
+    provider — is all it takes, and the unique constraint is on the STRING, so
+    the database is perfectly happy to hold both spellings.
+
+    What it would cost is the whole point: an ACTIVE paying customer read as
+    an UNKNOWN NUMBER. He is answered «أرسل رمز التفعيل» for a code we only
+    ever send to the operator, no inbound row is written, his 24h window is
+    never opened, a held bundle never descends, no ticket is raised — while
+    `_event_ten_codes` names him perfectly well in the operator's failure
+    notice, so the same file disagrees with itself about whether he exists.
+    This repository has paid for that exact boundary three times already (the
+    evening window-nudge, the §14 canary ordering, the whole zero-touch claim
+    path), each time as «a comparison that could not match a real customer
+    even once».
+    """
+    from career.whatsapp.worker import (
+        _UNRECOGNIZED,
+        _channel_for_phone,
+        _event_ten_codes,
+    )
+
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    deps = _worker_deps(wa)
+    phone = _plus_customer(owner_session, wa, deps)     # row holds «+9665…»
+    assert phone.startswith("+")
+    meta = phone.lstrip("+")                            # what Meta delivers
+    admin.messages.clear()
+    before = len(wa.sent)
+
+    wamid = f"wamid-{uuid.uuid4()}"
+    _deliver(owner_session, meta,
+             _text_msg(wamid, meta, "متى توصلني فرص اليوم؟"),
+             wa, admin, deps)
+
+    # THIS message, on HIS channel — not merely «some inbound row exists»,
+    # which his own activation already satisfies.
+    recorded = owner_session.execute(text(
+        "SELECT i.classification FROM inbound_messages i"
+        " JOIN customer_channels c ON c.id = i.channel_id"
+        " WHERE c.phone_e164 = :p AND i.wa_message_id = :w"),
+        {"p": phone, "w": wamid}).all()
+    assert recorded, \
+        "an ACTIVE customer's message was dropped as an unknown number"
+    said = [m.body or "" for m in wa.sent[before:]]
+    assert all(_UNRECOGNIZED not in body for body in said), (
+        "a paying customer was asked for the activation code he used months "
+        f"ago — {said}"
+    )
+    # …and the file no longer disagrees with itself about who he is
+    codes = _event_ten_codes(owner_session, _payload([_text_msg(
+        f"wamid-{uuid.uuid4()}", meta, "أي شي")]))
+    assert codes.startswith("TEN-"), codes
+    # the lookup itself, stated once directly: one number, either spelling,
+    # the same channel — the property that has to stay true when the routing
+    # around it changes
+    both = {_channel_for_phone(owner_session, p) for p in (phone, meta)}
+    assert len(both) == 1 and None not in both, \
+        "the same customer resolves to two different answers"
+
+
+def test_the_two_readings_of_the_phone_column_pick_the_same_row(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """Both spellings of ONE number in the table, bound to two tenants, and the
+    older binding inserted SECOND — so a sequential scan hands back the newer
+    row first.
+
+    `_channel_for_phone` orders by ``(created_at, id)``, and so does
+    `activation_flow._channel_for_phone`: the oldest binding, the proven one.
+    `_event_ten_codes` was the THIRD reading of this column and had no ORDER BY
+    at all, so it named whichever row the scan reached first — proved here on
+    2026-08-07 by an adversarial pass, which got a different TEN code out of it
+    than the row the message was actually routed to. An operator's failure
+    notice that names the wrong customer is worse than one that names nobody,
+    and it is silently non-deterministic besides. It now calls
+    `_channel_for_phone`, so there are two readings and not three, and this
+    pins the property rather than the implementation: whatever the tie-break
+    is, the function that NAMES him and the function that DECIDES for him must
+    agree on which row he is.
+    """
+    from career.whatsapp import activation_flow
+    from career.whatsapp.worker import _channel_for_phone, _event_ten_codes
+
+    digits = f"96650{uuid.uuid4().int % 10_000_000:07d}"
+    rows = {}
+    for label, spelling, created in (
+        ("newer", digits, NOW - timedelta(days=1)),      # physically first
+        ("older", f"+{digits}", NOW - timedelta(days=30)),
+    ):
+        tid = uuid.uuid4()
+        owner_session.execute(text(
+            "INSERT INTO tenants (id, code) VALUES (:i, :c)"),
+            {"i": str(tid), "c": f"TEN-Q{uuid.uuid4().int % 100_000:05d}"})
+        owner_session.execute(text(
+            "INSERT INTO customer_channels (id, tenant_id, provider,"
+            " phone_e164, created_at) VALUES (:i, :t, 'whatsapp', :p, :c)"),
+            {"i": str(uuid.uuid4()), "t": str(tid), "p": spelling,
+             "c": created})
+        rows[label] = tid
+    owner_session.commit()
+
+    older_code = owner_session.execute(text(
+        "SELECT code FROM tenants WHERE id = :t"),
+        {"t": str(rows["older"])}).scalar_one()
+
+    for lookup in (_channel_for_phone, activation_flow._channel_for_phone):
+        channel = lookup(owner_session, digits)
+        assert channel is not None and channel.tenant_id == rows["older"], (
+            f"{lookup.__module__}._channel_for_phone took the newer binding")
+
+    named = _event_ten_codes(owner_session, _payload([_text_msg(
+        f"wamid-{uuid.uuid4()}", digits, "أي شي")]))
+    assert named == older_code, (
+        "the operator's failure notice names a different customer than the "
+        f"one the message was routed to: {named} vs {older_code}")

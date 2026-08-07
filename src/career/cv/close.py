@@ -555,6 +555,24 @@ _WA_KIND_BY_CATEGORY = {"utility": "wa_utility", "marketing": "wa_marketing"}
 
 
 def _wa_price(kind: str) -> Decimal:
+    """The configured per-message price. §06 keeps provider list prices in the
+    settings, not the code, so the operator can correct them without a deploy —
+    and on 2026-08-08 they need correcting.
+
+    Meta's live Saudi Arabia rate card, read the same day the categories were:
+
+        marketing  $0.0501/message   (configured default: $0.0384 — 23% low)
+        utility    $0.0107/message   (configured default: $0.0157 — 47% high)
+
+    KSA's marketing rate was raised effective 2026-04-01 and the defaults
+    predate it, so the true multiple is ~4.7×, not the ~2.4× the old comments
+    around here assumed. Utility also has VOLUME TIERS in KSA (stepping to
+    $0.0080) and marketing has none — one more reason the category matters.
+    Correcting the defaults is `career/config.py`, which this change does not
+    own; the report carries the patch, and
+    ``WHATSAPP_USD_PER_{UTILITY,MARKETING}_MESSAGE`` in `.env` fixes it today
+    with no deploy at all.
+    """
     from career.config import get_settings
 
     settings = get_settings()
@@ -564,12 +582,38 @@ def _wa_price(kind: str) -> Decimal:
 
 
 def _wa_kind_of(template_name: str | None) -> str:
-    from career.whatsapp.templates import REGISTRY
+    """The billing kind for one template send.
 
-    spec = REGISTRY.get(str(template_name or ""))
-    if spec is None:
+    AUDIT 2026-08-08 — this read ``spec.category``, the category we SUBMITTED
+    the template under, and priced the bill from it. Meta had re-categorised
+    five of the eight live templates from UTILITY to MARKETING after approving
+    them, so every `welcome_activation`, `onboarding_reminder`,
+    `renewal_reminder`, `daily_service_update` and `daily_opportunities_utility`
+    send was billed here at the utility rate while Meta charged the marketing
+    one — on what `salla/lifecycle._live_channel` documents as the MAJORITY of
+    the account's billed template traffic. On Meta's live Saudi Arabia card
+    (verified 2026-08-08) that is $0.0107 recorded against $0.0501 charged:
+    **21% of the real price.** The number was not slightly off; it was derived
+    from the wrong source.
+
+    It now reads :func:`templates.billed_category`, which answers from a dated
+    measurement of the live account and falls back to MARKETING — the same
+    err-expensive rule ``wa_unknown`` already followed.
+
+    THE LIMIT, because it is real: the snapshot is TODAY's category applied to
+    every historical row, and Meta moves categories. Re-running
+    :func:`rollup_costs` over a day from before a re-categorisation will now
+    price it at the new category. The alternative — stamping the category on
+    `delivery_messages` at send time — needs a column and therefore a
+    migration, and is the right long-term fix; until then the error is bounded,
+    dated, and points the safe way (up).
+    """
+    from career.whatsapp.templates import REGISTRY, billed_category
+
+    name = str(template_name or "")
+    if name not in REGISTRY:
         return "wa_unknown"
-    return _WA_KIND_BY_CATEGORY.get(str(spec.category), "wa_unknown")
+    return _WA_KIND_BY_CATEGORY.get(str(billed_category(name)), "wa_unknown")
 
 
 def whatsapp_spend(

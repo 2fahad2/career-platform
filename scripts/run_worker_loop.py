@@ -15,8 +15,11 @@ is «warn» and not «fail hard».
 from __future__ import annotations
 
 import logging
+import os
 import time
+from collections.abc import Callable
 from datetime import UTC, date, datetime
+from pathlib import Path
 from typing import IO
 from zoneinfo import ZoneInfo
 
@@ -51,9 +54,287 @@ from career.whatsapp.worker import process_pending_whatsapp
 
 logger = logging.getLogger("career.worker_loop")
 
+#: How long a customer's WhatsApp message may sit before this loop looks at it.
+#:
+#: THE DEADLINE IS CONVERSATIONAL, not contractual. Nothing in the store
+#: promises a number of seconds; the thing being chased is a human who has just
+#: pressed send and is watching the screen. Three seconds is under the delay
+#: WhatsApp's own delivery ticks already cost, so the poll is not what the
+#: customer perceives — the Claude turn is (a measured cycle with an LLM turn
+#: is 18s). Halving this to 1.5s would move a number the customer cannot feel.
+#:
+#: WHAT IT COSTS, at the sizes this is priced for. `pending_whatsapp_events`
+#: filters `provider + processing_status + (next_attempt_at IS NULL OR <= now)`
+#: on `webhook_events`, and migration 0022 declined an index deliberately — so
+#: every pass is a sequential scan, 28,800 of them a day.
+#:
+#:   today, 1 customer     283 rows live, ~10/day.  A scan is microseconds and
+#:                         the table is one page set in cache. Free.
+#:   10 customers          ~100 rows/day. ~100k rows in about three years.
+#:   100 customers         ~1,000 rows/day. 100k in about a quarter.
+#:   1000 customers        ~10,000 rows/day. 100k inside a fortnight, and
+#:                         millions within the year — rows are redacted at 30
+#:                         days (RAW_PAYLOAD_RETENTION_DAYS) but never deleted,
+#:                         because the fingerprint is the idempotency record.
+#:
+#: So the number that must change with scale is NOT this one. 0022 names the
+#: threshold (~100k rows) and the exact remedy: a partial index on
+#: `(provider, received_at) WHERE processing_status = 'received'`, built
+#: CONCURRENTLY outside a migration transaction. An index removes the scan
+#: entirely; tightening the poll multiplies it. Loosening the poll to spare the
+#: database would be paying for the wrong thing with the customer's wait.
 POLL_SECONDS = 3.0
-REMINDER_SWEEP_SECONDS = 3600.0  # §05 stall nudges — hourly is plenty for 24h
+
+#: The housekeeping gate — and therefore the worst-case lateness of EVERY
+#: clock swept below, because nothing else in this system reads them.
+#:
+#: The old note here justified this number against the §05 stall nudge alone.
+#: That was true when the block held one sweep; it now drives eight, and a
+#: number defended against the loosest deadline it happens to serve is how two
+#: promises came to be measured 24× too coarsely in the first place. So the
+#: division is written out, against the TIGHTEST:
+#:
+#:   لمّاح+ reply SLA        24h    4.2%   ← binding
+#:   §05 stall nudge         24h    4.2%   ← binding
+#:   forgotten support ticket 48h   2.1%
+#:   72-hour start guarantee 72h    1.4%
+#:   enrichment session TTL  72h    1.4%
+#:   enrichment thin-role sweep 3d  1.4%
+#:   outcome question       14d     0.3%
+#:   the operator's evening window nudge — a four-hour band (window.py), so
+#:   three firings land inside it even at the worst phase
+#:
+#: 4.2% of the binding deadline. The nightly-only cadence this replaced on
+#: 2026-08-07 was 96% of it — a 24-hour promise very nearly measured after it
+#: had already expired.
+#:
+#: WHY NOT TIGHTER, which is the question the fractions above invite. This
+#: block is not free and its cost is not per-pass, it is per-customer-per-pass:
+#: eight sequential passes over the active book inside ONE worker cycle, and
+#: the enrichment sweep calls Claude once per due customer inside it.
+#: career-worker.service's WatchdogSec=300 already carries the warning that
+#: past roughly fifteen customers due in the same hour a single cycle can
+#: exceed the watchdog ON MERIT and be killed as a wedge. Halving this interval
+#: halves that headroom to buy 2% of a promise nobody measures in minutes. The
+#: right move when the book grows is the one that unit names — give the sweep
+#: its own timer — not a smaller number here.
+#:
+#: DURABLE ACROSS A RESTART, DELIBERATELY NOT ACROSS A REBOOT — the gate that
+#: enforces that is :class:`HousekeepingGate`, and the paragraph that used to
+#: sit here (a process-local float, «every restart runs the whole block
+#: immediately, and that direction is the safe one») is the thing it replaced.
+#: It was right about the direction and wrong about the bound: at RestartSec=5
+#: a crash loop ran the whole block every five seconds, and two of the stanzas
+#: below now PAGE.
+REMINDER_SWEEP_SECONDS = 3600.0
 _RIYADH = ZoneInfo("Asia/Riyadh")
+
+#: Where the housekeeping block records that it ran. `/run` is tmpfs, and that
+#: is the entire mechanism — see :class:`HousekeepingGate`.
+HOUSEKEEPING_STAMP = "/run/career/worker-housekeeping"
+
+
+class HousekeepingGate:
+    """May the hourly block run now? — asked so a crash loop cannot answer yes.
+
+    ── THE HAZARD THIS EXISTS FOR ───────────────────────────────────────────
+    The gate used to be ``last_reminder_sweep = 0.0`` compared against
+    ``time.monotonic()``, which on this host is ~2,170,615 — so the first pass
+    of EVERY boot ran the whole block. Under ``Restart=always`` /
+    ``RestartSec=5`` that is the whole block every five seconds for as long as
+    the crash loop lasts, and ``StartLimitBurst=20`` in 600s bounds it at
+    twenty only for a process that crashes FAST; one that dies every 45s never
+    trips the limit and loops all night.
+
+    Every idempotency guard downstream holds — one-way edges, advisory locks,
+    a weekly report that claims its week in the database — so nothing
+    double-stamps. What is not bounded is the PAGE: a pass killed between
+    ``_alert(...)`` and its commit re-pages on the next boot, and that trade
+    («duplicated by a crash, never lost») was priced when the block ran once a
+    day. Two stanzas below now page — the 72-hour guarantee breach and the
+    لمّاح+ SLA escalation — so at restart cadence the priced duplicate becomes
+    a storm on the one channel whose whole value is that a message on it means
+    something new happened. The cost is not only pages: the enrichment sweep
+    calls Claude once per due customer, so a crash-looping worker also bought
+    an LLM call per customer per five seconds.
+
+    ── WHAT «CORRECT» IS HERE ───────────────────────────────────────────────
+    Running housekeeping at boot is not the defect and must not be removed: a
+    worker that has been down for six hours SHOULD catch up the moment it is
+    back, and that is why the pattern exists at all. The defect is that a
+    crash loop and a long outage were indistinguishable, because the only
+    evidence was a float inside the process that had just died.
+
+    So the evidence moves OUT of the process — into a stamp under ``/run``.
+    Two lifetimes, and picking them apart is the whole design:
+
+    * it survives the PROCESS, so twenty restarts in ten minutes see the same
+      stamp and only the first of them sweeps;
+    * it does NOT survive the HOST, because ``/run`` is tmpfs. A reboot means
+      the machine was down, which is precisely the outage where catching up
+      immediately is right. The same reading, in the same words, as
+      ``scripts/alert_unit_failure.sh``: «a reboot is an intervention, and the
+      first failure after one is news».
+
+    Marked BEFORE the block runs, exactly as the float was set before it. A
+    pass that dies halfway therefore defers the REST of that hour's
+    housekeeping to the next hour instead of re-running it at every restart;
+    the sweeps are idempotent and the nightly is a backstop for both paging
+    ones, so the deferral costs at most the interval this file already prices
+    as the worst-case lateness of every clock in the block.
+
+    ── THE ALTERNATIVES, and why not them ───────────────────────────────────
+    * **A row in the database**, the shape the weekly report already uses for
+      its week. It is the strictly more durable answer and it was rejected:
+      the extra durability is across a REBOOT, which is the one case where
+      running immediately is the correct behaviour, so it buys nothing here —
+      and it costs a migration, a table, and a write on the transactional path
+      of a housekeeping tick. The weekly report needs the database because
+      what it protects is a SEND that must happen once per week whatever
+      happens to the host; what this protects is a rate, on this host, since
+      this boot.
+    * **Seeding the float with ``time.monotonic()``** so the block simply does
+      not run at boot. One line, and it deletes the catch-up: a worker
+      restarted after a six-hour outage would wait another hour, and every
+      deploy would push every promise clock back by up to an hour. That is
+      the failure this pattern exists to prevent, chosen on purpose.
+    * **Jitter or a back-off at boot.** Reduces the storm without bounding it:
+      twenty restarts still produce up to twenty passes, just less evenly.
+    * **Sweeping at boot with the pages suppressed.** Quiet in a crash loop
+      and quiet in a real outage too — it silences precisely the page that
+      must not be lost, which is the entire subject.
+    * **Leaning on ``StartLimitBurst``.** That is the bound today and it is
+      twenty pages; a slower crash loop never reaches it at all.
+
+    ── WHAT IT DOES NOT CLOSE ───────────────────────────────────────────────
+    * A duplicate page is still POSSIBLE — a pass killed between the alert and
+      its commit still re-pages on the next pass. This bounds the rate to one
+      per interval; the ordering inside `promises.guarantee` chooses the
+      duplicate over the silence, deliberately, and that choice is untouched.
+    * If ``/run`` cannot be written the gate DEGRADES to a process-local timer
+      seeded at start-up: no storm, and no catch-up either until the interval
+      has passed. Chosen in that direction because the lost catch-up is
+      bounded by the same hour the block already prices as its worst case and
+      both paging sweeps keep a nightly backstop, while the storm is bounded
+      by nothing. Detected in ``__init__`` — before the first pass — and not
+      when the first ``mark`` fails, because a gate that finds out only after
+      the block has run answers «no stamp, so catch up» on every boot and
+      reproduces the storm exactly. It logs ERROR — the journal harvester puts
+      those on the operator's error screen — so a silent host cannot silently
+      lose it.
+    * A wall clock that steps BACKWARDS over the stamp reads as «due» (doubt
+      measures rather than stalls), so a clock step during a crash loop can
+      still produce a second pass. Bounded by the step, not by the interval.
+    """
+
+    def __init__(
+        self,
+        *,
+        path: str = HOUSEKEEPING_STAMP,
+        wall: Callable[[], float] = time.time,
+        mono: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._path = Path(path)
+        #: Wall clock for the STAMP (a durable, cross-process fact) and
+        #: monotonic for the in-process fallback (immune to clock steps, and
+        #: meaningless outside this process — which is exactly the split).
+        self._wall = wall
+        self._mono = mono
+        self._local_since = mono()
+        self._degraded = False
+        # Proven, not assumed, and proven HERE: see the degradation note in
+        # the class docstring for why finding this out at the first `mark`
+        # would leave the storm exactly as it was.
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            probe = self._tmp_path()
+            probe.write_text("", encoding="utf-8")
+            probe.unlink()
+        except OSError:
+            self._degrade("cannot write")
+
+    def _tmp_path(self) -> Path:
+        return self._path.with_name(f"{self._path.name}.{os.getpid()}")
+
+    def due(self, interval: float) -> bool:
+        """Has `interval` seconds passed since the last pass on this host?
+
+        The interval is an ARGUMENT and not a field: this class is the
+        mechanism (where the record lives and how long it lives), and the
+        number is the policy that belongs beside the block it gates —
+        REMINDER_SWEEP_SECONDS, whose whole justification is written up there
+        against the deadlines it serves. It also keeps the call site readable
+        as one sentence, which is what a reader and an AST probe both want.
+        """
+        # `_read` can itself degrade the gate (an unreadable stamp), and the
+        # answer has to come from the mechanism that is still working — hence
+        # the second check rather than an else.
+        stamped = None if self._degraded else self._read()
+        if not self._degraded:
+            if stamped is None:
+                # No stamp on this boot: either tmpfs was cleared by a reboot
+                # or this host has never swept. Both mean «catch up now».
+                return True
+            age = self._wall() - stamped
+            # A stamp from the future is not an age, it is a clock that
+            # stepped. Doubt measures; it must never stall the block.
+            return age >= interval or age < 0
+        return self._mono() - self._local_since >= interval
+
+    def mark(self) -> None:
+        """Claim this interval BEFORE the block runs — see the class docstring
+        for why the ordering is that way round."""
+        self._local_since = self._mono()
+        if self._degraded:
+            return
+        now = self._wall()
+        tmp = self._tmp_path()
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            # The epoch first so the gate can read it, the human form after it
+            # so `cat` answers «when did housekeeping last run» on a bad night.
+            tmp.write_text(
+                f"{now:.0f} {datetime.fromtimestamp(now, UTC).isoformat()}\n",
+                encoding="utf-8",
+            )
+            # Atomic: a torn stamp would be an unreadable one, and an
+            # unreadable one runs the block (see `_read`).
+            os.replace(tmp, self._path)
+        except OSError:
+            tmp.unlink(missing_ok=True)
+            self._degrade("cannot write")
+
+    def _read(self) -> float | None:
+        try:
+            first = self._path.read_text(encoding="utf-8").split(" ", 1)[0]
+        except FileNotFoundError:
+            return None
+        except OSError:
+            self._degrade("cannot read")
+            return None
+        try:
+            return float(first)
+        except ValueError:
+            # Not a timestamp, so not evidence. Nothing may be suppressed by a
+            # stamp nobody can read; the next `mark` replaces it.
+            logger.warning("housekeeping stamp %s is unreadable — sweeping",
+                           self._path)
+            return None
+
+    def _degrade(self, why: str) -> None:
+        if self._degraded:
+            return
+        self._degraded = True
+        # ERROR and not WARNING: this silently changes when every clock in the
+        # housekeeping block is first read after a restart, and the journal
+        # harvester puts ERROR lines on the operator's screen.
+        logger.error(
+            "housekeeping stamp %s: %s — falling back to a process-local "
+            "timer. The block will NOT catch up at boot: after a restart the "
+            "first pass waits a full sweep interval, and the nightly run is "
+            "the backstop for both promise sweeps until then",
+            self._path, why, exc_info=True,
+        )
 
 
 #: P0-8: both parsers moved to ``career.engine.cli`` so the boot check and
@@ -318,7 +599,19 @@ def main() -> None:  # pragma: no cover — the C7.8 live runner
     else:
         logger.warning("no systemd watchdog on this process — a wedged cycle "
                        "will NOT be noticed by anything")
-    last_reminder_sweep = 0.0
+    #: A stamp under /run and not a local float, so «the first cycle of a boot
+    #: sweeps» stays true of a worker that has been DOWN and stops being true
+    #: of a worker that is merely restarting. See :class:`HousekeepingGate`:
+    #: the direction is still toward freshness, the crash loop is no longer
+    #: fresh twelve times a minute.
+    housekeeping = HousekeepingGate()
+    #: The one per-evening dedupe in this block that is NOT durable and is a
+    #: SEND rather than a sweep, so a restart inside the 19:00–22:00 band costs
+    #: the operator a duplicate line. Left as a local knowingly: the path is
+    #: gated on `canary_test_phone`, the cost is one repeated sentence on his
+    #: own channel bounded by the 20-starts-in-600s limit, and the durable fix
+    #: is a claim row like `weekly_report`'s — which is the right shape only
+    #: once this nudge is something a real customer's schedule depends on.
     last_window_nudge: date | None = None
 
     while True:
@@ -339,8 +632,8 @@ def main() -> None:  # pragma: no cover — the C7.8 live runner
                 logger.info("processed: %s", counts)
             if salla_counts:
                 logger.info("salla processed: %d orders", len(salla_counts))
-            if time.monotonic() - last_reminder_sweep >= REMINDER_SWEEP_SECONDS:
-                last_reminder_sweep = time.monotonic()
+            if housekeeping.due(REMINDER_SWEEP_SECONDS):
+                housekeeping.mark()
                 now = datetime.now(UTC)
                 with Session(engine) as session:
                     nudged = send_due_reminders(session, deps=deps, now=now)
@@ -368,6 +661,47 @@ def main() -> None:  # pragma: no cover — the C7.8 live runner
                     session.commit()
                 if any(oc_counts.values()):
                     logger.info("outcome questions: %s", oc_counts)
+                # «ضمان البداية» — the 72-hour start guarantee, swept HOURLY.
+                # The hour IS the promise: this sweep rode the 11:00 delivery
+                # run alone, so a guarantee that ran out at 12:05 was measured
+                # at 11:00 the NEXT morning — ~23 hours late on a promise the
+                # store writes in hours. Here because this process is the one
+                # that is awake at 03:00. `sweep_and_commit` commits its own
+                # work and never raises (this block is a barrier); the nightly
+                # keeps a backstop call and cannot double-page — its docstring
+                # names every guard, including the advisory lock.
+                from career.promises.guarantee import sweep_and_commit
+                with Session(engine) as session:
+                    gu_counts = sweep_and_commit(
+                        session, now=now, admin_client=admin,
+                    )
+                if gu_counts["breached"] or gu_counts["met"] or gu_counts["alerted"]:
+                    # never on "watching": every customer inside his first 72
+                    # hours would log a line every hour, saying nothing
+                    logger.info("guarantee sweep: %s", gu_counts)
+                # «والرد خلال ٢٤ ساعة» — the لمّاح+ session SLA, swept HOURLY
+                # for the same reason and with worse arithmetic: this one rode
+                # the 11:00 delivery run ALONE, so a request that crossed 24
+                # hours at 12:05 was ticketed at 11:00 the next morning — 23
+                # hours late on a promise 24 hours long, i.e. very nearly
+                # measured after it had already expired. Here for the same
+                # reason as the guarantee above: this process is awake at
+                # 03:00. `escalate_overdue_and_commit` commits its own work and
+                # never raises (this block is a barrier); the nightly keeps a
+                # backstop call and cannot double-escalate — `escalated_at` is
+                # a one-way NULL→stamp edge, and a whole-pass advisory lock on
+                # its OWN key (never the guarantee's) covers the two-in-flight
+                # case. Its docstring also states what an hourly sweep still
+                # does NOT measure: whether the operator then REPLIED.
+                from career.promises.career_session import (
+                    escalate_overdue_and_commit,
+                )
+                with Session(engine) as session:
+                    sla_counts = escalate_overdue_and_commit(
+                        session, now=now, admin_client=admin,
+                    )
+                if any(sla_counts.values()):
+                    logger.info("career session SLA sweep: %s", sla_counts)
                 # canary evening nudge: keep the operator's own 24h window
                 # open for tomorrow's 11:00 delivery (template-independence)
                 today = now.astimezone(_RIYADH).date()

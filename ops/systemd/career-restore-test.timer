@@ -1,3 +1,40 @@
+# The 1st of the month, 04:30 Riyadh. Monthly, deliberately, and this is the
+# one cadence on this host that is NOT tightened by the argument the others
+# are — because it is the only one whose extra frequency costs real money.
+#
+# WHAT IT CHASES. Constant 14's second half: «تُختبر بالاسترجاع دوريًا». Not
+# «is there a snapshot» — career-verify-restore answers that every morning —
+# but «does the snapshot actually restore into a working database». Those are
+# different questions and only this one can catch a repository that is
+# faithfully accepting bytes nobody can ever read back.
+#
+# WHAT THE DEADLINE IS. None, in the sense the promise sweeps have one: no
+# customer sentence and no external clock runs out because a restore drill is
+# late. The deadline is the day we need it, which is unknowable, so the number
+# cannot be derived by division and is derived from cost instead.
+#
+# WHAT IT COSTS, which is why this is not daily or weekly. A drill DOWNLOADS
+# the snapshot from B2 and restores it — egress plus class-B transactions
+# billed per run, CPU and disk for a full restore into a scratch database, and
+# a window in which this host is doing something heavy. Every other timer here
+# is metadata-only or local and costs nothing measurable; this one is the
+# exception, and «it buys precision on a real deadline for free» — the test
+# every other cadence on this host passes — is the test this one fails.
+#
+# WHAT THE LATENESS THEREFORE IS, stated rather than hidden: an unrestorable
+# repository can go up to 31 days undetected. That is accepted because the
+# failure it protects against is a slow one — an encryption key, a format, a
+# credential — and because the cheap daily probe covers the fast one (a chain
+# that stopped) at three days.
+#
+# WHY 04:30 AND THE 1st. After the 03:30 backup, so the drill exercises a
+# snapshot taken an hour earlier rather than yesterday's. The 1st because a
+# fixed date is auditable — «did the drill run last month» has a yes/no answer
+# and a weekday rule does not — and because it lands before the calendar month
+# anyone would reconcile costs or incidents against.
+#
+# Persistent=true — a host that was off on the 1st has skipped the whole
+# month, not an hour, so this is the timer where catching up matters most.
 [Unit]
 Description=Monthly restore test at 04:30 Riyadh on the 1st
 

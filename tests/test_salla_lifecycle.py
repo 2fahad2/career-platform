@@ -279,9 +279,13 @@ def test_renewal_reminder_is_recorded_and_therefore_billed(
     ][0]
 
     spend = close_mod.whatsapp_spend(owner_session, tenant_id=uuid.UUID(tenant_id))
-    # renewal_reminder is a UTILITY template — priced, not free
-    assert spend["wa_utility"][0] == 1
-    assert spend["wa_utility"][1] > 0
+    # AUDIT 2026-08-08: `renewal_reminder` was SUBMITTED as utility and Meta
+    # re-categorised it to MARKETING after approving it (it still carries
+    # ``previous_category: UTILITY``). This assertion used to read wa_utility
+    # and therefore certified a bill at 41% of what Meta actually charges.
+    assert "wa_utility" not in spend, spend
+    assert spend["wa_marketing"][0] == 1
+    assert spend["wa_marketing"][1] > 0
 
 
 def test_recovery_and_grace_reminders_are_recorded_too(

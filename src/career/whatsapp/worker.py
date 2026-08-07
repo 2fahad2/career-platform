@@ -56,6 +56,7 @@ from career.whatsapp.inbound import (
     has_readable_text,
     media_ack,
 )
+from career.whatsapp.phones import phone_variants
 
 logger = logging.getLogger("career.whatsapp")
 
@@ -216,9 +217,20 @@ def _event_ten_codes(session: Session, payload: dict[str, Any]) -> str:
     somewhere lost their turn and left them to find out who by reading the
     journal. The payload carries phone numbers, never the code, so it is
     resolved here — and only the code ever leaves this function (§15.13).
-    """
-    from career.whatsapp.phones import phone_variants
 
+    The lookup is :func:`_channel_for_phone` itself, not a fourth hand-written
+    copy of it. Until 2026-08-07 this ran its own ``select`` with the same
+    tolerant ``in_(phone_variants(...))`` set and **no ORDER BY**, so with both
+    spellings of one number in the table it took whichever row the scan handed
+    back first, while the two functions that DECIDE what happens to a customer
+    — `activation_flow._channel_for_phone` and :func:`_channel_for_phone` —
+    both take the oldest binding. Proven divergent: two channels on one number,
+    two tenants, and this named a TEN code other than the one the message was
+    routed to. A failure notice that names the wrong customer is worse than one
+    that names nobody, and it is the same «three readings of one column» hazard
+    the sibling's docstring was written about — so there are two readings now,
+    and the third cannot drift again because it no longer exists.
+    """
     phones: list[str] = []
     for entry in payload.get("entry", []) or []:
         for change in entry.get("changes", []) or []:
@@ -234,12 +246,7 @@ def _event_ten_codes(session: Session, payload: dict[str, Any]) -> str:
     codes: list[str] = []
     try:
         for phone in phones:
-            channel = session.execute(
-                select(CustomerChannel).where(
-                    CustomerChannel.provider == "whatsapp",
-                    CustomerChannel.phone_e164.in_(phone_variants(phone)),
-                )
-            ).scalars().first()
+            channel = _channel_for_phone(session, phone)
             if channel is None:
                 continue
             code = _ten_code(session, channel.tenant_id)
@@ -251,12 +258,49 @@ def _event_ten_codes(session: Session, payload: dict[str, Any]) -> str:
 
 
 def _channel_for_phone(session: Session, phone: str) -> CustomerChannel | None:
+    """The channel this number belongs to — tolerant of the ``+``.
+
+    Identical to `activation_flow._channel_for_phone` on purpose, and that is
+    the whole change: this compared ``phone_e164 == phone`` EXACTLY while the
+    two functions that resolve the same fact out of the same Meta payload —
+    `activation_flow._channel_for_phone`, one import away, and
+    :func:`_event_ten_codes`, immediately above in this file — both go through
+    `phone_variants`. Three readings of one column, two of them tolerant.
+
+    Not reachable today, and said plainly rather than dressed up: the only
+    writer of `customer_channels.phone_e164` in the tree is
+    `activation_flow._activate_with_token`, which stores Meta's own ``from``,
+    and Meta always delivers it without the ``+`` — so today's rows and
+    today's lookups are the same shape (staging holds no ``+`` row and no
+    number written both ways). It is one INSERT away from being live, though,
+    and the failure it would cause is not a small one: an ACTIVE paying
+    customer whose row carried the ``+`` would be read as an UNKNOWN NUMBER —
+    answered with «أرسل رمز التفعيل», no inbound row, no window opened, no
+    held bundle descended, no ticket — while :func:`_event_ten_codes` would
+    still name him in the operator's failure notice. The ``+`` boundary has
+    already cost this repository the window-nudge, the §14 canary ordering and
+    the whole zero-touch claim path (career.whatsapp.phones,
+    `activate_by_order_phone`), each time as «the comparison that could not
+    match a real customer even once». Agreeing with the siblings is cheaper to
+    keep true than a comment explaining why this one may differ.
+
+    `.first()` on an ordered query rather than `scalar_one_or_none`: the
+    unique constraint is on the STRING, so «+9665…» and «9665…» are two
+    permitted rows and an exact-one read of a variant set would raise on them.
+    Oldest first — the first binding of a number is the proven one — which is
+    the sibling's rule, so both now pick the same row as well as the same set.
+    That ORDER BY is why :func:`_event_ten_codes` now calls this instead of
+    running its own copy of the same ``select``: the copy had the same variant
+    set and no ordering, so the operator's failure notice could name a
+    different customer than the one his message was routed to. Two readings of
+    this column, not three.
+    """
     return session.execute(
         select(CustomerChannel).where(
             CustomerChannel.provider == "whatsapp",
-            CustomerChannel.phone_e164 == phone,
-        )
-    ).scalar_one_or_none()
+            CustomerChannel.phone_e164.in_(phone_variants(phone)),
+        ).order_by(CustomerChannel.created_at, CustomerChannel.id)
+    ).scalars().first()
 
 
 def _inbound_exists(session: Session, wamid: str) -> bool:
@@ -750,11 +794,17 @@ def _handle_message(
         # anyway, because an id can only have come from a card we sent).
         #
         # The cost is one `pending_job_ref` per message that gets this far,
-        # where before it was one per outcome tap and per typed label. It is a
-        # read of this tenant's own `outcome_events`, it runs once per inbound
-        # message on a human's typing speed, and it buys the property that
-        # nothing downstream can quietly widen: whether a question is open is
-        # asked once, of the ledger, in one place.
+        # where before it was one per outcome tap and per typed label. That
+        # cost is now ONE query — a grouped read of this tenant's own
+        # `outcome_events`, bounded by his history but not multiplied by it.
+        # This comment used to say «a read of this tenant's own
+        # outcome_events» while the function walked every ASKED row and
+        # queried per row, and returned early only when a question WAS open:
+        # the common case here — nothing pending, most messages — was the
+        # expensive one, at 1+N in a customer's own application count and
+        # growing for as long as he stays subscribed. What it buys is
+        # unchanged: whether a question is open is asked once, of the ledger,
+        # in one place, and nothing downstream can quietly widen it.
         pending = followup.pending_job_ref(session, tenant_id=channel.tenant_id)
         # A machine id is CONSUMED either way — with a question open or not.
         # Falling through when nothing was pending sent «oc_interview» into the

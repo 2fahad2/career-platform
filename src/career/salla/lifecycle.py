@@ -258,6 +258,38 @@ def _send_template(
     for a send that raised would be a bill we were never charged, which is the
     same defect as the missing rows pointing the other way — and
     ``whatsapp_spend`` counts everything whose status is not ``failed``.
+
+    **ALL THREE TEMPLATES THIS FUNCTION SENDS ARE MARKETING AT META** (audit
+    2026-08-08; `welcome_activation`, `onboarding_reminder` and
+    `renewal_reminder` were each accepted as UTILITY and re-categorised
+    afterwards — see `whatsapp/templates`). That is not only a price. Meta
+    documents two ways a marketing template is accepted and then not delivered:
+
+    * **131050** — the recipient turned «Offers and announcements» off for this
+      business. «The API will process the request but not send the message.»
+    * **131049** — the per-user marketing cap, which is per USER across all
+      businesses and is active in Saudi Arabia.
+
+    Both return **HTTP 200**. ``mid`` comes back, no exception is raised, this
+    function returns True, the caller writes its ``subscription_events`` mark —
+    and the mark is what makes the sweep idempotent, so the nudge is never
+    attempted again. A customer who has marketing switched off therefore misses
+    `welcome_activation` permanently, and `welcome_activation` is the message
+    whose REPLY claims a paid subscription: the order stays PAID_UNCLAIMED and
+    expires at the §05 claim deadline, with no error anywhere.
+
+    Nothing in this function can detect that — the failure arrives later, on
+    the status webhook, as ``status: failed`` with an ``errors`` array. The
+    ledger row is corrected there (`whatsapp/worker._handle_status` writes the
+    status, so the send stops being billed), but the REASON is discarded today
+    and no one is told. The fix is a category change at Meta, which is Fahad's
+    to make; the report carries it, together with the `_handle_status` patch
+    that would surface the code.
+
+    ``_live_channel``'s ``opt_out_at`` filter does NOT cover this: that column
+    is OUR opt-out, set when a customer tells US to stop. Meta's marketing
+    setting lives in the recipient's WhatsApp app and is invisible to us until
+    a send is refused.
     """
     if whatsapp_client is None or not phone:
         return False
@@ -269,7 +301,15 @@ def _send_template(
     try:
         mid = whatsapp_client.send_template(phone, template.name, template.language)
     except Exception:  # noqa: BLE001 — messaging never blocks the lifecycle
-        logger.warning("lifecycle template send failed", exc_info=True)
+        # ERROR, not warning: the operator's harvester forwards «ERROR:» lines
+        # only, and a lifecycle template that did not go out is a paid customer
+        # who was not told his subscription is ending — or, for
+        # `welcome_activation`, one who was never asked to claim what he bought.
+        # No mark is written on this path, so the next sweep retries; a nudge
+        # that fails every night must still be audible on the first one.
+        logger.error("lifecycle template %s NOT sent — the customer was not "
+                     "reached and the sweep will retry", template.name,
+                     exc_info=True)
         return False
     _record_send(
         session, tenant_id=tenant_id, channel_id=channel_id,

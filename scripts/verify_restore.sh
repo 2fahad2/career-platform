@@ -40,6 +40,137 @@ bad() {
 }
 section() { printf '\n▶ %s\n' "$1"; }
 
+# ── the watchdog alert hook classifier (used by section 6) ────────────────────
+#
+# It lives up here, as a function, for one reason: tests/test_verify_restore_
+# alert_hook.py sources THIS file and calls THIS function. The two bugs this
+# check has already shipped were both "the pattern was reasoned about, not run",
+# so the test must drive the deliverable itself — a copy of the logic in a test
+# would have passed on both of them.
+#
+# Input is the raw output of
+#
+#     systemctl show <unit> -p LoadState -p ExecStopPost -p ExecStopPostEx
+#
+# not the `--value` form, because the property NAME carries information the
+# value does not (see the "could not ask" verdict below).
+#
+# systemd prints ONE `{ … }` record per Exec entry, one per line — verified on
+# this host against secureboot-db.service, which has three ExecStartPre entries
+# on three lines. Until 2026-08-08 this classification ran a single `case` over
+# the whole concatenated property, so its globs spanned record boundaries: with
+# two entries, `*alert_unit_failure.sh*ignore_errors=yes*` matched the alert
+# script in the FIRST record against another entry's `ignore_errors=yes` in the
+# SECOND, and the verdict flipped with the order the entries were written in.
+# One order certified a hook that was missing its leading '-' — a false PASS
+# about the exact fatality this check exists to catch. So: split first, find the
+# entry whose own `path=` is the alert script, and judge THAT entry alone.
+#
+# The flag spellings are copied from this host (systemd 255, 2026-08-08,
+# `systemctl show career-worker.service -p ExecStopPost -p ExecStopPostEx`),
+# never remembered — the first bug was a pattern matching `ignore_exit_status=`,
+# a field systemd has never printed, which could not have fired at all:
+#
+#     ExecStopPost      with the '-'  →  ; ignore_errors=yes ;
+#     ExecStopPost      without it    →  ; ignore_errors=no ;
+#     ExecStopPostEx    with the '-'  →  ; flags=ignore-failure ;
+#     ExecStopPostEx    without it    →  ; flags= ;
+#
+# Five verdicts, and the separation between them is the whole point:
+#
+#   armed and non-fatal      the deployed shape — the only pass.
+#   loaded WITHOUT the '-'   accusation, made ONLY on systemd's own "no".
+#   CANNOT VERIFY            the hook is loaded but its flag field is in a
+#                            spelling this script does not know (or the two
+#                            properties disagree). Not a pass and not the
+#                            accusation: "this check went blind". Counted as a
+#                            failure on purpose — silence here is how a blind
+#                            check gets trusted.
+#   NO hook loaded           systemd answered, and there is no alert hook.
+#   could not ask            systemd did not answer for this unit at all. An
+#                            empty answer used to land on "NO hook loaded",
+#                            which says "no hook is installed" about a question
+#                            that was never asked — different operator action,
+#                            so a different sentence.
+classify_alert_hook() {
+  local unit="$1" show="$2"
+  local line loadstate="" records_post="" records_ex=""
+  while IFS= read -r line; do
+    case "$line" in
+      LoadState=*) loadstate="${line#LoadState=}" ;;
+      ExecStopPost=*) records_post+="${line#ExecStopPost=}"$'\n' ;;
+      ExecStopPostEx=*) records_ex+="${line#ExecStopPostEx=}"$'\n' ;;
+    esac
+  done <<<"$show"
+
+  # A unit systemd does not have (renamed, never installed, or a systemctl that
+  # cannot reach the manager) prints LoadState=not-found — with exit status 0,
+  # so the exit code cannot be used for this. Both Exec properties are then
+  # absent, which is indistinguishable from a unit that simply has no hook.
+  if [[ "$loadstate" != "loaded" ]]; then
+    bad "$unit: could not ask systemd about the alert hook — LoadState='${loadstate:-no answer}', so this line is UNCHECKED, not clean (counted as a failure). If the unit was renamed, fix the name in scripts/verify_restore.sh; otherwise install it: systemctl daemon-reload && systemctl status $unit"
+    return
+  fi
+
+  # ExecStopPost first, ExecStopPostEx as the fallback: they are two views of
+  # the same entries, so a systemd that stops answering the older property name
+  # can no longer make a loaded hook look absent. One property is consulted,
+  # never both, so the two views can never be mixed into one verdict.
+  local prop records rec path
+  local matched=0 armed=0 fatal=0 unknown=0
+  for prop in post ex; do
+    if [[ "$prop" == post ]]; then records="$records_post"; else records="$records_ex"; fi
+    matched=0 armed=0 fatal=0 unknown=0
+    while IFS= read -r rec; do
+      [[ -n "$rec" ]] || continue
+      # This record's OWN path field: everything after `path=` up to the space
+      # before systemd's ` ; ` separator. The basename is what is compared, so
+      # a checkout somewhere other than /root/career still classifies.
+      path="${rec#*path=}"
+      path="${path%% *}"
+      [[ "${path##*/}" == "alert_unit_failure.sh" ]] || continue
+      matched=1
+      case "$rec" in
+        *"ignore_errors=yes"* | *"flags=ignore-failure"*) armed=1 ;;
+        *"ignore_errors=no"* | *"flags= ;"*) fatal=1 ;;
+        *) unknown=1 ;;
+      esac
+    done <<<"$records"
+    [[ "$matched" -eq 1 ]] && break
+  done
+
+  local blind=""
+  if [[ "$matched" -eq 0 ]]; then
+    bad "$unit: NO ExecStopPost alert hook loaded — a watchdog kill restarts it silently forever, since WatchdogSec+RestartSec can never exhaust the start limit"
+    return
+  elif [[ "$fatal" -eq 1 && "$armed" -eq 1 ]]; then
+    blind="two entries run this hook and systemd reports them differently — one non-fatal, one fatal"
+  elif [[ "$fatal" -eq 1 ]]; then
+    # The leading '-' in the unit file. Without it a Telegram outage turns the
+    # alerting into a failure of the service it was reporting on.
+    bad "$unit: alert hook is loaded WITHOUT the leading '-' — a failed alert would fail the service itself; put the '-' back on ExecStopPost= in ops/systemd/$unit, then: systemctl daemon-reload && systemctl restart $unit"
+    return
+  elif [[ "$unknown" -eq 1 ]]; then
+    blind="systemd printed a flag spelling this script does not know"
+  fi
+
+  if [[ -n "$blind" ]]; then
+    bad "$unit: CANNOT VERIFY the alert hook's leading '-' — the hook IS loaded, but $blind, so this line is blind, not green (counted as a failure deliberately). Read it yourself, it takes ten seconds: systemctl show $unit -p ExecStopPost -p ExecStopPostEx — non-fatal means ignore_errors=yes or flags=ignore-failure. If it says one of those, teach that spelling to classify_alert_hook in scripts/verify_restore.sh and re-run. If it says anything else, ExecStopPost= in ops/systemd/$unit is missing its leading '-'."
+    return
+  fi
+  pass "$unit: watchdog alert hook armed and non-fatal"
+}
+
+# Sourced by tests/test_verify_restore_alert_hook.py, which wants the functions
+# above and none of the checks below — every one of them reads the live host.
+if [[ -n "${VERIFY_RESTORE_LIB_ONLY:-}" ]]; then
+  # `return` only works in a sourced file; the `exit` is the fallback for
+  # someone running the script with the variable set, and shellcheck cannot see
+  # that the two are alternatives rather than dead code.
+  # shellcheck disable=SC2317
+  return 0 2>/dev/null || exit 0
+fi
+
 section "1. secrets file present and locked down"
 if [[ -s "$ENV_FILE" ]]; then
   # Count key NAMES only — this script never reads or prints a value.
@@ -284,27 +415,12 @@ done
 # Without it a wedged worker is killed and restarted every WatchdogSec+RestartSec
 # forever and never reaches `failed`, so OnFailure= never fires and nobody is
 # told — a watchdog that heals the symptom and hides the illness.
+#
+# The classification is classify_alert_hook, defined at the top of this file so
+# the test can source it; the reasoning behind every branch lives there.
 for unit in career-worker.service career-admin-bot.service; do
-  hook=$(systemctl show "$unit" -p ExecStopPost --value 2>/dev/null)
-  case "$hook" in
-    # The flag's spelling is systemd's, not ours, and we got it wrong once:
-    # this pattern read `ignore_exit_status=`, which systemd never prints. On
-    # 2026-08-07 that made a correctly deployed host fail the check with the
-    # exact opposite diagnosis — «the hook is loaded WITHOUT the leading -»
-    # about a hook that had it. `systemctl show -p ExecStopPost` prints
-    # `ignore_errors=yes`; the `ExecStopPostEx=` variant prints
-    # `flags=ignore-failure`. Both are accepted so a systemd upgrade cannot
-    # reopen this, and an unrecognised spelling now falls to the branch that
-    # says it could not tell, rather than to the one that accuses.
-    *alert_unit_failure.sh*ignore_errors=yes*|*alert_unit_failure.sh*flags=ignore-failure*)
-      pass "$unit: watchdog alert hook armed and non-fatal" ;;
-    *alert_unit_failure.sh*)
-      # The leading '-' in the unit file. Without it a Telegram outage turns
-      # the alerting into a failure of the service it was reporting on.
-      bad "$unit: alert hook is loaded WITHOUT the leading '-' — a failed alert would fail the service itself" ;;
-    *)
-      bad "$unit: NO ExecStopPost alert hook loaded — a watchdog kill restarts it silently forever, since WatchdogSec+RestartSec can never exhaust the start limit" ;;
-  esac
+  classify_alert_hook "$unit" \
+    "$(systemctl show "$unit" -p LoadState -p ExecStopPost -p ExecStopPostEx 2>/dev/null)"
 done
 
 section "7. gateway and health"

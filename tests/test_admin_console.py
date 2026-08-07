@@ -3048,7 +3048,9 @@ def test_business_spend_is_the_one_definition_including_the_whatsapp_half(
     spend = data["spend_by_category"]
     assert spend["llm_generation"][0] == 1
     # both templates are billed — the channel-less one is not a second-class row
-    assert spend["wa_utility"][0] == 2
+    # (bucket corrected 2026-08-08: `renewal_reminder` is MARKETING at Meta,
+    # which re-categorised it after approving it as utility)
+    assert spend["wa_marketing"][0] == 2
     # and the screen agrees with the function, exactly
     canonical = close_mod.spend_by_kind(owner_session, since=NOW - timedelta(days=30))
     assert {k: v for k, v in spend.items()} == canonical

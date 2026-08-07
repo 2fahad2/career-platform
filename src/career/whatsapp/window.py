@@ -12,6 +12,11 @@ from datetime import datetime, time, timedelta
 from enum import StrEnum
 from zoneinfo import ZoneInfo
 
+#: NOT ours and not tunable: Meta's own rule. Every other number in this file
+#: is derived from it, and nothing in this repository may «adjust» it — a
+#: window we believe is 25 hours long is a free-form send that Meta rejects at
+#: the moment of delivery, and a window we believe is 23 hours long is a paid
+#: template bought for a message that was already free.
 WINDOW_HOURS = 24
 
 
@@ -43,10 +48,43 @@ _RIYADH = ZoneInfo("Asia/Riyadh")
 #: August): at dawn EVERY customer's window is shut, so every delivery needed
 #: a paid template; at eleven, anyone who wrote to us the previous evening is
 #: still inside their 24h window and the bundle goes out free-form.
+#: A COPY of `ops/systemd/career-engine-nightly.timer`'s OnCalendar hour, and
+#: the copy is the risk: that hour is Fahad's product decision and this module
+#: is engineering downstream of it. If the timer moves and this does not, the
+#: nudge is computed against a delivery that does not happen then — it would go
+#: quiet exactly when it was needed, which is the failure that does not
+#: announce itself. `tests/test_whatsapp_window.py` reads the timer file and
+#: fails on the difference, so the two cannot drift silently.
 _DELIVERY_HOUR = 11
 _DELIVERY_MINUTE = 0
-_REMINDER_HOURS = (19, 20, 21, 22)   # evening nudge window (Riyadh)
-_SAUDI_WEEKEND = (4, 5)     # Fri/Sat — no delivery on Thu/Fri evening
+
+#: The evening band, Riyadh — derived from the delivery hour twice over.
+#:
+#: WHY THESE HOURS AT ALL. A message the customer sends at hour H holds the
+#: window open until H+24. For the window to still be open at tomorrow's
+#: delivery, they must write to us AFTER the delivery hour today — so any hour
+#: after 11:00 would technically work. The band is late because the nudge asks
+#: for an action: it has to land when he is holding the phone and can answer in
+#: one tap, and a reminder at 13:00 is a reminder he intends to act on later.
+#:
+#: WHY IT IS FOUR HOURS WIDE, which is the cadence question. This is read by
+#: the worker's hourly housekeeping gate (REMINDER_SWEEP_SECONDS), and a band
+#: NARROWER than that gate could be stepped over entirely by an unlucky phase —
+#: the gate drifts forward by a cycle's work each hour, so its firings are not
+#: pinned to the clock. Four hours guarantees at least three firings inside the
+#: band no matter where the phase sits. A one-hour band would be a nudge that
+#: silently never fires, and the whole point of it is that its absence is
+#: invisible until a delivery day costs a paid template.
+#:
+#: The band must also lie entirely after `_DELIVERY_HOUR`, or the earliest hour
+#: in it would ask the customer for a message that expires BEFORE the run it is
+#: meant to cover. Asserted, not assumed — see tests/test_whatsapp_window.py.
+_REMINDER_HOURS = (19, 20, 21, 22)
+
+#: Fri/Sat. §08 delivers Sunday–Thursday, so a Thursday or Friday evening nudge
+#: would ask the customer to hold a window open for a run that never fires —
+#: and spend the goodwill of an unnecessary message to do it.
+_SAUDI_WEEKEND = (4, 5)
 
 
 def window_reminder_due(

@@ -1822,7 +1822,23 @@ def _announce_provision(
                 WELCOME_ACTIVATION.name, WELCOME_ACTIVATION.language,
             )
         except Exception:  # noqa: BLE001
-            logger.warning("welcome template send failed", exc_info=True)
+            # ERROR, not warning: the operator's harvester forwards «ERROR:»
+            # lines only, and this is the message whose REPLY claims a paid
+            # subscription. A failure here leaves the order PAID_UNCLAIMED
+            # until the §05 claim deadline with no signal anywhere — money
+            # taken, nothing delivered, and the first symptom is an expiry.
+            #
+            # Two independent audits reached this line from opposite ends on
+            # 2026-08-08: a revoked Meta credential raises here and was logged
+            # below the harvester's floor, and a customer who has switched off
+            # «Offers and announcements» never receives a MARKETING template
+            # at all — `welcome_activation` is categorised MARKETING at Meta —
+            # while the Graph call returns 200 and raises nothing. That second
+            # one does not even reach this branch. Raising the level closes the
+            # half that throws; the other half is closed by winning the
+            # template's UTILITY category back (see the appeal list).
+            logger.error("welcome template NOT sent — a paid order was never "
+                         "asked to claim itself", exc_info=True)
         else:
             # The sharpest corner of the unbilled-template hole. This send
             # happens BEFORE any CustomerChannel exists — that is the entire

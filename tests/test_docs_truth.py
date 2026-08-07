@@ -1786,26 +1786,83 @@ def test_the_only_trigger_of_a_career_session_is_the_operator() -> None:
     )
 
 
-def test_the_overdue_sweep_names_the_hour_its_timer_actually_fires() -> None:
-    """The claim: `escalate_overdue` runs once a day, at a stated hour.
+def test_the_overdue_sweep_names_the_cadence_it_is_actually_run_at() -> None:
+    """The claim: `escalate_overdue` is swept HOURLY, with the nightly kept as
+    a backstop at the hour its own unit file names.
 
-    It has no timer of its own — it rides `cv.daily_run.sweep_promises`, which
-    rides the delivery day, which rides `career-engine-nightly.timer`. Four
-    links, none of them visible from the function, and the docstring said
-    «04:30» for the five days after Fahad moved the run to 11:00 so that
-    deliveries would land inside the customer's open WhatsApp window. The
-    number is the whole content of that paragraph: it is how a reader works
-    out that a request breaching at noon waits nearly a day.
+    RE-PINNED 2026-08-07, and the previous pin is why this one is written the
+    way it is. Until then the claim was «runs once a day, at a stated hour»,
+    and this test read the hour out of `career-engine-nightly.timer` and
+    demanded the docstring say it — because the function has no timer of its
+    own (`cv.daily_run.sweep_promises` → the delivery day → the unit), four
+    links none of which are visible from the function, and the docstring said
+    «04:30» for five days after Fahad moved the run to 11:00.
+
+    That pin did its job and then became the thing it guards against: the
+    cadence changed, so a test that only checks for «11:00» would go on
+    passing over a docstring describing a schedule the code no longer runs.
+    A register entry that survives the change it was meant to catch is worse
+    than none, so this asserts the NEW truth in three parts, each of which is
+    a fact about the tree rather than a sentence about it:
+
+    1. an hourly caller genuinely EXISTS outside `cv.daily_run` — the point of
+       the change is worthless if the wiring is missing, and «rides the worker
+       loop» is exactly the kind of cross-module claim that rots;
+    2. the interval the module declares is at most an hour, and the docstring
+       pair says so — a constant raised to six hours with the prose still
+       reading «hourly» is the same defect in the other direction;
+    3. the nightly hour is STILL named, because the backstop is still real and
+       its hour is still the worst case whenever the worker is down. That half
+       of the old pin was never wrong; it had simply stopped being the whole
+       schedule.
     """
+    module = "src/career/promises/career_session.py"
+    doc = ast.get_docstring(_function(module, "escalate_overdue")) or ""
+    entry = ast.get_docstring(
+        _function(module, "escalate_overdue_and_commit")) or ""
+
+    # 1 — the hourly caller, in the tree and not in a sentence
+    callers = _calls_of("escalate_overdue_and_commit") - {module}
+    assert "scripts/run_worker_loop.py" in callers, (
+        f"escalate_overdue_and_commit is called from {sorted(callers)}. Both "
+        "docstrings say this promise is measured hourly from the conversation "
+        "worker; without that caller the only schedule is the nightly and the "
+        "24-hour promise is measured up to 23 hours after it expired"
+    )
+
+    # 2 — the declared interval, and the prose that describes it
+    from career.promises.career_session import SLA_SWEEP_INTERVAL_SECONDS
+
+    assert SLA_SWEEP_INTERVAL_SECONDS <= 3600.0, (
+        f"the SLA sweep interval is now {SLA_SWEEP_INTERVAL_SECONDS}s. That "
+        "is the worst-case lateness of the whole measurement, against a "
+        "promise 24 hours long — and both docstrings still call it hourly"
+    )
+    assert "HOURLY" in doc, (
+        "escalate_overdue's docstring no longer states its cadence. That "
+        "paragraph is where a reader learns how long «the promise broke» and "
+        "«the operator was told» can be apart"
+    )
+    assert "WHY AN HOUR" in entry, (
+        "escalate_overdue_and_commit no longer argues its cadence. The hour "
+        "is a decision — against the minute, against a job armed at each "
+        "request's own deadline — and an unargued interval is one nobody can "
+        "safely change"
+    )
+
+    # 3 — the backstop, still named, still at the hour the unit really fires
     timer = pathlib.Path("ops/systemd/career-engine-nightly.timer")
     fires = re.search(r"OnCalendar=\S+\s+(\d{2}:\d{2})", timer.read_text(encoding="utf-8"))
     assert fires is not None, f"{timer} no longer states an OnCalendar time"
-    doc = ast.get_docstring(
-        _function("src/career/promises/career_session.py", "escalate_overdue")
-    ) or ""
     assert fires.group(1) in doc, (
         f"the nightly timer fires at {fires.group(1)} and "
-        "career_session.escalate_overdue's docstring does not say so. That "
-        "docstring is where the delay between «the promise broke» and «the "
-        "operator was told» is written down, and a retired hour understates it"
+        "career_session.escalate_overdue's docstring does not say so. It is "
+        "still a caller — the backstop for the hour the worker is not there — "
+        "and its hour is still the worst case when the worker is down"
+    )
+    assert "cv.daily_run.sweep_promises" in doc and "backstop" in doc, (
+        "the docstring no longer says which caller is the schedule and which "
+        "is the backstop. With two callers that distinction is the whole "
+        "cadence: the reader cannot otherwise tell an hourly promise from a "
+        "nightly one"
     )

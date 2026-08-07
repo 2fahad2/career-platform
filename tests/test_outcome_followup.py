@@ -12,9 +12,11 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from sqlalchemy import event, select
 from sqlalchemy import text as sql_text
 
 from career.cv import outcome_followup as fu
+from career.db.models import OutcomeEvent
 from career.whatsapp.client import FakeWhatsAppClient
 
 NOW = datetime(2026, 8, 3, 9, 0, tzinfo=UTC)
@@ -295,3 +297,181 @@ def test_the_question_lines_are_direction_pure() -> None:
         assert not (has_ar and has_lat), line
     for _, label in fu.BUTTONS:
         assert len(label) <= 20, label      # Meta's button ceiling
+
+
+# ── the open question, and what it costs to ask ─────────────────────────────
+# `pending_job_ref` is no longer a sweep helper. It runs on EVERY inbound
+# message (whatsapp/worker resolves the open question before parsing a typed
+# label, so a sentence can never be read as an answer to a question nobody
+# asked). That put a 1+N walk of the customer's whole ledger on the message
+# path — and returning early only when a question IS open made the common case
+# (nothing pending, most messages) the expensive one. These two tests pin the
+# cost and the meaning separately, because a cheaper query that answers a
+# slightly different question either writes a §20 datum from nothing or drops
+# a real answer, and neither can be collected a second time.
+
+
+class _Statements:
+    """Every statement the engine actually sends, counted around a block."""
+
+    def __init__(self, session) -> None:  # noqa: ANN001
+        self._engine = session.get_bind()
+        self.sent: list[str] = []
+
+    def _note(self, conn, cursor, statement, params, context,  # noqa: ANN001
+              executemany) -> None:  # noqa: ANN001
+        self.sent.append(statement)
+
+    def __enter__(self) -> _Statements:
+        event.listen(self._engine, "before_cursor_execute", self._note)
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        event.remove(self._engine, "before_cursor_execute", self._note)
+
+
+def _event(session, tid, job, outcome, days_ago):  # noqa: ANN001
+    """One row on the ledger. `occurred_at` is SUPPLIED, never `now()` — the
+    ledger is append-only and a replayed webhook or a backfill can land an
+    answer with an earlier stamp than the question it answers."""
+    session.execute(sql_text(
+        "INSERT INTO outcome_events (id, tenant_id, job_ref, outcome,"
+        " occurred_at) VALUES (:i, :t, :j, :o, :w)"),
+        {"i": str(uuid.uuid4()), "t": str(tid), "j": job, "o": outcome,
+         "w": NOW - timedelta(days=days_ago)})
+
+
+def _pending_by_walking(session, tenant_id):  # noqa: ANN001
+    """`pending_job_ref` EXACTLY as it stood before the one-query rewrite.
+
+    Kept here as the ORACLE, not as a spare implementation: the question it
+    answers is real logic — which asked question is still pending — and a
+    GROUP BY that gets it subtly wrong is invisible until a customer is asked
+    something he already answered, or his answer is dropped on the floor. The
+    two are compared over the corpus below rather than reasoned about.
+    """
+    asked = session.execute(
+        select(OutcomeEvent.job_ref, OutcomeEvent.occurred_at).where(
+            OutcomeEvent.tenant_id == tenant_id,
+            OutcomeEvent.outcome == fu.ASKED,
+        ).order_by(OutcomeEvent.occurred_at.desc())
+    ).all()
+    for job_ref, _ in asked:
+        stages = fu._stages(session, tenant_id, job_ref)
+        if not (stages & {fu.INTERVIEW, fu.NO_REPLY, fu.REJECTED, fu.GAVE_UP}):
+            return str(job_ref)
+    return None
+
+
+def test_the_open_question_is_one_query_however_long_the_history(owner_session):
+    """The cost, measured where it is actually paid.
+
+    A customer a year in has hundreds of applications on an append-only ledger
+    that is never pruned, and every one of them was a query — per inbound
+    message. The walk's early return does not help: it fires only when a
+    question IS open, so the customer with nothing pending, writing «شكرًا»,
+    paid for his entire history.
+    """
+    quiet = _customer(owner_session)      # long history, nothing open
+    live = _customer(owner_session)       # long history + one open question
+    try:
+        for n in range(40):
+            job = f"https://jobs.example/q{n}"
+            _event(owner_session, quiet, job, "applied", 60 - n)
+            _event(owner_session, quiet, job, fu.ASKED, 46 - n)
+            _event(owner_session, quiet, job, fu.NO_REPLY, 40 - n)
+            _event(owner_session, live, job, "applied", 60 - n)
+            _event(owner_session, live, job, fu.ASKED, 46 - n)
+            _event(owner_session, live, job, fu.REJECTED, 40 - n)
+        _event(owner_session, live, "https://jobs.example/open", fu.ASKED, 1)
+        owner_session.commit()
+
+        with _Statements(owner_session) as counted:
+            assert fu.pending_job_ref(owner_session, tenant_id=quiet) is None
+        assert len(counted.sent) == 1, counted.sent
+
+        with _Statements(owner_session) as counted:
+            assert fu.pending_job_ref(owner_session, tenant_id=live) == \
+                "https://jobs.example/open"
+        assert len(counted.sent) == 1, counted.sent
+
+        # and the walk it replaced, on the same rows, to show the difference
+        # is real rather than an artefact of how the statements are counted
+        with _Statements(owner_session) as walked:
+            assert _pending_by_walking(owner_session, quiet) is None
+        assert len(walked.sent) > 40
+    finally:
+        _cleanup(owner_session, quiet, live)
+
+
+def test_the_one_query_and_the_walk_it_replaced_never_disagree(owner_session):
+    """The equivalence corpus.
+
+    Several tenants, several jobs each, asked / answered / expired / never
+    asked / never applied, an answer stamped BEFORE its question, one job_ref
+    shared by two tenants, and a tenant with no rows at all. Every case is
+    checked twice: against the walk, and against the answer a human would give
+    — so a corpus that quietly stops covering something cannot pass by
+    agreeing with a broken oracle.
+    """
+    corpus: dict[str, tuple[list[tuple[str, str, int]], str | None]] = {
+        # answered → closed; and the newer job was never asked about
+        "answered": ([("a1", "applied", 20), ("a1", fu.ASKED, 14),
+                      ("a1", fu.INTERVIEW, 13), ("a2", "applied", 10)], None),
+        # one closed, one open, one only applied → the open one
+        "one_open": ([("b1", "applied", 30), ("b1", fu.ASKED, 20),
+                      ("b1", fu.NO_REPLY, 19),
+                      ("b2", "applied", 25), ("b2", fu.ASKED, 15),
+                      ("b3", "applied", 5)], "b2"),
+        # two open at once (the sweep forbids it; the ledger can still hold
+        # it) → the most recently ASKED, which is what the walk returned
+        "two_open": ([("c1", fu.ASKED, 9), ("c2", fu.ASKED, 2)], "c2"),
+        # the question nobody answered, closed by the sweep → nothing pending
+        "expired": ([("d1", "applied", 40), ("d1", fu.ASKED, 35),
+                     ("d1", fu.GAVE_UP, 28)], None),
+        # never asked → nothing pending, and no row invented
+        "never_asked": ([("e1", "applied", 30), ("e2", "applied", 2)], None),
+        # THE ordering trap: the answer is stamped BEFORE the question. A
+        # «latest row wins» reading calls this open and re-asks a customer
+        # something he has already answered.
+        "answer_first": ([("f1", "applied", 30), ("f1", fu.REJECTED, 20),
+                          ("f1", fu.ASKED, 10)], None),
+        # THE other ordering trap: a closed job with LATER activity must not
+        # outrank an older question that is genuinely still open.
+        "late_noise": ([("g1", fu.ASKED, 20), ("g1", fu.INTERVIEW, 19),
+                        ("g1", "applied", 1), ("g2", fu.ASKED, 18)], "g2"),
+        # asked twice (a re-ask that should never happen) and then answered
+        "re_asked": ([("h1", fu.ASKED, 20), ("h1", fu.ASKED, 12),
+                      ("h1", fu.INTERVIEW, 11), ("h2", fu.ASKED, 18)], "h2"),
+        # a ledger gap — the applied row is missing and the question is real
+        "asked_only": ([("i1", fu.ASKED, 3)], "i1"),
+        # the rest of the ledger's vocabulary: «ignored» is `cv/deliver`'s
+        # other button and is neither a question nor an answer to one. It must
+        # not close a thread, and it must not open one either.
+        "ignored_open": ([("j1", "ignored", 20), ("j1", fu.ASKED, 5)], "j1"),
+        "ignored_only": ([("k1", "ignored", 3), ("k2", "applied", 2)], None),
+        # the same job_ref in two tenants, open for one and closed for the
+        # other: the grouping must not leak across the tenant boundary
+        "shared_open": ([("SHARED", "applied", 20), ("SHARED", fu.ASKED, 9)],
+                        "SHARED"),
+        "shared_closed": ([("SHARED", "applied", 20),
+                           ("SHARED", fu.ASKED, 9),
+                           ("SHARED", fu.REJECTED, 8)], None),
+        # the empty case
+        "empty": ([], None),
+    }
+    tenants = {name: _customer(owner_session) for name in corpus}
+    try:
+        for name, (rows, _expected) in corpus.items():
+            for job, outcome, days_ago in rows:
+                _event(owner_session, tenants[name], job, outcome, days_ago)
+        owner_session.commit()
+
+        for name, (_rows, expected) in corpus.items():
+            tid = tenants[name]
+            walked = _pending_by_walking(owner_session, tid)
+            grouped = fu.pending_job_ref(owner_session, tenant_id=tid)
+            assert grouped == walked, f"{name}: {grouped!r} != walk {walked!r}"
+            assert grouped == expected, f"{name}: {grouped!r} != {expected!r}"
+    finally:
+        _cleanup(owner_session, *tenants.values())

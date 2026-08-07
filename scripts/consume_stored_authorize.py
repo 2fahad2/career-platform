@@ -239,7 +239,7 @@ def _select(session: Session, event_id: str | None) -> WebhookEvent | None:
     return session.execute(stmt).scalars().first()
 
 
-class Offered(NamedTuple):
+class Offered:
     """The four values ``_apply_authorize`` pulls off the payload, pulled the
     same way and normalised the same way (a non-string access token becomes
     ``""``, a non-string refresh token becomes ``None`` — «inherit», which is
@@ -248,36 +248,131 @@ class Offered(NamedTuple):
     ``access`` is carried because the identity ladder uses it as proof of
     sameness, and because the writer needs it to answer at all.
 
-    A ``NamedTuple`` and not a ``@dataclass`` for a reason that looks like
-    trivia and is not: this file is loaded BY PATH, and ``@dataclass`` resolves
-    its annotations through ``sys.modules[cls.__module__]`` — so in a loader
-    that does not register the module first, a dataclass here raises «'NoneType'
-    object has no attribute '__dict__'» before the first assertion. All three
-    loaders in the suite now register before executing, so the trap is one
-    forgotten line away rather than currently sprung; that is exactly why
-    ``TestTheScriptStaysLoadable`` exercises the unregistered path on purpose.
-    Staying a ``NamedTuple`` is what keeps that test cheap to keep.
+    NEITHER a ``NamedTuple`` NOR a ``@dataclass``, and both halves of that are
+    deliberate. This class holds a live access token and a live refresh token,
+    so the only question it has to answer well is «can anything get the raw
+    values out of it into text».
+
+    **Why not a ``NamedTuple`` any more.** Its redacted ``__repr__``/``__str__``
+    covered thirteen rendering paths and left two open that no override can
+    close:
+
+    * ``offered._asdict()`` returns the raw values in a dict, and the method
+      CANNOT be overridden — ``typing._prohibited`` makes the class body raise
+      at creation time if you try. There is no version of this class that is a
+      ``NamedTuple`` and has a safe ``_asdict``.
+    * ``offered[0:2]`` (and ``list(offered)``, and ``tuple(offered)``, and
+      ``a, b, *_ = offered``) renders through ``tuple.__repr__``, which knows
+      nothing about the override.
+
+    Neither had a caller. «No caller today» is the argument that was wrong
+    about three separate things this week, and it is a especially weak argument
+    here: ``_asdict()`` is the first thing anyone reaches for when they want to
+    log or serialise a record, it reads as the safe and tidy option, and it
+    would put a live Salla token into a log line while the class docstring two
+    inches above says the token is hidden. A defence that cannot be extended to
+    the obvious next call site is a defence to stop relying on.
+
+    **Why not a ``@dataclass``.** The old docstring here reported that the
+    loader constraint might have lapsed. It has not. This file is loaded BY
+    PATH, and ``@dataclass`` resolves its annotations through
+    ``sys.modules[cls.__module__]`` — in a loader that does not register the
+    module first, ANY dataclass in this file raises «'NoneType' object has no
+    attribute '__dict__'» before the first line of ``main`` runs. Re-measured
+    on this host on 2026-08-07 (CPython 3.12.3): plain, ``frozen=True`` and
+    ``slots=True`` all still fail, so it is a property of the language and not
+    of the loaders. What HAS changed is that every loader in the suite now
+    registers first — which makes the trap one forgotten line away rather than
+    sprung, and is exactly why ``TestTheScriptStaysLoadable`` keeps exercising
+    the unregistered path on purpose. A break there would land in somebody
+    else's test file with a message that names neither this class nor this
+    file.
+
+    **So: a plain class.** It is the only one of the three that closes
+    ``_asdict`` and slicing (they simply do not exist) while resolving no
+    annotations at class-creation time, so the by-path loading property is kept
+    for free. ``__slots__`` is part of the redaction, not a micro-optimisation:
+    without it the instance carries a ``__dict__``, and ``vars(offered)`` is
+    then a third raw-value path of exactly the kind being closed here.
+
+    ``__eq__`` is written out because the ``NamedTuple`` had value semantics
+    and silently degrading to identity comparison is the same shape of latent
+    wrongness as the two paths above. It leaves the class unhashable, which the
+    ``NamedTuple`` was not — that difference fails loudly with a ``TypeError``
+    the moment anyone puts one in a set, so it needs no guard.
 
     The generated ``__repr__`` is replaced, for the same reason
-    ``SallaCredentials`` has none: a tuple that renders itself puts a live
+    ``SallaCredentials`` has none: a record that renders itself puts a live
     access token into every traceback frame and every pytest diff (constant 13).
 
-    Both hiding methods are written out as ``def``. ``__str__ = __repr__`` —
-    which is what ``SallaCredentials`` may legitimately write, because it is a
-    ``@dataclass`` — is NOT safe here: inside a ``NamedTuple`` body an
-    assignment is the syntax for «field with a default», so a type checker
-    reads that line as a fifth field named ``__str__`` and stops seeing the
-    class's rendering as methods at all. It happens to bind at runtime (the
-    metaclass ``setattr``s every non-field name onto the generated class), so
+    Both hiding methods are written out as ``def`` rather than
+    ``__str__ = __repr__``. That is now merely good practice — the assignment
+    form was outright unsafe while this was a ``NamedTuple``, where an
+    assignment in the class body is the syntax for «field with a default», so a
+    type checker read that line as a fifth field named ``__str__`` and stopped
+    seeing the redaction as a method at all. It happened to bind at runtime, so
     it was armour that worked while being invisible to the only tool that could
-    tell us it had stopped working. Written as ``def``, the redaction is
-    checkable — and TestNoContainerHereCanRenderItsSecret proves it binds.
+    have told us the day it stopped. TestNoContainerHereCanRenderItsSecret
+    proves it binds, and now also proves nothing hands the raw values to a
+    renderer that never heard of the override.
     """
 
-    access: str
-    refresh: str | None
-    expires_at: datetime | None
-    store_id: str | None
+    __slots__ = ("access", "expires_at", "refresh", "store_id")
+
+    def __init__(
+        self,
+        *,
+        access: str,
+        refresh: str | None,
+        expires_at: datetime | None,
+        store_id: str | None,
+    ) -> None:
+        # Keyword-only: the tuple is gone, and with it any meaning that
+        # positional order used to carry. A caller who still believes in the
+        # old field order gets a TypeError instead of a silent transposition
+        # of the access token and the refresh token.
+        self.access = access
+        self.refresh = refresh
+        self.expires_at = expires_at
+        self.store_id = store_id
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Offered):
+            return NotImplemented
+        return (
+            self.access == other.access
+            and self.refresh == other.refresh
+            and self.expires_at == other.expires_at
+            and self.store_id == other.store_id
+        )
+
+    def __getstate__(self) -> object:
+        # THE THIRD HANDOVER PATH, and the one `__slots__` opened rather than
+        # closed. `object.__getstate__` has existed on every object since
+        # CPython 3.11, and for a slotted class it returns
+        # `(None, {'access': <live token>, 'refresh': <live token>, …})` — a
+        # plain dict, rendered by `dict.__repr__`, which has never heard of the
+        # redaction two methods below. Without `__slots__` it would hand back
+        # `self.__dict__` instead: the same leak by the other door, so the
+        # choice of shape cannot close this one and a method has to.
+        #
+        # It is not a theoretical door. It is what `pickle.dumps(offered)`
+        # walks (via `__reduce_ex__`), which is how a record ends up in a cache,
+        # a queue, a multiprocessing hand-off or a crash dump — and it is the
+        # same «tidy, obviously-safe» reach as the `_asdict()` this class
+        # stopped being a `NamedTuple` to close.
+        #
+        # RAISING rather than returning a redacted state, deliberately: a
+        # redacted state would make `copy.copy(offered)` return an `Offered`
+        # whose token is the string «set», and this record's access token is
+        # what `_apply_authorize` WRITES. A copy that silently lost the
+        # credential is a worse bug than no copy at all. Nothing in this file
+        # or its tests copies or pickles one, so the loud failure costs
+        # nothing and names itself if that ever changes.
+        raise TypeError(
+            "Offered carries live credentials and refuses to be serialised "
+            "(pickle/copy/__getstate__) — read the fields you need by name"
+        )
 
     def __repr__(self) -> str:
         return (
@@ -382,10 +477,16 @@ class Prediction(NamedTuple):
     """What ``_apply_authorize`` will do, computed by the code that will do it.
 
     Every field is something the apply produces, so every field is assertable
-    against the apply — which is exactly what the tests do. (``NamedTuple`` for
-    the loader reason given on :class:`Offered`; every field here is already
-    safe to render, and ``after`` renders through
-    ``SallaCredentials.__repr__``.)
+    against the apply — which is exactly what the tests do.
+
+    Still a ``NamedTuple``, unlike :class:`Offered`, and the difference is the
+    whole reason that one stopped being one: nothing here is a secret. The
+    tuple paths a ``NamedTuple`` cannot close — ``_asdict()``, slicing — hand
+    out a row status, a verdict enum, a refusal string, a boolean and
+    ``after``, which is a ``SallaCredentials`` and redacts ITSELF wherever it
+    is rendered. So the paths are open and there is nothing behind them, and
+    the ``@dataclass`` that would close them is the one thing this file cannot
+    have (see :class:`Offered` on the by-path loader).
     """
 
     #: ``processing_status`` the row would be left in.

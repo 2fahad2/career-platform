@@ -33,6 +33,7 @@ import importlib.util
 import inspect
 import io
 import logging
+import pickle
 import sys
 import uuid
 from collections.abc import Iterable
@@ -72,11 +73,13 @@ def _load_script() -> Any:
     """Load the deliverable from its real path.
 
     Registered in ``sys.modules`` before execution — but the script must ALSO
-    load without that, because ``tests/test_salla_tokens.py`` loads it the other
-    way and a module-level construct that needs the registration (a
-    ``@dataclass``, whose annotations resolve through
-    ``sys.modules[cls.__module__]``) would break those tests instead of this
-    one. Asserted below in :class:`TestTheScriptStaysLoadable`.
+    load without that. Every loader of this script registers first today
+    (``tests/test_salla_tokens.TestTheConsumeScript`` does, and says why), so
+    the property is currently free; :class:`TestTheScriptStaysLoadable` keeps
+    it that way on purpose, because the cost of losing it is paid by whoever
+    writes the NEXT by-path loader, in a file that is not this one, with a
+    message («'NoneType' object has no attribute '__dict__'») that names
+    neither the script nor the construct that broke it.
     """
     path = REPO / "scripts" / "consume_stored_authorize.py"
     spec = importlib.util.spec_from_file_location("career_consume_authorize", path)
@@ -621,6 +624,58 @@ def _all_renderings(obj: object) -> list[str]:
     ]
 
 
+def _handover_renderings(obj: object) -> list[str]:
+    """The other half, and the half a redacted ``__repr__`` cannot reach.
+
+    ``_all_renderings`` asks the object to render ITSELF, so an override
+    answers every one of them. These ask the object to hand its CONTENTS to
+    something else, which then renders them with no idea an override exists —
+    and no override can intervene, because none of these dispatch through
+    ``__repr__`` or ``__str__`` at all.
+
+    Each entry is a real path that a real person types:
+
+    * ``_asdict()`` — what anyone reaches for to log or serialise a record, and
+      on a ``NamedTuple`` it CANNOT be overridden: ``typing._prohibited`` makes
+      the class body raise at creation time. The only fix is to stop being one.
+    * ``dataclasses.asdict`` — the same move for the other record type.
+    * ``vars()`` / ``__dict__`` — the reason a secret-carrying class wants
+      ``__slots__``; without it this is a free raw-value dump.
+    * slicing, ``list()``, ``tuple()``, iteration — a ``NamedTuple`` IS a
+      tuple, so ``offered[0:2]`` and ``a, b, *_ = offered`` go straight to
+      ``tuple.__repr__``.
+
+    An empty list here is the answer for a type that exposes none of them,
+    which is itself the property worth having.
+    """
+    out: list[str] = []
+    asdict = getattr(obj, "_asdict", None)
+    if callable(asdict):
+        out.append(repr(asdict()))
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        out.append(repr(dataclasses.asdict(obj)))
+    if getattr(obj, "__dict__", None) is not None:
+        out.append(repr(vars(obj)))
+    if isinstance(obj, tuple):
+        out += [repr(obj[0:2]), repr(list(obj)), repr(tuple(obj))]
+    # `object.__getstate__` (CPython >= 3.11) and the pickle protocol that
+    # walks it — added 2026-08-07 after the adversarial pass found the ONE
+    # handover path the rewrite left open. `Offered` closed `_asdict` and
+    # slicing by choosing its shape, then `__slots__` — added as redaction, to
+    # close `vars()` — REOPENED the same hole by the other door:
+    # `object.__getstate__()` returns `(None, {slot: raw value})` for a slotted
+    # class and `self.__dict__` for an unslotted one. Neither shape closes it,
+    # so only a method can, and `pickle.dumps` is the same path with bytes at
+    # the end of it (a cache, a queue, a crash dump).
+    # A path that REFUSES contributes nothing, exactly like a path that does
+    # not exist — which is what keeps «there are none» assertable below.
+    with contextlib.suppress(Exception):
+        out.append(repr(obj.__getstate__()))  # type: ignore[attr-defined]
+    with contextlib.suppress(Exception):
+        out.append(repr(pickle.dumps(obj)))
+    return out
+
+
 class TestNothingLeaks:
     def test_no_credential_reaches_the_terminal_on_any_path(
         self, owner_session: Session, clean_billing: None
@@ -642,7 +697,7 @@ class TestNothingLeaks:
         # the operator alert IS shown, and it is the worker's own text
         assert provisioning._RESTART_HINT in printed
 
-    def test_the_offered_tuple_refuses_to_render_its_token(self) -> None:
+    def test_the_offered_record_refuses_to_render_its_token(self) -> None:
         """Every rendering protocol, not just ``repr``.
 
         ``repr`` alone was what this asserted, and ``repr`` alone is not the
@@ -651,6 +706,11 @@ class TestNothingLeaks:
         ``logger.info("%s", offered)``, and through the repr of whatever list
         or dict it happens to be sitting in when a traceback prints a frame.
         Each of those dispatches differently, and each is checked.
+
+        These are the paths ``Offered`` answers ITSELF. The ones it cannot —
+        ``_asdict()``, slicing — are not redacted here because they no longer
+        exist; that is
+        :meth:`TestNoContainerHereCanRenderItsSecret.test_offered_exposes_no_handover_path_at_all`.
         """
         offered = script._offered(_event(_payload(merchant=REAL_STORE)))
         for rendered in _all_renderings(offered):
@@ -681,15 +741,28 @@ class TestNoContainerHereCanRenderItsSecret:
     forgotten, shadowed, defined in a scope that never reaches the class, or
     replaced by a container whose repr nobody overrode.
 
+    **Widened on 2026-08-07, and the widening is the interesting part.** Every
+    path above is one the object RENDERS ITSELF through, so a correct
+    ``__repr__`` answers all of them — and ``Offered`` passed all of them while
+    ``offered._asdict()`` handed back the live access token as a plain string.
+    A ratchet that only asks an object to render itself will always agree with
+    the override it is supposed to be auditing. So it now also asks for the
+    paths that hand the CONTENTS to a renderer that never heard of the override
+    (:func:`_handover_renderings`), which no ``__repr__`` can defend and which
+    are therefore closed by choosing the type, not by writing a method. That is
+    why ``Offered`` stopped being a ``NamedTuple``.
+
     Why not ``tests/test_salla_token_refresh.TestNoDataclassCarriesAToken``,
     which is the same idea: it cannot see this module, twice over. It looks at
-    ``dataclasses.is_dataclass`` classes, and these are ``NamedTuple``s (a
-    deliberate choice — see :class:`TestTheScriptStaysLoadable`); and its
-    word list is ``token/secret/password/credential/key``, while the two fields
-    holding live credentials here are called ``access`` and ``refresh``. Both
-    halves are widened below rather than there, because widening the wordlist
-    in that file would change which classes ITS ratchet polices — somebody
-    else's test, somebody else's failure.
+    ``dataclasses.is_dataclass`` classes, and nothing here is one (``Offered``
+    is a plain slotted class and ``Prediction`` is a ``NamedTuple`` — see
+    ``Offered``'s docstring and :class:`TestTheScriptStaysLoadable` for why a
+    dataclass is the one shape this file cannot use); and its word list is
+    ``token/secret/password/credential/key``, while the two fields holding live
+    credentials here are called ``access`` and ``refresh``. Both halves are
+    widened below rather than there, because widening the wordlist in that file
+    would change which classes ITS ratchet polices — somebody else's test,
+    somebody else's failure.
     """
 
     #: Deliberately broad, for the reason the sibling ratchet gives: a false
@@ -700,12 +773,25 @@ class TestNoContainerHereCanRenderItsSecret:
 
     SENTINEL = "ory_at_RATCHET-SENTINEL-OBVIOUSLY-NOT-A-REAL-TOKEN"
 
-    def _secret_fields(self, klass: type) -> list[str]:
+    def _field_names(self, klass: type) -> list[str]:
+        """What this type carries, whichever of the three shapes it is.
+
+        ``__slots__`` is here because ``Offered`` is now a plain class — and a
+        ratchet that only knows ``dataclasses.fields`` and ``_fields`` would
+        have found no fields on it, dropped it out of :meth:`carriers`, and
+        gone green by discovering nothing. That is the failure mode this whole
+        class was written against, so the discovery has to follow the type.
+        """
         if dataclasses.is_dataclass(klass):
-            names = [f.name for f in dataclasses.fields(klass)]
-        else:
-            names = list(getattr(klass, "_fields", ()))
-        return [n for n in names
+            return [f.name for f in dataclasses.fields(klass)]
+        fields = getattr(klass, "_fields", None)
+        if isinstance(fields, tuple):
+            return list(fields)
+        slots = getattr(klass, "__slots__", ())
+        return [slots] if isinstance(slots, str) else list(slots)
+
+    def _secret_fields(self, klass: type) -> list[str]:
+        return [n for n in self._field_names(klass)
                 if any(word in n.lower() for word in self.SECRET_WORDS)]
 
     def carriers(self, module: Any) -> list[type]:
@@ -718,21 +804,28 @@ class TestNoContainerHereCanRenderItsSecret:
         ]
 
     def offenders(self, classes: Iterable[type]) -> list[str]:
-        """Which of these would put a secret into text, and by which path."""
+        """Which of these would put a secret into text, and by which path.
+
+        Both halves are asked: the renderings the object controls, and the
+        handovers it does not (see :func:`_handover_renderings`). The second
+        half is the 2026-08-07 finding — ``Offered`` hid its token from all
+        thirteen rendering paths while ``offered._asdict()`` and
+        ``offered[0:2]`` still returned it in the clear, and no ``__repr__``
+        anywhere could have stopped either.
+        """
         found = []
         for klass in classes:
             secret = self._secret_fields(klass)
-            if dataclasses.is_dataclass(klass):
-                names = [f.name for f in dataclasses.fields(klass)]
-            else:
-                names = list(klass._fields)  # type: ignore[attr-defined]
+            names = self._field_names(klass)
             # A sentinel in the secret slots, `None` everywhere else: a hiding
             # `__repr__` reports presence, so `None` is enough for it to say
             # something, and it cannot be mistaken for the sentinel.
             instance = klass(**{n: self.SENTINEL if n in secret else None
                                 for n in names})
             leaked = sorted({
-                rendered for rendered in _all_renderings(instance)
+                rendered
+                for rendered in (_all_renderings(instance)
+                                 + _handover_renderings(instance))
                 if self.SENTINEL in rendered
             })
             if leaked:
@@ -782,6 +875,73 @@ class TestNoContainerHereCanRenderItsSecret:
         assert any("Shadowed" in o for o in offenders)
         # …and it does not cry wolf over the type that is actually safe.
         assert self.offenders([script.Offered]) == []
+
+    def test_the_ratchet_catches_a_perfect_repr_that_leaks_through_asdict(
+        self,
+    ) -> None:
+        """Teeth for the widening, and this one is not hypothetical: it is
+        ``Offered`` as it stood until 2026-08-07, reconstructed field for field
+        and redaction for redaction.
+
+        Everything about it looks right. The ``__repr__`` is written out, it
+        binds, it hides both credentials, and it survives all thirteen paths in
+        :func:`_all_renderings`. It is still a ``NamedTuple``, so one call to
+        ``._asdict()`` or one slice returns the live token — and there is no
+        edit to this class that fixes that, because ``typing._prohibited``
+        refuses an ``_asdict`` override at class-creation time. The detector
+        must report it anyway, or the choice of type is unpoliced.
+        """
+
+        class RedactedButStillATuple(NamedTuple):
+            access: str
+            store_id: str | None
+
+            def __repr__(self) -> str:
+                return f"RedactedButStillATuple(access=set, {self.store_id!r})"
+
+            def __str__(self) -> str:
+                return self.__repr__()
+
+        leaky = RedactedButStillATuple(access=self.SENTINEL, store_id=None)
+        # The half that was already checked says it is clean…
+        assert all(self.SENTINEL not in r for r in _all_renderings(leaky))
+        # …and the half added on 2026-08-07 says it is not.
+        assert self.offenders([RedactedButStillATuple]), (
+            "a NamedTuple carrying a live token was reported clean: the ratchet "
+            "is only auditing the paths the object's own __repr__ controls"
+        )
+        # The override that would have closed it is not available at all.
+        with pytest.raises(AttributeError):
+            class CannotHideIt(NamedTuple):  # pragma: no cover - never created
+                access: str
+
+                def _asdict(self) -> dict:
+                    return {"access": "redacted"}
+
+    def test_offered_exposes_no_handover_path_at_all(self) -> None:
+        """The property that replaced the impossible override.
+
+        Not «the handover paths are redacted» — they cannot be — but «there are
+        none». Asserted on a real instance built from a real payload, and named
+        one by one, because each is a thing somebody types on purpose.
+        """
+        offered = script._offered(_event(_payload(merchant=REAL_STORE)))
+        assert _handover_renderings(offered) == []
+        assert not hasattr(offered, "_asdict")
+        assert not isinstance(offered, tuple), (
+            "Offered is a tuple again: slicing, unpacking, list() and tuple() "
+            "all render the access token through tuple.__repr__"
+        )
+        assert not dataclasses.is_dataclass(offered)
+        # No instance __dict__, so `vars()` cannot dump the values either. This
+        # is what `__slots__` is doing in that class body.
+        assert getattr(offered, "__dict__", None) is None
+        with pytest.raises(TypeError):
+            offered[0:2]        # type: ignore[index]
+        # Still a record, though — the swap must not have cost the caller
+        # anything it was using.
+        assert offered.access and offered.store_id == REAL_STORE
+        assert offered == script._offered(_event(_payload(merchant=REAL_STORE)))
 
     def test_no_namedtuple_here_smuggled_a_dunder_into_its_fields(self) -> None:
         """The literal thing mypy reported, asked of the objects.
@@ -855,13 +1015,40 @@ class TestTheScriptAgreesWithTheWorkerAboutWhatIsPending:
 
 
 class TestTheScriptStaysLoadable:
+    """No loader in the suite needs this today. It is pinned anyway.
+
+    Every loader of the script now registers the module before executing it, so
+    this is the only caller left that does not — deliberately. The property is
+    free to keep (nothing in the script resolves an annotation at class-creation
+    time) and expensive to lose: a ``@dataclass`` at module level raises
+    «'NoneType' object has no attribute '__dict__'» here, in a message that
+    names neither the class nor the file, and the next by-path loader anyone
+    writes lands on it in THEIR file.
+
+    Re-measured on 2026-08-07 rather than assumed, because the previous note
+    here suggested the constraint might have lapsed: on CPython 3.12.3 plain
+    ``@dataclass``, ``frozen=True`` and ``slots=True`` ALL still fail this way.
+    It is a property of the language, not of the loaders — which is why
+    ``Offered`` closed its ``_asdict``/slicing paths by becoming a plain slotted
+    class rather than a dataclass.
+    """
+
     def test_it_loads_without_being_registered_in_sys_modules(self) -> None:
-        """``tests/test_salla_tokens.py`` loads it that way. A ``@dataclass``
-        at module level would break that loader — and the break would land in
-        somebody else's file."""
         path = REPO / "scripts" / "consume_stored_authorize.py"
         spec = importlib.util.spec_from_file_location("consume_unregistered", path)
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)          # must not raise
         assert callable(module.main)
+        # The construct that would break it, proven to still break it — so the
+        # test above is known to be asking a live question and not a dead one.
+        assert "consume_unregistered" not in sys.modules
+        with pytest.raises(AttributeError, match="'__dict__'"):
+            exec(                                                # noqa: S102
+                "from __future__ import annotations\n"
+                "import dataclasses\n"
+                "@dataclasses.dataclass\n"
+                "class Probe:\n"
+                "    field: str\n",
+                {"__name__": "consume_unregistered", "__builtins__": __builtins__},
+            )

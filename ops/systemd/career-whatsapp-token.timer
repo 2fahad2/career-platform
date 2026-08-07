@@ -1,0 +1,53 @@
+# 08:30 Riyadh, daily — both halves chosen, neither inherited.
+#
+# WHY DAILY, WHEN THERE IS NO MARGIN TO SPEND. career-salla-token.timer argues
+# its cadence from a retry budget: a five-day margin divided by a daily timer
+# is six attempts before the credential dies. That argument does not exist
+# here and must not be borrowed. The Meta token is a System User token with
+# expires_at 0 — it has no runway to divide, and nothing is retrying anything,
+# because there is nothing to renew. The only quantity a schedule can move is
+# TIME-TO-DETECTION of an event that arrives with no warning at all: a
+# revocation, a withdrawn scope, an unassigned number.
+#
+# So the cadence is set by what the operator can DO. Recovery is entirely
+# manual — open Meta Business Settings, generate a token, paste it, restart —
+# so a check that fires when nobody can act buys nothing but a louder channel.
+#
+#   Hourly was rejected. The outage it detects is already loud within one
+#   nightly run: every send raises, every customer's day closes
+#   WHATSAPP_FAILED, career.engine.cli.exit_code_for returns 3 and
+#   career-engine-nightly.service's OnFailure= pages. Twenty-four pages a day
+#   would buy hours of notice on a fix nobody can apply at 03:00, and the
+#   reliable end of that story is a muted channel.
+#
+#   Weekly was rejected outright. What this check catches that the nightly
+#   does not is the QUIET half — the zero-touch welcome template whose reply
+#   claims a paid subscription, and the lifecycle nudges, which fail at
+#   WARNING and ERROR into a log and reach nobody's phone. A week of paid
+#   orders that were never asked to claim themselves is the July incident
+#   again with a different credential.
+#
+# WHY 08:30. Three constraints, and they agree.
+#   * It is the start of Fahad's working day, which is the only time the one
+#     available recovery can actually happen.
+#   * It is two and a half hours before the 11:00 nightly delivery run — long
+#     enough to generate a token and paste it BEFORE the night this credential
+#     would have ruined, rather than after it.
+#   * It is thirty minutes before career-salla-token.timer at 09:00, so the two
+#     credential jobs never land on the phone in the same minute. Two red
+#     messages arriving together read as one incident, and these are unrelated
+#     failures with completely different recoveries.
+#
+# Persistent=true, for the same reason career-backup.timer has it: a machine
+# that was off at 08:30 is precisely the machine nobody was watching, and
+# catching up is harmless — this job reads two endpoints and writes no state
+# beyond an alert stamp.
+[Unit]
+Description=Daily Meta WhatsApp credential check at 08:30 Riyadh
+
+[Timer]
+OnCalendar=*-*-* 08:30:00 Asia/Riyadh
+Persistent=true
+
+[Install]
+WantedBy=timers.target

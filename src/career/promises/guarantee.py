@@ -38,6 +38,22 @@ A breach is **never un-breached by a late delivery**. A first opportunity that
 lands on day four is recorded — the operator needs to know service eventually
 started — but the status stays BREACHED, because the promise was about the
 first seventy-two hours and those are over.
+
+And the measurement is **hourly**, which it was not until 2026-08-07. The
+sweep's only caller was the nightly delivery run, which fires at 11:00 Riyadh,
+so a guarantee that ran out at 12:05 was noticed at 11:00 the NEXT morning:
+twenty-three hours of lateness on the one promise the store leads with. A
+clock written in hours cannot be read once a day. :func:`sweep_and_commit` is
+the entry point every scheduled caller uses, and the reasoning for the hour —
+against the minute, against the deadline itself — is written out there.
+
+What this module still does NOT do is tell the customer. The words exist
+(:func:`breach_notice_ar`), the extension exists, and nothing sends anything:
+the person whose promise we broke learns it only if he asks. That is a product
+decision Fahad has not made — see :func:`breach_notice_ar` for the exact
+question — and until he does, the operator's breach alert carries the text and
+says out loud that nobody has been told, because a gap nobody can see is how
+this one survived being written down twice.
 """
 
 from __future__ import annotations
@@ -48,7 +64,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from career.db.models import (
@@ -69,6 +85,23 @@ logger = logging.getLogger("career.promises")
 #: own unit. Not «three days»: a day boundary would round the promise in our
 #: favour for anyone who activates in the evening.
 GUARANTEE_HOURS = 72
+
+#: How often a scheduled caller runs the sweep — and therefore the worst-case
+#: lateness of the entire measurement, since nothing else looks at the clock.
+#: One hour is 1.4% of the promise; the nightly-only cadence it replaced was
+#: 32%. :func:`sweep_and_commit` argues the number.
+SWEEP_INTERVAL_SECONDS = 3600.0
+
+#: One pass at a time, across PROCESSES. Two callers now exist (the hourly
+#: worker and the nightly backstop) and they can land in the same second; the
+#: pass — not the row — is the unit of work here, so a whole-sweep advisory
+#: lock is the honest claim rather than the console's per-row ``FOR UPDATE …
+#: SKIP LOCKED`` (that pattern fits a QUEUE, where two workers taking
+#: different rows is progress; here the second pass would only redo the first).
+#: Transaction-scoped, so it is released by the caller's commit or rollback
+#: and cannot outlive a crash. The number is arbitrary and unique in this
+#: repository — grep it before reusing it in another advisory lock.
+_SWEEP_LOCK_KEY = 72_000_072
 
 #: The clock runs while we are watching, and stops the first time we can
 #: answer the customer's question honestly.
@@ -100,9 +133,10 @@ _RECEIVED_STATES = ("DELIVERED", "PARTIAL_DELIVERY")
 GUARANTEED_PLANS = RENEWABLE_PLANS
 
 #: What the customer reads when the operator decides to tell them. NOTHING
-#: sends this — see the module docstring. It is a named constant so the owner
-#: can change the words without going near the detection, and so the wording
-#: is reviewable in a diff instead of being typed differently every time.
+#: SENDS THIS — the only caller in the tree is the operator's own breach alert,
+#: which prints it for him to copy. It is a named constant so the owner can
+#: change the words without going near the detection, and so the wording is
+#: reviewable in a diff instead of being typed differently every time.
 GUARANTEE_BREACH_CUSTOMER_AR = (
     "وعدناك بأول فرصة خلال ٧٢ ساعة من تفعيل اشتراكك، وما وفينا 🙏\n"
     "الوعد وعدنا والخيار خيارك: نرجّع لك المبلغ كاملًا، أو نمدد لك المدة "
@@ -112,12 +146,53 @@ GUARANTEE_BREACH_CUSTOMER_AR = (
 
 
 def breach_notice_ar() -> str:
-    """The customer-facing sentence for a broken guarantee.
+    """The customer-facing sentence for a broken guarantee. NOT SENT BY US.
 
     A function rather than a bare constant so the operator's own decision —
     whether to send it at all, and when — has one place to be wired to, and so
     the day the wording gains a name or an amount it does not have to change
     shape at every call site.
+
+    ── THE GAP, and the decision that closes it ─────────────────────────────
+    Until 2026-08-07 this had ZERO callers anywhere, tests included: we
+    detected the broken promise, we told the operator, we could extend the
+    subscription — and the customer was never told a thing. The store page
+    answers that with «راسلنا على واتساب», which makes our keeping of the
+    guarantee conditional on the customer NOTICING it broke; the customer who
+    does not notice keeps a broken promise, silently, in our favour. That is
+    the exact failure this whole module was written against, one layer up.
+
+    It now has one caller — :func:`_breach_alert_ar`, which prints this text
+    on the OPERATOR's screen so he can send it by hand. That is a stopgap and
+    is written down as one. It does not send, does not record that anybody was
+    told, and cannot be audited afterwards.
+
+    Wiring a real send is a PRODUCT decision, and it is five questions, not
+    one. None of them are the code's to answer:
+
+    1. **Trigger** — automatic on detection, or a «أبلِغ العميل» button on the
+       breach card? Automatic tells everyone, including the customer whose
+       breach the operator was about to explain in person.
+    2. **Channel** — this text is free-form, so it only leaves the building
+       while the customer's 24h WhatsApp window is OPEN. A shut window means
+       either a new Meta template (submitted, approved, and worded to Meta's
+       rules rather than ours) or waiting — and «we told him» quietly becomes
+       «we will tell him if he writes to us first», which is the store page's
+       promise again with extra steps.
+    3. **Content** — does it name the number of days (:func:`lost_days`
+       computes them) and does it offer the refund unconditionally? The page
+       says «أنت تختار», so the menu is the promise; but a customer whose
+       account is already REFUNDED or charged back must not be offered a
+       refund a second time (:func:`_window_facts` already flags that case).
+    4. **The reply** — «استرداد» or «تمديد» comes back as free text into a
+       worker with no branch for it. An automatic notice manufactures inbound
+       nobody routes, on the day the customer is least patient with us.
+    5. **The silenced customer** — someone who sent «إيقاف» is opted out of
+       our messages. Do we still owe him this one? (A broken promise about
+       money is not marketing, but that call is Fahad's, not the code's.)
+
+    Until those are answered, the honest state is: detected, remedied on the
+    operator's tap, and NOT communicated — said in those words on the alert.
     """
     return GUARANTEE_BREACH_CUSTOMER_AR
 
@@ -379,8 +454,21 @@ def _breach_alert_ar(code: str, row: DeliveryGuarantee) -> str:
         # again. The breach stays on the record — it broke — but he reads
         # «closed» before he reads «choose a remedy».
         lines.append("لكن اشتراكه منتهٍ ماليًا الآن — راجع حالته قبل أي تعويض")
+        # No ready text here on purpose: the notice below offers «استرداد كامل»
+        # and this account's money has already moved. A copy-paste block under
+        # a «راجع حالته» line is an invitation to refund the same order twice.
+        lines.append("ولا تُرسل له عرض التعويض قبل ما تتأكد وش صار في حسابه")
     else:
         lines.append("الخيار للعميل: استرداد كامل أو تمديد المدة — وأنت تنفذه")
+        # THE GAP, on the screen, every single time — see `breach_notice_ar`.
+        # Nothing in this system tells the customer his promise broke, so the
+        # one place that knows says so out loud and hands over the words. A
+        # missing feature that is invisible on the operator's screen is a
+        # missing feature nobody schedules; this one survived being written
+        # into DEVIATIONS and STORE-PAGES twice without acquiring a caller.
+        lines.append("⚠️ والعميل ما أُبلغ — ما في إرسال تلقائي، ولا يدري")
+        lines.append("انسخ هذا النص وأرسله له بنفسك:")
+        lines.append(breach_notice_ar())
     return "\n".join(lines)
 
 
@@ -398,13 +486,17 @@ def sweep_delivery_guarantee(
 ) -> dict[str, int]:
     """One idempotent pass over every activated customer's start guarantee.
 
-    Runs from the nightly orchestrator BEFORE the weekend early return, so a
-    guarantee whose seventy-two hours run out on a Friday is still caught on
-    Friday — the promise is in hours and does not observe our delivery week.
+    Called HOURLY through :func:`sweep_and_commit` — from the conversation
+    worker's housekeeping block, and from the nightly orchestrator as a
+    backstop, BEFORE its weekend early return, so a guarantee whose
+    seventy-two hours run out on a Friday is still caught on Friday: the
+    promise is in hours and does not observe our delivery week.
 
     Idempotent by state: a guarantee that is MET or SETTLED is never looked at
     again, a BREACHED one alerts once (``alerted_at``) and its facts are
     frozen at the breach. Returns honest counters for the caller's summary.
+    Two callers cannot double-apply anything — see :func:`sweep_and_commit`,
+    which also explains the advisory lock this pass opens with.
 
     One customer, one row, one anchor — and that holds because
     ``onboarding_sessions`` carries ``uq_onboarding_sessions_tenant_id``. The
@@ -423,6 +515,15 @@ def sweep_delivery_guarantee(
     already had one.
     """
     counts = {"watching": 0, "met": 0, "breached": 0, "alerted": 0}
+    if not session.execute(
+        select(func.pg_try_advisory_xact_lock(_SWEEP_LOCK_KEY))
+    ).scalar_one():
+        # Another process is mid-pass. Standing down loses nothing: the pass
+        # that holds the lock is looking at exactly the same rows, and this
+        # caller comes back within SWEEP_INTERVAL_SECONDS. It is logged rather
+        # than counted because the counters describe WORK, and none was done.
+        logger.info("guarantee sweep already in flight — this pass stands down")
+        return counts
     journeys = session.execute(
         select(OnboardingSession.tenant_id, OnboardingSession.subscription_id,
                OnboardingSession.completed_at)
@@ -450,7 +551,30 @@ def sweep_delivery_guarantee(
             counts["met"] += 1
             continue
         if now <= row.deadline_at:
-            row.status = WATCHING
+            # Still inside the window: counted, and NOTHING IS WRITTEN.
+            #
+            # What stood here was `if row.status != WATCHING: row.status =
+            # WATCHING`, carrying the reason «assigning it back would send an
+            # UPDATE per tenant per pass, which was free once a night and is
+            # not free at hourly cadence». That reason was not a fact about
+            # this system. SQLAlchemy 2.0 compares the assigned value against
+            # the loaded one when it builds the UPDATE, so re-assigning an
+            # equal value emits no statement at all — `session.dirty` says the
+            # row is dirty and the flush writes nothing. There was no cost to
+            # avoid, at any cadence. (Pinned in tests/test_promises.py, driven
+            # through this pass rather than described, so the claim cannot
+            # rot into a different SQLAlchemy's behaviour unnoticed.)
+            #
+            # The line is gone rather than re-justified, because the only
+            # status that can REACH it is WATCHING — MET and SETTLED returned
+            # above — so for every reachable row it was a no-op with a story
+            # attached. The one row it could ever have touched is a BREACHED
+            # one seen with `now` behind its deadline, i.e. a wall clock that
+            # stepped backwards, and there the assignment did something this
+            # module promises never happens: un-breach a guarantee. It would
+            # have dropped the row off `open_breaches` — the operator's queue
+            # of customers owed a decision about money — until the clock
+            # caught up. A decided guarantee stays decided.
             counts["watching"] += 1
             continue
         # The deadline is behind us and nothing landed inside it. A delivery
@@ -494,6 +618,109 @@ def sweep_delivery_guarantee(
             counts["alerted"] += 1
     session.flush()
     return counts
+
+
+def sweep_and_commit(
+    session: Session, *, now: datetime, admin_client: Any = None,
+) -> dict[str, int]:
+    """The entry point every SCHEDULED caller uses: sweep, commit, never raise.
+
+    ── WHY AN HOUR ─────────────────────────────────────────────────────────
+    Until 2026-08-07 the sweep had exactly one caller, ``cv.daily_run
+    .sweep_promises``, which rides the delivery day, which rides
+    ``career-engine-nightly.timer`` — 11:00 Asia/Riyadh. So a guarantee that
+    ran out at 12:05 was measured at 11:00 the next morning: up to ~23 hours
+    late on a 72-hour promise, on the sentence the store leads with. The
+    detector was correct and the clock reading it was a day coarse.
+
+    An hour is the right grain, and every finer one was considered:
+
+    * **Every minute** is not obviously better and is measurably worse. What
+      sits on the other end of this alert is a human deciding whether to move
+      money, usually after a conversation with the customer; nothing about
+      that decision changes between 12:05 and 13:00. A minute-grained sweep
+      would buy 59 minutes of paper precision and pay a full pass over every
+      activated customer sixty times an hour for it, forever, so that an
+      operator who is asleep can be paged 59 minutes earlier.
+    * **At the deadline itself** — a job per guarantee, fired at its own
+      deadline — is the version that sounds exact and is the most fragile. It
+      needs a scheduler that survives restarts, and a schedule that is LOST
+      (a process that died between arming and firing, a row written while the
+      scheduler was down) is a promise that is never measured at all, with
+      nothing to notice the silence. A poll is self-healing by construction:
+      the next pass finds whatever the previous one missed, whatever happened
+      in between. That property is worth far more here than the 59 minutes.
+    * **Four-hourly** would still be four times the operator's own reaction
+      granularity and would leave a breach detected at 04:00 for a deadline
+      at 00:05 — and it saves nothing real, because the process that runs
+      this is already awake and already sweeping on the hour.
+
+    ── WHERE IT RUNS, and why not a timer of its own ────────────────────────
+    In ``scripts/run_worker_loop.py``'s hourly housekeeping block, beside the
+    enrichment sweep, the outcome questions, the weekly report and the
+    forgotten-ticket release. That process is up permanently under a systemd
+    watchdog, it already holds the operator's Telegram client and a session
+    factory, and it is — as ``sweep_forgotten_tickets`` puts it about exactly
+    this shape of problem — «the one that is awake at 03:00».
+
+    A dedicated ``career-promises.timer`` was the alternative and was
+    rejected. It buys one real thing, ``OnFailure=career-alert@`` on a failed
+    pass, and costs three: a unit that has to be installed by hand before the
+    measurement improves at all (and is silently absent until then, since
+    ``scripts/verify_restore.sh`` §6 checks a fixed list of units it is not
+    on), a second construction of the settings/engine/Telegram wiring that
+    this repository deliberately keeps in ``scripts/`` entry points, and a
+    second answer in one codebase to a question already answered four times
+    in that block. The failure signal is not lost either: a raised sweep logs
+    ERROR, and the journal harvester puts ERROR lines on the watchtower's
+    error screen.
+
+    ── WHY THE NIGHTLY STILL CALLS IT ───────────────────────────────────────
+    Kept on purpose, as a backstop for the one hour the worker is not there
+    (a wedged cycle, a deploy, a host that came back without it), and because
+    a worker outage is loud while a nightly one is louder still. It cannot
+    double-apply anything, and that is a property of the row rather than of
+    the schedule:
+
+    * MET and SETTLED short-circuit before anything is read;
+    * ``breached_at`` is stamped only on the WATCHING→BREACHED edge, so a
+      second pass over a BREACHED row counts nothing and rewrites nothing;
+    * ``facts`` are written only while empty — the packet describes a window
+      that is over and must not drift;
+    * ``alerted_at`` gates the page, so the operator is told once, ever;
+    * and the remedy is not in this path at all. It is applied by the
+      operator's own tap through :func:`apply_remedy`, which refuses any row
+      that is not BREACHED.
+
+    What those guards do NOT cover is two passes in flight AT THE SAME
+    INSTANT: both could read the same WATCHING row before either committed
+    and both would page it. That was impossible with one caller and became
+    possible with two, so the pass takes ``pg_try_advisory_xact_lock`` and
+    the loser stands down — the same lesson `release_forgotten_tickets`
+    learned the day it grew its second caller, in the shape that fits here.
+
+    ── THE CONTRACT ─────────────────────────────────────────────────────────
+    Commits its own work and NEVER raises. The hourly block is a barrier: an
+    escape from it costs that cycle its watchdog pet and, in the nightly, a
+    paying customer's delivery day. A failed pass rolls back — which is what
+    makes the alert-before-``alerted_at`` ordering inside the sweep safe: the
+    page may be duplicated by a crash, never lost.
+    """
+    zero = {"watching": 0, "met": 0, "breached": 0, "alerted": 0}
+    try:
+        counts = sweep_delivery_guarantee(
+            session, now=now, admin_client=admin_client
+        )
+        session.commit()
+        return counts
+    except Exception:  # noqa: BLE001 — a sweep never wedges its caller
+        logger.error("guarantee sweep failed — no breach was recorded or "
+                     "paged in this pass", exc_info=True)
+        try:
+            session.rollback()
+        except Exception:  # noqa: BLE001 — a dead session must not loop either
+            logger.error("guarantee sweep rollback failed", exc_info=True)
+        return zero
 
 
 def open_breaches(session: Session) -> list[BreachRow]:

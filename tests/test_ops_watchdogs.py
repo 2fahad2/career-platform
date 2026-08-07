@@ -422,6 +422,184 @@ class TestWedgeEscalation:
             )
 
 
+# ── every cadence, derived from the thing it measures ────────────────────────
+
+
+def _on_calendar_period_days(spec: str) -> float:
+    """An `OnCalendar=` line → the WORST-CASE gap between two firings, in days.
+
+    Not a general systemd calendar parser and deliberately not one: it
+    understands exactly the three shapes this repository uses and RAISES on a
+    fourth, because the failure this whole section exists to prevent is a
+    cadence that silently reads as something it is not. A parser that returned
+    a plausible number for an unrecognised spec would be that failure wearing
+    a test.
+    """
+    fields = spec.split()
+    if not fields:
+        raise ValueError(f"empty OnCalendar: {spec!r}")
+    head = fields[0]
+    weekdays = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+    if head.startswith(weekdays):
+        # `Sun *-*-* 05:00:00` — one firing a week per named day.
+        return 7.0 / len([d for d in head.replace("..", ",").split(",") if d])
+    date_field = head
+    if not re.fullmatch(r"[\d*]+-[\d*]+-[\d*]+", date_field):
+        raise ValueError(f"unrecognised OnCalendar date field: {spec!r}")
+    day = date_field.split("-")[-1]
+    if day == "*":
+        return 1.0                      # `*-*-* 03:30:00` — daily
+    # `*-*-01 04:30:00` — one firing a month. The worst-case gap is the
+    # longest month, because that is what «how late may this be» means.
+    return 31.0
+
+
+def _timer(unit: str) -> str:
+    return _directives(unit)["OnCalendar"]
+
+
+class TestCadencesAreDerivedFromWhatTheyMeasure:
+    """A schedule is only ever right relative to a deadline.
+
+    Two promises were measured nightly on 2026-08-07 — a 72-hour guarantee and
+    a 24-hour reply — so a clock that ran out at 12:05 was read at 11:00 the
+    next morning: 32% and 96% of the promise spent being late, by a schedule
+    nobody had ever divided into the deadline it served. Every assertion below
+    is that division, written down, so the next number that drifts away from
+    the thing it measures fails here instead of in a customer's week.
+    """
+
+    def test_the_backup_freshness_probe_samples_faster_than_its_own_threshold(
+        self,
+    ) -> None:
+        """§8 of `verify_restore.sh` is the ONLY unattended reader of backup age.
+
+        A failing backup pages the operator on its own (`career-backup.service`
+        carries `OnFailure=`). The case this probe exists for is the silent
+        one — a timer that stopped firing, a repository that quietly stopped
+        receiving snapshots — which produces no failed unit and therefore no
+        alert of any kind. So the probe's period IS the detection latency, and
+        a period longer than the threshold it tests makes the threshold
+        unenforceable: a chain that stops the hour after a weekly probe is
+        «less than two days old» for five days during which nothing looks.
+        """
+        source = (SCRIPTS / "verify_restore.sh").read_text(encoding="utf-8")
+        match = re.search(r'age_days"?\s*-le\s*(\d+)', source)
+        assert match, "§8 no longer states a backup-age threshold — reread both"
+        threshold_days = int(match.group(1))
+        period_days = _on_calendar_period_days(_timer("career-verify-restore.timer"))
+        assert period_days <= threshold_days, (
+            f"the probe samples every {period_days:g}d a condition it defines "
+            f"as bad at {threshold_days}d: a stopped backup chain is invisible "
+            f"for up to {period_days:g} days, and the threshold is decoration"
+        )
+
+    def test_the_backup_is_taken_before_the_probe_that_reads_its_age(self) -> None:
+        """`career-verify-restore.timer` claims §8 reads «a snapshot taken
+        ninety minutes earlier». That ordering is the difference between
+        catching last night's failed backup this morning and catching it a
+        whole period later, so it is asserted rather than described."""
+        backup = re.search(r"(\d\d):(\d\d):\d\d", _timer("career-backup.timer"))
+        probe = re.search(r"(\d\d):(\d\d):\d\d", _timer("career-verify-restore.timer"))
+        assert backup and probe
+        assert "Asia/Riyadh" in _timer("career-backup.timer")
+        assert "Asia/Riyadh" in _timer("career-verify-restore.timer")
+        backup_min = int(backup.group(1)) * 60 + int(backup.group(2))
+        probe_min = int(probe.group(1)) * 60 + int(probe.group(2))
+        assert backup_min < probe_min, (
+            "the freshness probe now runs BEFORE the backup it reads, so it "
+            "reports yesterday's age and a failed night survives a full period"
+        )
+
+    def test_the_hourly_block_is_a_small_fraction_of_the_tightest_clock(self) -> None:
+        """One `REMINDER_SWEEP_SECONDS` gate drives eight deadlines.
+
+        Its worst-case lateness is the whole measurement error for every one of
+        them, because nothing else in this system looks at those clocks. The
+        binding constraint is whichever deadline is SHORTEST — 24 hours, twice
+        over (the لمّاح+ reply promise and the §05 stall nudge) — and the number
+        has to be read against that one, not against the 72-hour guarantee it
+        happens to look generous next to.
+        """
+        from career.onboarding.fsm import REMINDER_STALL
+        from career.promises.career_session import RESPONSE_SLA_HOURS
+        from career.promises.guarantee import GUARANTEE_HOURS
+        from career.telegram.console import TICKET_FORGOTTEN_AFTER
+
+        source = (SCRIPTS / "run_worker_loop.py").read_text(encoding="utf-8")
+        sweep_s = float(
+            re.search(r"^REMINDER_SWEEP_SECONDS = ([\d.]+)", source, re.M).group(1)
+        )
+        deadlines_s = {
+            "لمّاح+ reply SLA": RESPONSE_SLA_HOURS * 3600.0,
+            "§05 stall nudge": REMINDER_STALL.total_seconds(),
+            "72-hour guarantee": GUARANTEE_HOURS * 3600.0,
+            "forgotten ticket": TICKET_FORGOTTEN_AFTER.total_seconds(),
+        }
+        tightest, tightest_s = min(deadlines_s.items(), key=lambda kv: kv[1])
+        # 5% is not a taste. Below it the lateness is smaller than the spread
+        # of the thing being measured (a customer writes «within the hour»,
+        # not within the minute); above it the sweep starts eating a promise
+        # the store publishes in hours. The nightly cadence this replaced was
+        # 96% of the same deadline.
+        assert sweep_s / tightest_s <= 0.05, (
+            f"the sweep is {100 * sweep_s / tightest_s:.0f}% of the "
+            f"{tightest}; a promise measured that coarsely is not measured"
+        )
+
+    def test_the_promise_sweeps_declare_the_cadence_that_actually_drives_them(
+        self,
+    ) -> None:
+        """Both promise modules publish an interval as the documented
+        worst-case lateness of their own measurement. If the caller's gate ever
+        drifts away from it, that published number becomes a lie in the one
+        place a reader would trust — this is the assertion that stops it, and
+        it is the assertion that would have failed on 2026-08-06."""
+        from career.promises.career_session import SLA_SWEEP_INTERVAL_SECONDS
+        from career.promises.guarantee import SWEEP_INTERVAL_SECONDS
+
+        source = (SCRIPTS / "run_worker_loop.py").read_text(encoding="utf-8")
+        sweep_s = float(
+            re.search(r"^REMINDER_SWEEP_SECONDS = ([\d.]+)", source, re.M).group(1)
+        )
+        assert SWEEP_INTERVAL_SECONDS == sweep_s
+        assert SLA_SWEEP_INTERVAL_SECONDS == sweep_s
+
+    def test_the_credential_refresh_gets_a_retry_BUDGET_inside_its_margin(
+        self,
+    ) -> None:
+        """`career-salla-token.timer` argues that daily is what turns the
+        five-day margin into six attempts. That is the whole reason the number
+        is not weekly, so it is arithmetic and not prose: a margin that holds
+        fewer than a handful of tries is one bad Sunday from the incident it
+        was written after (a credential that died with nobody told for nine
+        days, and a store that provisioned nothing)."""
+        source = (SCRIPTS / "refresh_salla_token.py").read_text(encoding="utf-8")
+        margin_days = int(
+            re.search(r"^REFRESH_MARGIN_DAYS = (\d+)", source, re.M).group(1)
+        )
+        period_days = _on_calendar_period_days(_timer("career-salla-token.timer"))
+        assert margin_days / period_days >= 5, (
+            "the refresh has fewer than five attempts before the credential "
+            "dies, and recovery is the operator reinstalling the app by hand"
+        )
+
+    def test_every_career_timer_states_its_period_in_a_shape_we_can_read(
+        self,
+    ) -> None:
+        """A cadence nothing can parse is a cadence nobody audits. Each timer
+        also fires in Riyadh time explicitly: a unit that inherits the host's
+        UTC would deliver, back up and probe at the wrong hour of the
+        customer's day the first time this server is moved to the Saudi host
+        that §13 requires before the second wave."""
+        timers = sorted(UNITS.glob("career-*.timer"))
+        assert timers, "no career timers found — reread this test"
+        for path in timers:
+            spec = _directives(path.name)["OnCalendar"]
+            assert "Asia/Riyadh" in spec, f"{path.name}: no timezone"
+            assert _on_calendar_period_days(spec) > 0
+
+
 # ── the operator's message ───────────────────────────────────────────────────
 
 

@@ -1,0 +1,70 @@
+# Ask Meta, every morning, whether the credential we DELIVER through is still
+# a credential.
+#
+# WHY IT EXISTS. The Salla token died on 2026-07-29 and the first symptom
+# anybody saw was paid orders provisioning nothing, nine days later. The
+# cadence audit that followed found the Meta access token had no scheduled
+# observer at all — the boot check asked whether WHATSAPP_ACCESS_TOKEN was a
+# non-empty string, which is a question about a file, not about a credential.
+#
+# WHAT IT DOES NOT DO, and the reason is the whole design. It does NOT renew
+# anything. A read-only GET /debug_token on 2026-08-08 says the live token is
+# type SYSTEM_USER with expires_at 0 and data_access_expires_at 0: it cannot
+# expire, and Meta publishes no refresh endpoint for it. A twin of
+# career-salla-token.service would therefore be a scheduled job whose only
+# possible outcome is failure, and a permanently red unit is a unit the
+# operator learns to skip. This one watches the four things that CAN still
+# take the token away without warning — revocation, a withdrawn scope, a phone
+# number unassigned from the System User, and somebody pasting a temporary
+# token over the permanent one — and says what to do about each.
+#
+# It sends no WhatsApp message and POSTs nothing anywhere: two read-only GETs,
+# and the verdict is read off them. A watchdog that proves the channel by
+# using it can bill us, can wake a customer, and can move the number's quality
+# rating.
+#
+# Type=oneshot with OnFailure=, exactly like career-backup.service,
+# career-engine-nightly.service and career-salla-token.service: a scheduled job
+# that exits non-zero did not do its work, and career-alert@ puts that fact on
+# the operator's phone once, deduplicated. The two messages are deliberately
+# different — «the check could not run» and «the token is revoked and nobody
+# is receiving anything» need different words and different frequencies, and
+# the second comes from the script's own escalating alert, which speaks on a
+# CHANGE and never on a repetition.
+#
+# EXIT CODES (scripts/check_whatsapp_token.py):
+#   0  healthy, or a temporary token that still has more than a week of runway
+#      (the finding is already on his phone once and in the nightly's boot
+#      check daily; a unit sitting in `failed` for fifty-five days is a red
+#      light that means «yes, we know»)
+#   1  Meta could not be asked. Transient: no Telegram from the script, only
+#      this unit's OnFailure=, because Meta's uptime is not our alarm
+#   2  a human must generate a new token, re-grant a scope, or re-assign the
+#      number
+#   3  nothing configured to check
+#
+# EnvironmentFile carries WHATSAPP_ACCESS_TOKEN, WHATSAPP_PHONE_NUMBER_ID and
+# the Telegram admin credentials. No DB_HOST/REDIS_HOST ride-along is needed:
+# this job touches neither Postgres nor Redis — that is also why it must never
+# import career.engine.cli (the D20 owner-role ratchet,
+# tests/test_rls_runtime_role.py).
+#
+# NOT installed by anyone but Fahad: this file is the deliverable, and the
+# `cp` + `daemon-reload` + `enable --now` is his gated step (scripts/gate.sh
+# --host tells him whether the machine is running what this repository says,
+# and will report this unit as missing until he does).
+[Unit]
+Description=Verify the Meta WhatsApp credential is still valid
+Wants=network-online.target
+After=network-online.target
+OnFailure=career-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/career
+EnvironmentFile=/root/career/.env.staging
+ExecStart=/root/career/.venv/bin/python /root/career/scripts/check_whatsapp_token.py
+# The script retries its GET in-process (a read-only call rotates nothing, so
+# unlike the Salla refresher it may safely ask again). This is the outer belt:
+# a hung HTTPS call cannot pile runs up across days.
+TimeoutStartSec=120

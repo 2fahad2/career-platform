@@ -1,4 +1,9 @@
-# The nine post-restore checks, run WEEKLY as a health probe.
+# The nine post-restore checks, run DAILY as a health probe.
+#
+# The period is argued in career-verify-restore.timer and derived there from
+# §8's own two-day threshold: this script is the only unattended reader of
+# backup age on this host, so its period IS the detection latency for a backup
+# chain that stopped without failing.
 #
 # scripts/verify_restore.sh was written as the last step of the disaster
 # runbook and had no unit, no timer and no caller — so every check in it only
@@ -23,7 +28,7 @@
 # below reachable — a oneshot has no Restart=, so the start-limit problem the
 # always-on units have does not exist here.
 [Unit]
-Description=Career platform weekly restore/health verification (9 checks)
+Description=Career platform daily restore/health verification (9 checks)
 Wants=network-online.target
 After=network-online.target docker.service caddy.service
 OnFailure=career-alert@%n.service

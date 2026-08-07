@@ -25,9 +25,11 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import text as sql_text
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
 from career.db.models import CareerSession, DeliveryGuarantee
@@ -42,6 +44,9 @@ from career.whatsapp.client import FakeWhatsAppClient
 
 NOW = datetime(2026, 7, 15, 9, 0, tzinfo=UTC)
 ADMIN = "666"
+#: The schedules in this system are written in Riyadh time — the delivery run,
+#: the guarantee window the customer counts, and the operator's own day.
+_RIYADH = ZoneInfo("Asia/Riyadh")
 
 _CATALOG = {"prod_pro": "professional", "prod_plus": "executive",
             "prod_cv": "cv_analysis"}
@@ -205,6 +210,285 @@ def test_the_breach_is_paged_exactly_once(
         )
         owner_session.commit()
     assert len(admin.messages) == 1
+
+
+# ── the CADENCE of the measurement, which is part of the promise ────────────
+#
+# The detector was correct from the day it was written and its clock was read
+# once a day, at 11:00 Riyadh, because its only caller was the nightly
+# delivery run. A promise the store writes in HOURS cannot be measured in
+# DAYS: a guarantee that ran out at 12:05 sat undetected — unrecorded,
+# unalerted, un-remedied — until 11:00 the following morning. The tests below
+# are about the schedule and not about the detection: they drive the sweep at
+# the cadence the system actually runs it at, and measure how late the answer
+# is.
+
+
+def _nightly_run_time() -> tuple[int, int]:
+    """The hour the delivery run fires, read from the unit rather than typed.
+
+    Same technique as `test_docs_truth`'s guard on `escalate_overdue`: the
+    number that makes this test mean something lives in
+    `ops/systemd/career-engine-nightly.timer`, and a test carrying its own
+    private copy of it stops describing the system the day Fahad moves the
+    run again (he has moved it once already — 04:30 to 11:00, 2 August).
+    """
+    unit = _REPO / "ops/systemd/career-engine-nightly.timer"
+    fires = re.search(r"OnCalendar=\S+\s+(\d{2}):(\d{2}):\d{2}\s+(\S+)",
+                      unit.read_text(encoding="utf-8"))
+    assert fires is not None, f"{unit} no longer states an OnCalendar time"
+    assert fires.group(3) == "Asia/Riyadh", (
+        "the nightly timer no longer fires on Riyadh time — this test's "
+        "arithmetic about «five minutes after the run» is written in it"
+    )
+    return int(fires.group(1)), int(fires.group(2))
+
+
+def test_a_breach_that_lands_after_the_nightly_is_caught_within_the_hour(
+    owner_session: Session, clean_billing: None,
+) -> None:
+    """THE TIMING DEFECT, in the only terms that matter: how late are we?
+
+    A customer activates so that his seventy-two hours run out FIVE MINUTES
+    after the delivery run has already swept and gone. With the nightly as the
+    only caller — which is what it was until 2026-08-07 — the next look at his
+    clock is at the same hour tomorrow, so the promise is broken at 11:05 and
+    measured at 11:00 the next day: nearly twenty-three hours of a product
+    knowing nothing about the sentence it leads with.
+
+    The sweeps below are not invented for the test. The first is the nightly,
+    at the hour its own unit file names; the rest are the hourly caller, one
+    `SWEEP_INTERVAL_SECONDS` apart. The assertion is the promise: the answer
+    is late by at most one sweep interval, and that interval is at most an
+    hour.
+    """
+    interval = timedelta(seconds=guarantee.SWEEP_INTERVAL_SECONDS)
+    hour, minute = _nightly_run_time()
+    tonight = datetime(2026, 7, 19, hour, minute, tzinfo=_RIYADH)
+    deadline = tonight + timedelta(minutes=5)
+    _p, tenant_id, _s = _customer(
+        owner_session,
+        activated_at=deadline - timedelta(hours=guarantee.GUARANTEE_HOURS),
+    )
+    admin = FakeTelegramAdminClient()
+
+    # the nightly runs five minutes early and honestly finds nothing yet
+    counts = guarantee.sweep_and_commit(
+        owner_session, now=tonight, admin_client=admin)
+    assert counts["watching"] == 1 and counts["breached"] == 0
+    assert admin.messages == []
+
+    caught_at: datetime | None = None
+    for step in range(1, 25):                      # a full day of hourly runs
+        now = tonight + step * interval
+        if guarantee.sweep_and_commit(
+            owner_session, now=now, admin_client=admin
+        )["breached"]:
+            caught_at = now
+            break
+
+    assert caught_at is not None, (
+        "a day of hourly sweeps never noticed a broken guarantee"
+    )
+    lateness = caught_at - deadline
+    assert lateness <= timedelta(hours=1), (
+        f"the breach was measured {lateness} after it became true. The store "
+        "writes this promise in HOURS; a measurement coarser than an hour is "
+        "coarser than the operator's own reaction time, and the cadence this "
+        f"replaced ({(tonight + timedelta(days=1)) - deadline}) is the defect"
+    )
+    assert lateness <= interval, (
+        f"…and it is the sweep interval ({interval}) that bounds it"
+    )
+    # the number this replaced, stated so the fix cannot silently rot back
+    # into it: the next nightly is the following day at the same hour.
+    assert (tonight + timedelta(days=1)) - deadline > timedelta(hours=23)
+
+    status, breached_at, alerted_at = owner_session.execute(sql_text(
+        "SELECT status, breached_at, alerted_at FROM delivery_guarantees"
+        " WHERE tenant_id = :t"), {"t": str(tenant_id)}).one()
+    assert status == guarantee.BREACHED
+    # the RECORD is late by the same small amount, not by a day — this is the
+    # timestamp the operator reads beside a decision about money
+    assert breached_at - deadline <= interval
+    assert alerted_at is not None
+    assert len([m for m in admin.messages if "🛡️" in m]) == 1
+
+
+def test_the_nightly_backstop_cannot_re_apply_what_the_hourly_sweep_did(
+    owner_session: Session, clean_billing: None,
+) -> None:
+    """Two callers, one breach: the second must find nothing left to do.
+
+    The hourly sweep is the schedule and the nightly is the backstop, so every
+    breach is now looked at by two different processes about twenty-five times
+    a day. Nothing may be counted twice, stamped twice, re-described twice or
+    — the one the operator would actually feel — paged twice.
+
+    The nightly half is driven through the REAL path (`sweep_promises`), not
+    through the sweep directly: the guard has to hold for the caller that
+    exists, including its own commit.
+    """
+    from career.cv.daily_run import DailyDeps, sweep_promises
+
+    _p, tenant_id, _s = _customer(owner_session)
+    hourly = FakeTelegramAdminClient()
+    breach_time = NOW + timedelta(hours=73)
+    guarantee.sweep_and_commit(
+        owner_session, now=breach_time, admin_client=hourly)
+
+    row = owner_session.execute(sql_text(
+        "SELECT breached_at, alerted_at, facts FROM delivery_guarantees"
+        " WHERE tenant_id = :t"), {"t": str(tenant_id)}).one()
+    assert len([m for m in hourly.messages if "🛡️" in m]) == 1
+
+    nightly = FakeTelegramAdminClient()
+    deps = DailyDeps(storage=None, whatsapp_client=FakeWhatsAppClient(),
+                     admin_client=nightly, llm=None)
+    counts = sweep_promises(
+        owner_session, deps=deps, now=breach_time + timedelta(hours=20))
+
+    assert counts["breached"] == 0 and counts["alerted"] == 0
+    assert [m for m in nightly.messages if "🛡️" in m] == []
+    after = owner_session.execute(sql_text(
+        "SELECT breached_at, alerted_at, facts FROM delivery_guarantees"
+        " WHERE tenant_id = :t"), {"t": str(tenant_id)}).one()
+    assert after == row          # same stamps, same frozen facts
+
+    # and the remedy — the only half that moves money — is still applicable
+    # exactly once, by the operator's hand and never by a sweep
+    assert guarantee.apply_remedy(
+        owner_session, tenant_id=tenant_id, remedy=guarantee.REMEDY_EXTENSION,
+        now=breach_time + timedelta(hours=21),
+    ).outcome == "applied"
+    assert guarantee.apply_remedy(
+        owner_session, tenant_id=tenant_id, remedy=guarantee.REMEDY_EXTENSION,
+        now=breach_time + timedelta(hours=22),
+    ).outcome == "already_settled"
+    owner_session.commit()
+
+
+def test_two_sweeps_in_flight_at_once_page_one_breach_exactly_once(
+    owner_engine: Engine, owner_session: Session, clean_billing: None,
+) -> None:
+    """The race the second caller created, in two real transactions.
+
+    Every «page once» guard in the sweep is a read followed by a write inside
+    ONE transaction — `alerted_at is None`, then `alerted_at = now`. With a
+    single nightly caller that was airtight. With an hourly sweep in the
+    worker AND the nightly backstop, two passes can read the same WATCHING row
+    in the same millisecond, and both would page: one customer, two identical
+    breach alerts, on the channel whose entire value is that a message on it
+    means something new happened.
+
+    NO THREADS, deliberately — `pg_try_advisory_xact_lock` never waits, so the
+    interleaving is built by hand and there is no timing window to lose.
+    `lock_timeout` is the safety valve and not the subject: without the lock
+    the second pass would block on the first one's uncommitted UPDATE, and a
+    hang is a rotten way for a suite to report a defect.
+    """
+    _p, tenant_id, _s = _customer(owner_session)
+    breach_time = NOW + timedelta(hours=73)
+    first, second = FakeTelegramAdminClient(), FakeTelegramAdminClient()
+
+    other = Session(owner_engine)
+    try:
+        # A — the hourly worker sweep. Reads, breaches, pages, uncommitted.
+        counts = guarantee.sweep_delivery_guarantee(
+            other, now=breach_time, admin_client=first)
+        assert counts["alerted"] == 1
+
+        # B — the nightly backstop, a millisecond later, in its own process.
+        owner_session.execute(sql_text("SET LOCAL lock_timeout = '3s'"))
+        assert guarantee.sweep_delivery_guarantee(
+            owner_session, now=breach_time, admin_client=second,
+        ) == {"watching": 0, "met": 0, "breached": 0, "alerted": 0}
+        assert second.messages == [], "one breach, two pages"
+
+        other.commit()
+    finally:
+        other.rollback()
+        other.close()
+    owner_session.rollback()
+
+    # …and once A has committed, B's next pass genuinely has nothing to do:
+    # the skip deferred no work, it declined to duplicate it. Not «zero
+    # because it was locked out» this time — zero because the row is already
+    # breached, already stamped and already paged.
+    assert guarantee.sweep_and_commit(
+        owner_session, now=breach_time + timedelta(hours=1),
+        admin_client=second,
+    ) == {"watching": 0, "met": 0, "breached": 0, "alerted": 0}
+    assert second.messages == []
+    assert len([m for m in first.messages if "🛡️" in m]) == 1
+
+
+def test_the_operator_is_told_that_nobody_has_told_the_customer(
+    owner_session: Session, clean_billing: None,
+) -> None:
+    """«الكشف والعلاج حيّان، وإبلاغ العميل معدوم» (STORE-PAGES §٨).
+
+    We detect the broken promise, we page the operator, we can extend the
+    subscription — and the person whose promise we broke is never told. The
+    store page's answer is «راسلنا على واتساب»: the customer must notice, or
+    he simply keeps a promise we know we broke. Wiring a real send is Fahad's
+    decision (five questions, in `breach_notice_ar`'s docstring); until he
+    makes it, the alert has to say the gap out loud and hand over the words,
+    because this one survived being written into DEVIATIONS and STORE-PAGES
+    twice without anybody scheduling it.
+    """
+    _p, tenant_id, sub_id = _customer(owner_session)
+    admin = FakeTelegramAdminClient()
+    guarantee.sweep_and_commit(
+        owner_session, now=NOW + timedelta(hours=73), admin_client=admin)
+    alert = admin.messages[0]
+
+    assert "والعميل ما أُبلغ" in alert
+    for line in guarantee.breach_notice_ar().splitlines():
+        assert line in alert, "the ready text is not on the operator's screen"
+
+    # …but NOT for an account whose money has already gone back: that text
+    # offers «نرجّع لك المبلغ كاملًا», and a second refund is exactly what the
+    # frozen `subscription_status` fact exists to prevent.
+    _p2, _t2, sub2 = _customer(owner_session)
+    owner_session.execute(sql_text(
+        "UPDATE subscriptions SET status = 'REFUNDED' WHERE id = :id"),
+        {"id": str(sub2)})
+    owner_session.commit()
+    refunded = FakeTelegramAdminClient()
+    guarantee.sweep_and_commit(
+        owner_session, now=NOW + timedelta(hours=73), admin_client=refunded)
+    assert guarantee.GUARANTEE_BREACH_CUSTOMER_AR not in refunded.messages[0]
+    assert "راجع حالته قبل أي تعويض" in refunded.messages[0]
+
+
+def test_the_customer_notice_still_has_nothing_that_sends_it() -> None:
+    """A tripwire on the gap above, so it cannot be closed by accident.
+
+    `GUARANTEE_BREACH_CUSTOMER_AR` had ZERO callers in the whole repository —
+    tests included — for as long as it existed, and its own comment said so
+    while three documents recorded it as «مبنيّ وغير موصول». It now has one:
+    the operator's alert, which PRINTS it for him to copy. Nothing sends it.
+
+    So the day a real sender appears, this test fails — on purpose. It is the
+    one place that knows the five product questions in `breach_notice_ar`'s
+    docstring are unanswered (trigger, channel and the 24h window, content,
+    the customer's reply, the silenced customer). Answer them, then change
+    this test to name the sender.
+    """
+    users: set[str] = set()
+    for root in ("src", "scripts"):
+        for path in sorted((_REPO / root).rglob("*.py")):
+            source = path.read_text(encoding="utf-8")
+            if ("breach_notice_ar" in source
+                    or "GUARANTEE_BREACH_CUSTOMER_AR" in source):
+                users.add(str(path.relative_to(_REPO)))
+    assert users == {"src/career/promises/guarantee.py"}, (
+        f"the breach notice is now referenced by {sorted(users)}. If that is "
+        "a real send to the customer, the five questions in "
+        "breach_notice_ar's docstring are the decision it needs first — and "
+        "this test is where the answer gets written down"
+    )
 
 
 def test_a_first_delivery_inside_the_window_meets_the_guarantee(
@@ -697,6 +981,284 @@ def test_an_unanswered_request_escalates_into_a_ticket_exactly_once(
         owner_session.commit()
 
     assert len(admin.messages) == 1
+    assert owner_session.execute(sql_text(
+        "SELECT count(*) FROM support_events WHERE tenant_id = :t AND kind = :k"),
+        {"t": str(tenant_id), "k": career_session.OVERDUE_TICKET_KIND}
+    ).scalar_one() == 1
+
+
+# ── the CADENCE of «الرد خلال ٢٤ ساعة», which is most of the promise ────────
+#
+# The same defect as the guarantee's, on a clock a third as long, which makes
+# the arithmetic worse rather than merely similar. `escalate_overdue` rode the
+# 11:00 delivery run and nothing else, so a request that crossed twenty-four
+# hours at 12:05 was ticketed at 11:00 the NEXT morning: a promise 24 hours
+# long, measured up to ~23 hours late — very nearly measured after it had
+# already expired. The tests below are about the SCHEDULE and not the
+# detection: they drive the sweep at the cadence the system actually runs it
+# at, and measure how late the answer is.
+
+
+def test_a_request_crossing_the_sla_after_the_nightly_waits_a_day_or_an_hour(
+    owner_session: Session, clean_billing: None,
+) -> None:
+    """THE TIMING DEFECT, and its fix, in one body — because the number only
+    means something next to the number it replaced.
+
+    Two identical لمّاح+ customers ask for their session at the identical
+    instant, chosen so the twenty-four hours run out FIVE MINUTES after the
+    delivery run has already swept and gone. One is then swept the way this
+    function was swept until 2026-08-07 — once a day, at the hour the unit
+    file names, through the same call `cv.daily_run.sweep_promises` makes. The
+    other is swept hourly.
+
+    The first waits nearly a full extra day for a ticket about a promise that
+    only lasted a day. The second is ticketed inside the hour. The assertion
+    is the comparison, so the fix cannot rot back into the defect without this
+    test saying which one it became.
+    """
+    interval = timedelta(seconds=career_session.SLA_SWEEP_INTERVAL_SECONDS)
+    hour, minute = _nightly_run_time()
+    tonight = datetime(2026, 7, 19, hour, minute, tzinfo=_RIYADH)
+    expires = tonight + timedelta(minutes=5)
+    requested_at = expires - timedelta(
+        hours=career_session.RESPONSE_SLA_HOURS)
+
+    def _asked() -> uuid.UUID:
+        _p, tenant_id, _s = _customer(
+            owner_session, product="prod_plus",
+            activated_at=requested_at - timedelta(hours=1),
+        )
+        assert career_session.request_session(
+            owner_session, tenant_id=tenant_id, now=requested_at,
+        ).outcome == "created"
+        owner_session.commit()
+        return tenant_id
+
+    nightly_only, hourly = _asked(), _asked()
+
+    def _ticketed_at(tenant_id: uuid.UUID, step: timedelta) -> datetime | None:
+        """Sweep on `step` for a full day; when did THIS customer get a
+        ticket? Every pass goes through the real entry point, commit and all.
+        """
+        admin = FakeTelegramAdminClient()
+        seen = 0
+        for n in range(1, int(timedelta(days=1) / step) + 1):
+            now = tonight + n * step
+            career_session.escalate_overdue_and_commit(
+                owner_session, now=now, admin_client=admin)
+            found = owner_session.execute(sql_text(
+                "SELECT escalated_at FROM career_sessions WHERE tenant_id = :t"),
+                {"t": str(tenant_id)}).scalar_one()
+            seen += 1
+            if found is not None:
+                assert seen >= 1
+                return now
+        return None
+
+    # the nightly runs five minutes early and honestly finds nothing yet
+    admin = FakeTelegramAdminClient()
+    assert career_session.escalate_overdue_and_commit(
+        owner_session, now=tonight, admin_client=admin)["escalated"] == 0
+    assert admin.messages == []
+
+    caught_hourly = _ticketed_at(hourly, interval)
+    assert caught_hourly is not None, (
+        "a day of hourly sweeps never noticed an unanswered لمّاح+ request"
+    )
+    lateness = caught_hourly - expires
+    assert lateness <= timedelta(hours=1), (
+        f"the broken SLA was noticed {lateness} after it became true. The "
+        "store writes this promise in HOURS and it is only twenty-four of "
+        "them long; a measurement coarser than an hour is coarser than the "
+        "operator's own reaction time"
+    )
+    assert lateness <= interval, (
+        f"…and it is the sweep interval ({interval}) that bounds it"
+    )
+
+    caught_nightly = _ticketed_at(nightly_only, timedelta(days=1))
+    assert caught_nightly is not None
+    was_late_by = caught_nightly - expires
+    assert was_late_by > timedelta(hours=23), (
+        "the once-a-day cadence is supposed to be the DEFECT this test names"
+    )
+    # …and that is 96% of the promise spent not knowing, against 4%.
+    assert was_late_by > timedelta(
+        hours=career_session.RESPONSE_SLA_HOURS) * 0.95
+    assert lateness < timedelta(
+        hours=career_session.RESPONSE_SLA_HOURS) * 0.05
+
+    # the RECORD is late by the small amount, not by a day: this stamp and the
+    # ticket under it are what the operator's queue sorts by.
+    stamped = owner_session.execute(sql_text(
+        "SELECT escalated_at FROM career_sessions WHERE tenant_id = :t"),
+        {"t": str(hourly)}).scalar_one()
+    assert stamped - expires <= interval
+    assert owner_session.execute(sql_text(
+        "SELECT count(*) FROM support_events WHERE tenant_id = :t AND kind = :k"),
+        {"t": str(hourly), "k": career_session.OVERDUE_TICKET_KIND}
+    ).scalar_one() == 1
+
+
+def test_twenty_four_sweeps_a_day_raise_one_ticket_and_one_page(
+    owner_session: Session, clean_billing: None,
+) -> None:
+    """The per-day assumption, hunted for and not found.
+
+    Going from one pass a night to twenty-five a day is only safe if nothing
+    in `escalate_overdue` counts nights. Nothing does: the select takes
+    ``REQUESTED`` rows with ``escalated_at IS NULL``, both branches stamp it,
+    and no path anywhere clears it — a one-way edge, not a «once tonight»
+    marker. `_is_overdue` compares flat hours with no date arithmetic, and the
+    returned counters describe the PASS. This drives a whole day of hourly
+    passes over one overdue request and asserts the operator's side of that:
+    one ticket, one page, one stamp — and the stamp is the FIRST pass that saw
+    it, never refreshed by the twenty-three that followed.
+    """
+    _p, tenant_id, _s = _customer(owner_session, product="prod_plus")
+    career_session.request_session(owner_session, tenant_id=tenant_id, now=NOW)
+    owner_session.commit()
+
+    admin = FakeTelegramAdminClient()
+    interval = timedelta(seconds=career_session.SLA_SWEEP_INTERVAL_SECONDS)
+    first_stamp: datetime | None = None
+    # from six hours before the SLA expires to eighteen hours after it
+    start = NOW + timedelta(hours=career_session.RESPONSE_SLA_HOURS - 6)
+    for step in range(24):
+        career_session.escalate_overdue_and_commit(
+            owner_session, now=start + step * interval, admin_client=admin)
+        stamp = owner_session.execute(sql_text(
+            "SELECT escalated_at FROM career_sessions WHERE tenant_id = :t"),
+            {"t": str(tenant_id)}).scalar_one()
+        if stamp is not None and first_stamp is None:
+            first_stamp = stamp
+
+    assert first_stamp is not None
+    # not stamped early — the six passes before the deadline saw an unbroken
+    # promise and left it alone
+    assert first_stamp >= NOW + timedelta(
+        hours=career_session.RESPONSE_SLA_HOURS)
+    assert owner_session.execute(sql_text(
+        "SELECT escalated_at FROM career_sessions WHERE tenant_id = :t"),
+        {"t": str(tenant_id)}).scalar_one() == first_stamp
+    assert len([m for m in admin.messages if "📅" in m]) == 1
+    assert owner_session.execute(sql_text(
+        "SELECT count(*) FROM support_events WHERE tenant_id = :t AND kind = :k"),
+        {"t": str(tenant_id), "k": career_session.OVERDUE_TICKET_KIND}
+    ).scalar_one() == 1
+
+
+def test_the_nightly_backstop_cannot_re_escalate_what_the_hourly_sweep_did(
+    owner_session: Session, clean_billing: None,
+) -> None:
+    """Two callers, one broken promise: the second must find nothing to do.
+
+    The hourly sweep is the schedule and the nightly is the backstop, kept for
+    the hour the worker is not there. The nightly half is driven through the
+    REAL path (`cv.daily_run.sweep_promises`) rather than through
+    `escalate_overdue` directly, because the guard has to hold for the caller
+    that actually exists — including its own commit, and including the fact
+    that it sweeps the 72-hour guarantee out of the same session first.
+    """
+    from career.cv.daily_run import DailyDeps, sweep_promises
+
+    _p, tenant_id, _s = _customer(owner_session, product="prod_plus")
+    career_session.request_session(owner_session, tenant_id=tenant_id, now=NOW)
+    owner_session.commit()
+
+    hourly = FakeTelegramAdminClient()
+    overdue_at = NOW + timedelta(hours=25)
+    assert career_session.escalate_overdue_and_commit(
+        owner_session, now=overdue_at, admin_client=hourly)["escalated"] == 1
+    before = owner_session.execute(sql_text(
+        "SELECT escalated_at FROM career_sessions WHERE tenant_id = :t"),
+        {"t": str(tenant_id)}).scalar_one()
+    assert len([m for m in hourly.messages if "📅" in m]) == 1
+
+    nightly = FakeTelegramAdminClient()
+    deps = DailyDeps(storage=None, whatsapp_client=FakeWhatsAppClient(),
+                     admin_client=nightly, llm=None)
+    counts = sweep_promises(
+        owner_session, deps=deps, now=overdue_at + timedelta(hours=20))
+
+    assert counts["escalated"] == 0 and counts["unticketed"] == 0
+    assert [m for m in nightly.messages if "📅" in m] == []
+    assert owner_session.execute(sql_text(
+        "SELECT escalated_at FROM career_sessions WHERE tenant_id = :t"),
+        {"t": str(tenant_id)}).scalar_one() == before
+    assert owner_session.execute(sql_text(
+        "SELECT count(*) FROM support_events WHERE tenant_id = :t AND kind = :k"),
+        {"t": str(tenant_id), "k": career_session.OVERDUE_TICKET_KIND}
+    ).scalar_one() == 1
+
+
+def test_two_sla_sweeps_in_flight_at_once_ticket_one_request_exactly_once(
+    owner_engine: Engine, owner_session: Session, clean_billing: None,
+) -> None:
+    """The race the second caller created, in two real transactions.
+
+    «Escalated once» is a read followed by a write inside ONE transaction —
+    ``escalated_at IS NULL``, then ``escalated_at = now`` — with a
+    `support_events` INSERT and a page in between. With a single nightly
+    caller that was airtight. With an hourly sweep in the worker AND the
+    nightly backstop, two passes can read the same unstamped row in the same
+    millisecond: one customer, two tickets on the operator's queue, two
+    identical pages on the channel whose entire value is that a message on it
+    means something new happened.
+
+    NO THREADS, deliberately — `pg_try_advisory_xact_lock` never waits, so the
+    interleaving is built by hand and there is no timing window to lose.
+    `lock_timeout` is the safety valve and not the subject: without the
+    advisory lock the second pass would block on the first one's uncommitted
+    UPDATE of `career_sessions`, and a hang is a rotten way for a suite to
+    report a defect.
+
+    And the key is the SESSION SLA's own, never the guarantee's: the two
+    passes run off the same two schedules and must be able to overlap freely,
+    because a 72-hour sweep standing a 24-hour sweep down would be one promise
+    silencing another it shares no row with.
+    """
+    assert (career_session._SLA_SWEEP_LOCK_KEY
+            != guarantee._SWEEP_LOCK_KEY), (
+        "the two promise sweeps share an advisory lock key. They run from the "
+        "same two schedules over different tables, so a shared key lets each "
+        "one stand the other down for a reason that has nothing to do with it"
+    )
+
+    _p, tenant_id, _s = _customer(owner_session, product="prod_plus")
+    career_session.request_session(owner_session, tenant_id=tenant_id, now=NOW)
+    owner_session.commit()
+    overdue_at = NOW + timedelta(hours=25)
+    first, second = FakeTelegramAdminClient(), FakeTelegramAdminClient()
+
+    other = Session(owner_engine)
+    try:
+        # A — the hourly worker sweep. Reads, tickets, pages, uncommitted.
+        assert career_session.escalate_overdue(
+            other, now=overdue_at, admin_client=first)["escalated"] == 1
+        assert len([m for m in first.messages if "📅" in m]) == 1
+
+        # B — the nightly backstop, a millisecond later, in its own process.
+        owner_session.execute(sql_text("SET LOCAL lock_timeout = '3s'"))
+        assert career_session.escalate_overdue(
+            owner_session, now=overdue_at, admin_client=second,
+        ) == {"escalated": 0, "unticketed": 0}
+        assert second.messages == [], "one broken promise, two pages"
+
+        other.commit()
+    finally:
+        other.rollback()
+        other.close()
+    owner_session.rollback()
+
+    # …and once A has committed, B's next pass genuinely has nothing to do:
+    # the stand-down deferred no work, it declined to duplicate it.
+    assert career_session.escalate_overdue_and_commit(
+        owner_session, now=overdue_at + timedelta(hours=1),
+        admin_client=second,
+    ) == {"escalated": 0, "unticketed": 0}
+    assert second.messages == []
     assert owner_session.execute(sql_text(
         "SELECT count(*) FROM support_events WHERE tenant_id = :t AND kind = :k"),
         {"t": str(tenant_id), "k": career_session.OVERDUE_TICKET_KIND}
@@ -1666,3 +2228,562 @@ def test_the_direct_message_alerts_do_not_reverse_for_the_operator() -> None:
     assert not hits, "mixed-direction operator line(s) — " + " ; ".join(
         f"L{n}: {line.replace(SLOT, '{…}')!r}" for n, line in hits
     )
+
+
+# ── the gate that decides WHEN the cadence above is read ────────────────────
+#
+# Everything above measures how late a promise is noticed once the housekeeping
+# block runs. This is the other half: what makes it run at all. Both paging
+# sweeps live in `scripts/run_worker_loop.py`'s hourly block, so its gate is
+# part of how these two promises are measured — and it is the piece that had
+# no test.
+#
+# THE HAZARD, as it shipped: `last_reminder_sweep = 0.0` compared against
+# `time.monotonic()`, which is ~2,170,615 on this host, so the first pass of
+# EVERY boot ran the whole block. Under Restart=always / RestartSec=5 a crash
+# loop ran it every five seconds. Every idempotency guard below it holds — but
+# a pass killed between `_alert(...)` and its commit re-pages on the next boot,
+# and that trade («duplicated by a crash, never lost») was priced for a block
+# that ran once a day.
+
+
+def _worker_loop() -> Any:
+    """`scripts/run_worker_loop.py` as a module — the process systemd runs.
+
+    Loaded exactly as `test_whatsapp_worker._worker_loop` loads it, and for
+    the same reason: the gate is code, and the wiring in a script is where
+    this repository keeps losing things. `main()` is never executed —
+    importing under a name other than `__main__` cannot start the loop.
+    """
+    import importlib.util
+    import sys
+
+    path = _REPO / "scripts" / "run_worker_loop.py"
+    spec = importlib.util.spec_from_file_location("career_worker_loop", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["career_worker_loop"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class _Boots:
+    """A host: one wall clock, one monotonic clock, and a `/run` that survives
+    processes and not reboots. Every `boot()` is a NEW gate, because every
+    systemd restart is a new process — which is exactly what the float this
+    replaced could not see."""
+
+    def __init__(self, stamp: pathlib.Path) -> None:
+        self.loop = _worker_loop()
+        self.stamp = stamp
+        #: A realistic host uptime, because the defect was arithmetic about
+        #: this number: 0.0 is never within an hour of it.
+        self.mono = 2_170_615.0
+        self.wall = 1_754_600_000.0
+
+    def tick(self, seconds: float) -> None:
+        self.mono += seconds
+        self.wall += seconds
+
+    def boot(self) -> Any:
+        return self.loop.HousekeepingGate(
+            path=str(self.stamp),
+            wall=lambda: self.wall,
+            mono=lambda: self.mono,
+        )
+
+    @property
+    def interval(self) -> float:
+        """The number the loop actually passes — read from the module, never
+        typed here, so this suite cannot go on describing an hour after the
+        block has been moved to four."""
+        return float(self.loop.REMINDER_SWEEP_SECONDS)
+
+    def sweeps_over(self, *, restarts: int, every: float) -> int:
+        """How many times the housekeeping block runs across `restarts`
+        boots `every` seconds apart. This is the shape of the whole defect."""
+        swept = 0
+        for _ in range(restarts):
+            gate = self.boot()
+            if gate.due(self.interval):
+                swept += 1
+                gate.mark()
+            self.tick(every)
+        return swept
+
+
+def test_a_crash_loop_cannot_run_the_housekeeping_block_at_restart_cadence(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Twenty restarts in ten minutes must not be twenty housekeeping passes.
+
+    The block pages twice — the 72-hour guarantee breach and the لمّاح+ SLA
+    escalation — so at RestartSec=5 the priced duplicate becomes a storm on
+    the one channel whose entire value is that a message on it means something
+    new happened. `scripts/alert_unit_failure.sh` had to learn the same lesson
+    about 283 identical messages a day: «muting is what happens to identical
+    messages», and a muted channel silences the next real failure too.
+
+    The number the fix replaced is asserted beside it, because a bound only
+    means something next to what it bounds.
+    """
+    host = _Boots(tmp_path / "run" / "career" / "worker-housekeeping")
+
+    # THE DEFECT, in the shape it shipped: a process-local float, zero at
+    # every boot, compared against a monotonic clock measured in weeks.
+    storm = 0
+    for _ in range(20):
+        last_reminder_sweep = 0.0                    # a fresh process
+        if host.mono - last_reminder_sweep >= host.interval:
+            storm += 1
+        host.tick(30.0)
+    assert storm == 20, (
+        "the old gate is supposed to be the defect this test names"
+    )
+
+    # …and the gate that ships now, over the same ten minutes, on a host that
+    # has just started (an empty /run of its own).
+    host = _Boots(tmp_path / "run-fixed" / "career" / "worker-housekeeping")
+    assert host.sweeps_over(restarts=20, every=30.0) == 1, (
+        "a crash loop still runs the housekeeping block once per restart"
+    )
+
+    # …and the loop is actually WIRED to it. A gate nothing calls is the shape
+    # of defect this repository keeps finding: built, tested, reaching nobody.
+    #
+    # Read from the TREE and not from the text. The first version of this
+    # grepped for «last_reminder_sweep» and went red on the fix itself, whose
+    # docstring names the float in order to bury it — a tripwire that cannot
+    # tell a quotation from a claim teaches its next reader to delete the
+    # quotation. An assignment is a Name node; a docstring is not.
+    tree = ast.parse(
+        (_REPO / "scripts" / "run_worker_loop.py").read_text(encoding="utf-8"))
+    assigned = {
+        target.id
+        for node in ast.walk(tree) if isinstance(node, ast.Assign)
+        for target in node.targets if isinstance(target, ast.Name)
+    }
+    assert "last_reminder_sweep" not in assigned, (
+        "the process-local float is back in the loop — whatever it gates, it "
+        "cannot tell a crash loop from an outage, because it dies with the "
+        "process that was crashing"
+    )
+    gated = [
+        node for node in ast.walk(tree) if isinstance(node, ast.If)
+        and "attr='due'" in ast.dump(node.test)
+    ]
+    assert len(gated) == 1, "the hourly block is not gated by the stamp"
+    assert any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+               and n.func.attr == "mark" for n in ast.walk(gated[0])), (
+        "the pass never claims its interval, so the next boot sweeps again"
+    )
+
+
+def test_a_worker_that_was_down_still_catches_up_the_moment_it_is_back(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The property the boot-time pass exists for, and which the fix must not
+    trade away: catching up is the REASON housekeeping runs at boot.
+
+    A worker down for six hours has six hours of unmeasured promises behind
+    it. It must sweep the instant it returns — not an hour later — and the two
+    cases below are the two ways a worker comes back.
+    """
+    host = _Boots(tmp_path / "run" / "career" / "worker-housekeeping")
+
+    first = host.boot()
+    assert first.due(host.interval), "the very first boot of a host has nothing to catch up"
+    first.mark()
+
+    # 1 — the process died and stayed dead for six hours (systemd gave up, or
+    # a human stopped it). The host stayed up, so the stamp is still there and
+    # is six hours old: that is an OUTAGE, and it is due.
+    host.tick(6 * 3600.0)
+    assert host.boot().due(host.interval), (
+        "a worker back from a six-hour outage waited for its housekeeping — "
+        "which is the whole reason the block runs at boot"
+    )
+
+    # 2 — the HOST rebooted. /run is tmpfs, so the stamp is gone with it, and
+    # a machine that was down is an outage by definition. Even one second
+    # later, this is due.
+    host.stamp.unlink()
+    host.tick(1.0)
+    assert host.boot().due(host.interval), (
+        "a reboot cleared the stamp and the block still stood down — /run "
+        "being tmpfs is the mechanism, not an accident of the path"
+    )
+
+
+def test_the_gate_is_a_rate_and_not_a_one_shot(tmp_path: pathlib.Path) -> None:
+    """A long-lived healthy worker still sweeps every interval, and a crash
+    loop that outlives an hour gets exactly one more pass in the next hour —
+    the bound is a RATE, so a wedge that restarts all night pages at the
+    cadence the promises are already measured at."""
+    host = _Boots(tmp_path / "run" / "career" / "worker-housekeeping")
+    interval = host.interval
+
+    gate = host.boot()
+    assert gate.due(interval)
+    gate.mark()
+    host.tick(interval - 1.0)
+    assert not gate.due(interval)
+    host.tick(2.0)
+    assert gate.due(interval), "the healthy loop stopped sweeping after one pass"
+
+    # four hours of crash-looping every 30s: four passes, not four hundred.
+    # A `/run` of its own — a stamp is per HOST, and reusing the one above
+    # would be a second host that inherited the first one's memory.
+    host = _Boots(tmp_path / "run-2" / "career" / "worker-housekeeping")
+    assert host.sweeps_over(restarts=480, every=30.0) == 4
+
+
+def test_a_clock_that_stepped_backwards_measures_rather_than_stalls(
+    tmp_path: pathlib.Path,
+) -> None:
+    """A stamp in the future is not an age — it is evidence the wall clock
+    moved (NTP correcting a drifted host, a restored snapshot). Doubt about
+    the clock has to measure, never stall: the alternative is a housekeeping
+    block that stops reading a 24-hour promise until the clock catches up.
+
+    `scripts/alert_unit_failure.sh` reasons its way to the same answer in its
+    own backwards-step branch, and this is the residue named in
+    `HousekeepingGate`: a step during a crash loop can still buy one extra
+    pass. Bounded by the step, and it is the cheap direction.
+    """
+    host = _Boots(tmp_path / "run" / "career" / "worker-housekeeping")
+    gate = host.boot()
+    gate.mark()
+    assert not gate.due(host.interval)
+
+    host.wall -= 3 * 3600.0                       # the clock steps back
+    assert gate.due(host.interval), (
+        "a backwards clock step silenced the housekeeping block")
+
+
+def test_an_unwritable_run_degrades_toward_silence_and_says_so(
+    tmp_path: pathlib.Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The one case the fix cannot have both halves of, decided out loud.
+
+    With no durable stamp, a crash loop and a long outage are indistinguishable
+    again — so the gate picks the bounded loss. It stands down at boot (the
+    catch-up is delayed by at most the interval this block already prices as
+    the worst-case lateness of every clock in it, and BOTH paging sweeps keep
+    their nightly backstop), rather than sweeping at boot (a storm bounded by
+    nothing). And it says ERROR, because the journal harvester puts ERROR
+    lines on the operator's error screen: a degradation nobody can see is how
+    the last one survived.
+
+    Detected in `__init__` and not at the first failed `mark`, which is the
+    part that actually matters: a gate that finds out afterwards answers «no
+    stamp, so catch up» on every single boot — the storm, exactly as it was.
+    """
+    # A parent that is a FILE, so the failure is real for root too (this suite
+    # runs as root, and root ignores a chmod).
+    blocker = tmp_path / "run"
+    blocker.write_text("not a directory", encoding="utf-8")
+    host = _Boots(blocker / "career" / "worker-housekeeping")
+
+    with caplog.at_level("ERROR", logger="career.worker_loop"):
+        assert host.sweeps_over(restarts=20, every=30.0) == 0
+    assert any("housekeeping stamp" in r.getMessage() for r in caplog.records), (
+        "the gate lost its durable record and told nobody"
+    )
+
+    # …and it is still a working hourly gate inside the process it is in:
+    # degraded means «no catch-up», never «no housekeeping».
+    gate = host.boot()
+    assert not gate.due(host.interval)
+    host.tick(host.interval + 1.0)
+    assert gate.due(host.interval)
+
+
+def test_an_unreadable_stamp_sweeps_rather_than_trusting_it(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Nothing may be suppressed by a stamp nobody can read. The write is
+    atomic so this is near-unreachable, and «near» is not a reason to let
+    garbage in a file stand a promise sweep down."""
+    host = _Boots(tmp_path / "run" / "career" / "worker-housekeeping")
+    gate = host.boot()
+    gate.mark()
+    assert not gate.due(host.interval)
+
+    host.stamp.write_text("not-a-timestamp\n", encoding="utf-8")
+    assert host.boot().due(host.interval)
+
+
+def test_the_stamp_says_when_the_last_pass_ran(tmp_path: pathlib.Path) -> None:
+    """`cat /run/career/worker-housekeeping` has to answer «when did
+    housekeeping last run» on the night somebody is asking. The epoch is for
+    the gate; the ISO copy beside it is for the human."""
+    host = _Boots(tmp_path / "run" / "career" / "worker-housekeeping")
+    host.boot().mark()
+    epoch, iso = host.stamp.read_text(encoding="utf-8").split(" ", 1)
+    assert float(epoch) == pytest.approx(host.wall, abs=1.0)
+    assert str(datetime.fromtimestamp(host.wall, UTC).year) in iso
+    # nothing but the stamp is left behind — the tmp file is renamed, never
+    # accumulated, in a directory that lives for the whole boot
+    assert [p.name for p in host.stamp.parent.iterdir()] == [host.stamp.name]
+
+
+# ── the guard whose reason was invented ─────────────────────────────────────
+
+
+def test_re_assigning_a_guarantees_own_status_writes_nothing(
+    owner_session: Session, owner_engine: Engine, clean_billing: None,
+) -> None:
+    """The claim a comment in `guarantee` used to make, driven instead of read.
+
+    It said re-assigning `row.status = WATCHING` «would send an UPDATE per
+    tenant per pass, which was free once a night and is not free at hourly
+    cadence». SQLAlchemy 2.0 compares the assigned value against the LOADED
+    one when it builds the UPDATE, so an equal value emits no statement at
+    all — `session.dirty` reports the row as dirty (it is documented as an
+    optimistic guess) and the flush writes nothing. There was no cost to
+    avoid, at any cadence.
+
+    Two halves, and the second is the one that will still be true in a year:
+    the exact assignment the comment described, and then a whole real pass
+    over a WATCHING customer, asserting that the pass writes to
+    `delivery_guarantees` exactly once — the INSERT that creates the row — and
+    never again.
+    """
+    from sqlalchemy import event
+
+    statements: list[str] = []
+
+    def record(conn: Any, cursor: Any, statement: str, params: Any,
+               context: Any, executemany: bool) -> None:
+        head = " ".join(statement.split()[:2]).upper()
+        if "DELIVERY_GUARANTEES" in statement.upper() and head.startswith(
+                ("INSERT", "UPDATE", "DELETE")):
+            statements.append(head.split()[0])
+
+    _p, tenant_id, sub_id = _customer(owner_session)
+    event.listen(owner_engine, "before_cursor_execute", record)
+    try:
+        # 1 — the reviewer's experiment, on the real row through the real
+        # loader: assign the value the row already holds, and flush.
+        row = guarantee._guarantee_row(
+            owner_session, tenant_id=tenant_id, subscription_id=sub_id,
+            activated_at=NOW,
+        )
+        assert statements == ["INSERT"], "the row is created once"
+        # Committed first, so what follows is a LOADED value and not the
+        # constant this module built the row from. That is the whole question:
+        # the UPDATE is built by comparing against what came back from the
+        # database, and a comparison against itself would prove nothing.
+        owner_session.commit()
+        statements.clear()
+        loaded = row.status
+        assert (loaded is not guarantee.WATCHING
+                and loaded == guarantee.WATCHING), (
+            "the assignment has to be a DIFFERENT object with an EQUAL value, "
+            "or this proves nothing about how the UPDATE is built"
+        )
+        row.status = guarantee.WATCHING
+        assert row in owner_session.dirty, (
+            "session.dirty is an optimistic guess — if it ever stops saying "
+            "«dirty» here, the flush below is no longer the thing being proven"
+        )
+        owner_session.flush()
+        assert statements == [], (
+            "SQLAlchemy wrote an UPDATE for an unchanged value — the comment "
+            "this test replaced would then have been right, and the guard it "
+            "justified has to come back with this test's output beside it"
+        )
+
+        # 2 — and a whole pass over a customer still inside his window writes
+        # nothing at all.
+        owner_session.commit()
+        statements.clear()
+        counts = guarantee.sweep_and_commit(
+            owner_session, now=NOW + timedelta(hours=1),
+            admin_client=FakeTelegramAdminClient(),
+        )
+        assert counts["watching"] == 1
+        assert statements == []
+    finally:
+        event.remove(owner_engine, "before_cursor_execute", record)
+        # never leave an open transaction behind an assertion: `clean_billing`
+        # deletes the tenant, and an uncommitted row that references it turns a
+        # failing assertion into a hung suite
+        owner_session.rollback()
+
+
+def test_a_clock_that_steps_backwards_does_not_un_breach_a_guarantee(
+    owner_session: Session, clean_billing: None,
+) -> None:
+    """«A breach is never un-breached» — including by the wall clock.
+
+    The guard that carried the invented cost was `if row.status != WATCHING:
+    row.status = WATCHING`, and the only status that could ever reach it —
+    MET and SETTLED return above — is a BREACHED row seen with `now` behind
+    its deadline. There the guard did not prevent a write, it PERFORMED one:
+    it set a decided guarantee back to WATCHING, which drops the customer off
+    `open_breaches`, the operator's queue of people owed a decision about
+    money, until the clock catches up. And `breached_at` — the timestamp he
+    reads beside that decision — would then be rewritten to whenever the row
+    re-broke.
+
+    Unlikely, and the module's own words are «never»: this promise costs
+    money, and a sweep that can quietly reopen a settled question about it is
+    not something to leave standing because the trigger is rare.
+    """
+    _p, tenant_id, _s = _customer(owner_session)
+    admin = FakeTelegramAdminClient()
+    breach_time = NOW + timedelta(hours=73)
+    assert guarantee.sweep_and_commit(
+        owner_session, now=breach_time, admin_client=admin)["breached"] == 1
+    breached_at = owner_session.execute(sql_text(
+        "SELECT breached_at FROM delivery_guarantees WHERE tenant_id = :t"),
+        {"t": str(tenant_id)}).scalar_one()
+
+    # NTP corrects a host that had drifted forward: the next pass runs with a
+    # `now` inside the window this row has already outlived.
+    guarantee.sweep_and_commit(
+        owner_session, now=NOW + timedelta(hours=1), admin_client=admin)
+
+    status, still = owner_session.execute(sql_text(
+        "SELECT status, breached_at FROM delivery_guarantees"
+        " WHERE tenant_id = :t"), {"t": str(tenant_id)}).one()
+    assert status == guarantee.BREACHED, (
+        "a backwards clock step un-breached a guarantee the customer is owed "
+        "a refund or an extension for"
+    )
+    assert still == breached_at, "…and rewrote when it broke"
+    assert [b.tenant_id for b in guarantee.open_breaches(owner_session)
+            if b.tenant_id == tenant_id], (
+        "the breach fell off the operator's queue while the clock was behind"
+    )
+    # and it is still paged exactly once, across all three passes
+    assert len([m for m in admin.messages if "🛡️" in m]) == 1
+
+
+# ── «commits its own work and NEVER raises», driven at the commit ───────────
+
+
+class _CommitFails:
+    """A session whose COMMIT dies — the failure both entry points claim to
+    absorb, and the only one their tests never drove.
+
+    Everything else delegates to a real session, so the sweep above the commit
+    is the real sweep against the real database. `rollback_too` is the double
+    fault: a connection that has already gone takes the rollback with it, and
+    that is precisely the shape in which a bare `session.rollback()` in a
+    caller's own except-block escapes into the delivery day.
+    """
+
+    def __init__(self, session: Session, *, rollback_too: bool = False) -> None:
+        self._session = session
+        self._rollback_too = rollback_too
+        self.rolled_back = 0
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._session, name)
+
+    def commit(self) -> None:
+        raise RuntimeError("server closed the connection unexpectedly")
+
+    def rollback(self) -> None:
+        self.rolled_back += 1
+        if self._rollback_too:
+            raise RuntimeError("connection already closed")
+        self._session.rollback()
+
+
+@pytest.mark.parametrize("rollback_too", [False, True])
+def test_the_scheduled_entry_points_never_raise_when_the_commit_does(
+    owner_session: Session, clean_billing: None, rollback_too: bool,
+) -> None:
+    """The contract both `*_and_commit` docstrings state, at the one line
+    nothing was driving.
+
+    «Commits its own work and NEVER raises» was tested for failures INSIDE the
+    sweep and never for a failure of `session.commit()` itself — so the suite
+    would not have noticed a future edit moving the commit out of the `try`.
+    It holds today, including the double fault where the rollback dies too;
+    this is what makes that a fact about the tree rather than a reading of it.
+
+    It matters at both callers. In the worker the hourly block is a barrier —
+    an escape costs that cycle its watchdog pet, and a wedged cycle is a
+    killed worker. In the nightly it runs FIRST, before any of the delivery
+    day exists.
+    """
+    _p, tenant_id, _s = _customer(owner_session, product="prod_plus")
+    career_session.request_session(
+        owner_session, tenant_id=tenant_id, now=NOW)
+    owner_session.commit()
+
+    overdue = NOW + timedelta(hours=25, days=4)     # both promises are broken
+    admin = FakeTelegramAdminClient()
+    dying = _CommitFails(owner_session, rollback_too=rollback_too)
+
+    # The rollback is in a `finally` and the assertions come after it. A
+    # double fault leaves the real session «idle in transaction» holding an
+    # uncommitted INSERT, and `clean_billing`'s DELETE then waits on it
+    # forever: without this, a FAILING assertion here does not report, it
+    # hangs the suite.
+    try:
+        swept = guarantee.sweep_and_commit(
+            dying, now=overdue, admin_client=admin)
+        escalated = career_session.escalate_overdue_and_commit(
+            dying, now=overdue, admin_client=admin)
+    finally:
+        owner_session.rollback()
+
+    assert swept == {"watching": 0, "met": 0, "breached": 0, "alerted": 0}
+    assert escalated == {"escalated": 0, "unticketed": 0}
+    assert dying.rolled_back == 2, "a failed pass has to try to roll back"
+    # nothing survived the failed passes: no breach, no ticket, no stamp
+    assert owner_session.execute(sql_text(
+        "SELECT count(*) FROM delivery_guarantees WHERE tenant_id = :t"),
+        {"t": str(tenant_id)}).scalar_one() == 0
+    assert owner_session.execute(sql_text(
+        "SELECT escalated_at FROM career_sessions WHERE tenant_id = :t"),
+        {"t": str(tenant_id)}).scalar_one() is None
+    assert owner_session.execute(sql_text(
+        "SELECT count(*) FROM support_events WHERE tenant_id = :t AND kind = :k"),
+        {"t": str(tenant_id), "k": career_session.OVERDUE_TICKET_KIND}
+    ).scalar_one() == 0
+
+
+def test_a_dying_connection_in_the_promise_sweep_cannot_stop_the_night(
+    owner_session: Session, clean_billing: None,
+) -> None:
+    """The same double fault through the REAL nightly caller.
+
+    `cv.daily_run.sweep_promises` is called by `run_daily_delivery` FIRST,
+    before any of the night's own work exists, so anything that escapes it
+    costs a paying customer his delivery day. Until 2026-08-08 the SLA half
+    did not go through `escalate_overdue_and_commit` at all: it called the raw
+    sweep and re-implemented the contract here with its own try/except and a
+    bare `session.rollback()`. That copy was the weaker one — a rollback that
+    itself raised went straight up — and the entry point it declined to use is
+    the one whose docstring says it is «the entry point every SCHEDULED caller
+    should use», with the guarded rollback already in it.
+    """
+    from career.cv.daily_run import DailyDeps, sweep_promises
+
+    _p, tenant_id, _s = _customer(owner_session, product="prod_plus")
+    career_session.request_session(
+        owner_session, tenant_id=tenant_id, now=NOW)
+    owner_session.commit()
+
+    deps = DailyDeps(storage=None, whatsapp_client=FakeWhatsAppClient(),
+                     admin_client=FakeTelegramAdminClient(), llm=None)
+    dying = _CommitFails(owner_session, rollback_too=True)
+
+    try:                       # see the note in the test above: a failed
+        counts = sweep_promises(   # assertion must report, never hang
+            dying, deps=deps, now=NOW + timedelta(hours=25, days=4))
+    finally:
+        owner_session.rollback()
+
+    # every key present and zero: the night gets an honest «nothing measured»,
+    # never a missing counter and never an exception
+    assert counts == {"watching": 0, "met": 0, "breached": 0, "alerted": 0,
+                      "escalated": 0, "unticketed": 0}
+    assert dying.rolled_back == 2
