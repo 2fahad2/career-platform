@@ -306,6 +306,14 @@ A6 رابط التفعيل ما زال يصل محادثة ذات سجل دائ�
 
 **ممنوع على الثلاثة**: `tests/test_alert_direction_purity.py` — الحارس نفسه لا يُعدَّل ليُخضِر شيئًا.
 
+### الموجة الرابعة عشرة — البنود التي أبلغ عنها المنفّذون ولم يملكوها (سُجّلت قبل الإطلاق، ٧ أغسطس)
+
+| # | الملكية الحصرية | المهمة |
+|---|---|---|
+| **K1** | `src/career/onboarding/orchestrator.py` · `src/career/onboarding/deps.py` (إن وُجد) · `tests/test_onboarding_orchestrator.py` | **سؤال قبل إصلاح**: `handle_enrichment` يرجع `False` من أول سطر حين `achievement_renderer is None` — **وهو الافتراضي المشحون**. فهل F-ENRICH كلها ميتة في الإنتاج؟ والجلسة تبقى مفتوحة، فالمحادثة ميتة والحالة باقية |
+| **K2** | `src/career/cv/outcome_followup.py` · `src/career/telegram/console.py` · `tests/test_outcome_followup.py` | تذكرة مفتوحة منسيّة **تُسكِت خطّ ذلك العميل إلى الأجل** ولا شيء يكنسها · ومطابقة الجواب المكتوب موضعها `parse_answer` لا التفافٌ في العامل |
+| **K3** | `docs/DEVIATIONS.md` · `docs/PROGRESS.md` · `README.md` · `tests/test_docs_truth.py` | وثائق **متأخرة في الاتجاه الآمن**: قيست حين كان خط لمّاح+ نصف مشحون وقد اكتمل بعدها · وسطر البطاقة يمكن أن يُسنَد إلى كود حقيقي الآن |
+
 **ملاحظة للمراجعة القادمة**: `refund_deduction_sar` و`breach_notice_ar` و`record_suppression` **بلا نداء إنتاجي واحد** — فما وُصف بأنه إصلاح مالٍ خطير كان في شيفرة لا يبلغها أحد. **التحقق من وجود نداء حيّ يسبق تقدير الخطورة.**
 
 ### الموجة الرابعة (اكتملت — أُطلقت ٦ أغسطس بعد `566b935`)
