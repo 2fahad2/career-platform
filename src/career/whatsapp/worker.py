@@ -303,32 +303,6 @@ def _text_of(msg: dict[str, Any]) -> str | None:
     return raw if isinstance(raw, str) else None
 
 
-def _typed_outcome(text: str | None) -> str | None:
-    """The §20 outcome a customer TYPED instead of tapping, or None.
-
-    The map is derived from ``outcome_followup.BUTTONS`` at call time rather
-    than copied here: the labels the customer sees and the labels we accept
-    are then the same object, and a relabelled button cannot leave a stale
-    second spelling behind in this file.
-
-    Matched on the WHOLE folded message and nothing less. `normalize_ar`
-    collapses «ما ردّوا» / «ما ردوا» and drops the emoji off «جاني مقابلة 🎉»,
-    so the three labels arrive here in one form each — but a message that
-    merely CONTAINS one of them is not an answer, and this module's two live
-    incidents were both a substring reading of an ordinary word.
-    """
-    from career.arabic import normalize_ar
-    from career.cv import outcome_followup as followup
-
-    folded = normalize_ar(text)
-    if not folded:
-        return None
-    for button_id, label in followup.BUTTONS:
-        if normalize_ar(label) == folded:
-            return followup.parse_answer(button_id)
-    return None
-
-
 def _start_handover(
     session: Session, *, tenant_id: uuid.UUID, subscription_id: uuid.UUID,
     channel_id: uuid.UUID, onboarding: orchestrator.Deps, now: datetime,
@@ -761,38 +735,56 @@ def _handle_message(
         # open conversation, or the datum is lost and cannot be re-collected.
         from career.cv import outcome_followup as followup
 
-        answer = followup.parse_answer(effective)
-        # CONSUMES the tap either way. Falling through when nothing was
-        # pending sent «oc_interview» into the enrichment branch, whose
-        # final else treats unmatched text as the customer's achievement
-        # — so a double tap, or a tap on an old card (WhatsApp keeps them
-        # tappable forever), wrote a button id into the achievement bank
-        # and paid for an LLM call to render it. Constant 5.
-        pending = (
-            followup.pending_job_ref(session, tenant_id=channel.tenant_id)
-            if answer is not None else None
+        # The open question is resolved BEFORE the parse, not after it, and
+        # that inversion is the whole change: reading a typed label is only
+        # safe while a question is actually open, so the parser has to be told.
+        # This file used to answer that itself — a second label map derived
+        # from `BUTTONS` inside the message loop — because `parse_answer` read
+        # machine ids and nothing else. It reads both now, at its permanent
+        # home, and a workaround with a home to go to is a second authority
+        # waiting to disagree with the first. Proven equivalent over the whole
+        # reachable input space before it was deleted (the two differ only on
+        # the machine ids themselves, which cannot reach the typed branch: it
+        # ran only when `_button_id_of` was None AND `parse_answer` had already
+        # declined the same string — and there the permanent home is right
+        # anyway, because an id can only have come from a card we sent).
+        #
+        # The cost is one `pending_job_ref` per message that gets this far,
+        # where before it was one per outcome tap and per typed label. It is a
+        # read of this tenant's own `outcome_events`, it runs once per inbound
+        # message on a human's typing speed, and it buys the property that
+        # nothing downstream can quietly widen: whether a question is open is
+        # asked once, of the ledger, in one place.
+        pending = followup.pending_job_ref(session, tenant_id=channel.tenant_id)
+        # A machine id is CONSUMED either way — with a question open or not.
+        # Falling through when nothing was pending sent «oc_interview» into the
+        # enrichment branch, whose final else treats unmatched text as the
+        # customer's achievement: a double tap, or a tap on an old card
+        # (WhatsApp keeps them tappable forever), wrote a button id into the
+        # achievement bank and paid for an LLM call to render it. Constant 5.
+        #
+        # A TYPED label is consumed only while a question is open, and that is
+        # now the parser's own default rather than this branch's arithmetic.
+        # «ما ردّوا» typed by a customer who scrolled past the card — or whose
+        # client rendered the buttons as plain text — used to fall through
+        # everything and become a direct-line ticket raised against him: our
+        # own question turned into a complaint, and the §20 datum that can
+        # never be re-collected thrown away. The other direction is the reason
+        # for the gate: a sentence is just a sentence, and answering «مسجّلة
+        # عندنا 👍» to someone who happened to write «اعتذروا» about something
+        # else is the over-eager reading this file has already paid for twice.
+        # `tapped=` is NOT the `tapped` local above. That one is true for a
+        # template `button` message whose `effective` is the human LABEL, not
+        # an id — broader than the fact being asserted here. The exact fact is
+        # "the string in `effective` IS a machine id lifted from the payload",
+        # which is what `_button_id_of` answers. Getting this wrong writes a
+        # §20 outcome — a datum that can never be collected again — from a
+        # string a person typed.
+        answer = followup.parse_answer(
+            effective,
+            question_open=pending is not None,
+            tapped=_button_id_of(msg) is not None,
         )
-        if answer is None and not tapped:
-            # …and the same question answered by TYPING what the button says.
-            # `parse_answer` reads machine ids only, so «ما ردّوا» typed by a
-            # customer who scrolled past the card — or whose client rendered
-            # the buttons as plain text — fell through everything and became a
-            # direct-line ticket raised against him: our own question turned
-            # into a complaint, and the §20 datum that can never be
-            # re-collected thrown away.
-            #
-            # Unlike a tap, a typed label is consumed ONLY while a question is
-            # actually open. A tap can only have come from our card; a
-            # sentence is just a sentence, and answering «مسجّلة عندنا 👍» to
-            # someone who happened to write «اعتذروا» about something else is
-            # the over-eager reading this file has already paid for twice. So
-            # a typed label with nothing pending falls through untouched, and
-            # is heard as the ordinary message it is.
-            typed = _typed_outcome(text_body)
-            if typed is not None:
-                pending = followup.pending_job_ref(
-                    session, tenant_id=channel.tenant_id)
-                answer = typed if pending is not None else None
         if answer is not None:
             if pending is not None:
                 thanks = followup.record_answer(

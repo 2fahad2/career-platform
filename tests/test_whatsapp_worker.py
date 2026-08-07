@@ -1654,16 +1654,110 @@ def test_a_typed_outcome_label_is_the_answer_not_a_ticket(
         "answering our question raised a ticket against the customer"
 
 
+def test_a_typed_label_with_no_question_open_is_still_the_customers_sentence(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """The other half of the typed reading, and the expensive half to get wrong.
+
+    «اعتذروا» is a word. With one of our questions open it is an answer to it;
+    with nothing open it is a sentence a human wrote, and consuming it would
+    both lose his message and lie back to him («مسجّلة عندنا 👍» about a job he
+    never mentioned). This module has paid for the over-eager reading twice
+    already — «مساعده» read as a support command, «تسويق، دعم، مبيعات» read as
+    one — so the narrow direction is asserted end to end, not only at the
+    parser: nothing is recorded, and the message travels all the way to the
+    direct line like any other sentence.
+    """
+    from career.cv import outcome_followup as followup
+
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    deps = _worker_deps(wa)
+    phone = _plus_customer(owner_session, wa, deps)   # no ASKED row anywhere
+    admin.messages.clear()
+
+    _deliver(owner_session, phone,
+             _text_msg(f"wamid-{uuid.uuid4()}", phone, "اعتذروا"),
+             wa, admin, deps)
+
+    recorded = owner_session.execute(text(
+        "SELECT o.outcome FROM outcome_events o JOIN customer_channels c"
+        " ON c.tenant_id = o.tenant_id WHERE c.phone_e164 = :p"),
+        {"p": phone}).all()
+    assert recorded == [], \
+        "a word was recorded as the answer to a question nobody asked"
+    assert followup.ALREADY_ANSWERED_AR not in (wa.sent[-1].body or ""), \
+        "the customer was told we had filed an answer he never gave"
+    assert _direct_tickets(owner_session, phone), \
+        "his sentence was eaten by the survey and reached nobody"
+
+
+def test_the_worker_holds_no_second_reading_of_the_outcome_labels() -> None:
+    """The guard against the workaround growing back.
+
+    While `outcome_followup.parse_answer` read machine ids only, this file
+    carried its own label map — derived from `BUTTONS`, folded with
+    `normalize_ar`, inside the message loop — so that a customer who TYPED
+    «ما ردّوا» was not answered with a support ticket. The parser reads both
+    now, and two readings of one vocabulary is the shape
+    `test_the_replay_tool_and_the_worker_can_never_rank_receipts_differently`
+    already caught once in this module: not two opinions, one bug waiting for
+    the day they disagree.
+
+    So the worker is asserted to fold nothing and to know no labels. It routes
+    by machine id (`_button_id_of`) and asks the module that owns the words.
+    """
+    import ast
+    from pathlib import Path
+
+    from career.whatsapp import worker as wa_worker
+
+    assert not hasattr(wa_worker, "_typed_outcome"), (
+        "the typed-label workaround is back in the worker — its permanent "
+        "home is outcome_followup.parse_answer(question_open=...)"
+    )
+    source = Path(str(wa_worker.__file__)).read_text(encoding="utf-8")
+    names = {
+        node.attr for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Attribute)
+    } | {
+        node.id for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Name)
+    }
+    assert "BUTTONS" not in names, \
+        "the worker reads the button labels again — one vocabulary, one reader"
+    assert "normalize_ar" not in names, \
+        "the worker folds Arabic itself again — folding belongs to the module "\
+        "that owns the words being compared"
+
+
 def test_an_enrichment_answer_is_never_a_ticket_when_the_renderer_is_unwired(
     owner_session: Session, clean_billing: None
 ) -> None:
     """D1.3 — the «structural guarantee» had a hole with no floor under it.
 
-    `orchestrator.handle_enrichment` returns False when
+    `orchestrator.handle_enrichment` used to return False when
     `deps.achievement_renderer is None`, and `_mid_flow` never looked at the
-    enrichment session at all (the journey is ACTIVE while it runs). So with
-    the renderer unwired — the shipped default — a genuine achievement answer
-    fell through to the direct line and became a ticket.
+    enrichment session at all (the journey is ACTIVE while it runs). So a
+    process without a renderer let a genuine achievement answer fall through
+    to the direct line, where it became a support ticket raised against the
+    customer for answering us.
+
+    An earlier version of this docstring called the unwired renderer «the
+    SHIPPED default», and that was never true: `scripts/run_worker_loop.py` —
+    the only process that serves customers — has passed
+    `AnthropicAchievementRenderer` since the feature's own commit, and `None`
+    is a dataclass default that only tests reach. The sentence was wrong,
+    load-bearing in argument, and copied onward twice before anybody read the
+    wiring; it is corrected rather than deleted so the correction travels too.
+    The hole itself was real either way — the guard must not rest on which
+    boundaries a caller happened to wire.
+
+    `_mid_flow` is asserted BEFORE the message is processed, which is what it
+    actually protects: the escalation is decided while the customer is
+    mid-conversation. Afterwards he genuinely is not — `handle_enrichment` now
+    OWNS the message it cannot render and closes the session rather than
+    leaving a cursor open — so asserting it after processing would assert the
+    bug the orchestrator was just fixed for.
     """
     from career.promises import career_session
 
@@ -1675,6 +1769,13 @@ def test_an_enrichment_answer_is_never_a_ticket_when_the_renderer_is_unwired(
                  '{"enrichment": {"open": true}}')
     admin.messages.clear()
 
+    # the guard is in the promises module, not only in branch order
+    tenant = owner_session.execute(text(
+        "SELECT tenant_id FROM customer_channels WHERE phone_e164 = :p"),
+        {"p": phone}).scalar_one()
+    assert career_session._mid_flow(owner_session, tenant) is True, \
+        "an open enrichment session did not read as mid-flow"
+
     _deliver(owner_session, phone,
              _text_msg(f"wamid-{uuid.uuid4()}", phone,
                        "قللت وقت الإغلاق الشهري من عشرة أيام لأربعة"),
@@ -1682,11 +1783,6 @@ def test_an_enrichment_answer_is_never_a_ticket_when_the_renderer_is_unwired(
 
     assert _direct_tickets(owner_session, phone) == [], \
         "an answer to our own enrichment question became a support ticket"
-    # and the guard is in the promises module, not only in branch order
-    tenant = owner_session.execute(text(
-        "SELECT tenant_id FROM customer_channels WHERE phone_e164 = :p"),
-        {"p": phone}).scalar_one()
-    assert career_session._mid_flow(owner_session, tenant) is True
 
 
 # ── a buyer who is still silenced (D2.2 / D2.3) ─────────────────────────────
@@ -1795,6 +1891,153 @@ def test_the_way_back_is_printed_again_for_a_near_miss_resume(
         "SELECT opt_out_at FROM customer_channels WHERE phone_e164 = :p"),
         {"p": phone}).scalar_one()
     assert still is not None, "a near miss un-silenced him by guessing"
+
+
+# ── the forgotten ticket, swept while the operator sleeps ───────────────────
+
+
+def _worker_loop() -> Any:
+    """`scripts/run_worker_loop.py` as a module — the process the systemd unit
+    runs. Loaded exactly like `_replay_tool` above, and for the same reason:
+    the wiring in a script is still code, and code with no test is how a
+    feature ends up built and reaching nobody. `main()` is not executed —
+    importing under a name other than `__main__` cannot start the loop."""
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / "run_worker_loop.py"
+    spec = importlib.util.spec_from_file_location("career_worker_loop", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["career_worker_loop"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _forgotten_ticket(
+    owner_session: Session, phone: str, *, age_hours: int = 72
+) -> tuple[str, str]:
+    """An open support ticket nobody has closed for `age_hours`. Returns
+    (ticket id, TEN code)."""
+    channel_id, tenant_id, code = owner_session.execute(text(
+        "SELECT c.id, c.tenant_id, t.code FROM customer_channels c"
+        " JOIN tenants t ON t.id = c.tenant_id WHERE c.phone_e164 = :p"),
+        {"p": phone}).one()
+    ticket_id = str(uuid.uuid4())
+    owner_session.execute(text(
+        "INSERT INTO support_events (id, tenant_id, channel_id, kind, status,"
+        " created_at) VALUES (:i, :t, :c, 'executive_direct_message', 'open',"
+        " :a)"),
+        {"i": ticket_id, "t": tenant_id, "c": channel_id,
+         "a": NOW - timedelta(hours=age_hours)})
+    owner_session.commit()
+    return ticket_id, str(code)
+
+
+def _ticket_status(owner_engine: Engine, ticket_id: str) -> str:
+    """Read from a session of its own, so «released» means COMMITTED and not
+    merely pending in the caller's transaction."""
+    with Session(owner_engine) as s:
+        return str(s.execute(text(
+            "SELECT status FROM support_events WHERE id = :i"),
+            {"i": ticket_id}).scalar_one())
+
+
+def test_a_forgotten_ticket_is_released_while_the_operator_sleeps(
+    owner_session: Session, owner_engine: Engine, clean_billing: None
+) -> None:
+    """`console.release_forgotten_tickets` had one caller: the operator's own
+    console traffic.
+
+    Which releases fastest for the customers who need it least — the operator
+    who has stopped opening the watchtower is exactly the operator who forgot
+    the ticket, and while it sits open the dedupe («one open ticket per
+    customer») silences that customer's direct line. The worker loop is the
+    process that is awake at 03:00, so the sweep runs there too, hourly.
+    """
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    deps = _worker_deps(wa)
+    phone = _plus_customer(owner_session, wa, deps)
+    ticket, code = _forgotten_ticket(owner_session, phone)
+    admin.messages.clear()
+
+    released = _worker_loop().sweep_forgotten_tickets(
+        owner_session, admin_client=admin, now=NOW)
+
+    assert released >= 1
+    assert _ticket_status(owner_engine, ticket) == "released", \
+        "the loop swept nothing — the mute outlives the operator's attention"
+    pages = [m for m in admin.messages if code in m]
+    assert len(pages) == 1, f"paged {len(pages)} times, not once: {pages}"
+    assert phone.lstrip("+") not in pages[0]           # §15.13
+    # …and once EVER: a second pass an hour later has nothing to release,
+    # because «open → released» is a one-way edge on the row itself.
+    admin.messages.clear()
+    again = _worker_loop().sweep_forgotten_tickets(
+        owner_session, admin_client=admin, now=NOW + timedelta(hours=1))
+    assert not [m for m in admin.messages if code in m], \
+        f"the same ticket paged twice (released={again})"
+
+
+def test_a_dead_telegram_never_costs_the_customer_his_released_line(
+    owner_session: Session, owner_engine: Engine, clean_billing: None
+) -> None:
+    """The ordering, asserted rather than described.
+
+    The release commits and the page follows it, so an operator channel that
+    is down loses a notice that can never be raised again — the trade named in
+    `console.release_forgotten_tickets` and taken here deliberately. What it
+    must NEVER do is the other thing: hold the customer's line shut because
+    Telegram is unwell. The repair is his, the page is the operator's, and the
+    ticket is still on the operator's queue with its age and its ⏳ mark
+    either way.
+    """
+    class _DeafOperator:
+        def send_admin(self, text: str) -> str:
+            raise RuntimeError("telegram is down")
+
+    wa = FakeWhatsAppClient()
+    deps = _worker_deps(wa)
+    phone = _plus_customer(owner_session, wa, deps)
+    ticket, _code = _forgotten_ticket(owner_session, phone)
+
+    # it does not raise: a housekeeping sweep never takes the message loop
+    # (nor this cycle's watchdog heartbeat) down with it
+    released = _worker_loop().sweep_forgotten_tickets(
+        owner_session, admin_client=_DeafOperator(), now=NOW)
+
+    assert released >= 1
+    assert _ticket_status(owner_engine, ticket) == "released", \
+        "a Telegram outage rolled back the customer's own repair"
+
+
+def test_the_worker_loop_sweeps_forgotten_tickets_every_hour() -> None:
+    """The wiring itself, at the one place it can be read: the hourly block.
+
+    A sweep with a tested function and no call in the loop is the defect this
+    change exists to close, and the loop's `main()` cannot be executed in a
+    test (it polls forever against a live Graph client), so the CALL is
+    asserted from the source. It has to sit inside the hourly branch — one per
+    cycle would be a release sweep every three seconds — and after the sends
+    it must not be able to skip.
+    """
+    import ast
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1]
+              / "scripts" / "run_worker_loop.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+             and isinstance(n.func, ast.Name)
+             and n.func.id == "sweep_forgotten_tickets"]
+    assert len(calls) == 1, "the sweep is called once per hourly pass or not at all"
+    # inside the hourly gate, never in the 3-second body
+    hourly = [n for n in ast.walk(tree) if isinstance(n, ast.If)
+              and "REMINDER_SWEEP_SECONDS" in ast.dump(n.test)]
+    assert len(hourly) == 1
+    assert id(calls[0]) in {id(node) for node in ast.walk(hourly[0])}, \
+        "the ticket sweep runs on the poll cycle, not on the hourly sweep"
 
 
 def test_no_alert_from_this_worker_reverses_on_the_operator_screen() -> None:

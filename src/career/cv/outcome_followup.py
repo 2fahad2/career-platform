@@ -41,6 +41,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from career.arabic import normalize_ar
 from career.db.models import CustomerChannel, OutcomeEvent
 from career.whatsapp.delivery import record_out
 from career.whatsapp.window import WindowState, window_state
@@ -103,9 +104,96 @@ THANKS_OTHER_AR = (
 )
 
 
-def parse_answer(button_id: str | None) -> str | None:
-    """The outcome a tapped button means, or None."""
-    return _ANSWERS.get((button_id or "").strip())
+#: The same three answers as the customer's own typing, keyed on the folded
+#: label. DERIVED from :data:`BUTTONS` and :data:`_ANSWERS` rather than
+#: written out a second time: the labels we show and the labels we accept are
+#: then one object, and a relabelled button cannot leave a stale spelling
+#: behind. `normalize_ar` is what makes «ما ردّوا» and «ما ردوا» one key, and
+#: what drops the 🎉 off «جاني مقابلة» — the customer types the word, not the
+#: emoji.
+_TYPED_ANSWERS: dict[str, str] = {
+    normalize_ar(label): outcome
+    for button_id, label in BUTTONS
+    if (outcome := _ANSWERS.get(button_id)) is not None
+}
+
+
+def parse_answer(
+    reply: str | None, *, question_open: bool = False,
+    tapped: bool | None = None,
+) -> str | None:
+    """The outcome this reply means, or None.
+
+    A machine id — «oc_noreply» — is read when ``tapped`` says the payload
+    carried a button id, and then regardless of ``question_open``: a tap on an
+    old card is still our own card coming back, and whether a question is
+    still open decides only what we SAY back (the caller's
+    :data:`ALREADY_ANSWERED_AR` branch), never whether we understood it.
+
+    AUDIT 2026-08-07 — that used to be «read ALWAYS», justified by «a machine
+    id can only have come from a card we ourselves sent, so it is by
+    construction an answer to this question». The construction does not exist.
+    `whatsapp.worker` computes ``effective = _button_id_of(msg) or text_body``
+    and hands us THAT, so for a plain text message ``reply`` is literally what
+    the customer typed — and a customer who types ``oc_interview`` while a
+    question is open had it recorded through :func:`record_answer` as his
+    answer, which is a §20 datum that can never be re-collected, written from
+    a typed string. Unlikely, and a false invariant is worth removing at the
+    price of one argument.
+
+    The fact lives with the caller and cannot be recovered here: by the time
+    the two are collapsed into one string, «id from the payload» and «the same
+    characters typed by a human» are indistinguishable. So the caller states
+    it. ``tapped=True`` is the payload's button id, ``tapped=False`` is
+    anything a person typed, and ``None`` — the default — means the caller has
+    not been taught to say. ``None`` still reads the id, exactly as before,
+    and logs that it did, because there is one call site left in that state
+    (`whatsapp.worker`, whose fix is a single keyword) and a transitional
+    default that is silent is a transitional default that becomes permanent.
+    When that call site passes ``tapped=``, this arm and this paragraph go.
+
+    A TYPED label — the customer writes «ما ردّوا» instead of tapping — is read
+    only when ``question_open`` is true. Until this parameter existed the
+    typing was read nowhere: `whatsapp.worker` derived its own label map from
+    :data:`BUTTONS` inside the message loop, and before THAT the sentence fell
+    through every branch and opened a لمّاح+ direct-message ticket against the
+    customer — our own question turned into a complaint, and the one §20 datum
+    that can never be re-collected thrown away.
+
+    Two rules keep this from becoming the over-eager reading this file's
+    neighbours have already paid for twice («مساعده» read as a support
+    command, «تسويق، دعم، مبيعات» read as one):
+
+    * **The whole message, or nothing.** Matching is equality on the folded
+      string, never a substring: «ما ردّوا عليّ من الشركة اللي رشحتوها لي» is a
+      sentence for a human, not an answer to a survey, and it stays one.
+    * **Never a question that was not asked.** ``question_open`` is the
+      caller's answer to :func:`pending_job_ref`, and it is PRESERVED rather
+      than replaced — nothing inside a string can tell us that «اعتذروا» is
+      about the job we asked about rather than about a wedding invitation, and
+      answering «مسجّلة عندنا 👍» to someone who wrote it about something else
+      both loses his message and lies to him. It is not defended by the
+      caller's branch order any more, though: the default is the safe reading,
+      so a future call site has to state the fact to get the wider one.
+
+    Deliberately NOT taken here: the session. This stays a pure string
+    function — it is called on every inbound message, and a parser that opens
+    a query is a parser that cannot be used in the cheap position.
+    """
+    value = (reply or "").strip()
+    if tapped is not False:
+        outcome = _ANSWERS.get(value)
+        if outcome is not None:
+            if tapped is None:
+                # No id, no phone, no body — just the fact that a call site
+                # is still relying on the transitional arm.
+                logger.warning(
+                    "outcome: machine id read as an answer without the caller "
+                    "stating it came from a tap")
+            return outcome
+    if not question_open:
+        return None
+    return _TYPED_ANSWERS.get(normalize_ar(value))
 
 
 def _stages(session: Session, tenant_id: uuid.UUID, job_ref: str) -> set[str]:

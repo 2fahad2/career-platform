@@ -33,6 +33,7 @@ from career.db.models import (
     Delivery,
     DiscoveryRun,
     FunnelSession,
+    InboundMessage,
     OnboardingSession,
     OutcomeEvent,
     Subscription,
@@ -319,6 +320,138 @@ TICKET_CLOSED_AR = "✅ أغلقنا التذكرة\n{code}"
 TICKET_ALREADY_AR = "⚪ التذكرة مغلقة أصلًا — لم نغيّر شيئًا\n{code}"
 TICKET_GONE_AR = "⚪ لم نجد هذه التذكرة — قد تكون أُغلقت من شاشة أخرى"
 
+#: ── the forgotten ticket ────────────────────────────────────────────────────
+#: THREE paths refuse to raise a second ticket while one is open for the same
+#: customer — the لمّاح+ direct line (`promises.career_session`), the funnel's
+#: consent stall (`funnel.flow`) and the paid-while-opted-out alert
+#: (`whatsapp.activation_flow`) — and every one of them is right to. A customer
+#: who writes four messages in a row is one human waiting, not four, and paging
+#: per message is how an operator learns to stop reading the channel. (The
+#: «دعم» keyword in `whatsapp.worker` is the exception that proves it: it
+#: dedupes on nothing, because a customer who types the word twice has asked
+#: twice.)
+#:
+#: What none of them has is a way OUT. Nothing closed a ticket but the button
+#: above, and nothing swept a forgotten one — so one ticket left open by
+#: accident silenced that customer's line for as long as it stayed open, and
+#: the ticket kept the age and the ``inbound_message_id`` of the FIRST message
+#: forever: the queue said «since when» and never «about what». The direct
+#: line's own docstring states both as residue
+#: (``promises.career_session.escalate_direct_message``); this is the sweep it
+#: asks for.
+#:
+#: WHAT MAKES A TICKET FORGOTTEN — age alone, deliberately.
+#:
+#: «Age plus no operator action» was the obvious alternative and it is not
+#: available honestly. The tier sells «تلقاني على نفس المحادثة»: the common
+#: route is that the operator answers the customer in WhatsApp from his own
+#: phone, and that route leaves nothing in our tables at all. So an activity
+#: test would report «nobody did anything» about every ticket he handled the
+#: way the store page promises.
+#:
+#: AUDIT 2026-08-07 — that used to say NOTHING he does reaches our tables,
+#: which is a stronger claim than the facts and it is false: `_run_reply`, the
+#: console's own reply box, sends the customer WhatsApp text and writes a
+#: `delivery_messages` row through `record_out(kind=REPLY_KIND)`. The rule
+#: survives the correction because the weaker sentence is the one it needed.
+#: That row carries a tenant and a channel and NO ticket, so at best it says
+#: «this customer was written to», never «THIS ticket was dealt with» — and it
+#: exists only for the replies that went through the console. An activity test
+#: built on it would still be silent about every answer sent from his phone,
+#: and would still be unable to attribute the ones it can see.
+#:
+#: The one action that means «I have dealt with this human» is the close
+#: button, and a ticket still open is precisely the absence of it. Age it is.
+#:
+#: The distinction the age cannot make — unanswered vs merely unnoticed — is
+#: put in the ALERT instead of in the rule: it carries how many messages the
+#: customer has sent since, which separates a person still writing into
+#: silence from one who was answered off-console and left a row behind. It
+#: colours the sentence; it never decides the release.
+TICKET_FORGOTTEN_AFTER = timedelta(hours=48)
+#: `support_events.status`, third value: open, then RELEASED, then resolved.
+#: Not a closure — a released ticket is still owed, still on the screen below,
+#: still carrying its original age, and still waiting for the operator's own
+#: button. What it stops being is a MUTE. The dedupes above all read «status =
+#: open», so this one word is what lets the customer's next message raise a
+#: ticket of its own, with its own age and its own message id.
+#:
+#: Auto-CLOSING was the alternative, and it is the one thing this screen must
+#: never do: «resolved» is a claim that a human was dealt with, and a claim
+#: nobody can make on the operator's behalf. It would also take the customer
+#: off the queue entirely — the promise dropped silently, which is worse than
+#: the mute it was fixing.
+#:
+#: The uniform rule (any kind, not a list of the kinds that dedupe today) is
+#: deliberate: it states one invariant — NO TICKET MUTES ANYTHING FOR LONGER
+#: THAN THIS — that stays true when a fifth dedupe is written tomorrow. A list
+#: of kinds copied from four other modules is a list that rots silently, which
+#: is the failure this sweep exists to end, rebuilt one level up.
+TICKET_RELEASED = "released"
+#: The storm the dedupe exists to prevent is NOT rebuilt, and the arithmetic
+#: is the same as `scripts/alert_unit_failure.sh`'s: a release is a one-way
+#: edge written once per ticket, so it pages at most once per ticket, ever —
+#: and the next ticket for that customer cannot exist until he writes again
+#: AND ages another two days. Ceiling: one page per customer per two days,
+#: each one carrying a different message, a different id and a different age.
+#: Repetition is what gets muted; escalation with a changed number is not.
+#:
+#: The one-way edge is only half of that «ever», and the half it does not
+#: cover is what :func:`release_forgotten_tickets` had to buy with a lock: an
+#: edge written once still pages twice if two transactions read the row open
+#: before either wrote it. The ceiling above is the SELECT's claim as much as
+#: the column's.
+TICKET_FORGOTTEN_ALERT_AR = (
+    "🔁 تذكرة عميل مفتوحة من زمان وما أحد أغلقها\n"
+    "{kind}\n"
+    "{code}\n"
+    "{age}\n"
+    "{traffic}\n"
+    "فتحنا خطه من جديد — أي رسالة جديدة منه ترفع تذكرة وتوصلك\n"
+    "والتذكرة نفسها باقية في القائمة لين تغلقها"
+)
+TICKET_TRAFFIC_SINCE_AR = "وراسلك بعدها مرات عددها: {count}"
+#: No new message since. Said out loud rather than left blank, because it is
+#: the likeliest shape of «you answered him in واتساب and the row stayed».
+TICKET_TRAFFIC_QUIET_AR = "وما راسلك بعدها ولا مرة"
+#: On the screen, under a released ticket.
+TICKET_RELEASED_MARK_AR = "⏳ مفتوحة من زمان — فتحنا خط العميل ومازالت تنتظرك"
+
+#: WHICH message opened the ticket. `inbound_message_id` has been stored since
+#: the direct line shipped and rendered NOWHERE, which is half of «the queue
+#: says since when, never about what». The body is PII and stays out of this
+#: channel forever (§15.13) — what is safe, and what actually answers the
+#: operator's question, is the SHAPE: a customer who wrote to you, versus a
+#: stale card tapped by a thumb. (The worker refuses to escalate a tap today;
+#: tickets raised before that rule are still in this table, and the funnel and
+#: the «دعم» paths still point at messages of every shape.)
+_TICKET_OPENER_AR = {
+    "text": "فتحتها رسالة كتبها العميل",
+    "audio": "فتحتها رسالة صوتية من العميل",
+    "voice": "فتحتها رسالة صوتية من العميل",
+    "image": "فتحتها صورة أرسلها العميل",
+    "video": "فتحتها مقطع أرسله العميل",
+    "document": "فتحتها ملف أرسله العميل",
+    "sticker": "فتحتها ملصق أرسله العميل",
+    "button": "فتحتها ضغطة زر — يمكن ما قصد يراسلك",
+    "interactive": "فتحتها ضغطة زر — يمكن ما قصد يراسلك",
+}
+#: A shape we have no Arabic word for keeps the raw token on a line of its own
+#: — a Latin word inside an Arabic line arrives reversed on his client.
+TICKET_OPENER_OTHER_AR = "فتحتها رسالة من نوع:"
+#: Nothing to point at — the funnel's consent stall, the session SLA, the
+#: paid-while-silenced alert. All three are raised BY US about a customer's
+#: situation rather than about one message, and none of them stores an id.
+#:
+#: A ticket whose message row was deleted underneath it was drafted as a
+#: second sentence here and removed as fiction: the FK is ON DELETE SET NULL,
+#: but the only path that deletes an inbound message is a §12 data deletion,
+#: which deletes `customer_channels` — and support_events cascades from THAT.
+#: The customer's tickets go with his channel, so a ticket pointing at a
+#: vanished message is not a state this system can reach, and a line for it
+#: would be a line no operator will ever see and no test can honestly produce.
+TICKET_OPENER_SYSTEM_AR = "ما فيها رسالة — المنظومة هي اللي فتحتها"
+
 _WESTERN_TO_ARABIC = str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩")
 
 # ── the operator's one free-form reply (audit: «دعم» paged and left them
@@ -547,6 +680,16 @@ def _age_ar(since: datetime | None, now: datetime) -> str:
     return f"منذ {_ar_digits(hours // 24)} يوم"
 
 
+def _opener_lines(opener_type: str | None) -> list[str]:
+    """The shape of the message behind a ticket — never one character of it."""
+    if opener_type is None:
+        return [TICKET_OPENER_SYSTEM_AR]
+    known = _TICKET_OPENER_AR.get(str(opener_type))
+    if known is not None:
+        return [known]
+    return [TICKET_OPENER_OTHER_AR, str(opener_type)]
+
+
 def _tickets_screen(
     session: Session, *, now: datetime
 ) -> tuple[str, Keyboard]:
@@ -564,21 +707,34 @@ def _tickets_screen(
     line and arrives reversed on the operator's client, so the tie is an
     Arabic-Indic numeral (which is what :func:`_ar_digits` is for) and the
     code stays alone on its own line in the body.
+
+    RELEASED tickets are listed here too, and that is the whole reason the
+    release is not a close: the sweep takes a forgotten ticket's power to
+    silence a customer away from it, and takes nothing else — the row keeps
+    its own age, keeps its place at the top of a list ordered oldest-first,
+    and keeps waiting for the one button that means a human was dealt with.
+
+    Each ticket also says WHICH message opened it, in shape only. See
+    :data:`_TICKET_OPENER_AR`: with a dedupe upstream, «a customer wrote to
+    you» and «a thumb hit a card from three months ago» are the same row
+    otherwise, and they are not the same thing to answer.
     """
     rows = session.execute(
         select(SupportEvent.id, Tenant.code, SupportEvent.kind,
-               SupportEvent.created_at)
+               SupportEvent.created_at, SupportEvent.status,
+               InboundMessage.message_type)
         .join(Tenant, Tenant.id == SupportEvent.tenant_id)
-        .where(SupportEvent.status == TICKET_OPEN)
+        .outerjoin(InboundMessage,
+                   InboundMessage.id == SupportEvent.inbound_message_id)
+        .where(SupportEvent.status.in_((TICKET_OPEN, TICKET_RELEASED)))
         .order_by(SupportEvent.created_at)
     ).all()
     lines = [f"{TICKETS_TITLE_AR}: {_ar_digits(len(rows))}"]
     if not rows:
         lines.append(TICKETS_NONE_AR)
     close_buttons: list[tuple[str, str]] = []
-    for number, (ticket_id, code, kind, created_at) in enumerate(
-        rows[:TICKETS_PAGE], start=1
-    ):
+    for number, row in enumerate(rows[:TICKETS_PAGE], start=1):
+        ticket_id, code, kind, created_at, status, opener_type = row
         marker = _ar_digits(number)
         lines.append("")
         # an unknown kind keeps its own line: it is a raw Latin token and a
@@ -587,6 +743,9 @@ def _tickets_screen(
         lines.append(f"{marker} • {known}" if known else f"{marker} •\n{kind}")
         lines.append(str(code))
         lines.append(_age_ar(created_at, now))
+        lines.extend(_opener_lines(opener_type))
+        if status == TICKET_RELEASED:
+            lines.append(TICKET_RELEASED_MARK_AR)
         close_buttons.append((f"✅ إغلاق {marker}", f"v1|tclose|{ticket_id}"))
     if len(rows) > TICKETS_PAGE:
         lines.append("")
@@ -734,7 +893,12 @@ def _run_ticket_close(
         done = TICKET_GONE_AR
     else:
         ticket, code = row
-        if ticket.status != TICKET_OPEN:
+        # RELEASED closes exactly like OPEN. The sweep only took away the
+        # ticket's power to mute the customer; it is still a human waiting,
+        # still on the screen, and the button under it has to work — a listed
+        # ticket whose own button answers «مغلقة أصلًا» is the contradiction
+        # inside one screen that `_transition` was fixed for.
+        if ticket.status not in (TICKET_OPEN, TICKET_RELEASED):
             done = TICKET_ALREADY_AR.format(code=code)
         else:
             ticket.status = TICKET_RESOLVED
@@ -747,6 +911,122 @@ def _run_ticket_close(
             done = TICKET_CLOSED_AR.format(code=code)
     text, keyboard = _tickets_screen(session, now=now)
     return f"{done}\n\n{text}", keyboard
+
+
+def release_forgotten_tickets(
+    session: Session, *, now: datetime
+) -> list[str]:
+    """Take the mute off every ticket nobody has closed in two days.
+
+    Returns one alert per released ticket — the operator's copy, ready for
+    any channel that can send it. Nothing is sent from here: this function is
+    a fact about the ledger, and every caller in this file hands its strings
+    back as :class:`Outcome` s so the runner does the talking.
+
+    THE ACT ITSELF IS THE SUPPRESSION. `scripts/alert_unit_failure.sh` settled
+    the same question yesterday for a wedged unit — repetition gets muted,
+    escalation does not — and paid for a stamp file in /run to keep 283
+    identical messages a day down to 24 that each carry a changed number.
+    Here the stamp is free and durable: «open → released» is a one-way edge on
+    a row, so a ticket pages once. There is no cadence to tune and no state to
+    lose, and the sweep is idempotent at any frequency, which is what makes it
+    safe to call from a screen tap.
+
+    THAT LAST SENTENCE COST A LOCK, and it is worth saying why it did not come
+    free. «Released once, therefore paged once» is an argument about the row,
+    and this function has two callers in two processes: :func:`handle_update`
+    below, on every operator tap, and
+    ``scripts/run_worker_loop.sweep_forgotten_tickets``, hourly. The select
+    read ``status = 'open'`` and the loop then wrote ``released`` keyed on
+    ``id`` alone, with no status predicate between them — so two transactions
+    could read the same open row before either committed, and both would write
+    and both would return an alert. The ROW was never at risk: the edge stayed
+    one-way and the two writers agree on the value. The operator was: he was
+    paged twice about one customer, on the channel whose entire value is that
+    a message on it means something new happened.
+
+    The read is therefore what had to become the claim: ``FOR UPDATE OF
+    support_events SKIP LOCKED``. SKIP and not wait, deliberately — a blocking
+    sweep would hang an operator's screen tap on the worker's open
+    transaction, and the row another sweeper is holding is a row already being
+    released and already being paged. Skipping loses no work; it is the second
+    caller correctly finding nothing left to do. What that buys is exact and
+    no more: at most one alert per ticket, ever, whatever the number of
+    concurrent callers. Proven with two sessions and two transactions rather
+    than argued (``tests/test_admin_console.py``).
+
+    WHAT THIS DOES NOT DO, on purpose: it does not close, does not answer the
+    customer, does not touch `resolved_at`, and does not remove the row from
+    the operator's queue. A forgotten promise is not fixed by being tidied
+    away; it is fixed by the operator, and all this does is stop it costing
+    the customer his line while it waits for him.
+
+    WHERE IT RUNS — both halves, now. From :func:`handle_update`, off the
+    operator's own console traffic, which is honest and was never sufficient:
+    an operator who has stopped opening the watchtower is exactly the operator
+    who forgot the ticket, so the console alone releases fastest for the
+    customers who need it least. The half that runs while he sleeps is
+    ``scripts/run_worker_loop.sweep_forgotten_tickets`` — hourly, in the
+    process that is up at 03:00, whether he taps or not. NOT ``cv.daily_run``:
+    that module's own comments refuse a dependency on the operator console on
+    purpose, and a delivery engine importing screens to send a ticket reminder
+    would be the wrong debt.
+
+    One thing that wiring decided rather than inherited, and the decision is
+    written out where it is made: the release commits and the page is
+    best-effort after it, so a Telegram outage loses a page that can never be
+    raised again (the edge is one-way). That is the same trade
+    ``promises.career_session.escalate_overdue`` already makes with
+    ``escalated_at``, and it is the right one — the ticket stays on this
+    screen either way — but it is a trade, not an oversight.
+    """
+    rows = session.execute(
+        select(SupportEvent, Tenant.code)
+        .join(Tenant, Tenant.id == SupportEvent.tenant_id)
+        .where(SupportEvent.status == TICKET_OPEN,
+               SupportEvent.created_at <= now - TICKET_FORGOTTEN_AFTER)
+        .order_by(SupportEvent.created_at)
+        .with_for_update(skip_locked=True, of=SupportEvent)
+        # `of=SupportEvent` and not a bare FOR UPDATE: the join is only there
+        # to read the TEN code, and locking `tenants` rows would put every
+        # sweep in the way of every other writer that touches a tenant.
+    ).all()
+    alerts: list[str] = []
+    for ticket, code in rows:
+        ticket.status = TICKET_RELEASED
+        # AUDIT 2026-08-07 — the ticket's OWN opening message has to be taken
+        # out by ID, and `received_at > created_at` does not do it. The two
+        # stamps come from two different clocks: the ticket carries the `now`
+        # the worker loop captured BEFORE it opened its transaction, and the
+        # inbound row carries `received_at`'s server default (`func.now()`,
+        # the transaction clock), which is therefore always LATER. So every
+        # لمّاح+ ticket counted the message that opened it and paged «وراسلك
+        # بعدها مرات عددها: ١» about a customer who had written once and
+        # waited — and TICKET_TRAFFIC_QUIET_AR, described as the likeliest
+        # shape of all, was unreachable for the one kind that stores an id.
+        # That is the whole distinction this line exists to draw: a person
+        # still writing into silence versus one answered off-console.
+        counted = [
+            InboundMessage.tenant_id == ticket.tenant_id,
+            InboundMessage.received_at > ticket.created_at,
+        ]
+        if ticket.inbound_message_id is not None:
+            counted.append(InboundMessage.id != ticket.inbound_message_id)
+        since = session.execute(
+            select(func.count()).select_from(InboundMessage).where(*counted)
+        ).scalar_one()
+        kind = _TICKET_KIND_AR.get(str(ticket.kind)) or str(ticket.kind)
+        alerts.append(TICKET_FORGOTTEN_ALERT_AR.format(
+            kind=kind,
+            code=str(code),
+            age=_age_ar(ticket.created_at, now),
+            traffic=(TICKET_TRAFFIC_SINCE_AR.format(count=_ar_digits(since))
+                     if since else TICKET_TRAFFIC_QUIET_AR),
+        ))
+    if alerts:
+        session.flush()
+        logger.warning("released %d forgotten support tickets", len(alerts))
+    return alerts
 
 
 def _today_data(
@@ -1813,10 +2093,49 @@ def handle_update(
         logger.warning("watchtower: ignored update from foreign chat")
         return []
     try:
-        return _dispatch(
+        # BEFORE the screen is drawn, so the tickets list he is about to read
+        # already shows what the sweep just changed. Best-effort in its own
+        # right: a sweep that raised would cost the operator the tap he
+        # actually made, and the ticket it could not release is still on the
+        # screen with its age growing. See :func:`release_forgotten_tickets`
+        # for why running off console traffic is honest but not sufficient.
+        try:
+            alerts = release_forgotten_tickets(session, now=now)
+            # AUDIT 2026-08-07 — COMMITTED HERE, in its own unit of work, and
+            # that is not tidiness. The sweep ran BEFORE `_dispatch`, in the
+            # same transaction, and several dispatch actions end their refusal
+            # path with `session.rollback()` (`_run_career_session` on «no
+            # request on file», `_run_subscription_action` on a refused
+            # transition, `_run_reply` on a failed send). Any one of them threw
+            # the release away — and the alert below was still returned, so the
+            # operator read «فتحنا خطه من جديد» about a ticket that was still
+            # `open` and still muting the customer. Worse than a lost page: the
+            # row stayed releasable, so the SAME page came back on his next
+            # refusing tap, and the next — the exact repetition the one-way
+            # edge was supposed to make impossible. `run_admin_bot` states the
+            # rule this restores: a screen drawn over a rolled-back commit is a
+            # lie the operator acts on.
+            if alerts:
+                session.commit()
+        except Exception:  # noqa: BLE001 — never costs him the tap
+            logger.error("forgotten-ticket sweep failed", exc_info=True)
+            # …and the rollback is what makes that sentence true. A failed
+            # statement leaves the transaction aborted, so without this every
+            # query the screen below runs would raise too and the sweep WOULD
+            # have cost him the tap — by the back door.
+            try:
+                session.rollback()
+            except Exception:  # noqa: BLE001
+                logger.error("sweep rollback failed", exc_info=True)
+            alerts = []
+        outcomes = _dispatch(
             session, update, probes=probes, now=now,
             whatsapp_client=whatsapp_client,
         )
+        # Appended, never prepended: the ack that stops his spinner and the
+        # screen he asked for go first, and the pages arrive behind them.
+        return [*outcomes,
+                *(Outcome(kind="send", text=text) for text in alerts)]
     except Exception:  # noqa: BLE001 — see the docstring: outage vs failed tap
         logger.error("watchtower update failed", exc_info=True)
         try:

@@ -366,10 +366,19 @@ def escalate_overdue(
     joins the queue the operator already works, and stamps ``escalated_at``
     so the ticket is raised once and not once per night.
 
-    The nightly cadence is the honest limit of this: the sweep runs at 04:30
-    Riyadh, so a request that crosses 24 hours at noon is escalated the
-    following night. The ledger's own age is exact and the console reads it
-    live, so the delay is in the ALERT, never in the record.
+    The once-a-day cadence is the honest limit of this, and the HOUR is not
+    the one this docstring named until 2026-08-07. There is no timer of its
+    own: the caller is ``cv.daily_run.sweep_promises``, which rides the
+    delivery day (``engine.cli`` → ``cv.daily_run.run_daily_delivery``) on
+    ``ops/systemd/career-engine-nightly.timer`` — **11:00 Riyadh**, and has
+    been since 2 August, when the run was pulled into the customer's open
+    24-hour WhatsApp window (the timer file carries the reasoning). This said
+    «04:30 … escalated the following night», which was true of the hour before
+    that move and describes nothing now: a request that crosses 24 hours at
+    noon waits until 11:00 the NEXT day. That is a longer wait than the retired
+    sentence promised, which is exactly why a stale number is worse here than
+    no number. The ledger's own age is exact and the console reads it live, so
+    the delay is in the ALERT, never in the record.
     """
     counts = {"escalated": 0, "unticketed": 0}
     rows = session.execute(
@@ -430,12 +439,16 @@ def escalate_overdue(
 #: It lives in this module because it is the same tier, the same human, and
 #: the same ledger discipline as the session above — and because the audit
 #: that found it (STORE-PAGES-AR §6, DEVIATIONS §6) found it in exactly the
-#: same shape: sold, and reachable by nobody. An ACTIVE customer's ordinary
-#: sentence classifies as ``OTHER`` in :mod:`career.whatsapp.inbound`, the
-#: worker answers it with a template, and no operator is ever told it
-#: happened. The only thing that reaches a human is the word «دعم» — which
-#: every 199 customer has too, so what the higher tier actually bought was a
-#: star on somebody else's alert, not access.
+#: same shape: sold, and reachable by nobody. WHAT IT FOUND, in the tense that
+#: now belongs to it: an ACTIVE customer's ordinary sentence classified as
+#: ``OTHER`` in :mod:`career.whatsapp.inbound`, the worker answered it with a
+#: template, and no operator was ever told it happened; the only thing that
+#: reached a human was the word «دعم», which every 199 customer has too — so
+#: what the higher tier actually bought was a star on somebody else's alert,
+#: not access. The CLASSIFICATION is unchanged and does not need to change
+#: (second bullet below); what changed is the worker's last branch, which now
+#: calls :func:`escalate_direct_message`, so an ``OTHER`` from this tier lands
+#: on the operator's tickets screen instead of nowhere.
 #:
 #: THREE decisions are load-bearing here, and each of them is a live incident
 #: this file or its neighbour already paid for once:
@@ -534,13 +547,36 @@ def _mid_flow(session: Session, tenant_id: uuid.UUID) -> bool:
     the only defence». It was not a defence at all. F-ENRICH runs with the
     journey ACTIVE, so the state test above waves it through, and the call
     site's enrichment branch declines the message and falls through whenever
-    ``orchestrator.handle_enrichment`` returns False — which it does, first
-    line, when ``deps.achievement_renderer is None``. That is the SHIPPED
-    default: every deployment without a renderer wired turned a customer's
-    achievement («قللت وقت الإغلاق من عشرة أيام لأربعة») into a support ticket
-    raised against him, and the answer was gone. So the enrichment session is
-    read here, from the journey's own context, where a branch order cannot
-    reach it.
+    ``orchestrator.handle_enrichment`` returns False — at which point a
+    customer's achievement («قللت وقت الإغلاق من عشرة أيام لأربعة») becomes a
+    support ticket raised against him and the answer is gone. So the
+    enrichment session is read here, from the journey's own context, where a
+    branch order cannot reach it.
+
+    CORRECTED 2026-08-07, same day, IN PLACE — because the correction has to
+    travel the way the error did. The paragraph above used to name the reason
+    ``handle_enrichment`` declines: «which it does, first line, when
+    ``deps.achievement_renderer is None``. That is the SHIPPED default.» Both
+    halves were false, and the second was copied out of this docstring into
+    the project's own state before anybody read the wiring.
+
+    * There is no such first line any more. ``handle_enrichment`` decides
+      OWNERSHIP before CAPABILITY: it returns False only when nothing is open
+      (no channel row, no journey, journey not ACTIVE, cursor not ``open``),
+      and the renderer is consulted AFTER that — a missing one now CLOSES the
+      session, answers the customer, and returns True. Which branch owns an
+      enrichment answer no longer depends on what a process has wired.
+    * ``None`` was never shipped. ``scripts/run_worker_loop.py`` — the only
+      construction of ``orchestrator.Deps`` outside the tests — passes
+      ``achievement_renderer=AnthropicAchievementRenderer(...)``, and has
+      since F-ENRICH's own commit; ``None`` is a dataclass default that only
+      tests exercise. So the incident this guard was written against never
+      had a live population.
+
+    The guard stays, and on the narrower ground it actually stands on: ANY
+    decline by ``handle_enrichment`` — not a renderer outage — lands the
+    message in the branch below, and «the call site is ordered correctly» is
+    the assurance this module twice paid for trusting.
 
     What remains uncovered is now ONE thing and it is a tap, not a sentence:
     an outcome-button tap arrives with the journey ACTIVE and nothing open in
@@ -605,14 +641,38 @@ def escalate_direct_message(
     waiting, not a list of sentences, and he answers it by opening the
     conversation, where every message he has not read is sitting in order.
 
-    Two pieces of residue, stated rather than glossed. (1) A second SUBJECT
-    from the same customer raises nothing and moves nothing: the ticket keeps
-    the age and the ``inbound_message_id`` of the FIRST message, so the queue
-    says «since when», never «about what». (2) Nothing closes a ticket except
-    the operator's own button, and nothing sweeps a forgotten one — so a
-    ticket left open indefinitely silences that customer's direct line
-    indefinitely. Both are bounded by the same act (he opens the card, answers
-    the human, closes the ticket) and neither is fixed here.
+    Two pieces of residue, stated rather than glossed.
+
+    (1) A second SUBJECT from the same customer raises nothing and moves
+    nothing: the ticket keeps the age and the ``inbound_message_id`` of the
+    FIRST message. The console renders the SHAPE of that first message from
+    the id (``console._TICKET_OPENER_AR``), so the queue says «since when»
+    and «written or recorded» — never «about what», and never that a second
+    question exists at all until he opens the conversation.
+
+    (2) CORRECTED 2026-08-07, same day. This read «nothing closes a ticket
+    except the operator's own button, and nothing sweeps a forgotten one — so
+    a ticket left open indefinitely silences that customer's direct line
+    indefinitely». The first half stands; the second was true when written and
+    is not true now, and ``telegram.console.release_forgotten_tickets`` cites
+    THIS sentence as the request it fulfils — so left alone it would have two
+    files describing one mechanism in contradictory tenses.
+
+    What sweeps: a ticket still ``open`` after ``console.TICKET_FORGOTTEN_AFTER``
+    (48h) is moved to ``released``. That is not a closure — it is the removal
+    of the MUTE, so the dedupe above stops matching and the customer's next
+    message raises a ticket of its own with its own age and its own id. It
+    runs off the operator's own console traffic and, since the same audit,
+    hourly from ``scripts/run_worker_loop.sweep_forgotten_tickets``, the
+    process that is awake at 03:00 whether he taps or not.
+
+    So the residue is a BOUND rather than an indefinite, and the bound is the
+    honest thing to write down: one forgotten ticket can mute this customer's
+    direct line for up to 48 hours — twice the «الرد خلال ٢٤ ساعة» the same
+    card sells — and no sweep closes the ticket, answers the customer, or
+    measures that 24 hours (DEVIATIONS D26 item 5). All of it is still bounded
+    by the same act (he opens the card, answers the human, closes the ticket)
+    and none of it is fixed here.
 
     The ticket is stamped with the message's own time rather than the
     database's clock, because the age on that screen is the whole promise:

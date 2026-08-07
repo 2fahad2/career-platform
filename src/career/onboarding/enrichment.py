@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import select
@@ -678,6 +678,20 @@ def pick_example(state: dict[str, Any], body: str) -> str | None:
 # ── the hourly sweep: 3-day fallback nudge + 72h auto-close ──────────────────
 
 
+def _opened_at(raw: Any) -> datetime | None:
+    """The cursor's own clock, or None when it carries none we can read.
+
+    A naive value is read as UTC — that is what ``enqueue_enrichment`` writes
+    — because comparing it to an aware ``now`` used to raise TypeError out of
+    the sweep, and the sweep is not alone in its hour: the §20 outcome
+    questions and the weekly report run after it in the same worker block."""
+    try:
+        parsed = datetime.fromisoformat(str(raw or ""))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
 def run_hourly_sweep(
     session: Session,
     *,
@@ -708,12 +722,18 @@ def run_hourly_sweep(
         state = context.get("enrichment") or {}
 
         if state.get("open"):
-            opened_raw = str(state.get("opened_at") or "")
-            try:
-                opened_at = datetime.fromisoformat(opened_raw)
-            except ValueError:
-                opened_at = None
-            if opened_at is not None and opened_at <= now - ENRICH_SESSION_TTL:
+            # A cursor we cannot AGE is a cursor that never closes. What stood
+            # here parsed `opened_at`, and when it was absent or unreadable it
+            # set the age to None and skipped the row — silently, every hour,
+            # for ever. An eternally-open session is not harmless leftover
+            # state: `enqueue_enrichment` refuses while one is open, so that
+            # customer never receives another nudge for any role again, and
+            # `promises.career_session._mid_flow` reads the same flag, so the
+            # لمّاح+ direct line stops escalating anything they write. So an
+            # unusable clock reads as EXPIRED — the only reading that can ever
+            # resolve itself. The close is silent by design (below).
+            opened_at = _opened_at(state.get("opened_at"))
+            if opened_at is None or opened_at <= now - ENRICH_SESSION_TTL:
                 current = state.get("current")
                 if current:
                     row = session.execute(

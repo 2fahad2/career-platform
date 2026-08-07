@@ -537,12 +537,21 @@ def handle_enrichment(
     deps: Deps, now: datetime,
 ) -> bool:
     """F-ENRICH (§13): route a reply while an enrichment session is open.
-    Returns True when handled. No-op (False) when nothing is open or the
-    renderer isn't wired — the caller falls through to its other branches."""
+    Returns True when handled. No-op (False) only when nothing is open —
+    the caller falls through to its other branches.
+
+    AUDIT 2026-08-07: this used to decide its own CAPABILITY before it
+    decided OWNERSHIP. The first line returned False when
+    ``deps.achievement_renderer is None``, so a process without a renderer
+    disowned a message that unambiguously belongs to an open enrichment
+    session: the worker fell through to its generic fallback, the answer we
+    had asked for was discarded, and — worse than the lost answer — the
+    cursor was left ``open``, so the state persisted while the conversation
+    did not. Ownership is decided by the journey's own state below;
+    capability is decided after it, and a flow we cannot run is CLOSED
+    rather than left waiting."""
     from career.onboarding import enrichment as enr
 
-    if deps.achievement_renderer is None:
-        return False
     channel = session.get(CustomerChannel, channel_id)
     if channel is None:
         return False
@@ -578,6 +587,39 @@ def handle_enrichment(
         )
         record_out(session, tenant_id=tenant_id, channel_id=channel.id,
                    kind="interactive", wa_message_id=mid, now=now)
+
+    # CAPABILITY, decided after ownership. The renderer is the one dependency
+    # this flow cannot degrade around — no renderer, no bullet — but the
+    # customer is mid-conversation, so the answer is «we stop», never silence
+    # and never a message that falls through to the worker's generic reply.
+    # The session is CLOSED here rather than left to the 72h sweep: an open
+    # cursor blocks every future nudge for this customer (enqueue_enrichment
+    # refuses while one is open) and keeps promises.career_session._mid_flow
+    # reading True, which suppresses the لمّاح+ direct line they pay for.
+    if deps.achievement_renderer is None:
+        logger.warning(
+            "enrichment reply with no renderer wired — closing the session "
+            "instead of dropping the customer's answer"
+        )
+        if pending and enr.matches(body, enr.OK_LABELS) and role_id is not None:
+            # The draft already exists; promoting it needs no model at all, so
+            # the tap is honoured exactly as it would be with a renderer. A
+            # confirmed bullet must never be thrown away by OUR wiring.
+            enr.confirm_answer(session, tenant_id=tenant_id,
+                               pending_fact_id=uuid.UUID(str(pending)),
+                               role_fact_id=role_id, now=now)
+            enr.close_session(context)
+            _send(enr.ack_thanks(name))
+        else:
+            skipped = enr.matches(body, enr.SKIP_LABELS)
+            if role_id is not None:
+                enr.skip_role(session, tenant_id=tenant_id,
+                              role_fact_id=role_id, now=now)
+            enr.close_session(context)
+            _send(enr._ACK_SKIP if skipped else enr._LETS_MOVE_ON)
+        journey.context = context
+        session.flush()
+        return True
 
     # awaiting confirmation of a rendered bullet
     if pending:

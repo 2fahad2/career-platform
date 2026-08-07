@@ -71,6 +71,111 @@ class JournalAdminClient:
         return "journal"
 
 
+def sweep_forgotten_tickets(
+    session: Session, *, admin_client: TelegramAdminClient, now: datetime,
+) -> int:
+    """Lift the mute off every support ticket nobody has closed in 48h.
+
+    The caller `telegram.console.release_forgotten_tickets` asked for and did
+    not have. It has run off the operator's own console traffic until now,
+    which — as its own docstring says — releases fastest for the customers who
+    need it least: the operator who has stopped opening the watchtower is
+    exactly the operator who forgot the ticket. This process is the one that
+    is awake at 03:00, so the sweep runs here, hourly, whether he taps or not.
+    Idempotent at any frequency: «open → released» is a one-way edge on the
+    row, and the select now takes each row under ``FOR UPDATE … SKIP LOCKED``,
+    so this caller and the console's own tap can read in the same millisecond
+    and the ticket is still released once and paged once.
+
+    ── THE ORDERING, which is a decision and not an inheritance ──────────────
+    The release COMMITS, and the pages go out afterwards, best-effort and one
+    at a time. So a Telegram outage across this minute loses a page that can
+    never be raised again. That is a real loss and it is the right way round:
+
+    * The two halves are not the same kind of thing. The release is the REPAIR
+      — it is what lets the customer's next message raise a ticket and reach a
+      human — and the page is the NOTICE. Ordering the notice first would make
+      the customer's repair conditional on the operator's chat client being
+      up, which is the same shape as the bug being fixed: a mute that outlives
+      its reason because a mechanism nobody could see failed quietly.
+    * Page-then-commit does not even buy what it looks like it buys. If the
+      page lands and the commit then fails, the operator has been told we
+      opened a line that is still shut — a false statement about our own
+      ledger, on the one channel he trusts — and the next sweep releases and
+      pages it again. It trades a lost notice for a wrong notice plus a
+      duplicate, and a wrong notice is the more expensive of the two here,
+      because his screen is the thing he acts on.
+    * A lost page is RECOVERABLE by the operator and a lost release is not.
+      The ticket stays on the console's queue either way, with its original
+      age and its ⏳ released mark: the sweep never closes, never hides, never
+      answers the customer. So the page is a nudge toward a screen that
+      already says the same thing, while the release is the only thing that
+      gives the customer his line back.
+
+    That is also the trade `promises.career_session.escalate_overdue` makes
+    with `escalated_at` and the trade the worker's own «دعم» branch makes with
+    `support_events` — but the precedent is not the argument. The argument is
+    the asymmetry above, and it would point the same way with no precedent at
+    all. Where it would NOT point this way is a page carrying information that
+    exists nowhere else; that is not this page.
+
+    Per-alert `try` rather than one around the loop, for the same reason: a
+    dead socket on the third page must not cost the fourth and fifth ones,
+    which are about different customers.
+
+    ── what a SECOND caller cost, and where it was paid ──────────────────────
+    Adding this caller broke «pages at most once per ticket, ever» down to
+    «once per ticket per sweeper»: `release_forgotten_tickets` read
+    `status = 'open'` and wrote `released` with no status predicate between
+    them, so this process and the admin bot's console tap could both read the
+    same open row before either committed and both page it. The cost was
+    bounded and it was the cheap half — a DUPLICATE NOTICE; the release stayed
+    one-way, the ticket ended released exactly once, and no customer was
+    affected, because the two writers agree on the value they write. It was
+    still worth removing: a channel where a repeat means nothing new is a
+    channel that stops being read.
+
+    Fixed in the module that owns the query rather than worked around here —
+    the select takes its rows with ``FOR UPDATE OF support_events SKIP
+    LOCKED``, so a second sweeper finds nothing to do instead of finding the
+    same work twice. SKIP and not wait matters for THIS caller in particular:
+    a blocking sweep would hold the worker's transaction open behind an
+    operator's screen tap, and this whole function is housekeeping that must
+    never be in anything's way. Two sessions prove it in
+    `tests/test_admin_console.py`.
+
+    The whole sweep is a barrier too. It is housekeeping, and housekeeping
+    that can take the message loop down with it is a bad trade at any hour —
+    the cycle's own watchdog pet lives at the end of the loop body, so an
+    escape from here would cost this cycle its heartbeat as well as its work.
+    Returns the number of tickets RELEASED (pages attempted), never the number
+    of pages delivered — this function cannot honestly claim the second.
+    """
+    from career.telegram.console import release_forgotten_tickets
+
+    try:
+        alerts = release_forgotten_tickets(session, now=now)
+        session.commit()
+    except Exception:  # noqa: BLE001 — a sweep never wedges the worker
+        logger.error("forgotten-ticket sweep failed", exc_info=True)
+        try:
+            session.rollback()
+        except Exception:  # noqa: BLE001 — a dead session must not loop either
+            logger.error("forgotten-ticket rollback failed", exc_info=True)
+        return 0
+    for alert in alerts:
+        try:
+            admin_client.send_admin(alert)
+        except Exception:  # noqa: BLE001 — the release is already committed
+            # ERROR, not WARNING: the journal harvester forwards our ERROR
+            # lines to the watchtower's error screen, and this is the one
+            # notice in the system that cannot be raised a second time.
+            logger.error("forgotten-ticket page failed — the release stands "
+                         "and the ticket is still on the queue, but this "
+                         "page is gone for good", exc_info=True)
+    return len(alerts)
+
+
 def _acquire_single_instance_lock(name: str) -> IO[str]:
     """One instance per service — a second copy exits loudly instead of
     double-processing the queue (audit fix: no lock existed)."""
@@ -327,6 +432,18 @@ def main() -> None:  # pragma: no cover — the C7.8 live runner
                         with Session(engine) as session:
                             weekly.release_weekly_report(
                                 session, restore_to=previous)
+                # A forgotten support ticket mutes the customer it was raised
+                # for — one open ticket per customer is the dedupe, so a ticket
+                # nobody closed silences his direct line for as long as it
+                # stays open. The console released them off the operator's own
+                # taps and nothing released them while he slept. LAST in the
+                # hourly block on purpose: it is housekeeping, and nothing
+                # above it may be skipped by it.
+                with Session(engine) as session:
+                    released = sweep_forgotten_tickets(
+                        session, admin_client=admin, now=now)
+                if released:
+                    logger.info("forgotten tickets released: %d", released)
             # THE LAST STATEMENT OF THE CYCLE, and it has to stay that way.
             # Not in a `finally`, not in the `except` below: the two failures
             # this exists to catch — 100s of a restarting Postgres on

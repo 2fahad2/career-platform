@@ -878,27 +878,84 @@ _BACKED_PROMISES: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
          ("src/career/cv/daily_run.py::MonthlyCapBudget",)),
     ),
     "449": (
+        # «ومعه رقمي أنا» is the same direct line the bullet below sells, in
+        # four words, so it gets the same backer for the same reason.
         ("**العنوان:** كل لمّاح، ومعه رقمي أنا",
          ("src/career/onboarding/policy.py::build_draft_policy",
+          "src/career/promises/career_session.py::escalate_direct_message",
           "src/career/telegram/console.py::_run_reply")),
         ("كل اللي في لمّاح، وزيادة:",
          ("src/career/onboarding/policy.py::build_draft_policy",)),
+        # RE-POINTED 2026-08-07. This row registered `_run_reply` + `_OPERATOR`
+        # and that was the truth AT REGISTRATION: the reply box existed, and
+        # NOTHING carried an ordinary message to it. A لمّاح+ customer who
+        # wrote «عرض وصلك وتبي رأي» was classified OTHER, answered by a robot,
+        # and reached no human at all — so the inbound half of «اكتب لي وقت ما
+        # تحتاج» rested on the operator happening to open a conversation.
+        # `escalate_direct_message` is that half, and it is reached from the
+        # live worker: `whatsapp/worker._handle_message` (last branch) →
+        # `process_pending_whatsapp`, the loop `run_worker_loop.py` runs.
+        # `_OPERATOR` STAYS, and removing it would be the lie this file exists
+        # to stop: the escalation guarantees the message is put in front of a
+        # human, never that one is awake. «بلا انتظار دورك» is still kept by
+        # him, and now it is kept where he can see it.
         ("- **تواصل مباشر معي** — أنا اللي بنيت لمّاح، وتلقاني على نفس "
          "المحادثة. سيرة تبي تراجعها، فرصة محتار فيها، عرض وصلك وتبي رأي: "
          "اكتب لي وقت ما تحتاج، بلا موعد وبلا انتظار دورك",
-         ("src/career/telegram/console.py::_run_reply", _OPERATOR)),
+         ("src/career/promises/career_session.py::escalate_direct_message",
+          "src/career/telegram/console.py::_run_reply", _OPERATOR)),
         ("- **جلسة مسار** واحدة متى طلبتها: وين موقعك، ووين تقدر توصل، وش "
          "ينقصك بالضبط",
          ("src/career/promises/career_session.py::request_session",)),
-        # «اسمك معلّم عندي بنجمة … والرد خلال ٢٤ ساعة» — one line, two halves.
-        # The star is code and is named. The 24 hours is not, and
-        # `support_sla_hours` remains a column nothing reads: the reply comes
-        # from the operator, and the star is what lets him see whose it is
-        # before he answers. Recorded as an operator promise rather than
-        # quietly counted as an implemented one.
+        # «اسمك معلّم عندي بنجمة … والرد خلال ٢٤ ساعة» — one line, FOUR
+        # claims, and they are backed differently on purpose. (THREE, until
+        # 2026-08-07 folded «أشوف رسالتك» into «أعرف مين أنت» and attributed
+        # both to code. They are not the same claim and only one of them is.)
+        #   the star            `views._plan_marked` — code, and always was.
+        #   «أعرف مين أنت»     code SINCE 2026-08-07 and not before: the star
+        #                       marked a customer the operator had already
+        #                       decided to open, and an ordinary message
+        #                       arrived nowhere. `escalate_direct_message`
+        #                       opens the ⭐ ticket, and the tickets screen
+        #                       renders its kind, its TEN code, its age and
+        #                       the SHAPE of the message — which is «أعرف مين
+        #                       أنت قبل ما أرد» literally.
+        #   «أشوف رسالتك»       NOT code, and the attribution written here on
+        #                       2026-08-07 said it was. The code deliberately
+        #                       never shows him the message: §15.13 keeps the
+        #                       body off the admin channel, the screen above
+        #                       carries no word of it, and the media alert
+        #                       says so out loud — «ما نقدر نفتحها من هنا —
+        #                       افتح محادثته في واتساب». He SEES the message in
+        #                       WhatsApp, on his own phone, which is the same
+        #                       place the tier sells («تلقاني على نفس
+        #                       المحادثة») and is `_OPERATOR`'s half. What the
+        #                       code guarantees is that he KNOWS there is one
+        #                       to open; reading it is his act, not ours.
+        #   «الرد خلال ٢٤ ساعة» STILL NOT CODE, and that is why `_OPERATOR`
+        #                       stays. `RESPONSE_SLA_HOURS` is consumed by the
+        #                       career-session path only; the ticket is stamped
+        #                       with the customer's own send time and the
+        #                       screen prints its age, so the duration is
+        #                       VISIBLE — and nothing measures it and nothing
+        #                       raises AT twenty-four hours (DEVIATIONS D26
+        #                       item 5). `console.release_forgotten_tickets`
+        #                       does raise, at FORTY-EIGHT, and it is not this
+        #                       promise's alarm: it fires at twice the sold
+        #                       window and it is about the MUTE the ticket puts
+        #                       on the customer's line, not about the reply he
+        #                       was promised. Visible is not measured, a
+        #                       different clock is not this clock, and the
+        #                       register must not round either one up.
+        # THE TUPLE IS UNCHANGED and it holds. Two code backers that each
+        # genuinely back a part — `_plan_marked` the star, and
+        # `escalate_direct_message` «أعرف مين أنت» — plus `_OPERATOR` for the
+        # two halves no code keeps: seeing the message, and the 24 hours.
+        # Only the attribution above was wrong; nothing about what ships was.
         ("- **اسمك معلّم عندي بنجمة** في لوحتي — أشوف رسالتك وأعرف مين أنت قبل "
          "ما أرد، والرد خلال ٢٤ ساعة",
-         ("src/career/telegram/views.py::_plan_marked", _OPERATOR)),
+         ("src/career/promises/career_session.py::escalate_direct_message",
+          "src/career/telegram/views.py::_plan_marked", _OPERATOR)),
         ("للي وصل مرحلة يكون فيها القرار أثقل من البحث — ويبي إنسانًا يسأله، "
          "لا نظامًا يرد عليه.",
          (_NO_CLAIM,)),
@@ -1543,4 +1600,212 @@ def test_the_whitepaper_states_one_version_number() -> None:
                 if found is not None}
     assert len(set(declared.values())) == 1, (
         f"the whitepaper declares more than one current version: {declared}"
+    )
+
+
+# ── the cross-module claims this repository's prose leans on ────────────────
+#
+# WHY THIS SECTION EXISTS, and why it is five assertions and not fifty.
+#
+# On 2026-08-07 a reviewer found five sentences that were true when written and
+# false when read, and the expensive one was not the wrongest — it was the one
+# other files CITED. `promises/career_session._mid_flow` said
+# `handle_enrichment` returns False «first line, when
+# `deps.achievement_renderer is None` — that is the SHIPPED default», and by
+# the time anybody checked, two agents and a project-state note had copied the
+# claim onward. The check took one `grep`: `scripts/run_worker_loop.py` has
+# passed a real renderer since F-ENRICH's own commit, and the first line had
+# been deleted that morning.
+#
+# The rest of this file already knows the shape of the answer. A promise that
+# names a backer is checked against the tree (`_defines`), not against
+# somebody's memory of the tree. What follows applies the same rule one level
+# up: a handful of PRESENT-TENSE facts about other modules that prose in this
+# repository rests its argument on, each one turned into a question ast can
+# answer.
+#
+# The bar for being here is deliberately high, because a guard for a claim
+# nobody leans on is just a second thing to keep true. A claim earns a test
+# when another module cites it, or a shipped guard's justification depends on
+# it. Prose that merely describes is left as prose — describing is what prose
+# is for, and a test cannot tell a stale description from a wrong one anyway.
+
+
+def _function(path: str, name: str) -> ast.FunctionDef:
+    """The top-level `def name` in that file. Missing is a failure, not None —
+    every caller here is asserting something ABOUT it."""
+    for node in _parsed(pathlib.Path(path)).body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise AssertionError(f"{path} no longer defines {name}()")
+
+
+def _py_files() -> list[pathlib.Path]:
+    return sorted(_SRC.rglob("*.py")) + sorted(pathlib.Path("scripts").glob("*.py"))
+
+
+def _calls_of(name: str) -> set[str]:
+    """Every file under `src/` or `scripts/` that CALLS this function."""
+    callers: set[str] = set()
+    for path in _py_files():
+        for node in ast.walk(_parsed(path)):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            called = (func.id if isinstance(func, ast.Name)
+                      else func.attr if isinstance(func, ast.Attribute) else None)
+            if called == name:
+                callers.add(str(path))
+    return callers
+
+
+def _tests_renderer_missing(node: ast.expr) -> bool:
+    """`deps.achievement_renderer is None`, however it is spelled."""
+    return any(
+        isinstance(inner, ast.Attribute) and inner.attr == "achievement_renderer"
+        for inner in ast.walk(node)
+    )
+
+
+def test_handle_enrichment_decides_ownership_before_capability() -> None:
+    """The claim: an open enrichment session is OWNED by `handle_enrichment`
+    whatever a process has wired, so a missing renderer can no longer make the
+    worker fall through and raise a لمّاح+ support ticket against a customer
+    who was answering our own question.
+
+    Three files rest on it — `promises/career_session._mid_flow` (whose guard
+    is written as a defence-in-depth against branch order and NOT against a
+    renderer), the function's own AUDIT docstring, and
+    `tests/test_onboarding_enrichment.py`'s header. The property is structural
+    and therefore checkable: the renderer test must sit AFTER every `return
+    False`, and the branch it guards must end in `return True` — «we stop and
+    close», never «this is not mine».
+    """
+    body = _function("src/career/onboarding/orchestrator.py",
+                     "handle_enrichment").body
+    disowns = [i for i, statement in enumerate(body)
+               if any(isinstance(node, ast.Return)
+                      and isinstance(node.value, ast.Constant)
+                      and node.value.value is False
+                      for node in ast.walk(statement))]
+    capability = [i for i, statement in enumerate(body)
+                  if isinstance(statement, ast.If)
+                  and _tests_renderer_missing(statement.test)]
+    assert capability, (
+        "handle_enrichment no longer tests deps.achievement_renderer at its "
+        "top level — three docstrings describe a capability gate here"
+    )
+    assert min(capability) > max(disowns), (
+        "handle_enrichment tests CAPABILITY before it has finished deciding "
+        "OWNERSHIP. That is the 2026-08-07 bug exactly: a process without a "
+        "renderer disowns a message that belongs to an open enrichment "
+        "session, the worker falls through, and the customer's answer becomes "
+        "a support ticket raised against him"
+    )
+    tail = body[min(capability)].body[-1]
+    assert (isinstance(tail, ast.Return)
+            and isinstance(tail.value, ast.Constant)
+            and tail.value.value is True), (
+        "the no-renderer branch no longer ends in `return True` — a flow we "
+        "cannot run must be CLOSED and answered, not handed back to the caller"
+    )
+
+
+def test_a_forgotten_ticket_is_swept_by_something_other_than_the_console() -> None:
+    """The claim: a support ticket nobody closes stops muting its customer.
+
+    `promises.career_session.escalate_direct_message` writes down the residue
+    of its own one-open-ticket-per-customer dedupe, and until 2026-08-07 that
+    residue read «nothing sweeps a forgotten one». The sentence was cited BY
+    `telegram/console.release_forgotten_tickets` as the request it fulfils,
+    and it outlived the sweep it asked for by a day.
+
+    The console's own docstring makes the second half load-bearing: releasing
+    off the operator's console traffic «releases fastest for the customers who
+    need it least», because the operator who stopped opening the watchtower is
+    the one who forgot the ticket. So a caller OUTSIDE the console is the
+    thing being asserted — not merely that a sweeper exists.
+    """
+    console = "src/career/telegram/console.py"
+    _function(console, "release_forgotten_tickets")
+    elsewhere = _calls_of("release_forgotten_tickets") - {console}
+    assert elsewhere, (
+        "release_forgotten_tickets is called only from the module that "
+        "defines it. Two docstrings — career_session.escalate_direct_message "
+        "and console.release_forgotten_tickets itself — say a ticket is swept "
+        "while the operator sleeps. Restore the caller, or make both of them "
+        "say that the mute is only lifted by the operator opening the console"
+    )
+
+
+def test_the_only_trigger_of_a_career_session_is_the_operator() -> None:
+    """The claim: `request_session` is pulled by a human, never by a keyword.
+
+    `_open_or_used`'s AUDIT note calls this the strongest argument against a
+    keyword trigger, and it is an argument that only holds while nothing can
+    CANCEL: a false positive would consume the customer's one session for the
+    period with no shipped way to give it back. DEVIATIONS D26 item 13 rests
+    on the same fact and describes the promise as a «pull» rather than a
+    «push» because of it. Both halves are checked here, because it is the
+    PAIR that is safe — an inbound trigger would be defensible the day a
+    cancel path exists, and a cancel path needs its own answer to
+    cancel→request→cancel (that answer is a money question and is Fahad's).
+    """
+    callers = _calls_of("request_session")
+    assert callers == {"src/career/telegram/console.py"}, (
+        f"request_session is called from {sorted(callers)}. It was the "
+        "operator's own button and nothing else, which is what makes a false "
+        "positive impossible rather than merely unlikely — and a request "
+        "recorded in error cannot be cleared by any shipped path"
+    )
+    # SCOPED to the module that owns the ledger, and to calls of `_transition`
+    # by name — not to `to_status=` anywhere in the tree. The first draft of
+    # this assertion swept `src/` and failed on `salla/subscriptions.py`, whose
+    # eleven-state machine uses the SAME keyword about a different table. That
+    # is D26's own lesson arriving inside its own guard: a matching spelling is
+    # not a matching fact. `_transition` is module-private and is the only
+    # writer of `career_sessions.status` after `request_session` creates the
+    # row, so one file is not a shortcut here — it is the whole surface.
+    session_module = pathlib.Path("src/career/promises/career_session.py")
+    written = {
+        keyword.value.id
+        for node in ast.walk(_parsed(session_module))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name) and node.func.id == "_transition"
+        for keyword in node.keywords
+        if keyword.arg == "to_status" and isinstance(keyword.value, ast.Name)
+    }
+    assert written == {"SCHEDULED", "COMPLETED"}, (
+        f"career-session transitions now write {sorted(written)}. If CANCELED "
+        "has acquired a writer, `_open_or_used`'s note is out of date and the "
+        "unbounded cancel→request→cancel loop it names needs its answer first"
+    )
+    assert not _calls_of("_transition") - {str(session_module)}, (
+        "`_transition` is called from outside the module that defines it — it "
+        "is the private writer the note above assumes is private"
+    )
+
+
+def test_the_overdue_sweep_names_the_hour_its_timer_actually_fires() -> None:
+    """The claim: `escalate_overdue` runs once a day, at a stated hour.
+
+    It has no timer of its own — it rides `cv.daily_run.sweep_promises`, which
+    rides the delivery day, which rides `career-engine-nightly.timer`. Four
+    links, none of them visible from the function, and the docstring said
+    «04:30» for the five days after Fahad moved the run to 11:00 so that
+    deliveries would land inside the customer's open WhatsApp window. The
+    number is the whole content of that paragraph: it is how a reader works
+    out that a request breaching at noon waits nearly a day.
+    """
+    timer = pathlib.Path("ops/systemd/career-engine-nightly.timer")
+    fires = re.search(r"OnCalendar=\S+\s+(\d{2}:\d{2})", timer.read_text(encoding="utf-8"))
+    assert fires is not None, f"{timer} no longer states an OnCalendar time"
+    doc = ast.get_docstring(
+        _function("src/career/promises/career_session.py", "escalate_overdue")
+    ) or ""
+    assert fires.group(1) in doc, (
+        f"the nightly timer fires at {fires.group(1)} and "
+        "career_session.escalate_overdue's docstring does not say so. That "
+        "docstring is where the delay between «the promise broke» and «the "
+        "operator was told» is written down, and a retired hour understates it"
     )

@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 from sqlalchemy import text as sql_text
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
 from career.telegram import console, views
@@ -557,11 +558,14 @@ def test_action_nonce_expires_after_five_minutes(
         owner_session.commit()
 
 
-def _seed_subscription(session: Session, tenant_id: str, status: str) -> None:
+def _seed_subscription(
+    session: Session, tenant_id: str, status: str, *,
+    plan: str = "professional",
+) -> None:
     session.execute(sql_text(
         "INSERT INTO subscriptions (id, tenant_id, plan_code, status,"
-        " salla_order_id) VALUES (:i, :t, 'professional', :s, :o)"),
-        {"i": str(uuid.uuid4()), "t": tenant_id, "s": status,
+        " salla_order_id) VALUES (:i, :t, :p, :s, :o)"),
+        {"i": str(uuid.uuid4()), "t": tenant_id, "p": plan, "s": status,
          "o": f"O-{uuid.uuid4()}"})
     session.commit()
 
@@ -2039,6 +2043,7 @@ def test_link_replies_are_direction_pure(
 def _seed_ticket(
     session: Session, tenant_id: str, channel_id: str, *,
     kind: str = "support_request", age_hours: int = 1,
+    inbound_message_id: str | None = None,
 ) -> str:
     """A ticket exactly as the product makes one: «open», never anything else.
 
@@ -2053,9 +2058,10 @@ def _seed_ticket(
     ticket_id = str(uuid.uuid4())
     session.execute(sql_text(
         "INSERT INTO support_events (id, tenant_id, channel_id, kind, status,"
-        " created_at) VALUES (:i, :t, :c, :k, 'open', :a)"),
+        " inbound_message_id, created_at)"
+        " VALUES (:i, :t, :c, :k, 'open', :m, :a)"),
         {"i": ticket_id, "t": tenant_id, "c": channel_id, "k": kind,
-         "a": NOW - timedelta(hours=age_hours)})
+         "m": inbound_message_id, "a": NOW - timedelta(hours=age_hours)})
     session.commit()
     return ticket_id
 
@@ -2375,6 +2381,350 @@ def test_the_tickets_screen_is_pii_free_and_direction_pure(
     finally:
         _drop_tickets(owner_session, t1)
         _clear_delivery(owner_session, t1)
+
+
+# ── the forgotten ticket: a mute nobody could ever lift ──────────────────────
+
+
+def _seed_inbound(
+    session: Session, tenant_id: str, channel_id: str, *,
+    message_type: str = "text", when: datetime = NOW,
+) -> str:
+    inbound_id = str(uuid.uuid4())
+    session.execute(sql_text(
+        "INSERT INTO inbound_messages (id, tenant_id, channel_id,"
+        " wa_message_id, message_type, text_body, classification, payload,"
+        " received_at) VALUES (:i, :t, :c, :w, :m, :b, 'other', '{}', :r)"),
+        {"i": inbound_id, "t": tenant_id, "c": channel_id,
+         "w": f"wamid.{uuid.uuid4()}", "m": message_type,
+         "b": "أبي رأيك في عرض وظيفي وصلني", "r": when})
+    session.commit()
+    return inbound_id
+
+
+def _drop_inbound(session: Session, *tenant_ids: str) -> None:
+    session.rollback()
+    for tenant_id in tenant_ids:
+        session.execute(sql_text(
+            "DELETE FROM inbound_messages WHERE tenant_id = :t"),
+            {"t": tenant_id})
+    session.commit()
+
+
+def _phone_of(session: Session, channel_id: str) -> str:
+    return str(session.execute(sql_text(
+        "SELECT phone_e164 FROM customer_channels WHERE id = :c"),
+        {"c": channel_id}).scalar_one())
+
+
+def _ticket_status(session: Session, ticket_id: str) -> str:
+    session.rollback()
+    return str(session.execute(sql_text(
+        "SELECT status FROM support_events WHERE id = :i"),
+        {"i": ticket_id}).scalar_one())
+
+
+def _direct_line(session: Session, tenant_id: str, channel_id: str) -> str:
+    """What the لمّاح+ direct line does with this customer's next message."""
+    from career.promises import career_session
+
+    return career_session.escalate_direct_message(
+        session, tenant_id=uuid.UUID(tenant_id),
+        channel_id=uuid.UUID(channel_id), now=NOW,
+    )
+
+
+def test_a_forgotten_ticket_stops_silencing_the_customers_direct_line(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """The residue `escalate_direct_message` wrote down and could not close.
+
+    ONE open ticket per customer is right — four messages in a row are one
+    human waiting — but nothing ever swept a forgotten one, so a ticket left
+    open by accident silenced that customer's direct line for as long as it
+    stayed open, which was forever. Here the ticket is two days old: the line
+    reopens, the operator is told once, and the ticket is neither closed nor
+    hidden.
+    """
+    import re
+
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    channel = _seed_channel(owner_session, t1)
+    _seed_subscription(owner_session, t1, "ACTIVE", plan="executive")
+    try:
+        opener = _seed_inbound(owner_session, t1, channel,
+                               when=NOW - timedelta(hours=72))
+        ticket = _seed_ticket(
+            owner_session, t1, channel, kind="executive_direct_message",
+            age_hours=72, inbound_message_id=opener,
+        )
+        # he wrote twice more into the silence
+        _seed_inbound(owner_session, t1, channel, when=NOW - timedelta(hours=5))
+        _seed_inbound(owner_session, t1, channel, when=NOW - timedelta(hours=2))
+
+        # before: his next message reaches nobody
+        assert _direct_line(owner_session, t1, channel) == "already_open"
+        owner_session.rollback()
+
+        outcomes = handle_update(
+            owner_session, _msg(ADMIN, "/start"), admin_chat_id=ADMIN,
+            probes=FakeProbes(), now=NOW,
+        )
+        owner_session.commit()
+
+        pages = [o for o in outcomes if o.kind == "send"
+                 and "🔁" in o.text]
+        assert len(pages) == 1, [o.text for o in outcomes]
+        page = pages[0].text
+        assert code in page
+        assert "منذ ٣ يوم" in page
+        assert "وراسلك بعدها مرات عددها: ٢" in page
+        # §15.13 + the bidi rule: TEN code only, and no Latin inside Arabic
+        assert _phone_of(owner_session, channel) not in page
+        for line in page.splitlines():
+            if re.search(r"[؀-ۿ]", line):
+                assert not re.search(r"[A-Za-z0-9]", line), line
+
+        # the ticket is released — not closed, not hidden
+        assert _ticket_status(owner_session, ticket) == console.TICKET_RELEASED
+        screen = _tickets(owner_session).text
+        assert code in screen
+        assert console.TICKET_RELEASED_MARK_AR in screen
+
+        # after: the same message now reaches the operator
+        assert _direct_line(owner_session, t1, channel) == "escalated"
+        owner_session.rollback()
+
+        # …and it pages ONCE, ever: a second sweep releases nothing new
+        again = handle_update(
+            owner_session, _msg(ADMIN, "/start"), admin_chat_id=ADMIN,
+            probes=FakeProbes(), now=NOW + timedelta(hours=1),
+        )
+        owner_session.commit()
+        assert not [o for o in again if "🔁" in o.text]
+
+        # the operator's own button still closes it
+        assert "أغلقنا التذكرة" in _close_ticket(owner_session, ticket)
+        assert _ticket_status(owner_session, ticket) == console.TICKET_RESOLVED
+    finally:
+        _drop_tickets(owner_session, t1)
+        _drop_inbound(owner_session, t1)
+        _drop_subscriptions(owner_session, t1)
+        _clear_delivery(owner_session, t1)
+
+
+def test_the_queue_says_which_message_opened_each_ticket(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """`inbound_message_id` was stored from the first day and rendered
+    nowhere, so the queue said «since when» and never «about what». The body
+    is PII and stays out (§15.13); the SHAPE is what tells a customer who
+    wrote to you from a thumb on a card three months old."""
+    t1, t2 = two_tenants
+    channel1 = _seed_channel(owner_session, t1)
+    channel2 = _seed_channel(owner_session, t2)
+    try:
+        wrote = _seed_inbound(owner_session, t1, channel1)
+        _seed_ticket(owner_session, t1, channel1, age_hours=3,
+                     inbound_message_id=wrote)
+        tapped = _seed_inbound(owner_session, t2, channel2,
+                               message_type="interactive")
+        _seed_ticket(owner_session, t2, channel2, age_hours=2,
+                     inbound_message_id=tapped)
+        text = _tickets(owner_session).text
+
+        assert console._TICKET_OPENER_AR["text"] in text
+        assert console._TICKET_OPENER_AR["interactive"] in text
+        # a system-raised ticket says so rather than pretending to a message
+        _seed_ticket(owner_session, t1, channel1,
+                     kind="career_session_overdue", age_hours=1)
+        assert console.TICKET_OPENER_SYSTEM_AR in _tickets(owner_session).text
+        # There is no «its message was deleted» line, and this is why: a §12
+        # deletion removes the customer's channel, and support_events cascades
+        # from the channel — so the ticket goes with the message rather than
+        # outliving it. A branch for the other case would be a state only a
+        # test could produce.
+        owner_session.execute(sql_text(
+            "DELETE FROM inbound_messages WHERE id = :i"), {"i": wrote})
+        owner_session.commit()
+        assert console.TICKET_OPENER_SYSTEM_AR in _tickets(owner_session).text
+    finally:
+        _drop_tickets(owner_session, t1, t2)
+        _drop_inbound(owner_session, t1, t2)
+        _clear_delivery(owner_session, t1)
+        _clear_delivery(owner_session, t2)
+
+
+def test_the_traffic_line_never_counts_the_message_that_opened_the_ticket(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """ADVERSARIAL 2026-08-07, in the production order of operations.
+
+    `escalate_direct_message` stamps the ticket with the `now` the worker loop
+    captured before it opened its transaction; `inbound_messages.received_at`
+    is `server_default=func.now()`, the transaction clock, which is later. So
+    `received_at > created_at` matched the ticket's OWN opener and the alert
+    told the operator the customer had written once SINCE — about a customer
+    who had written once and then waited.
+    """
+    from career.db.models import InboundMessage
+    from career.promises import career_session as _cs
+
+    t1, _ = two_tenants
+    channel = _seed_channel(owner_session, t1)
+    _seed_subscription(owner_session, t1, "ACTIVE", plan="executive")
+    try:
+        now = datetime.now(UTC)          # the worker's `now`, captured first
+        inbound = InboundMessage(
+            id=uuid.uuid4(), tenant_id=uuid.UUID(t1),
+            channel_id=uuid.UUID(channel),
+            wa_message_id=f"wamid.{uuid.uuid4()}", message_type="text",
+            text_body="أبي رأيك في عرض وظيفي وصلني", classification="other",
+            payload={}, processed_at=now,
+        )
+        owner_session.add(inbound)
+        owner_session.flush()            # …and only now does the clock start
+        assert _cs.escalate_direct_message(
+            owner_session, tenant_id=uuid.UUID(t1),
+            channel_id=uuid.UUID(channel), now=now,
+            inbound_message_id=inbound.id,
+        ) == "escalated"
+        owner_session.commit()
+
+        alerts = console.release_forgotten_tickets(
+            owner_session, now=now + timedelta(hours=49))
+        owner_session.commit()
+        assert len(alerts) == 1
+        assert console.TICKET_TRAFFIC_QUIET_AR in alerts[0], alerts[0]
+    finally:
+        owner_session.rollback()
+        _drop_tickets(owner_session, t1)
+        _drop_inbound(owner_session, t1)
+        _drop_subscriptions(owner_session, t1)
+        _clear_delivery(owner_session, t1)
+
+
+def test_a_release_the_operators_own_tap_rolled_back_is_never_paged(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """ADVERSARIAL 2026-08-07. The sweep runs at the top of `handle_update`,
+    inside the transaction `_dispatch` is about to use — and several dispatch
+    actions END on `session.rollback()`: `_run_career_session` when there is
+    no request on file, `_run_subscription_action` on a refused transition,
+    `_run_reply` on a failed send. Each of them threw the release away while
+    the alert was still returned, so the operator read «فتحنا خطه من جديد»
+    about a ticket that was still `open` and still muting the customer.
+
+    And it did not stop at one wrong page. The row stayed releasable, so the
+    same ticket was released and paged again on his next refusing tap, and
+    again after that — the repetition the «one-way edge» was supposed to make
+    structurally impossible, rebuilt by the caller.
+
+    Driven through the operator's real two taps on a real refusing action.
+    """
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    channel = _seed_channel(owner_session, t1)
+    _seed_subscription(owner_session, t1, "ACTIVE", plan="executive")
+    try:
+        ticket = _seed_ticket(
+            owner_session, t1, channel, kind="executive_direct_message",
+            age_hours=72,
+        )
+        # «تم التنسيق للجلسة» with no session request on file — the refusal
+        # path rolls back.
+        first = handle_update(
+            owner_session, _cbq(ADMIN, f"v1|act|{code}|cs_scheduled"),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW)
+        second = handle_update(
+            owner_session, _cbq(ADMIN, first[1].keyboard[0][0][1]),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW)
+        assert console.SESSION_NO_REQUEST_AR.format(code=code) in second[1].text
+
+        paged = [o for o in (*first, *second)
+                 if o.kind == "send" and "🔁" in o.text]
+        assert len(paged) == 1, [o.text for o in (*first, *second)]
+        # …and what he was told is TRUE of the ledger he acts on.
+        assert _ticket_status(owner_session, ticket) == console.TICKET_RELEASED
+
+        # the mute is really gone: his next message reaches a human
+        assert _direct_line(owner_session, t1, channel) == "escalated"
+        owner_session.rollback()
+
+        # and no later refusing tap pages it a second time
+        third = handle_update(
+            owner_session, _cbq(ADMIN, f"v1|act|{code}|cs_scheduled"),
+            admin_chat_id=ADMIN, probes=FakeProbes(),
+            now=NOW + timedelta(hours=1))
+        assert not [o for o in third if "🔁" in o.text]
+    finally:
+        owner_session.rollback()
+        _drop_tickets(owner_session, t1)
+        _drop_subscriptions(owner_session, t1)
+        _clear_delivery(owner_session, t1)
+
+
+def test_two_concurrent_sweeps_page_one_forgotten_ticket_exactly_once(
+    owner_engine: Engine, owner_session: Session,
+    two_tenants: tuple[str, str],
+) -> None:
+    """ADVERSARIAL 2026-08-07 — the second sweeper, in two real transactions.
+
+    `release_forgotten_tickets` has two callers in two processes: the admin
+    bot runs it on every operator tap (`handle_update`) and
+    `scripts/run_worker_loop.sweep_forgotten_tickets` runs it hourly in the
+    worker. Its select read `status = 'open'` and its loop then wrote
+    `released` keyed on `id` with no status predicate, so a transaction that
+    read before the other committed still wrote and still returned an alert:
+    ONE customer, TWO «🔁» pages, on the channel whose whole value is that a
+    message on it means something new happened. Both docstrings called that
+    impossible.
+
+    NO THREADS, and that is the point of the test rather than a convenience.
+    `FOR UPDATE … SKIP LOCKED` never waits, so the interleaving can be built
+    by hand: session A takes the row and holds it open, session B sweeps in
+    the same thread and must find nothing. There is no timing window to lose,
+    so this cannot become a test that passes because the machine was busy.
+
+    `lock_timeout` is the safety valve, not the subject. WITHOUT the locking
+    clause B's select happily returns the row and B's UPDATE then blocks on
+    A's uncommitted write — a hang, which is a rotten way for a suite to
+    report a defect. With the timeout it is a fast, legible failure; with the
+    fix the timeout is never reached, because SKIP LOCKED does not wait.
+    """
+    t1, _ = two_tenants
+    channel = _seed_channel(owner_session, t1)
+    try:
+        ticket = _seed_ticket(owner_session, t1, channel, age_hours=72)
+        owner_session.commit()
+
+        other = Session(owner_engine)
+        try:
+            # A: the hourly worker sweep. Reads, releases, still uncommitted.
+            first = console.release_forgotten_tickets(other, now=NOW)
+            assert len(first) == 1, first
+            assert "🔁" in first[0]
+
+            # B: the operator taps the console a millisecond later.
+            owner_session.execute(sql_text("SET LOCAL lock_timeout = '3s'"))
+            second = console.release_forgotten_tickets(owner_session, now=NOW)
+            assert second == [], f"{len(second) + 1} pages for one ticket"
+
+            other.commit()
+        finally:
+            other.rollback()
+            other.close()
+
+        # the release itself is untouched by the skip: exactly once, one-way.
+        assert _ticket_status(owner_session, ticket) == console.TICKET_RELEASED
+        # …and once A has committed, B's next sweep has genuinely nothing to
+        # do — the skip deferred no work, because the row is no longer open.
+        assert console.release_forgotten_tickets(
+            owner_session, now=NOW + timedelta(hours=1)) == []
+    finally:
+        owner_session.rollback()
+        _drop_tickets(owner_session, t1)
 
 
 # ── one product, one Arabic name, on every screen ────────────────────────────
