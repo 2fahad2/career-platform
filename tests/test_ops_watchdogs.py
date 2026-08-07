@@ -7,6 +7,7 @@ import ast
 import http.server
 import os
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -800,33 +801,138 @@ def _expand(value: str, unit: str) -> str:
                  .replace("%%", "%"))
 
 
-def _exec_shape(spec: str) -> str:
-    """A repo ExecStopPost= line → the two things that must survive the deploy.
+#: An Exec* command, reduced to the three things a unit file actually asks for:
+#: the binary systemd will execute, the argument vector it will hand it, and
+#: whether a non-zero exit is allowed to pass. Everything else systemd prints
+#: alongside them is runtime state.
+_ExecRecord = tuple[str, tuple[str, ...], bool]
+
+#: The fields systemd interleaves into every Exec* record that describe what the
+#: process DID on its last run, not what the unit file asked for. They move on
+#: their own — a restart changes `pid`, a stop changes `status` — so a
+#: comparison that reads them reports drift for a host nobody touched.
+_EXEC_RUNTIME_FIELDS = frozenset({"start_time", "stop_time", "pid", "code", "status"})
+
+#: systemd's spellings of «the leading `-`», by property variant and version:
+#: the plain `ExecStopPost=` prints `ignore_errors=yes|no`, the structured
+#: `ExecStopPostEx=` prints it inside `flags=` as `ignore-failure`. Both are
+#: accepted, and `ignore_exit_status` with them, because THIS check was red for
+#: a real deploy on the strength of guessing one spelling and meeting another —
+#: see TestExecPropertiesAreComparedOnMeaning for the incident.
+_EXEC_IGNORE_KEYS = ("ignore_errors", "ignore_exit_status")
+_EXEC_IGNORE_FLAG = "ignore-failure"
+
+#: One `{ … }` record. systemd concatenates several when a unit carries several
+#: lines of the same directive, so this is findall, never search.
+_EXEC_RECORD_RE = re.compile(r"\{(.*?)\}", re.S)
+
+
+def _exec_words(value: str) -> tuple[str, ...]:
+    """Split a command line the way systemd does for the cases these units use.
+
+    `shlex` because systemd honours quotes in Exec lines; the fallback because a
+    live argv[] is re-joined by systemd WITHOUT re-quoting, so a pathological
+    argument can come back unbalanced and an exception here would read as a
+    crash rather than as drift.
+    """
+    try:
+        return tuple(shlex.split(value))
+    except ValueError:
+        return tuple(value.split())
+
+
+def _exec_repo_record(spec: str) -> tuple[_ExecRecord, ...]:
+    """A repo `ExecStopPost=` line → the canonical record(s).
 
     The leading `-` is not decoration: without it a failing alert script turns
-    the unit itself into a failure, and the unit comment says so. systemd
-    renders it as `ignore_exit_status=yes`, so it is comparable rather than
-    merely present.
+    the unit itself into a failure, and both unit comments say so. It is carried
+    as a BOOLEAN rather than as systemd's text for it, which is the whole point
+    of this pair of functions — see _exec_live_records().
     """
-    if not spec:
-        return ""
-    ignore = "no"
-    body = spec
+    body = spec.strip()
+    if not body:
+        return ()
+    ignore = False
+    argv0_given = False
     while body and body[0] in _EXEC_PREFIXES:
-        if body[0] == "-":
-            ignore = "yes"
+        ignore = ignore or body[0] == "-"
+        # `@` means the token after the path is argv[0] rather than an argument.
+        argv0_given = argv0_given or body[0] == "@"
         body = body[1:]
-    return f"{body.split()[0] if body.split() else ''} ignore_exit_status={ignore}"
+    words = _exec_words(body)
+    if not words:
+        return ()
+    path = words[0]
+    return ((path, words[1:] if argv0_given else words, ignore),)
 
 
-def _live_exec_shape(rendered: str) -> str:
-    """systemd prints ExecStopPost= as `{ path=… ; argv[]=… ; ignore_exit_status=… }`."""
-    if not rendered.strip():
-        return ""
-    path = re.search(r"path=(\S+)", rendered)
-    ignore = re.search(r"ignore_exit_status=(\S+)", rendered)
-    return (f"{path.group(1) if path else '?'} "
-            f"ignore_exit_status={ignore.group(1) if ignore else '?'}")
+def _exec_live_records(rendered: str) -> tuple[_ExecRecord, ...]:
+    """systemd's rendering of an Exec* property → the same canonical record(s).
+
+    systemd prints a command as a structured record:
+
+        { path=… ; argv[]=… ; ignore_errors=yes ; start_time=… ; pid=… ; … }
+
+    Only the first three fields are configuration. Comparing the printed string
+    against a unit-file line can never work — they are two spellings of one
+    fact — so both sides are parsed to (path, argv, ignore) and the comparison
+    happens there.
+    """
+    records: list[_ExecRecord] = []
+    for body in _EXEC_RECORD_RE.findall(rendered):
+        fields: dict[str, str] = {}
+        for field in body.split(" ; "):
+            key, sep, value = field.partition("=")
+            if sep:
+                fields[key.strip()] = value.strip()
+        records.append((
+            fields.get("path", ""),
+            _exec_words(fields.get("argv[]", "")),
+            _exec_ignores_errors(fields),
+        ))
+    return tuple(records)
+
+
+def _exec_ignores_errors(fields: dict[str, str]) -> bool:
+    for key in _EXEC_IGNORE_KEYS:
+        if key in fields:
+            return fields[key] == "yes"
+    return _EXEC_IGNORE_FLAG in fields.get("flags", "").split()
+
+
+def _exec_understood(rendered: str) -> bool:
+    """Did we recognise systemd's spelling of the ignore flag at all?
+
+    A rename in some future systemd would make every `-` look absent and turn
+    this check red for a correct host — which is exactly the failure being fixed
+    here. TestExecPropertiesAreComparedOnMeaning asserts this against the real
+    machine so the next rename fails with its own name on it instead of
+    masquerading as ExecStopPost drift.
+    """
+    return all(
+        any(key in body for key in _EXEC_IGNORE_KEYS) or "flags=" in body
+        for body in _EXEC_RECORD_RE.findall(rendered)
+    )
+
+
+def _render_exec(records: tuple[_ExecRecord, ...]) -> str:
+    """A record back in the spelling a human would type into the unit file.
+
+    The fix for real Exec drift is always an edit to a unit file, so that is the
+    form the drift message prints — `-/path/script.sh career-worker.service`
+    rather than the eighty characters of runtime state systemd wraps it in.
+    Display only: the comparison is on the records themselves.
+    """
+    if not records:
+        return "<unset>"
+    out = []
+    for path, argv, ignore in records:
+        prefix = "-" if ignore else ""
+        if argv[:1] == (path,):
+            out.append(" ".join((prefix + path, *argv[1:])).strip())
+        else:
+            out.append(" ".join((prefix + "@" + path, *argv)).strip())
+    return " ; ".join(out)
 
 
 def _timespan(spec: str) -> float:
@@ -866,8 +972,25 @@ def _compare(kind: str, repo: str, live: str) -> bool:
     if kind == "units":
         return set(repo.split()) == set(live.split())
     if kind == "exec":
-        return _exec_shape(repo) == _live_exec_shape(live)
+        # Both sides parsed to (path, argv, ignore) — see _exec_live_records().
+        # The tuples, not their rendering: a comparison on _render_exec() output
+        # would be a comparison on a display string, which is the class of
+        # mistake this branch exists to have stopped making.
+        return _exec_repo_record(repo) == _exec_live_records(live)
     return repo == live
+
+
+def _for_humans(kind: str, repo: str, live: str) -> tuple[str, str]:
+    """The pair of values a drift message should print.
+
+    Raw for everything whose printed form IS its meaning; normalised for the
+    kinds where systemd's rendering buries the difference — an operator reading
+    this at 03:00 needs to see which script and which flag, not `pid=0 ;
+    code=(null) ; status=0/0`.
+    """
+    if kind == "exec":
+        return _render_exec(_exec_repo_record(repo)), _render_exec(_exec_live_records(live))
+    return repo, live
 
 
 def live_unit_drift(
@@ -966,8 +1089,9 @@ def live_unit_drift(
             repo_value = _expand(repo_directives.get(directive, fallback), name)
             live_value = live.get(prop, "")
             if not _compare(kind, repo_value, live_value):
+                shown_repo, shown_live = _for_humans(kind, repo_value, live_value)
                 differences.append(
-                    f"{prop}: repo={repo_value!r} live={live_value!r}"
+                    f"{prop}: repo={shown_repo!r} live={shown_live!r}"
                 )
         if not differences:
             continue
@@ -1404,6 +1528,16 @@ _MANAGER = {
 #: What `systemctl show career-worker` prints on a host that IS running the
 #: repository's unit. Hand-written on purpose: deriving it from the same
 #: normalisers the check uses would make the green case prove nothing.
+#:
+#: CORRECTED 2026-08-07, and the correction is the whole lesson. The
+#: ExecStopPost line below used to read `ignore_exit_status=yes` — a spelling no
+#: systemd has ever printed. Hand-writing the fixture was right; hand-writing it
+#: from imagination was not. This table said the deploy was fine while the real
+#: machine reported `ignore_errors=yes` and the gate refused, so the fixture
+#: certified the very bug it existed to catch. Every value here is now copied
+#: verbatim from `systemctl show career-worker.service` on the live host
+#: (systemd 255.4-1ubuntu8.16), runtime fields included, precisely because those
+#: are what the parser must learn to ignore.
 _WORKER_DEPLOYED = {
     "Type": "notify",
     "Restart": "always",
@@ -1416,7 +1550,8 @@ _WORKER_DEPLOYED = {
     "ExecStopPost": (
         "{ path=/root/career/scripts/alert_unit_failure.sh ; "
         "argv[]=/root/career/scripts/alert_unit_failure.sh career-worker.service ; "
-        "ignore_exit_status=yes ; start_time=[n/a] }"
+        "ignore_errors=yes ; start_time=[n/a] ; stop_time=[n/a] ; "
+        "pid=0 ; code=(null) ; status=0/0 }"
     ),
     "NeedDaemonReload": "no",
     "LoadState": "loaded",
@@ -1609,6 +1744,252 @@ class TestTheDriftCheckItself:
         drift, _tolerated, _skip = _synthetic_drift(host)
         assert any("WatchdogUSec" in line and "loaded with something else" in line
                    for line in drift), drift
+
+
+# ── Exec* properties: compared on what they MEAN ─────────────────────────────
+#
+# THE FALSE RED OF 2026-08-07. A correct deploy landed, systemd loaded both
+# units exactly as written, and scripts/deploy_preflight.sh refused:
+#
+#   career-worker.service: systemd is loaded with something else — ExecStopPost:
+#     repo='-/root/career/scripts/alert_unit_failure.sh career-worker.service'
+#     live='{ path=/root/career/scripts/alert_unit_failure.sh ;
+#             argv[]=/root/career/scripts/alert_unit_failure.sh career-worker.service ;
+#             ignore_errors=yes ; start_time=[n/a] ; stop_time=[n/a] ;
+#             pid=0 ; code=(null) ; status=0/0 }'
+#
+# Those two lines say the SAME THING. The unit file's leading `-` is what
+# systemd reports as `ignore_errors=yes`; `%n` has been expanded to the unit
+# name; and start_time/stop_time/pid/code/status are what the process did last
+# time, not what the unit file asked for. Nothing had drifted.
+#
+# The checker was reading `ignore_exit_status=`, a field systemd does not print,
+# so the flag came back `?` and every correctly deployed host was drift.
+#
+# WHY THAT IS WORTH MORE THAN A CORRECTED REGEX. A drift check that cries wolf
+# about a correct machine is a drift check somebody deletes at 02:00 — this
+# file's own history says so — but the failure mode of a lazy fix is worse.
+# Loosening the comparison until the real host goes quiet (matching only the
+# script name, or dropping ExecStopPost from SERVICE_PROPERTIES) would silence
+# the three drifts this property exists to catch: a hook pointed at a DIFFERENT
+# script, a hook that lost its `-` (so a Telegram outage would fail the service
+# it was reporting on), and a hook handed a different argument (so the alert
+# names the wrong unit). All three are tested below, in both directions.
+#
+# THE RULE, and it is the rule the rest of _compare() already follows: a
+# property is compared on its MEANING, never on its rendering. `time` parses
+# `5min` and `300` to the same number; `watchdog` collapses systemd's two
+# spellings of «disarmed»; `units` compares sets. `exec` now parses both sides
+# to (path, argv, ignore_errors) and compares THAT. What was rejected: a regex
+# that strips the runtime tail — it would still have compared two spellings of
+# one fact, and it would still have ignored argv entirely, which the old code
+# did and which is why a changed argument was invisible.
+#
+# NOT CHANGED, checked and left alone: WatchdogUSec, RestartUSec,
+# TimeoutStartUSec and StartLimitIntervalUSec are already compared on meaning
+# through _seconds(), which reads the `5min` / `3min` / `10min` this host prints;
+# StartLimitBurst is compared as an int; OnFailure as a set after %n expansion.
+# ExecStopPost was the only structured record among the properties this checker
+# reads. (ExecStart is structured too, and is NOT read here — adding it is a
+# separate decision, not a bug fix.)
+
+
+class TestExecPropertiesAreComparedOnMeaning:
+    """Both directions. Neither half is worth anything without the other."""
+
+    #: Copied verbatim from `systemctl show career-worker.service -p ExecStopPost`
+    #: on the live host, 2026-08-07, systemd 255.4-1ubuntu8.16 — the exact string
+    #: that produced the false red.
+    LIVE = (
+        "{ path=/root/career/scripts/alert_unit_failure.sh ; "
+        "argv[]=/root/career/scripts/alert_unit_failure.sh career-worker.service ; "
+        "ignore_errors=yes ; start_time=[n/a] ; stop_time=[n/a] ; "
+        "pid=0 ; code=(null) ; status=0/0 }"
+    )
+
+    def _repo(self, unit: str = "career-worker.service") -> str:
+        """The repository's own ExecStopPost=, %n expanded as systemd expands it."""
+        return _expand(_directives(unit)["ExecStopPost"], unit)
+
+    # ── direction one: the correct host must go quiet ────────────────────────
+
+    def test_the_deployed_hook_is_not_drift(self) -> None:
+        """The false red, reproduced from its own two strings and now green."""
+        assert _compare("exec", self._repo(), self.LIVE)
+
+    def test_both_units_agree_with_what_the_machine_printed(self) -> None:
+        for unit in LOOP_UNITS:
+            live = self.LIVE.replace("career-worker.service", unit)
+            assert _compare("exec", self._repo(unit), live), unit
+
+    def test_runtime_state_is_not_configuration(self) -> None:
+        """pid/code/status move on their own — a restart is not a deploy.
+
+        This is the half a «strip the tail» fix would also have got right, and
+        it is kept because it is the reason the tail must be parsed rather than
+        pattern-matched: the running unit and the idle one print different
+        values here and are the same configuration.
+        """
+        running = (
+            "{ path=/root/career/scripts/alert_unit_failure.sh ; "
+            "argv[]=/root/career/scripts/alert_unit_failure.sh career-worker.service ; "
+            "ignore_errors=yes ; start_time=[Fri 2026-08-07 18:48:34 CEST] ; "
+            "stop_time=[Fri 2026-08-07 18:48:34 CEST] ; pid=1796574 ; "
+            "code=exited ; status=0 }"
+        )
+        assert _compare("exec", self._repo(), running)
+        assert _exec_live_records(running) == _exec_live_records(self.LIVE)
+
+    def test_every_spelling_of_the_leading_dash_is_understood(self) -> None:
+        """systemd prints the `-` three different ways depending on which
+        property you ask for and which version answers. Guessing one of them is
+        the entire bug, so all three are read."""
+        head = ("{ path=/x.sh ; argv[]=/x.sh a ; ")
+        for spelling in ("ignore_errors=yes", "ignore_exit_status=yes",
+                         "flags=ignore-failure"):
+            assert _exec_live_records(head + spelling + " ; pid=0 }")[0][2], spelling
+        for spelling in ("ignore_errors=no", "ignore_exit_status=no", "flags="):
+            assert not _exec_live_records(head + spelling + " ; pid=0 }")[0][2], spelling
+
+    # ── direction two: real drift must still be caught ───────────────────────
+
+    def test_a_hook_pointed_at_a_different_script_is_drift(self) -> None:
+        live = self.LIVE.replace("alert_unit_failure.sh", "alert_unit_failure.sh.bak")
+        assert not _compare("exec", self._repo(), live)
+
+    def test_a_hook_that_lost_its_leading_dash_is_drift(self) -> None:
+        """The one that costs the most and shows the least: the unit still has
+        its alert, and a Telegram outage now turns the alerting into a failure
+        of the service it was reporting on."""
+        live = self.LIVE.replace("ignore_errors=yes", "ignore_errors=no")
+        assert not _compare("exec", self._repo(), live)
+        # …and via the other spelling, so the `flags=` reader is held to it too.
+        assert not _compare("exec", self._repo(),
+                            self.LIVE.replace("ignore_errors=yes", "flags="))
+
+    def test_a_changed_argument_is_drift(self) -> None:
+        """What the OLD code could not see at all: it compared the path and the
+        flag and threw argv away, so a hook alerting under the WRONG UNIT NAME
+        read as correctly deployed."""
+        live = self.LIVE.replace(
+            "alert_unit_failure.sh career-worker.service ;",
+            "alert_unit_failure.sh career-admin-bot.service ;",
+        )
+        assert not _compare("exec", self._repo(), live)
+
+    def test_a_dropped_argument_is_drift(self) -> None:
+        live = self.LIVE.replace("alert_unit_failure.sh career-worker.service ;",
+                                 "alert_unit_failure.sh ;")
+        assert not _compare("exec", self._repo(), live)
+
+    def test_a_hook_that_is_gone_entirely_is_drift(self) -> None:
+        assert not _compare("exec", self._repo(), "")
+
+    def test_a_binary_swapped_under_an_unchanged_argv_is_drift(self) -> None:
+        """Why `path` is in the record and in the rendering, though it is
+        USUALLY just argv[0] repeated.
+
+        With systemd's `@` prefix the two come apart: `@/bin/A x` and `@/bin/B x`
+        have the identical argv `('x',)` and run different binaries. A record of
+        (argv, ignore) alone — the tempting simplification, since path is
+        redundant in every unit this repository ships — would call those two the
+        same deploy. So path is compared, and `_render_exec` prints the `@` back:
+        drop it from the RENDERING and the message shows `repo=X live=X` for two
+        configurations that genuinely differ, which reads as a broken tool.
+        """
+        assert _exec_repo_record("@/bin/A x") != _exec_repo_record("@/bin/B x")
+        assert _render_exec(_exec_repo_record("@/bin/A x")) != \
+               _render_exec(_exec_repo_record("@/bin/B x"))
+        # and the `@` rendering is a UNIT-FILE line, not a systemd one: it parses
+        # straight back to the record it came from, so both halves of a drift
+        # message are written in the language the operator edits.
+        live = _exec_live_records(
+            "{ path=/a/alert.sh ; argv[]=/a/alert.sh.bak career-worker.service ; "
+            "ignore_errors=no ; pid=0 }"
+        )
+        assert _exec_repo_record(_render_exec(live)) == live
+
+    def test_a_second_hook_nobody_shipped_is_drift(self) -> None:
+        """systemd concatenates records, so an extra ExecStopPost= injected by a
+        drop-in appears as `{ … } { … }` — and must not read as the one the
+        repository ships."""
+        live = self.LIVE + (" { path=/usr/bin/curl ; argv[]=/usr/bin/curl http://x ; "
+                            "ignore_errors=no ; pid=0 }")
+        assert not _compare("exec", self._repo(), live)
+        assert len(_exec_live_records(live)) == 2
+
+    # ── the message a human has to act on ────────────────────────────────────
+
+    def test_the_drift_message_names_the_property_and_both_values(
+        self, tmp_path: Path
+    ) -> None:
+        """Through the real `live_unit_drift`, not the comparison alone.
+
+        The old message pasted eighty characters of runtime state into the
+        operator's terminal and left them to spot which field mattered. Both
+        values are now printed in the spelling of the unit file — which is the
+        form the FIX takes.
+        """
+        live = {"career-worker.service": {
+            **_WORKER_DEPLOYED,
+            # both the `-` and the script: one message, two faults, and the
+            # operator must be able to see both without opening anything.
+            "ExecStopPost": self.LIVE.replace("ignore_errors=yes", "ignore_errors=no")
+                                     .replace("alert_unit_failure.sh",
+                                              "alert_unit_failure.sh.bak"),
+        }}
+        host = _synthetic_host(tmp_path, live, installed=["career-worker.service"])
+        drift, _tolerated, _skip = _synthetic_drift(host)
+        line = next((x for x in drift if "ExecStopPost" in x), "")
+        assert line, drift
+        # the property, so nobody has to diff two blobs to find it
+        assert "ExecStopPost" in line
+        # what the repository asks for, as a unit-file line
+        assert "repo='-/root/career/scripts/alert_unit_failure.sh career-worker.service'" in line
+        # what the machine has, in the same spelling: no `-`, wrong script
+        assert "live='/root/career/scripts/alert_unit_failure.sh.bak career-worker.service'" in line
+        # and none of the runtime noise that made the old message unreadable
+        assert not any(field in line for field in _EXEC_RUNTIME_FIELDS), line
+
+    def test_a_correct_hook_is_absent_from_that_message_entirely(
+        self, tmp_path: Path
+    ) -> None:
+        """The green direction through the same path: the fixture host is
+        deployed correctly, so ExecStopPost must not appear in the drift list at
+        all. Without this, «no drift» could mean «the exec branch never ran»."""
+        host = _synthetic_host(
+            tmp_path, {"career-worker.service": _WORKER_DEPLOYED},
+            installed=["career-worker.service"],
+        )
+        drift, _tolerated, _skip = _synthetic_drift(host)
+        assert not any("ExecStopPost" in line for line in drift), drift
+
+    # ── and the machine itself ───────────────────────────────────────────────
+
+    @pytest.mark.livehost
+    def test_this_machine_spells_the_ignore_flag_a_way_we_know(self) -> None:
+        """A guard against the NEXT rename.
+
+        If some future systemd prints the flag under a fourth name, every `-`
+        would look absent and this check would go red for a correct host all
+        over again — but with the same misleading message as 2026-08-07. This
+        test fails first, and says what it actually is.
+        """
+        if not RUN_MARKER_DEFAULT.is_dir():
+            pytest.skip("systemd is not running here — nothing to read")
+        systemctl = shutil.which("systemctl")
+        if systemctl is None:
+            pytest.skip("no systemctl on this host")
+        for unit in LOOP_UNITS:
+            rendered = _show(systemctl, ["ExecStopPost"], unit).get("ExecStopPost", "")
+            if not rendered.strip():
+                continue  # not installed here; the drift check is what says so
+            assert _exec_understood(rendered), (
+                f"{unit}: systemd no longer spells the ignore flag any of "
+                f"{_EXEC_IGNORE_KEYS + (_EXEC_IGNORE_FLAG,)} — teach "
+                f"_exec_ignores_errors() the new name before believing any "
+                f"ExecStopPost drift this run reports.\n  {rendered}"
+            )
 
 
 # ── the alert that must not become a storm ───────────────────────────────────

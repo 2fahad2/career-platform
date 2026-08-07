@@ -1,23 +1,30 @@
-// Deployed copy lives at /etc/caddy/Caddyfile. This is the reviewable source.
-//
-// INCIDENT 2026-08-07: the `api` A record vanished for roughly 26 hours after the
-// domain moved onto Salla's nameservers, and EVERY inbound webhook stopped —
-// Salla's app-install token and WhatsApp customer messages alike. Nothing here
-// recorded the silence, because no access log existed: "did the webhook arrive?"
-// could only ever be answered by inference from the database, and only for the
-// requests that got far enough to become a row. A gateway that keeps no record
-// of what reached it has the same defect as a test that reads the repository
-// instead of the host — it measures what should be, not what is.
-//
-// The log is therefore not a nicety. It is the only place a REFUSED request
-// (bad signature, wrong path, 404) leaves any trace at all; those never become
-// a webhook_events row, so today they are invisible in both directions.
-//
-// To deploy:
-//     mkdir -p /var/log/caddy && chown caddy:caddy /var/log/caddy
-//     cp ops/caddy/Caddyfile /etc/caddy/Caddyfile
-//     caddy validate --config /etc/caddy/Caddyfile
-//     systemctl reload caddy          # reload, not restart: no dropped connections
+# Deployed copy lives at /etc/caddy/Caddyfile. This is the reviewable source.
+#
+# INCIDENT 2026-08-07: the `api` A record vanished for roughly 26 hours after the
+# domain moved onto Salla's nameservers, and EVERY inbound webhook stopped —
+# Salla's app-install token and WhatsApp customer messages alike. Nothing here
+# recorded the silence, because no access log existed: "did the webhook arrive?"
+# could only ever be answered by inference from the database, and only for the
+# requests that got far enough to become a row. A gateway that keeps no record
+# of what reached it has the same defect as a test that reads the repository
+# instead of the host — it measures what should be, not what is.
+#
+# The log is therefore not a nicety. It is the only place a REFUSED request
+# (bad signature, wrong path, 404) leaves any trace at all; those never become
+# a webhook_events row, so today they are invisible in both directions.
+#
+# To deploy:
+#     mkdir -p /var/log/caddy && chown caddy:caddy /var/log/caddy
+#     cp ops/caddy/Caddyfile /etc/caddy/Caddyfile
+#     caddy validate --config /etc/caddy/Caddyfile
+#     systemctl reload caddy          # reload, not restart: no dropped connections
+#
+# EXCEPT the first time. A reload hands the new config to the RUNNING caddy,
+# whose systemd mount namespace was built before /var/log/caddy existed, so it
+# answers «permission denied» on a directory that is plainly writable. The
+# first deploy of this file therefore needs `systemctl restart caddy` — under
+# a second of downtime, and both webhook senders retry. Reload is right for
+# every deploy after it.
 
 api.career-platform.net {
 	log {

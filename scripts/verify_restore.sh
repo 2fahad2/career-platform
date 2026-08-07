@@ -287,7 +287,16 @@ done
 for unit in career-worker.service career-admin-bot.service; do
   hook=$(systemctl show "$unit" -p ExecStopPost --value 2>/dev/null)
   case "$hook" in
-    *alert_unit_failure.sh*ignore_exit_status=yes*)
+    # The flag's spelling is systemd's, not ours, and we got it wrong once:
+    # this pattern read `ignore_exit_status=`, which systemd never prints. On
+    # 2026-08-07 that made a correctly deployed host fail the check with the
+    # exact opposite diagnosis — «the hook is loaded WITHOUT the leading -»
+    # about a hook that had it. `systemctl show -p ExecStopPost` prints
+    # `ignore_errors=yes`; the `ExecStopPostEx=` variant prints
+    # `flags=ignore-failure`. Both are accepted so a systemd upgrade cannot
+    # reopen this, and an unrecognised spelling now falls to the branch that
+    # says it could not tell, rather than to the one that accuses.
+    *alert_unit_failure.sh*ignore_errors=yes*|*alert_unit_failure.sh*flags=ignore-failure*)
       pass "$unit: watchdog alert hook armed and non-fatal" ;;
     *alert_unit_failure.sh*)
       # The leading '-' in the unit file. Without it a Telegram outage turns
