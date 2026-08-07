@@ -62,6 +62,9 @@ def receive_whatsapp_webhook(
     event_id = persist_deduped_event(
         session, provider="whatsapp", event_type=_derive_event_type(payload),
         fingerprint=fingerprint, payload=payload,
+        # Reached only past the guard above — and the intake will not write a
+        # row without being told so (see `persist_deduped_event`).
+        signature_valid=True,
     )
     if event_id is None:
         return WhatsAppIntakeResult(WhatsAppIntakeStatus.DUPLICATE)

@@ -18,11 +18,15 @@ lapsed.
 
 from __future__ import annotations
 
+import ast
+import pathlib
+import re
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
+import pytest
 from sqlalchemy import text as sql_text
 from sqlalchemy.orm import Session
 
@@ -287,6 +291,200 @@ def test_the_breach_carries_the_facts_the_owner_judges_with(
         {"t": str(tenant_id)}).scalar_one()
     assert row["day_states"] == {"NO_MATCHES": 2}
     assert row["paused"] is False and row["opted_out"] is False
+
+
+def test_a_pause_the_customer_lifted_is_still_a_fact_about_the_window(
+    owner_session: Session, clean_billing: None,
+) -> None:
+    """«وكان اشتراكه موقوفًا مؤقتًا بطلبه» is past tense, and the code used to
+    answer it in the present: `subscription.status == PAUSED` read at SWEEP
+    time. A customer who paused on day one and resumed on day two therefore
+    read as never having paused — and «he asked us to stop delivering» is the
+    single fact most likely to change whether the operator refunds."""
+    _p, tenant_id, sub_id = _customer(owner_session)
+    for at, to_status in ((NOW + timedelta(hours=2), "PAUSED"),
+                          (NOW + timedelta(hours=30), "ACTIVE")):
+        owner_session.execute(sql_text(
+            "INSERT INTO subscription_events (id, tenant_id, subscription_id,"
+            " event_type, to_status, details, created_at)"
+            " VALUES (:id, :t, :s, 'customer_pause', :st, '{}', :at)"),
+            {"id": str(uuid.uuid4()), "t": str(tenant_id), "s": str(sub_id),
+             "st": to_status, "at": at})
+    owner_session.commit()
+
+    guarantee.sweep_delivery_guarantee(
+        owner_session, now=NOW + timedelta(hours=73),
+        admin_client=FakeTelegramAdminClient(),
+    )
+    owner_session.commit()
+
+    facts = owner_session.execute(
+        sql_text("SELECT facts FROM delivery_guarantees WHERE tenant_id = :t"),
+        {"t": str(tenant_id)}).scalar_one()
+    assert facts["paused"] is True          # resumed long before the sweep
+
+
+def test_an_opt_out_weeks_later_never_explains_an_old_breach(
+    owner_session: Session, clean_billing: None,
+) -> None:
+    """`opt_out_at is not None` answers «have they EVER», and the facts packet
+    is read beside a decision to move money. A customer who silenced us on day
+    forty had that carried back onto a breach from day two as if it were the
+    reason — and, because the facts were recomputed on every sweep, it grew
+    into the record of a window that had been over for a month."""
+    _p, tenant_id, _s = _customer(owner_session)
+    admin = FakeTelegramAdminClient()
+    guarantee.sweep_delivery_guarantee(
+        owner_session, now=NOW + timedelta(hours=73), admin_client=admin)
+    owner_session.commit()
+
+    owner_session.execute(sql_text(
+        "UPDATE customer_channels SET opt_out_at = :at WHERE tenant_id = :t"),
+        {"at": NOW + timedelta(days=40), "t": str(tenant_id)})
+    owner_session.commit()
+    guarantee.sweep_delivery_guarantee(
+        owner_session, now=NOW + timedelta(days=41), admin_client=admin)
+    owner_session.commit()
+
+    facts = owner_session.execute(
+        sql_text("SELECT facts FROM delivery_guarantees WHERE tenant_id = :t"),
+        {"t": str(tenant_id)}).scalar_one()
+    assert facts["opted_out"] is False       # it happened outside the window
+    assert len(admin.messages) == 1          # and it did not re-page anybody
+
+
+def _inbound(
+    session: Session, *, tenant_id: uuid.UUID, classification: str,
+    at: datetime,
+) -> None:
+    """One «إيقاف» or «استئناف» exactly as `whatsapp.worker` records it."""
+    channel_id = session.execute(sql_text(
+        "SELECT id FROM customer_channels WHERE tenant_id = :t"),
+        {"t": str(tenant_id)}).scalar_one()
+    session.execute(sql_text(
+        "INSERT INTO inbound_messages (id, tenant_id, channel_id,"
+        " wa_message_id, message_type, text_body, classification, payload,"
+        " received_at) VALUES (:id, :t, :c, :w, 'text', NULL, :k, '{}', :at)"),
+        {"id": str(uuid.uuid4()), "t": str(tenant_id), "c": str(channel_id),
+         "w": f"wamid.{uuid.uuid4()}", "k": classification, "at": at})
+    session.commit()
+
+
+def test_a_stop_inside_the_window_outlives_the_resume_that_cleared_it(
+    owner_session: Session, clean_billing: None,
+) -> None:
+    """The `paused` snapshot bug, still living in `opted_out`.
+
+    `customer_channels.opt_out_at` remembers ONE flip: `whatsapp/worker` sets
+    it on «إيقاف» and puts it back to NULL on «استئناف». So a customer who
+    silenced us at hour one and came back at hour seventy-four read as
+    ``opted_out: False`` at the sweep — for a window he was silent through,
+    which is the single fact most likely to explain the breach and the one the
+    operator needs before he moves money. The stop and the resume both carry a
+    TIMESTAMP in `inbound_messages`; that is what the window is read from now.
+    """
+    _p, tenant_id, _s = _customer(owner_session)
+    _inbound(owner_session, tenant_id=tenant_id, classification="stop",
+             at=NOW + timedelta(hours=1))
+    _inbound(owner_session, tenant_id=tenant_id, classification="resume",
+             at=NOW + timedelta(hours=74))
+    owner_session.execute(sql_text(          # exactly what the resume does
+        "UPDATE customer_channels SET opt_out_at = NULL WHERE tenant_id = :t"),
+        {"t": str(tenant_id)})
+    owner_session.commit()
+
+    admin = FakeTelegramAdminClient()
+    guarantee.sweep_delivery_guarantee(
+        owner_session, now=NOW + timedelta(hours=80), admin_client=admin)
+    owner_session.commit()
+
+    facts = owner_session.execute(
+        sql_text("SELECT facts FROM delivery_guarantees WHERE tenant_id = :t"),
+        {"t": str(tenant_id)}).scalar_one()
+    assert facts["opted_out"] is True
+    assert "وكان موقفًا للرسائل داخل المهلة" in admin.messages[0]
+
+
+def test_a_silence_from_before_the_window_is_not_dressed_up_as_one_inside_it(
+    owner_session: Session, clean_billing: None,
+) -> None:
+    """A column with no lower bound answers a question nobody asked.
+
+    A buyer who replies, silences us during onboarding, and only activates
+    days later carries an `opt_out_at` from BEFORE his guarantee window ever
+    opened — and the alert reported it as «وكان موقفًا للرسائل داخل المهلة»,
+    a sentence about the window that nothing inside the window supports. The
+    fact is real and the operator still gets it; it just gets its own true
+    sentence instead of borrowing another one's.
+    """
+    _p, tenant_id, _s = _customer(owner_session)
+    _inbound(owner_session, tenant_id=tenant_id, classification="stop",
+             at=NOW - timedelta(days=1))
+    owner_session.execute(sql_text(
+        "UPDATE customer_channels SET opt_out_at = :at WHERE tenant_id = :t"),
+        {"at": NOW - timedelta(days=1), "t": str(tenant_id)})
+    owner_session.commit()
+
+    admin = FakeTelegramAdminClient()
+    guarantee.sweep_delivery_guarantee(
+        owner_session, now=NOW + timedelta(hours=73), admin_client=admin)
+    owner_session.commit()
+
+    facts = owner_session.execute(
+        sql_text("SELECT facts FROM delivery_guarantees WHERE tenant_id = :t"),
+        {"t": str(tenant_id)}).scalar_one()
+    assert facts["opted_out"] is False               # nothing happened inside
+    assert facts["opted_out_before_window"] is True  # and this is why
+    assert "وكان موقفًا للرسائل داخل المهلة" not in admin.messages[0]
+    assert "ودخل المهلة وهو موقف للرسائل من قبلها" in admin.messages[0]
+
+
+def test_a_refunded_customer_is_not_offered_a_refund_a_second_time(
+    owner_session: Session, clean_billing: None,
+) -> None:
+    """The breach is still recorded — it really did break — but «الخيار
+    للعميل: استرداد كامل» printed over an account whose money has already gone
+    back is an invitation to refund the same order twice."""
+    _p, tenant_id, sub_id = _customer(owner_session)
+    owner_session.execute(sql_text(
+        "UPDATE subscriptions SET status = 'REFUNDED' WHERE id = :id"),
+        {"id": str(sub_id)})
+    owner_session.commit()
+    admin = FakeTelegramAdminClient()
+
+    counts = guarantee.sweep_delivery_guarantee(
+        owner_session, now=NOW + timedelta(hours=73), admin_client=admin)
+    owner_session.commit()
+
+    assert counts["breached"] == 1           # the record stays honest
+    assert "منتهٍ ماليًا" in admin.messages[0]
+    assert "استرداد كامل أو تمديد المدة" not in admin.messages[0]
+
+
+def test_the_breach_screen_reads_the_money_status_live_not_frozen(
+    owner_session: Session, clean_billing: None,
+) -> None:
+    """The facts are frozen because the window is over — but the status of the
+    money is not a fact about the window. Frozen, it says what the account was
+    the night it broke, and the screen that prints it sits days later beside
+    the buttons that move money."""
+    _p, tenant_id, sub_id = _customer(owner_session)
+    guarantee.sweep_delivery_guarantee(
+        owner_session, now=NOW + timedelta(hours=73),
+        admin_client=FakeTelegramAdminClient())
+    owner_session.commit()
+
+    owner_session.execute(sql_text(          # refunded the next morning
+        "UPDATE subscriptions SET status = 'REFUNDED' WHERE id = :id"),
+        {"id": str(sub_id)})
+    owner_session.commit()
+
+    row = [b for b in guarantee.open_breaches(owner_session)
+           if b.tenant_id == tenant_id][0]
+    assert row.facts["subscription_status"] == "REFUNDED"      # today
+    assert row.facts["subscription_status_at_breach"] == "ACTIVE"   # that night
+    assert "راجع حالته قبل أي تعويض" in "\n".join(
+        console._fact_lines_ar(row.facts))
 
 
 def test_a_funnel_only_customer_has_no_start_guarantee(
@@ -582,6 +780,150 @@ def test_the_pending_session_is_visible_with_its_age(
     assert "منذ" in screen and "تجاوز مهلة الرد" in screen
 
 
+def test_the_refund_deduction_is_scoped_to_the_order_being_refunded(
+    owner_session: Session, clean_billing: None,
+) -> None:
+    """«تُخصم قيمة الخدمات البشرية اللي استلمتها فعليًا» is scoped to the thing
+    being refunded, and this counted the customer's whole life: a لمّاح+
+    customer in their second period who took the session they paid for each
+    time had 300 SAR deducted from a 449 SAR refund. Every one of those
+    sessions was already paid for by the period it belonged to."""
+    _p, tenant_id, first_sub = _customer(owner_session, product="prod_plus")
+    career_session.request_session(owner_session, tenant_id=tenant_id, now=NOW)
+    career_session.mark_completed(
+        owner_session, tenant_id=tenant_id, now=NOW + timedelta(days=1))
+    owner_session.commit()
+
+    # the period rolls: §16 gives the renewal its own subscription row
+    later = NOW + timedelta(days=31)
+    owner_session.execute(sql_text(
+        "UPDATE subscriptions SET status = 'EXPIRED' WHERE id = :id"),
+        {"id": str(first_sub)})
+    renewed = uuid.uuid4()
+    owner_session.execute(sql_text(
+        "INSERT INTO subscriptions (id, tenant_id, salla_order_id, plan_code,"
+        " status, amount_sar, currency, current_period_start,"
+        " current_period_end) VALUES (:id, :t, :o, 'executive', 'ACTIVE',"
+        " 449.00, 'SAR', :s, :e)"),
+        {"id": str(renewed), "t": str(tenant_id), "o": f"ORD-{uuid.uuid4()}",
+         "s": later, "e": later + timedelta(days=30)})
+    owner_session.commit()
+
+    # the new period grants its own session — «واحدة» is per period
+    assert career_session.request_session(
+        owner_session, tenant_id=tenant_id, now=later).outcome == "created"
+    career_session.mark_completed(
+        owner_session, tenant_id=tenant_id, now=later + timedelta(days=1))
+    owner_session.commit()
+
+    # two sessions really were received, and the refund of ONE order deducts one
+    assert career_session.completed_sessions_count(
+        owner_session, tenant_id=tenant_id) == 2
+    assert career_session.refund_deduction_sar(
+        owner_session, tenant_id=tenant_id) == Decimal("150")
+    assert career_session.refund_deduction_sar(
+        owner_session, tenant_id=tenant_id, subscription_id=first_sub,
+    ) == Decimal("150")
+
+
+def test_a_renewal_never_hides_a_session_nobody_answered(
+    owner_session: Session, clean_billing: None,
+) -> None:
+    """An entitlement expires with its period; an unanswered promise does not.
+    `current_session` is keyed on subscription_id, so a customer who asked, was
+    never answered and then RENEWED vanished from their own card at the exact
+    moment they paid us again — and the card is what the operator opens when
+    that customer writes to him.
+
+    AUDIT 2026-08-06 — and this test asserted only the READ side, which is why
+    the gate stayed green over a card that contradicted its own button. The
+    read fell back across periods; every write still resolved through
+    `_open_or_used(subscription_id=current.id)`, so the card paged the operator
+    about an overdue REQUESTED session and the confirm button answered «لا يوجد
+    طلب جلسة لهذا العميل — لم نغيّر شيئًا» in the same screen. Both sides are
+    asserted here now."""
+    _p, tenant_id, first_sub = _customer(owner_session, product="prod_plus")
+    career_session.request_session(owner_session, tenant_id=tenant_id, now=NOW)
+    owner_session.commit()
+
+    later = NOW + timedelta(days=31)
+    owner_session.execute(sql_text(
+        "UPDATE subscriptions SET status = 'EXPIRED' WHERE id = :id"),
+        {"id": str(first_sub)})
+    owner_session.execute(sql_text(
+        "INSERT INTO subscriptions (id, tenant_id, salla_order_id, plan_code,"
+        " status, amount_sar, currency, current_period_start,"
+        " current_period_end) VALUES (:id, :t, :o, 'executive', 'ACTIVE',"
+        " 449.00, 'SAR', :s, :e)"),
+        {"id": str(uuid.uuid4()), "t": str(tenant_id),
+         "o": f"ORD-{uuid.uuid4()}", "s": later, "e": later + timedelta(days=30)})
+    owner_session.commit()
+
+    # the read side: the card still pages him about it
+    still_owed = career_session.current_session(owner_session, tenant_id=tenant_id)
+    assert still_owed is not None
+    assert still_owed.status == career_session.REQUESTED
+    assert still_owed.subscription_id == first_sub
+
+    # the write side, on the same screen: the button UNDER that card must
+    # answer the row the card just named, not «لا يوجد طلب جلسة لهذا العميل»
+    code = _code(owner_session, tenant_id)
+    reply = _confirm(owner_session, code, "cs_scheduled",
+                     now=later + timedelta(hours=1))
+    assert "لا يوجد طلب جلسة" not in reply
+    assert "اتفقتم على موعد" in reply
+
+    # …and «سجّل طلبًا» must not open a SECOND promise behind the one the
+    # card is already showing
+    asked_again = career_session.request_session(
+        owner_session, tenant_id=tenant_id, now=later,
+    )
+    # rolled back BEFORE the assertion on purpose: a failing assert would
+    # otherwise leave this session holding uncommitted rows, and the
+    # `clean_billing` teardown deletes those tenants from a DIFFERENT session
+    # — the suite would hang on the lock instead of reporting the failure.
+    owner_session.rollback()
+    assert asked_again.outcome == "already_open"
+
+    rows = owner_session.execute(sql_text(
+        "SELECT status, subscription_id FROM career_sessions WHERE"
+        " tenant_id = :t"), {"t": str(tenant_id)}).all()
+    assert len(rows) == 1                      # one promise, not two
+    assert rows[0][0] == career_session.SCHEDULED
+    assert str(rows[0][1]) == str(first_sub)   # the row the operator saw
+
+
+def test_a_deleted_customers_open_session_is_announced_once_not_nightly(
+    owner_session: Session, clean_billing: None,
+) -> None:
+    """`career_sessions` is RETAINED by a §12 deletion and `customer_channels`
+    is not, so «a لمّاح+ customer without a channel cannot have asked» was not
+    the impossible row it was written as. Unstamped, it wrote the same ERROR
+    line every night forever — and the operator's feed harvests ERROR lines,
+    so a permanent one is camouflage for the next real failure."""
+    _p, tenant_id, _s = _customer(owner_session, product="prod_plus")
+    career_session.request_session(owner_session, tenant_id=tenant_id, now=NOW)
+    owner_session.commit()
+    owner_session.execute(sql_text(
+        "DELETE FROM customer_channels WHERE tenant_id = :t"),
+        {"t": str(tenant_id)})
+    owner_session.commit()
+
+    admin = FakeTelegramAdminClient()
+    first = career_session.escalate_overdue(
+        owner_session, now=NOW + timedelta(hours=30), admin_client=admin)
+    owner_session.commit()
+    second = career_session.escalate_overdue(
+        owner_session, now=NOW + timedelta(hours=54), admin_client=admin)
+    owner_session.commit()
+
+    assert first["unticketed"] == 1 and first["escalated"] == 0
+    assert second["unticketed"] == 0          # noticed once, not every night
+    assert len(admin.messages) == 1
+    assert "ولا نقدر نفتح له تذكرة" in admin.messages[0]
+    assert _code(owner_session, tenant_id) in admin.messages[0]
+
+
 # ── PROMISE 3 — «سعره اليوم مقفول له … ما دام تجديده مستمر» ─────────────────
 
 
@@ -872,3 +1214,455 @@ def test_the_locked_price_never_reaches_the_admin_channel_with_a_phone(
     for message in admin.messages:
         assert phone not in message
         assert phone.lstrip("+") not in message
+
+
+# ── the opt-out invariant, made structural ───────────────────────────────────
+#
+# `_silence_inside` answers «did he silence us inside the 72-hour window?» from
+# `inbound_messages.classification`, because the column `customer_channels
+# .opt_out_at` remembers only the LATEST flip: a customer who stopped at hour
+# one and resumed at hour seventy-four read as «never opted out» for a window
+# he was silent through, and the fact most likely to explain the breach was
+# missing from the packet the operator refunds on.
+#
+# That rewrite is correct TODAY for a reason nothing enforces: there happen to
+# be exactly two assignments to `opt_out_at` in the tree, both in
+# `whatsapp/worker._handle_message`, each standing beside the `_record_inbound`
+# call that writes its matching classified row, both inside one transaction and
+# one commit. A third assignment written anywhere else — an operator command in
+# the console, a compliance repair script, an unsubscribe link — silences a
+# customer that `inbound_messages` never hears about, and the guarantee goes
+# back to being confidently wrong in exactly the direction that costs money.
+#
+# So the pair is enforced instead of observed. The technique is the one
+# `test_cv_close` uses for the single writer of `tenant_day_states` and
+# `test_db_engine_guard` uses for `create_engine`: parse the tree, find every
+# shape of the write, and prove on synthetic violations that the finder sees
+# them.
+
+_REPO = pathlib.Path(__file__).resolve().parents[1]
+
+#: Scanned in full — `src` and not `src/career`, so `src/career_core` is
+#: covered the day it grows a database surface. `scripts/` is deliberately
+#: absent and it is a real residual: a one-shot repair script that flips the
+#: column by hand is outside this guard. Naming it beats pretending.
+_SCAN_ROOTS = ("src",)
+
+#: Taken from the code under test, never typed here. If somebody renames
+#: `guarantee._STOP`, the guard renames with it instead of silently enforcing
+#: a spelling the query no longer looks for.
+_STOP = guarantee._STOP
+_RESUME = guarantee._RESUME
+
+#: Flips that genuinely have no inbound message behind them, with the reason.
+#: Empty on purpose: today there is no such thing, and the entry that arrives
+#: has to be argued for in writing rather than added to make a red test green.
+#: Ratcheted in both directions by
+#: `test_the_opt_out_escape_list_still_earns_its_place`.
+_FLIP_WITHOUT_AN_INBOUND: dict[tuple[str, str, str], str] = {}
+
+#: The pair as it exists today, asserted so the guard cannot end up guarding
+#: air on the day the flips move or are deleted.
+_AUTHORITY = "src/career/whatsapp/worker.py"
+
+
+def _classified_rows_in(node: ast.AST) -> set[str]:
+    """Every classification LITERAL this scope writes onto an inbound row.
+
+    Three shapes, because the row is built in three plausible ways: a keyword
+    (`_record_inbound(..., classification="stop")`, which is how the tree does
+    it, and `InboundMessage(classification="stop")`, which is how the next
+    author might), an attribute assignment on a row already in hand, and a
+    mapping literal handed to a bulk insert.
+
+    A literal is REQUIRED. `classification=kind` — a variable — reads as no
+    classification at all, and the guard says so rather than guessing: a value
+    it cannot see is a value it cannot prove matches the flip beside it.
+    """
+    found: set[str] = set()
+    for child in ast.walk(node):
+        if isinstance(child, ast.keyword) and child.arg == "classification":
+            if isinstance(child.value, ast.Constant) and isinstance(
+                child.value.value, str
+            ):
+                found.add(child.value.value)
+        elif isinstance(child, ast.Assign):
+            for target in child.targets:
+                if (
+                    isinstance(target, ast.Attribute)
+                    and target.attr == "classification"
+                    and isinstance(child.value, ast.Constant)
+                    and isinstance(child.value.value, str)
+                ):
+                    found.add(child.value.value)
+        elif isinstance(child, ast.Dict):
+            for key, value in zip(child.keys, child.values, strict=True):
+                if (
+                    isinstance(key, ast.Constant) and key.value == "classification"
+                    and isinstance(value, ast.Constant)
+                    and isinstance(value.value, str)
+                ):
+                    found.add(value.value)
+    return found
+
+
+def _flip_kind(value: ast.AST | None) -> str:
+    """Setting the column silences; clearing it is the way back."""
+    if isinstance(value, ast.Constant) and value.value is None:
+        return _RESUME
+    return _STOP
+
+
+#: A raw-SQL write of the column, however it is quoted or spaced. The table
+#: name comes off the model for the same reason the classifications do.
+def _sql_write(table: str) -> re.Pattern[str]:
+    return re.compile(
+        r"(insert\s+into|update|delete\s+from)\s+[\"']?" + re.escape(table)
+        + r"[\s\S]*opt_out_at",
+        re.IGNORECASE,
+    )
+
+
+def _flip_sites(
+    paths: list[pathlib.Path], root: pathlib.Path
+) -> set[tuple[str, str, str, str]]:
+    """Every place in `paths` that WRITES `opt_out_at`, and what it wrote.
+
+    Returns ``(file, scope, flip, paired)`` where ``flip`` is `_STOP` or
+    `_RESUME` and ``paired`` is the classification recorded in the same
+    function — or ``"<none>"``. The scope is qualified through nested classes
+    and functions, so a flip hidden in a closure is still named and still has
+    to satisfy the rule (`ast.walk` alone would lose which function it was in,
+    which IS the rule here).
+    """
+    from career.db.models import CustomerChannel
+
+    column = "opt_out_at"
+    sql_write = _sql_write(CustomerChannel.__tablename__)
+    found: set[tuple[str, str, str, str]] = set()
+
+    for path in paths:
+        rel = path.relative_to(root).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+        def record(
+            scope: list[str], flip: str, paired: set[str], *, rel: str = rel
+        ) -> None:
+            found.add((
+                rel, ".".join(scope) or "<module>", flip,
+                ",".join(sorted(paired)) or "<none>",
+            ))
+
+        def check(node: ast.AST, scope: list[str], paired: set[str]) -> None:
+            if isinstance(node, ast.Assign | ast.AugAssign | ast.AnnAssign):
+                targets = (
+                    node.targets if isinstance(node, ast.Assign) else [node.target]
+                )
+                for target in targets:
+                    if isinstance(target, ast.Attribute) and target.attr == column:
+                        record(scope, _flip_kind(node.value), paired)
+            if isinstance(node, ast.Call):
+                verb = (
+                    node.func.attr if isinstance(node.func, ast.Attribute)
+                    else getattr(node.func, "id", None)
+                )
+                if verb == "setattr" and len(node.args) >= 3:
+                    name = node.args[1]
+                    if isinstance(name, ast.Constant) and name.value == column:
+                        record(scope, _flip_kind(node.args[2]), paired)
+                # `CustomerChannel(opt_out_at=…)`, and the Core forms:
+                # `update(CustomerChannel).values(opt_out_at=…)`,
+                # `insert(...).values(...)`, `session.execute(stmt, {...})`.
+                constructs = (
+                    (isinstance(node.func, ast.Name)
+                     and node.func.id == "CustomerChannel")
+                    or (isinstance(node.func, ast.Attribute)
+                        and node.func.attr in {"CustomerChannel", "values"})
+                )
+                if constructs:
+                    for kw in node.keywords:
+                        if kw.arg == column:
+                            record(scope, _flip_kind(kw.value), paired)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                if sql_write.search(node.value):
+                    flip = (
+                        _RESUME
+                        if re.search(r"opt_out_at\s*=\s*NULL", node.value, re.I)
+                        else _STOP
+                    )
+                    record(scope, flip, paired)
+
+        def descend(node: ast.AST, scope: list[str], paired: set[str]) -> None:
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef):
+                    descend(child, [*scope, child.name], _classified_rows_in(child))
+                elif isinstance(child, ast.ClassDef):
+                    descend(child, [*scope, child.name], paired)
+                else:
+                    check(child, scope, paired)
+                    descend(child, scope, paired)
+
+        descend(tree, [], set())
+    return found
+
+
+def _production_flip_sites() -> set[tuple[str, str, str, str]]:
+    files = [
+        p
+        for root in _SCAN_ROOTS
+        for p in sorted((_REPO / root).rglob("*.py"))
+        if "__pycache__" not in p.parts
+    ]
+    return _flip_sites(files, _REPO)
+
+
+def _unpaired(
+    sites: set[tuple[str, str, str, str]]
+) -> list[tuple[str, str, str, str]]:
+    return sorted(
+        site for site in sites
+        if site[2] not in set(site[3].split(","))
+        and (site[0], site[1], site[2]) not in _FLIP_WITHOUT_AN_INBOUND
+    )
+
+
+def test_every_opt_out_flip_records_the_inbound_row_that_caused_it() -> None:
+    """The invariant `_silence_inside` rests on, enforced instead of observed.
+
+    `opt_out_at` is a switch that remembers one flip; `inbound_messages` is the
+    history the guarantee actually reads. Writing the switch without writing
+    the history makes a customer's silence invisible to the promise — and the
+    promise is «استرداد كامل أو تمديد»: real money, decided weeks later, from a
+    packet that would simply not contain the reason.
+    """
+    offenders = _unpaired(_production_flip_sites())
+    assert not offenders, (
+        "opt_out_at is flipped without the inbound row that makes the flip "
+        f"visible to the start guarantee: {offenders}\n"
+        "\n"
+        "WHAT TO DO: write the classified row in the same function, in the "
+        "same transaction, the way whatsapp/worker._handle_message does —\n"
+        "    channel.opt_out_at = now\n"
+        '    _record_inbound(session, ..., classification="stop", ...)\n'
+        "and `channel.opt_out_at = None` beside classification=\"resume\". The "
+        "classification must be a LITERAL: this guard cannot read a variable, "
+        "and will not assume one matches.\n"
+        "\n"
+        "WHY: promises/guarantee._silence_inside answers «did he silence us "
+        "inside the 72-hour window?» from inbound_messages, NOT from this "
+        "column — the column keeps only the LAST flip, so a stop at hour 1 "
+        "followed by a resume at hour 74 reads as «never opted out» and the "
+        "operator decides a refund without the one fact that explains the "
+        "breach.\n"
+        "\n"
+        "IF THERE REALLY IS NO INBOUND MESSAGE behind this flip (an operator "
+        "action, a data repair), then it is a silence the guarantee can never "
+        "explain: add it to _FLIP_WITHOUT_AN_INBOUND with the reason, and "
+        "expect to be asked why the customer's own history does not show it."
+    )
+
+
+def test_the_two_flips_the_guarantee_was_written_around_are_still_there() -> None:
+    """The other direction: the guard above passes perfectly if nobody flips
+    the column at all — including on the day the stop/resume handling is moved
+    or deleted, which is exactly when it should speak up."""
+    sites = _production_flip_sites()
+    authority = {
+        (flip, paired) for path, _scope, flip, paired in sites if path == _AUTHORITY
+    }
+    assert any(flip == _STOP and _STOP in paired.split(",")
+               for flip, paired in authority), (
+        f"nothing in {_AUTHORITY} silences a customer any more — if the opt-out "
+        "moved, move _AUTHORITY with it; if it was deleted, this guard now "
+        "guards air"
+    )
+    assert any(flip == _RESUME and _RESUME in paired.split(",")
+               for flip, paired in authority), (
+        f"nothing in {_AUTHORITY} clears the silence any more — the way BACK "
+        "is the half that has already gone missing once (whatsapp/worker's own "
+        "note: «nothing anywhere cleared opt_out_at»)"
+    )
+
+
+def test_the_classifications_the_guard_enforces_are_the_ones_stored() -> None:
+    """The chain has three links and this is the one an AST cannot see: the
+    literals the ratchet demands must be the literals `whatsapp/inbound`
+    produces AND the ones `_silence_inside` filters on. Two of the three agree
+    by construction here; the third is asserted."""
+    from career.whatsapp.inbound import InboundKind
+
+    assert _STOP == InboundKind.STOP.value
+    assert _RESUME == InboundKind.RESUME.value
+
+
+def test_the_opt_out_escape_list_still_earns_its_place() -> None:
+    """An allow-list nobody re-checks stops being an exception and becomes
+    permission (the `_PRICE_HISTORY` lesson, learned the same week)."""
+    sites = {(f, scope, flip) for f, scope, flip, _paired in _production_flip_sites()}
+    stale = sorted(set(_FLIP_WITHOUT_AN_INBOUND) - sites)
+    assert not stale, (
+        f"these flips no longer exist: {stale} — delete them from "
+        "_FLIP_WITHOUT_AN_INBOUND so the guard covers those sites again"
+    )
+
+
+#: One synthetic module per way the pair can come apart, written the way a real
+#: author would write it — hurried, not malicious. Kept here rather than tried
+#: once by hand, because «somebody checked in August» is not a property the
+#: next edit of the guard preserves.
+_UNPAIRED_SHAPES: tuple[tuple[str, str], ...] = (
+    (
+        "a plain assignment in another module",
+        "def unsubscribe(session, channel, now):\n"
+        "    channel.opt_out_at = now\n",
+    ),
+    (
+        "a clear with no resume row — the way back, silently",
+        "def resume(session, channel):\n"
+        "    channel.opt_out_at = None\n",
+    ),
+    (
+        "the WRONG row beside the flip",
+        "def unsubscribe(session, channel, now):\n"
+        "    channel.opt_out_at = now\n"
+        "    _record_inbound(session, classification='resume')\n",
+    ),
+    (
+        "a classification the guard cannot read",
+        "def flip(session, channel, now, kind):\n"
+        "    channel.opt_out_at = now\n"
+        "    _record_inbound(session, classification=kind)\n",
+    ),
+    (
+        "setattr instead of an assignment",
+        "def unsubscribe(session, channel, now):\n"
+        "    setattr(channel, 'opt_out_at', now)\n",
+    ),
+    (
+        "SQLAlchemy Core — update(CustomerChannel).values(...)",
+        "from sqlalchemy import update\n"
+        "from career.db.models import CustomerChannel\n"
+        "def unsubscribe(session, now):\n"
+        "    session.execute(update(CustomerChannel).values(opt_out_at=now))\n",
+    ),
+    (
+        "raw SQL that never mentions the class",
+        "from sqlalchemy import text\n"
+        "def unsubscribe(session):\n"
+        "    session.execute(text(\n"
+        "        \"UPDATE customer_channels SET opt_out_at = now()\"))\n",
+    ),
+    (
+        "raw SQL clearing it — a bulk un-silencing nobody can audit",
+        "from sqlalchemy import text\n"
+        "def resume_everyone(session):\n"
+        "    session.execute(text(\n"
+        "        \"UPDATE customer_channels SET opt_out_at = NULL\"))\n",
+    ),
+    (
+        "a channel born silenced",
+        "from career.db.models import CustomerChannel\n"
+        "def seed(session, now):\n"
+        "    session.add(CustomerChannel(opt_out_at=now))\n",
+    ),
+    (
+        "an async writer",
+        "async def unsubscribe(session, channel, now):\n"
+        "    channel.opt_out_at = now\n",
+    ),
+    (
+        "a flip hidden inside a closure",
+        "def outer(channel, now):\n"
+        "    def inner():\n"
+        "        channel.opt_out_at = now\n"
+        "    return inner\n",
+    ),
+    (
+        "a flip on a class method",
+        "class Compliance:\n"
+        "    async def silence(self, channel, now):\n"
+        "        channel.opt_out_at = now\n",
+    ),
+    (
+        "the pair split across two functions",
+        "def silence(channel, now):\n"
+        "    channel.opt_out_at = now\n"
+        "def audit(session):\n"
+        "    _record_inbound(session, classification='stop')\n",
+    ),
+    (
+        "a flip at module scope",
+        "channel = get_channel()\n"
+        "channel.opt_out_at = None\n",
+    ),
+)
+
+
+@pytest.mark.parametrize(("label", "source"), _UNPAIRED_SHAPES, ids=lambda v: v[:44])
+def test_each_way_the_pair_comes_apart_is_seen(
+    tmp_path: pathlib.Path, label: str, source: str
+) -> None:
+    module = tmp_path / "second_flipper.py"
+    module.write_text(source, encoding="utf-8")
+    assert _unpaired(_flip_sites([module], tmp_path)), (
+        f"the opt-out pairing guard does not see: {label}"
+    )
+
+
+def test_the_guard_accepts_the_pair_written_correctly(tmp_path: pathlib.Path) -> None:
+    """The other half of «does it work». A guard that flags the correct code
+    too is deleted by the first author it inconveniences, and then nothing is
+    guarded at all. Both flips, both rows, one function — the shape
+    `whatsapp/worker._handle_message` already has."""
+    module = tmp_path / "correct.py"
+    module.write_text(
+        "def handle(session, channel, msg, now, kind):\n"
+        "    if kind == 'stop':\n"
+        "        channel.opt_out_at = now\n"
+        "        _record_inbound(session, channel_id=channel.id,\n"
+        "                        classification='stop', now=now)\n"
+        "    elif kind == 'resume':\n"
+        "        channel.opt_out_at = None\n"
+        "        _record_inbound(session, channel_id=channel.id,\n"
+        "                        classification='resume', now=now)\n",
+        encoding="utf-8",
+    )
+    assert _unpaired(_flip_sites([module], tmp_path)) == []
+
+
+def test_the_guard_does_not_flag_a_reader(tmp_path: pathlib.Path) -> None:
+    """Reading the column is what half the tree does — the window calculation,
+    the console screens, the privacy export. None of it is a flip."""
+    module = tmp_path / "reader.py"
+    module.write_text(
+        "from sqlalchemy import select\n"
+        "from career.db.models import CustomerChannel\n"
+        "def show(session, channel, now):\n"
+        "    rows = session.execute(\n"
+        "        select(CustomerChannel).where(CustomerChannel.opt_out_at.is_(None))\n"
+        "    ).scalars().all()\n"
+        "    state = window_state(opt_out_at=channel.opt_out_at, now=now)\n"
+        "    export = {'opted_out_at': str(channel.opt_out_at)}\n"
+        "    return rows, state, export\n",
+        encoding="utf-8",
+    )
+    assert _flip_sites([module], tmp_path) == set()
+
+
+def test_the_direct_message_alerts_do_not_reverse_for_the_operator() -> None:
+    """The لمّاح+ escalation alerts, held direction-pure.
+
+    `{shape}` renders an Arabic noun today (`whatsapp.worker._SPOKEN_MEDIA` is
+    the only caller and every value in it is Arabic), so the old one-line form
+    read correctly — but nothing on this side of the call can HOLD a future
+    caller to that, and a message type passed through verbatim would reverse
+    the line and take «مشترك لمّاح+» with it. On its own line it cannot.
+    Green counterpart to the tree-wide bidi guard, which is red for other
+    owners' files; see the same test in `test_whatsapp_worker`.
+    """
+    from tests.test_alert_direction_purity import SLOT, verdict
+
+    hits = verdict().get("src/career/promises/career_session.py", [])
+    assert not hits, "mixed-direction operator line(s) — " + " ; ".join(
+        f"L{n}: {line.replace(SLOT, '{…}')!r}" for n, line in hits
+    )

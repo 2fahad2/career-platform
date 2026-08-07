@@ -82,6 +82,11 @@ def receive_webhook(
     event_id = persist_deduped_event(
         session, provider=provider, event_type=event_type,
         fingerprint=fingerprint, payload=payload, order_id=order_id,
+        # The verdict travels with the body. It is the same `True` the column
+        # used to be given unconditionally, but it is now this function's
+        # answer about THIS request rather than the intake's assumption about
+        # every request — and the intake refuses the row without it.
+        signature_valid=True,
     )
     if event_id is None:
         return WebhookResult(WebhookStatus.DUPLICATE, event_fingerprint=fingerprint)

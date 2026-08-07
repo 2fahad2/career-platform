@@ -1,19 +1,20 @@
 """CV render core acceptance tests (LEGACY §1.1–§1.4, §1.10) — before code.
 
-The centerpiece: the v5 CV template and the cover-letter template are
-BYTE-VERBATIM constants, guarded by extracting the fenced blocks straight out
-of LEGACY_KNOWLEDGE.md and comparing — the template can never drift from the
-documented source of truth. fmt_month is the verbatim filter. Rendering goes
-through Jinja with AUTOESCAPE ON (deliberately safer than legacy: summaries
-and skills pass through an LLM/bank — markup in them must never execute) and
-WeasyPrint to a real PDF verified §1.10-style: exactly one A4 page, sections
-in order, dates via fmt_month.
+The centerpiece: the v5 CV template is a BYTE-VERBATIM constant, guarded by
+extracting the fenced block straight out of LEGACY_KNOWLEDGE.md and comparing —
+the template can never drift from the documented source of truth. fmt_month is
+the verbatim filter. Rendering goes through Jinja with AUTOESCAPE ON
+(deliberately safer than legacy: summaries and skills pass through an LLM/bank
+— markup in them must never execute) and WeasyPrint to a real PDF verified
+§1.10-style: exactly one A4 page, sections in order, dates via fmt_month.
 
-The cover-letter RENDERER is gone (DEVIATIONS D23) — we do not sell a letter.
-The byte-verbatim guard on the cover-letter TEMPLATE constant stays, because
-the constant does: `career/cv/template.py` belongs to another owner, and an
-unguarded verbatim constant is how drift starts. Both should be deleted in
-the same change, and this test with them.
+The whole cover-letter path is gone (DEVIATIONS D23) — we sell a tailored CV
+per opportunity, not a letter. The renderer went first; the byte-verbatim
+TEMPLATE constant and this file's guard on it went together on 2026-08-06,
+in that order and in one change, because an unguarded verbatim constant is
+where drift starts: deleting the guard first would have left a live template
+nothing was watching. What remains here is `test_the_renderer_offers_nothing_
+we_do_not_sell`, which fails if either renderer comes back.
 """
 
 from __future__ import annotations
@@ -52,12 +53,6 @@ def _fenced_block(section_marker: str, language: str) -> str:
 def test_cv_template_is_byte_verbatim_with_legacy() -> None:
     assert cv_template.CV_TEMPLATE == _fenced_block(
         "### 1.2 The CV template", "html"
-    )
-
-
-def test_cover_letter_template_is_byte_verbatim_with_legacy() -> None:
-    assert cv_template.COVER_LETTER_TEMPLATE == _fenced_block(
-        "### 1.7 Cover letter template", "html"
     )
 
 
@@ -186,12 +181,20 @@ def test_pdf_renders_exactly_one_page(tmp_path: Path) -> None:
 
 def test_the_renderer_offers_nothing_we_do_not_sell(tmp_path: Path) -> None:
     """DEVIATIONS D23. The letter renderer worked, was tested, and had no
-    caller — and the whitepaper's plan table still lists «خطاب تقديم كامل» on
-    the تنفيذي tier, so a reader had every reason to believe it shipped. The
+    caller — and the whitepaper's plan table listed «خطاب تقديم كامل» on the
+    تنفيذي tier, so a reader had every reason to believe it shipped. The
     deletion is the product decision; this asserts it stayed deleted rather
-    than being restored by someone who found the template and assumed."""
+    than being restored by someone who found the template and assumed.
+
+    The template is named here too, because that assumption needed something
+    to start from: while `COVER_LETTER_TEMPLATE` sat in `cv/template.py`, the
+    honest reading of this repository was that the feature was half-wired
+    rather than withdrawn. The whitepaper row and card are struck (§04) and
+    `tests/test_docs_truth.py` keeps them struck.
+    """
     assert not hasattr(cv_render, "render_cover_letter_pdf")
     assert not hasattr(cv_render, "render_cover_letter_html")
+    assert not hasattr(cv_template, "COVER_LETTER_TEMPLATE")
 
 
 def test_pdf_render_is_deterministic_for_identical_input(tmp_path: Path) -> None:

@@ -27,7 +27,36 @@ StartLimitIntervalSec=600
 StartLimitBurst=20
 
 [Service]
-Type=simple
+# THE WEDGE, and why this line is `notify` and not `simple`.
+#
+# The loop in run_worker_loop.py catches every exception and continues, which
+# is the right shape for a process that must survive one bad message — and the
+# reason nothing could see it die. A database that never comes back, a Meta
+# token that expired, a poll that blocks forever: the process stays ALIVE, the
+# unit stays ACTIVE, and nothing is processed. Twice, for real, with
+# `systemctl` reporting active / Result=success / NRestarts=0 throughout and no
+# alert anywhere:
+#
+#   2026-08-04 09:39:08 → 09:40:48   34 cycles failed against a Postgres that
+#                                    was being restarted underneath the worker.
+#   2026-08-06 06:58:04 → 15:59+     restarted onto code that reads
+#                                    webhook_events.next_attempt_at, a column
+#                                    staging does not have. Every cycle since
+#                                    has failed on the same query: nine hours,
+#                                    ten thousand tracebacks, not one WhatsApp
+#                                    message processed, every screen green.
+#
+# Type=notify means systemd now hears from the loop itself: READY=1 once after
+# the boot checks, then WATCHDOG=1 at the END of each cycle — after the work
+# returned, never from a `finally` and never from the `except`. Both incidents
+# above kept the loop LOOPING, so «the loop is running» is worth nothing and
+# only «a cycle COMPLETED» is worth a heartbeat.
+Type=notify
+# Implicit under WatchdogSec=, stated because it depends on a detail of
+# ExecStart below: /usr/bin/env EXECs the interpreter in the same PID rather
+# than forking, so the Python process IS the main process systemd will accept
+# notifications from. Wrap ExecStart in a shell and this silently stops working.
+NotifyAccess=main
 WorkingDirectory=/root/career
 EnvironmentFile=/root/career/.env.staging
 # EnvironmentFile beats Environment= — overrides ride inside ExecStart.
@@ -35,31 +64,108 @@ ExecStart=/usr/bin/env DB_HOST=127.0.0.1 DB_PORT=5433 REDIS_HOST=127.0.0.1 REDIS
 Restart=always
 RestartSec=5
 
-# WHAT THE ABOVE STILL DOES NOT COVER, stated plainly so nobody reads the
-# alert as complete cover. The failure this unit cannot see is the WEDGE: the
-# loop in run_worker_loop.py catches every exception and continues (`except
-# Exception: logger.error(...)` around the whole cycle), so a database that
-# never comes back, a Meta token that expired, or a poll that blocks forever
-# leaves the process ALIVE and the unit ACTIVE while nothing is processed.
-# systemd is watching the process, and the process is fine.
+# WatchdogSec — measured on this host, not rounded from a feeling.
 #
-# Closing it needs a heartbeat, which needs code in a file this unit's author
-# does not own. The exact change, for the architect:
+#   the slowest cycle ever observed  18s  (2026-07-29T21:43:03→21:43:21, a
+#                                         customer message with its LLM turn;
+#                                         the other measured ones were 4s, 6s
+#                                         and 10s, and an idle cycle is ~1s)
+#   longest LEGITIMATE stretch with
+#   no cycle able to complete       100s  (2026-08-04, Postgres restarted
+#                                         under the worker and recovered)
+#   every bounded network timeout
+#   one cycle can chain             100s  (Graph 60s + Salla 10s + the admin
+#                                         Telegram send 30s)
 #
-#   1. scripts/run_worker_loop.py — add `Type=notify`-compatible signalling:
-#      `from systemd.daemon import notify` (or a 40-line sd_notify writing
-#      NOTIFY_SOCKET directly, no dependency), call `notify("READY=1")` once
-#      after the boot checks, and `notify("WATCHDOG=1")` at the END of each
-#      loop iteration — after process_pending_whatsapp returns, never in a
-#      `finally`, or a wedged cycle would keep petting the dog.
-#   2. Then, and only then, add here:  Type=notify  and  WatchdogSec=120
-#      (40× the 3s poll — generous enough for a slow Claude call inside a
-#      cycle). systemd restarts a unit that misses its deadline, and the
-#      restart counts toward the start limit above, so a persistent wedge
-#      escalates to the alert on its own.
+# 300s is three times the longest stretch in which a HEALTHY system could not
+# complete a cycle. Tighter and an ordinary Postgres restart during a deploy
+# would kill and page; looser and the deadline stops being a watchdog. Against
+# the failure it exists for it is not close: nine hours becomes five minutes.
 #
-# Do NOT add Type=notify before step 1: systemd would wait for a READY=1 that
-# never arrives and kill the worker at start.
+# What it deliberately does NOT wait for: the Anthropic SDK's own ceiling. Its
+# default is a 600s timeout with 2 retries, so one hung call can legitimately
+# occupy ~30 minutes — and a worker that has processed nothing for half an hour
+# IS wedged, whatever the cause. The cycle's DB work is committed per event, so
+# a kill re-drives at most the event in flight.
+#
+# REVISIT when the hourly sweep grows: enrichment calls Claude once per due
+# customer, sequentially, inside a single cycle. Past roughly fifteen customers
+# due in the same hour that one cycle can exceed 300s on merit, and the sweep
+# wants its own timer rather than a bigger number here.
+WatchdogSec=300
+# Type=notify makes start-up lethal: no READY=1 within this window and systemd
+# kills the worker at boot. The boot checks query Postgres and send a Telegram
+# heartbeat before READY can be sent; a measured boot is 4s. 180s is room for a
+# slow morning, not a licence to hang.
+#
+# What that budget is actually made of, corrected 2026-08-06 — the old note
+# here said «30s client timeout» and understated it twice over. `requests`
+# applies its timeout PER PHASE, so 30s is 30s to connect PLUS 30s to read, 60s
+# worst case; and neither phase covers DNS resolution, which happens before the
+# connect timer starts and is bounded only by the resolver. The Telegram
+# heartbeat is therefore the largest and least bounded term in this budget, not
+# the smallest.
+#
+# The database term used to be unbounded and is no longer: since 2026-08-06
+# every engine in the process carries connect_timeout=10 (career.db.session,
+# injected in the `do_connect` listener so the nine bare create_engine call
+# sites get it too). Before that, `report_environment()` opened a session on a
+# DSN with no connect timeout — a Postgres that accepted the TCP connection and
+# never answered blocked there forever, which is the concrete way this unit
+# reaches TimeoutStartSec and the reason SERVICE_RESULT=timeout has its own
+# headline in the alert script.
+TimeoutStartSec=180
+
+# The wedge alert, and why it is HERE rather than left to OnFailure= above.
+#
+# A watchdog kill restarts the worker; it does not, by arithmetic, ever reach
+# `failed`. One wedge-and-restart cycle costs WatchdogSec+RestartSec = 305s, and
+# twenty of those cannot fit in the 600s start-limit window — so a permanently
+# wedged worker would restart quietly every five minutes forever, which is the
+# original incident wearing a watchdog. ExecStopPost= is the path that always
+# runs: systemd hands it $SERVICE_RESULT, the script sends the operator a
+# message when that value is `watchdog` or `timeout` — the two verdicts no unit
+# can escalate on its own — and stays silent for the `systemctl restart` of a
+# deploy. The leading `-` keeps a failed alert from becoming a failed unit.
+#
+# AND THE COST OF THAT, decided 2026-08-06. The same arithmetic that makes this
+# hook necessary makes it a firehose: 86400/305 ≈ 283 restarts a day for a
+# permanently wedged worker, every one of them reaching this script. 283
+# identical Telegram messages is not an alert, it is a reason to mute the
+# channel — and a muted channel takes the backup failure and the
+# start-limit-hit down with it.
+#
+# The fix is NOT to retune StartLimitBurst/StartLimitIntervalSec so the wedge
+# exhausts the start limit and the unit stays down. That was considered and
+# rejected: Restart=always is the only unattended recovery this host has, the
+# 2026-08-04 wedge healed by itself in 100s with nobody awake, and the same two
+# knobs govern the hung-start verdict — so a Postgres merely slow to come back
+# at boot would leave the worker permanently dead AFTER the database recovered.
+# The start limit therefore stays deliberately unreachable, and that is
+# asserted by tests/test_ops_watchdogs.py::TestTheAlertDoesNotBecomeAStorm so
+# nobody retunes it without reading this.
+#
+# The storm is a property of the NOTIFICATION, so it is fixed there: the script
+# sends one message when the failure starts, a reminder every REPEAT_S=3600
+# carrying how long it has been broken and how many kills it stands for, and a
+# distinct sentence when a failure RETURNS after a quiet spell instead of never
+# having stopped. At most 24 messages a day, none of them identical.
+ExecStopPost=-/root/career/scripts/alert_unit_failure.sh %n
+
+# DEPLOY ORDER — three files MUST land before this one.
+#
+#   src/career/notify.py            the sd_notify writer
+#   scripts/run_worker_loop.py      READY=1 and the per-cycle WATCHDOG=1
+#   scripts/alert_unit_failure.sh   knows to stay silent unless the result is
+#                                   `watchdog`; the old copy would page the
+#                                   operator on every ordinary restart, this
+#                                   deploy's own included
+#
+# Only then this file, then `systemctl daemon-reload`, then
+# `systemctl restart career-worker`. Type=notify against a worker that cannot
+# say READY=1 is a worker systemd kills at TimeoutStartSec and keeps killing.
+# Proof it took: the journal line
+# «systemd watchdog armed: a cycle must complete every 300s».
 
 [Install]
 WantedBy=multi-user.target

@@ -101,70 +101,13 @@ class Document(Base):
     tenant: Mapped[Tenant] = relationship(back_populates="documents")
 
 
-class OutboxEvent(Base):
-    """Transactional outbox (§15 / whitepaper §10). Written in the same
-    transaction as the business change; a relay (owner role) publishes
-    unpublished rows to the queue and stamps ``published_at``. Payload is
-    PII-free by contract."""
-
-    __tablename__ = "outbox_events"
-    __table_args__ = (
-        # Partial index for the relay's "unpublished" scan.
-        Index(
-            "ix_outbox_events_unpublished", "created_at",
-            postgresql_where=text("published_at IS NULL"),
-        ),
-    )
-
-    id: Mapped[uuid.UUID] = mapped_column(
-        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
-    tenant_id: Mapped[uuid.UUID] = mapped_column(
-        PGUUID(as_uuid=True),
-        ForeignKey("tenants.id", ondelete="CASCADE"),
-        nullable=False,
-    )
-    aggregate_type: Mapped[str] = mapped_column(String(64), nullable=False)
-    aggregate_id: Mapped[uuid.UUID | None] = mapped_column(
-        PGUUID(as_uuid=True), nullable=True
-    )
-    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
-    payload: Mapped[dict[str, Any]] = mapped_column(
-        JSONB, nullable=False, default=dict
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
-    published_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-
-
-class ProcessedMessage(Base):
-    """Idempotency ledger. A redelivered message whose (tenant_id,
-    idempotency_key) already exists is a no-op (§15.11 companion)."""
-
-    __tablename__ = "processed_messages"
-    __table_args__ = (
-        UniqueConstraint(
-            "tenant_id", "idempotency_key",
-            name="uq_processed_messages_tenant_id_idempotency_key",
-        ),
-    )
-
-    id: Mapped[uuid.UUID] = mapped_column(
-        PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
-    tenant_id: Mapped[uuid.UUID] = mapped_column(
-        PGUUID(as_uuid=True),
-        ForeignKey("tenants.id", ondelete="CASCADE"),
-        nullable=False,
-    )
-    idempotency_key: Mapped[str] = mapped_column(String(200), nullable=False)
-    processed_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
+# `OutboxEvent` and `ProcessedMessage` stood here until 0029 dropped their
+# tables. The queue subsystem they served was deleted this week — the worker
+# loop reads `webhook_events` directly and dedupes on
+# `inbound_messages.wa_message_id` — and a mapped class for a table that no
+# longer exists is worse than an unused import: `Base.metadata` is what the RLS
+# meta-tests and the schema comparisons walk, so a ghost model makes them
+# assert about a relation the database does not have.
 
 
 class AuditEvent(Base):
@@ -464,8 +407,18 @@ class DeliveryMessage(Base):
     tenant_id: Mapped[uuid.UUID] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
     )
-    channel_id: Mapped[uuid.UUID] = mapped_column(
-        PGUUID(as_uuid=True), ForeignKey("customer_channels.id", ondelete="CASCADE"), nullable=False
+    # Nullable since 0028, and the reason is a billing hole rather than a
+    # modelling preference. Two APPROVED templates are sent to the phone on the
+    # Salla order — the zero-touch welcome and the day-5 claim reminder — and
+    # both fire BEFORE the buyer has replied even once, so no CustomerChannel
+    # exists yet to point at. NOT NULL therefore made those two sends
+    # unrecordable, and `close.whatsapp_spend` derives the WhatsApp bill from
+    # this table: an order that never activates was billed by Meta for 100% of
+    # its templates and counted by us for none of them. The FK is unchanged —
+    # when there IS a channel the row still carries it, and only a send that
+    # genuinely had no channel may leave it NULL.
+    channel_id: Mapped[uuid.UUID | None] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("customer_channels.id", ondelete="CASCADE"), nullable=True
     )
     delivery_id: Mapped[uuid.UUID | None] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("deliveries.id", ondelete="SET NULL"), nullable=True

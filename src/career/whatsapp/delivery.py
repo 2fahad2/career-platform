@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import String, select
 from sqlalchemy.orm import Session
 
 from career.db.models import CustomerChannel, Delivery, DeliveryMessage
@@ -42,6 +42,76 @@ RESEND_SENT = "sent"
 RESEND_NO_BUNDLE = "no_bundle"
 RESEND_OPTED_OUT = "opted_out"
 RESEND_WINDOW_CLOSED = "window_closed"
+
+#: The widest provider id the two columns that hold one can store, read off
+#: the model instead of typed here. Both `delivery_messages.wa_message_id` and
+#: `deliveries.template_message_id` are ``varchar(128)`` today; a migration
+#: that widens either one widens this guard with it, rather than leaving a
+#: number written in August 2026 rejecting ids the database would now accept.
+_WA_ID_COLUMN = DeliveryMessage.__table__.c.wa_message_id.type
+_WA_MESSAGE_ID_MAX: int = (
+    _WA_ID_COLUMN.length if isinstance(_WA_ID_COLUMN, String) and _WA_ID_COLUMN.length
+    else 128
+)
+
+
+def usable_message_id(value: object, *, what: str) -> str | None:
+    """Meta's message id, or ``None`` when the database would refuse it.
+
+    AUDIT 2026-08-06, second review. The last wave taught
+    `salla/lifecycle._record_send` to check this value — and stopped there,
+    at ONE of `record_out`'s twenty-two call sites. Every other site is a
+    delivery-shaped path where the row a refused INSERT destroys is a DELIVERY
+    LEDGER row: constant 3 evidence that a customer was sent his CVs, the
+    source `close.whatsapp_spend` bills from, and the row a Meta receipt is
+    later written onto. The reviewer reproduced it at one of them —
+    ``DataError (StringDataRightTruncation)`` at commit, and the ledger row
+    that mattered persisted zero times, taking the `deliveries` row with it
+    because a rollback is whole.
+
+    So the check lives at the funnel every send passes through, and the
+    twenty-two callers are covered by construction rather than by twenty-two
+    authors each remembering. **Rejected alternative:** repeating the check at
+    each call site. That is the same shape as the defect — a rule that holds
+    wherever somebody remembered it — and the twenty-third caller written next
+    month would not have it.
+
+    **Rejected alternative:** truncating to fit. A truncated id is not a
+    damaged id, it is a DIFFERENT id: `worker._handle_status` matches receipts
+    by exact equality on this column, and two ids sharing a 128-character
+    prefix would hand one send's receipt to another send's row. Silence beats
+    a wrong answer about what reached a customer.
+
+    ``value`` is typed `object` because this is the one place in the module
+    that must assume nothing: it is the parsed body of an HTTP response from
+    somebody else's service. Both failure modes are real and neither is
+    exotic — an id longer than the column (a provider format change) and an id
+    that is not a string at all (a client returning the response envelope
+    instead of digging the id out of it, one refactor away at all times).
+
+    THE PRICE, because it is not nothing (the last wave's docstring called it
+    «harmless»): a row with a NULL id can never be matched by an incoming
+    receipt, so its status stays ``sent`` for good. `close.whatsapp_spend`
+    bills every ``kind="template"`` row whose status is not ``failed``, so a
+    template that Meta later reports as FAILED is billed anyway. That
+    over-reports spend — the safe direction, and far better than the
+    alternative it replaces, where the row did not exist at all and a template
+    Meta charged us for was counted at zero. It is also why the log line below
+    is ERROR: the operator's harvester forwards ``ERROR:`` lines only, and a
+    provider whose ids stopped fitting our columns is a thing he must hear
+    about the first time, not after a month of quietly unmatchable sends.
+    """
+    mid = value if isinstance(value, str) else None
+    if mid is not None and len(mid) > _WA_MESSAGE_ID_MAX:
+        mid = None
+    if mid is None:
+        logger.error(
+            "provider message id unusable for %s — the row is written with a "
+            "NULL id, so the send is still counted (and, if it is a template, "
+            "still billed) but its delivery receipt can never be matched",
+            what,
+        )
+    return mid
 
 
 @dataclass(frozen=True)
@@ -73,7 +143,11 @@ def record_out(
     session: Session,
     *,
     tenant_id: uuid.UUID,
-    channel_id: uuid.UUID,
+    # None only where there is genuinely no channel to point at: the two
+    # lifecycle templates that go to the phone on the Salla order fire before
+    # the buyer has ever replied, so no CustomerChannel exists yet (0028). Every
+    # send from THIS module has a channel and always passes one.
+    channel_id: uuid.UUID | None,
     kind: str,
     wa_message_id: str,
     template_name: str | None = None,
@@ -81,10 +155,53 @@ def record_out(
     now: datetime | None = None,
     status: str = "sent",
 ) -> DeliveryMessage:
+    """The one door onto `delivery_messages`, and the one place the provider's
+    id is checked before it enters the session.
+
+    ``wa_message_id`` is annotated ``str`` because every caller in the tree has
+    one to hand — but the annotation is a statement about CALLERS, not a
+    promise about the value: what they hand over came out of somebody else's
+    HTTP response and was never inspected on the way. :func:`usable_message_id`
+    therefore assumes nothing about it, and the column is written NULL when the
+    database would refuse it. Read that function before changing this: the NULL
+    has a price, and it is written down there.
+
+    Of the row's five text columns this is the only one that is not ours.
+    ``kind`` and ``status`` are module literals, ``template_name`` comes from
+    our own approved `TemplateSpec` — none of them can be widened by a provider
+    changing its mind. One value from outside, one check.
+
+    NO SAVEPOINT HERE, deliberately, and this is a separate decision from the
+    one above rather than the other half of it:
+
+    * `salla/lifecycle._record_send` wraps its row in ``begin_nested()``
+      because its transaction carries OTHER work — a whole night of
+      subscription marks for customers already processed — and one refused
+      accounting row must not discard them.
+    * Here the transaction carries the delivery this row is the evidence FOR.
+      A failure that validation cannot prevent (a channel deleted underneath
+      us, a tenant that no longer exists) means we cannot record what we sent,
+      and constant 3 says a delivery we cannot evidence is not a delivery we
+      may claim. Swallowing it would commit a `deliveries` row saying
+      COMPLETED with no messages under it, and bill for sends nothing shows.
+      Failing the transaction refuses to claim it — loudly, where the caller
+      can see it.
+    * And it would not be free. A savepoint is only meaningful with a flush
+      inside it, which turns one batched INSERT per commit into a
+      SAVEPOINT/INSERT/RELEASE round trip PER LEDGER ROW on the hot delivery
+      path — a grouped bundle writes one row per job card, one per document
+      and one per outcome prompt.
+
+    The failure this module actually suffered was not «a row failed», it was
+    «a row failed AVOIDABLY, from a value nobody checked». That is what the
+    check above removes; wrapping every row would have hidden the rest.
+    """
     dm = DeliveryMessage(
         id=uuid.uuid4(), tenant_id=tenant_id, channel_id=channel_id,
-        delivery_id=delivery_id, wa_message_id=wa_message_id, kind=kind,
-        template_name=template_name, status=status, status_updated_at=now,
+        delivery_id=delivery_id,
+        wa_message_id=usable_message_id(wa_message_id, what=template_name or kind),
+        kind=kind, template_name=template_name, status=status,
+        status_updated_at=now,
     )
     session.add(dm)
     return dm
@@ -341,7 +458,18 @@ def deliver_adaptive(
             channel.phone_e164, daily_template.name, daily_template.language,
             buttons=daily_template.buttons,
         )
-        delivery.template_message_id = mid
+        # The SECOND unguarded provider write on this path, and the reason
+        # «validate once, at the funnel» was not the whole fix:
+        # `deliveries.template_message_id` is `varchar(128)` too, and it is
+        # stamped here, outside `record_out`. An id the ledger row survives
+        # would still have failed the UPDATE on THIS row and rolled back the
+        # held bundle whole — the customer receives a morning template, taps
+        # it, and there is no delivery left to descend. Nothing in the tree
+        # reads this column (it is a debugging convenience; the ledger row
+        # below is the real record), so writing NULL here costs nothing at all.
+        delivery.template_message_id = usable_message_id(
+            mid, what=daily_template.name
+        )
         record_out(session, tenant_id=channel.tenant_id, channel_id=channel.id,
                    kind="template", wa_message_id=mid,
                    template_name=daily_template.name, delivery_id=delivery.id, now=now)

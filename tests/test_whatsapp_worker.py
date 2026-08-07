@@ -1479,3 +1479,341 @@ def test_the_classifier_defaults_to_the_side_that_cannot_double_send() -> None:
         assert _is_transient(exc) is True, type(exc).__name__
     for exc in terminal:
         assert _is_transient(exc) is False, f"{type(exc).__name__}: {exc}"
+
+
+# ── the لمّاح+ direct line: heard, and only when he actually spoke ───────────
+# Theme of this block. The tier sells «تواصل مباشر معي — اكتب لي وقت ما تحتاج»,
+# and the escalation that delivers it sits in the worker's LAST branch. Two
+# opposite failures live one line apart there: a real message that reaches
+# nobody, and a machine event that raises a ticket against a customer who said
+# nothing. The dedupe is one open ticket per customer, so the second failure
+# also SPENDS the first one's only slot.
+
+
+def _plus_customer(owner_session: Session, wa: Any, deps: Any) -> str:
+    """An ACTIVE لمّاح+ (449) customer, past onboarding — the tier that buys
+    the direct line."""
+    phone = _start_journey(owner_session, wa, deps)
+    _set_journey(owner_session, phone, "ACTIVE")
+    _set_subscription(owner_session, phone, plan_code="executive",
+                      status="ACTIVE")
+    return phone
+
+
+def _direct_tickets(owner_session: Session, phone: str) -> list[Any]:
+    return list(owner_session.execute(text(
+        "SELECT e.id, e.inbound_message_id FROM support_events e"
+        " JOIN customer_channels c ON c.id = e.channel_id"
+        " WHERE c.phone_e164 = :p AND e.kind = 'executive_direct_message'"
+        " AND e.status = 'open'"), {"p": phone}))
+
+
+def _hold_a_bundle(owner_session: Session, phone: str, wa: Any) -> None:
+    """Shut the 24h window and queue tonight's bundle behind it — the state
+    every customer who went quiet for a day is in by morning."""
+    ch = owner_session.execute(
+        select(CustomerChannel).where(CustomerChannel.phone_e164 == phone)
+    ).scalar_one()
+    ch.last_inbound_at = NOW - timedelta(hours=25)
+    owner_session.commit()
+    deliver_adaptive(owner_session, ch, {"parts": [{"kind": "text",
+                                                    "body": "#1 job"}]},
+                     run_date=NOW.date(), whatsapp_client=wa,
+                     daily_template=DAILY_UTILITY, now=NOW)
+    owner_session.commit()
+
+
+def test_a_landed_bundle_never_swallows_the_customers_own_question(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """D1.1 — the likeliest message of all.
+
+    `descend_pending_delivery` fires on ANY inbound while a bundle sits
+    PENDING_WINDOW, and the first message a customer sends after a quiet day
+    is exactly the one that lands it. The escalation was gated on
+    `landed is None`, so a لمّاح+ customer asking a real question got a job
+    bundle and reached nobody: no ticket, no page, no card.
+
+    `landed` is a DELIVERY event. It says a held bundle went out; it says
+    nothing whatever about what the customer wrote.
+    """
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    deps = _worker_deps(wa)
+    phone = _plus_customer(owner_session, wa, deps)
+    _hold_a_bundle(owner_session, phone, wa)
+    admin.messages.clear()
+
+    _deliver(owner_session, phone,
+             _text_msg(f"wamid-{uuid.uuid4()}", phone,
+                       "أبي رأيك في عرض وظيفي وصلني، أوافق ولا أنتظر؟"),
+             wa, admin, deps)
+
+    tickets = _direct_tickets(owner_session, phone)
+    assert tickets, (
+        "a لمّاح+ customer's real question reached NOBODY because a held "
+        f"bundle happened to land on the same message — {tickets}"
+    )
+    # D1.5 — and the ticket points at the message that caused it, so the
+    # operator's queue can tell a real sentence from a machine event.
+    assert tickets[0][1] is not None, "the ticket links to no message"
+    assert any("⭐" in m for m in admin.messages), "the operator was not paged"
+    assert all(phone.lstrip("+") not in m for m in admin.messages)  # §15.13
+    # and the customer is still answered: a bundle is tonight's scheduled
+    # delivery, never a reply to a sentence somebody typed.
+    assert "وصلتني رسالتك" in (wa.sent[-1].body or "")
+
+
+def test_a_voice_note_from_a_plus_customer_reaches_a_human(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """D1.2 — a voice note is the commonest thing a Saudi customer sends.
+
+    A document paged the operator; audio, image and video fell through to a
+    media ack and reached nobody. The tier sells access, not a file format.
+    The operator cannot hear it from Telegram, so the alert says so and sends
+    him to the conversation instead of pretending there is a body to read.
+    """
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    deps = _worker_deps(wa)
+    phone = _plus_customer(owner_session, wa, deps)
+    admin.messages.clear()
+
+    _deliver(owner_session, phone, _media_msg(phone, "audio"), wa, admin, deps)
+
+    assert _direct_tickets(owner_session, phone), \
+        "a لمّاح+ voice note reached nobody"
+    pages = [m for m in admin.messages if "⭐" in m]
+    assert pages, "the operator was not paged"
+    assert "رسالة صوتية" in pages[0], "the alert does not say what he gets"
+    assert "واتساب" in pages[0], "he is not told where to go and hear it"
+    assert phone.lstrip("+") not in pages[0]
+    # the customer still gets the honest media answer
+    assert "ما أقدر أقرأ إلا النص المكتوب" in (wa.sent[-1].body or "")
+
+
+def test_a_tap_on_a_stale_card_is_never_a_ticket(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """D1.3/D1.4 — WhatsApp keeps every card tappable forever.
+
+    A tap on a months-old enrichment card («مضبوط ✅», id `enr_ok`) is a
+    machine event from a card WE sent, not a customer writing to us. It used
+    to open the ONE direct-line ticket the dedupe allows, so Tuesday's real
+    question returned `already_open` and paged nobody.
+    """
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    deps = _worker_deps(wa)
+    phone = _plus_customer(owner_session, wa, deps)
+    admin.messages.clear()
+
+    _deliver(owner_session, phone, {
+        "id": f"wamid.{uuid.uuid4().hex}", "from": phone, "type": "interactive",
+        "interactive": {"type": "button_reply",
+                        "button_reply": {"id": "enr_ok", "title": "مضبوط ✅"}},
+    }, wa, admin, deps)
+
+    assert _direct_tickets(owner_session, phone) == [], \
+        "a stale card tap opened the one ticket a real message needs"
+    assert not [m for m in admin.messages if "⭐" in m]
+    assert wa.sent, "the tap was met with silence"
+
+
+def test_a_typed_outcome_label_is_the_answer_not_a_ticket(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """D1.3 — «ما ردّوا» typed instead of tapped.
+
+    `outcome_followup.parse_answer` reads BUTTON IDS only, so a customer who
+    types the label he can see fell all the way through to the direct line: a
+    ticket raised against someone answering OUR question, and the §20 datum —
+    which can never be collected twice — thrown away.
+    """
+    from career.cv import outcome_followup as followup
+
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    deps = _worker_deps(wa)
+    phone = _plus_customer(owner_session, wa, deps)
+    owner_session.execute(text(
+        "INSERT INTO outcome_events (id, tenant_id, job_ref, outcome,"
+        " occurred_at) SELECT :i, c.tenant_id, 'JOB-1', :o, :t"
+        " FROM customer_channels c WHERE c.phone_e164 = :p"),
+        {"i": str(uuid.uuid4()), "o": followup.ASKED, "t": NOW, "p": phone})
+    owner_session.commit()
+    admin.messages.clear()
+
+    _deliver(owner_session, phone,
+             _text_msg(f"wamid-{uuid.uuid4()}", phone, "ما ردوا"),
+             wa, admin, deps)
+
+    recorded = owner_session.execute(text(
+        "SELECT o.outcome FROM outcome_events o JOIN customer_channels c"
+        " ON c.tenant_id = o.tenant_id WHERE c.phone_e164 = :p"
+        " AND o.outcome = :v"), {"p": phone, "v": followup.NO_REPLY}).all()
+    assert recorded, "the customer's own answer to our question was discarded"
+    assert _direct_tickets(owner_session, phone) == [], \
+        "answering our question raised a ticket against the customer"
+
+
+def test_an_enrichment_answer_is_never_a_ticket_when_the_renderer_is_unwired(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """D1.3 — the «structural guarantee» had a hole with no floor under it.
+
+    `orchestrator.handle_enrichment` returns False when
+    `deps.achievement_renderer is None`, and `_mid_flow` never looked at the
+    enrichment session at all (the journey is ACTIVE while it runs). So with
+    the renderer unwired — the shipped default — a genuine achievement answer
+    fell through to the direct line and became a ticket.
+    """
+    from career.promises import career_session
+
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    deps = _worker_deps(wa)                      # achievement_renderer is None
+    assert deps.achievement_renderer is None
+    phone = _plus_customer(owner_session, wa, deps)
+    _set_journey(owner_session, phone, "ACTIVE",
+                 '{"enrichment": {"open": true}}')
+    admin.messages.clear()
+
+    _deliver(owner_session, phone,
+             _text_msg(f"wamid-{uuid.uuid4()}", phone,
+                       "قللت وقت الإغلاق الشهري من عشرة أيام لأربعة"),
+             wa, admin, deps)
+
+    assert _direct_tickets(owner_session, phone) == [], \
+        "an answer to our own enrichment question became a support ticket"
+    # and the guard is in the promises module, not only in branch order
+    tenant = owner_session.execute(text(
+        "SELECT tenant_id FROM customer_channels WHERE phone_e164 = :p"),
+        {"p": phone}).scalar_one()
+    assert career_session._mid_flow(owner_session, tenant) is True
+
+
+# ── a buyer who is still silenced (D2.2 / D2.3) ─────────────────────────────
+
+
+def _silence(owner_session: Session, phone: str) -> None:
+    owner_session.execute(text(
+        "UPDATE customer_channels SET opt_out_at = :n WHERE phone_e164 = :p"),
+        {"n": NOW, "p": phone})
+    owner_session.commit()
+
+
+def test_a_silenced_buyer_is_not_walked_through_a_journey_he_cannot_read(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """D2.2 — `ActivationResult.opted_out` was added to be read and had no
+    reader anywhere in the tree.
+
+    A customer who bought while still opted out gets ONE welcome saying why
+    nothing will arrive — and then the handover started the journey on top of
+    it, buried that line under the consent gate, and carried him all the way
+    to ACTIVE. «Fully onboarded» with every prompt unread, to someone whose
+    standing instruction is silence.
+    """
+    from career.whatsapp.worker import _handle_message
+
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    deps = _worker_deps(wa)
+    phone = _phone()
+    order_id = f"ORD-{uuid.uuid4()}"
+    salla = FakeSallaClient({
+        order_id: SallaOrder(order_id, "paid", "prod_pro", Decimal("279.00"),
+                             "SAR", customer_phone=_probe_phone())
+    })
+    result = provision_order(
+        owner_session, order_id, salla_client=salla, product_catalog=CATALOG,
+        expected_pricing={k: (Decimal("279.00"), "SAR") for k in CATALOG})
+    token = result.activation_token
+    assert token is not None
+    # He opted out before he paid — the channel exists and is silenced.
+    owner_session.execute(text(
+        "INSERT INTO customer_channels (id, tenant_id, provider, phone_e164,"
+        " opt_out_at) VALUES (:i, :t, 'whatsapp', :p, :n)"),
+        {"i": str(uuid.uuid4()), "t": result.tenant_id, "p": phone, "n": NOW})
+    owner_session.commit()
+
+    _handle_message(owner_session,
+                    _text_msg(f"wamid-{uuid.uuid4()}", phone, f"تفعيل {token}"),
+                    whatsapp_client=wa, admin_client=admin, now=NOW,
+                    onboarding=deps)
+    owner_session.commit()
+
+    journeys = owner_session.execute(text(
+        "SELECT o.state FROM onboarding_sessions o JOIN customer_channels c"
+        " ON c.tenant_id = o.tenant_id WHERE c.phone_e164 = :p"),
+        {"p": phone}).all()
+    assert journeys == [], \
+        f"a silenced buyer was walked into the journey anyway — {journeys}"
+    # the notice is the LAST thing on his screen, not the first of five
+    assert "موقفة" in (wa.sent[-1].body or "") or \
+           "موقوفة" in (wa.sent[-1].body or ""), wa.sent[-1].body
+
+    # …and the handover is deferred, never lost: the word brings it back.
+    _handle_message(owner_session,
+                    _text_msg(f"wamid-{uuid.uuid4()}", phone, "تشغيل الرسائل"),
+                    whatsapp_client=wa, admin_client=admin, now=NOW,
+                    onboarding=deps)
+    owner_session.commit()
+    resumed = owner_session.execute(text(
+        "SELECT o.state FROM onboarding_sessions o JOIN customer_channels c"
+        " ON c.tenant_id = o.tenant_id WHERE c.phone_e164 = :p"),
+        {"p": phone}).all()
+    assert resumed, "the deferred handover never ran — he is activated and mute"
+
+
+def test_the_way_back_is_printed_again_for_a_near_miss_resume(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """D2.3 — «طيب تشغيل الرسائل من فضلك» classifies as OTHER.
+
+    RESUME is matched on the WHOLE message and deliberately so. Its docstring
+    argued the miss was cheap «because the confirmation prints تشغيل
+    الرسائل» — true only for a customer who still has that message on screen,
+    and the opted-out branch answered him with ZERO outbound. He asked to come
+    back, in words, and heard nothing at all.
+    """
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    deps = _worker_deps(wa)
+    phone = _start_journey(owner_session, wa, deps)
+    _set_journey(owner_session, phone, "ACTIVE")
+    _silence(owner_session, phone)
+    before = len(wa.sent)
+
+    _deliver(owner_session, phone,
+             _text_msg(f"wamid-{uuid.uuid4()}", phone,
+                       "طيب تشغيل الرسائل من فضلك"),
+             wa, admin, deps)
+
+    assert len(wa.sent) > before, \
+        "a customer asking to come back was answered with nothing at all"
+    reply = wa.sent[-1].body or ""
+    assert "تشغيل الرسائل" in reply, "the exact word back is not printed"
+    # still silenced — a guess must never un-mute someone on record as having
+    # asked for silence (that is the surface RESUME's narrowness protects)
+    still = owner_session.execute(text(
+        "SELECT opt_out_at FROM customer_channels WHERE phone_e164 = :p"),
+        {"p": phone}).scalar_one()
+    assert still is not None, "a near miss un-silenced him by guessing"
+
+
+def test_no_alert_from_this_worker_reverses_on_the_operator_screen() -> None:
+    """The two alerts Fahad actually reads from here, held direction-pure.
+
+    `tests/test_alert_direction_purity` owns the rule and scans the whole
+    tree — but that test is red for files other agents own, so a regression
+    in THIS file would land inside an already-failing assertion and be read
+    by nobody. This is the green half, and it fails for one file only.
+
+    Both lines it protects carried a TEN code INSIDE an Arabic sentence:
+    «🔇 عميل أوقف الرسائل TEN-0002 — …» when a paying customer silences us,
+    and «📎 عميل أرسل ملفًا بعد التفعيل TEN-0002 — …» when one sends a file.
+    His client reverses such a line, and the code — the only part that says
+    WHOSE line just went quiet — is the part that moves.
+    """
+    from tests.test_alert_direction_purity import SLOT, verdict
+
+    hits = verdict().get("src/career/whatsapp/worker.py", [])
+    assert not hits, "mixed-direction operator line(s) — " + " ; ".join(
+        f"L{n}: {line.replace(SLOT, '{…}')!r}" for n, line in hits
+    )

@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
+from career import notify as sd_notify
 from career.config import get_settings
 from career.db.models import CustomerChannel
 from career.engine.cli import (
@@ -191,6 +192,27 @@ def main() -> None:  # pragma: no cover — the C7.8 live runner
             " as unscanned",
             boot_scan_health.state, boot_scan_health.detail,
         )
+    # ── the heartbeat (career-worker.service, WatchdogSec) ────────────────
+    # READY=1 goes here and nowhere else: AFTER the boot checks, so systemd
+    # calls this unit «started» only once the selling environment and the
+    # upload scanner have actually been looked at, and BEFORE the loop, so the
+    # watchdog deadline starts counting from the first cycle. One send only —
+    # sd_notify's READY is a start-up edge, not a heartbeat.
+    #
+    # Outside systemd (the C7.8 canary by hand, the logging-wiring probes)
+    # NOTIFY_SOCKET is absent, every call below is a no-op, and nothing about
+    # this loop changes. See src/career/notify.py for the two incidents that
+    # bought this.
+    sd_notify.ready()
+    armed = sd_notify.watchdog_interval_s()
+    if armed:
+        # Printed so the operator can prove the watchdog is real from the
+        # journal after a deploy, instead of trusting the unit file.
+        logger.info("systemd watchdog armed: a cycle must complete every "
+                    "%.0fs or this worker is killed and restarted", armed)
+    else:
+        logger.warning("no systemd watchdog on this process — a wedged cycle "
+                       "will NOT be noticed by anything")
     last_reminder_sweep = 0.0
     last_window_nudge: date | None = None
 
@@ -305,6 +327,14 @@ def main() -> None:  # pragma: no cover — the C7.8 live runner
                         with Session(engine) as session:
                             weekly.release_weekly_report(
                                 session, restore_to=previous)
+            # THE LAST STATEMENT OF THE CYCLE, and it has to stay that way.
+            # Not in a `finally`, not in the `except` below: the two failures
+            # this exists to catch — 100s of a restarting Postgres on
+            # 2026-08-04, and every cycle since 2026-08-06 06:58 raising on a
+            # column staging does not have — both kept this loop LOOPING. A
+            # dog petted by the loop is a dog petted by the incident. Only a
+            # cycle that got all the way here processed anything.
+            sd_notify.watchdog()
         except Exception:  # noqa: BLE001 — the loop must survive anything
             logger.error("worker cycle failed", exc_info=True)
         time.sleep(POLL_SECONDS)

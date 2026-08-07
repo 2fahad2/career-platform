@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 import pytest
@@ -130,7 +131,7 @@ def test_today_screen_shows_ten_codes_and_states(
         text = outcomes[1].text
         assert code in text
         assert "✅ سُلّم" in text
-        assert "سُلّم 2" in text
+        assert "سُلّم ٢" in text          # a count inside an Arabic line
     finally:
         owner_session.execute(sql_text(
             "DELETE FROM tenant_day_states WHERE tenant_id = :t"), {"t": t1})
@@ -224,9 +225,12 @@ def test_render_health_full_and_unknown() -> None:
         "backup_age_hours": 11.0,
     })
     assert "🟢 يعمل" in text
-    assert "🟠 ينتهي بعد 5" in text
-    assert "باقي 9000 من 10000" in text
-    assert "⏳ 5 معلق" in text
+    # every count on this screen is Arabic-Indic: it is what lets each fact
+    # keep ONE line, and half-and-half would be worse than either choice
+    assert "🟠 ينتهي بعد ٥" in text
+    assert "باقي ٩٠٠٠ من ١٠٠٠٠" in text
+    assert "⏳ ٥ معلق" in text
+    assert "مؤقت التسليم: 🟢 التالي السبت ٠٤:٣٠" in text
     assert keyboard[0][0][1] == "v1|health"
 
     text_unknown, _ = views.render_health({})
@@ -284,7 +288,7 @@ def test_today_screen_says_no_run_when_the_night_did_not_fire(
         )
         text = out[1].text
         assert "ما صارت تشغيلة اليوم" in text
-        assert "99" not in text            # yesterday's counters stay away
+        assert "٩٩" not in text            # yesterday's counters stay away
         assert yesterday in text           # but its date is shown, labelled
 
         # and once today's run exists, TODAY's numbers are the ones shown
@@ -299,7 +303,7 @@ def test_today_screen_says_no_run_when_the_night_did_not_fire(
             probes=FakeProbes(), now=NOW,
         )
         assert "🟠 جزئية" in out2[1].text
-        assert "المكتشف: 12" in out2[1].text
+        assert "المكتشف: ١٢" in out2[1].text
         assert "ما صارت تشغيلة اليوم" not in out2[1].text
     finally:
         owner_session.execute(
@@ -323,6 +327,126 @@ def test_views_render_only_ten_codes_never_identity_fields() -> None:
     assert "TEN-0009" in text
 
 
+def test_every_screen_and_button_is_direction_pure_when_rendered() -> None:
+    """The rule applied to the OUTPUT, not to the source.
+
+    ``tests/test_alert_direction_purity`` reads the source and is the stronger
+    guard — it cannot be dodged by a value nobody thought to test. This one
+    catches what the source cannot see: a VALUE arriving mixed from outside
+    the module (the timer probe's «السبت 04:30», a plan code or a day state
+    nobody mapped, a status token straight from the database). Every screen is
+    rendered with its unknown-token path taken on purpose, and the BUTTONS are
+    checked too, because a button label is a line the same client scrambles
+    and it is the one line that cannot be split in half.
+    """
+    import re
+
+    arabic = re.compile(r"[؀-ۿ]")
+    latin_or_digit = re.compile(r"[A-Za-z0-9]")
+
+    def check(what: str, text: str, keyboard: object = ()) -> None:
+        for line in text.split("\n"):
+            assert not (arabic.search(line) and latin_or_digit.search(line)), (
+                f"{what}: mixed line {line!r}"
+            )
+        for row in keyboard or ():
+            for label, _cb in row:
+                assert not (arabic.search(label)
+                            and latin_or_digit.search(label)), (
+                    f"{what}: mixed button {label!r}"
+                )
+
+    check("menu", *views.render_menu())
+    check("today", *views.render_today(
+        NOW.date(),
+        {"status": "weird_new_status", "counts": {"fetched": 12}},
+        [("TEN-0002", "DELIVERED", {"delivered": 2, "failed_sends": 1}),
+         ("TEN-0009", "A_STATE_NOBODY_MAPPED", {})],
+        {"run_date": "2026-07-14", "status": "another_unknown"},
+    ))
+    check("health", *views.render_health({
+        "worker_active": True, "timer_next": "السبت 04:30 بتوقيت الرياض",
+        "meta_token_ok": True, "salla_days_left": 5,
+        "searchapi": (10_000, 9_000),
+        "templates": {"APPROVED": 2, "PENDING": 5, "REJECTED": 1},
+        "deployed_source": ("abc123", "def456"), "backup_age_hours": 40.0,
+    }))
+    check("customers", *views.render_customers(
+        [{"code": "TEN-0002", "plan_code": "executive",
+          "journey_state": "ACTIVE", "window": "open"},
+         {"code": "TEN-0009", "plan_code": "a_plan_nobody_mapped",
+          "journey_state": "SOME_NEW_STATE", "window": "closed"}],
+        page=0, total=17,
+    ))
+    check("card", *views.render_tenant_card({
+        "code": "TEN-0002", "plan_code": "a_plan_nobody_mapped",
+        "sub_status": "ACTIVE", "sub_age_days": 22,
+        "journey_state": "SOME_NEW_STATE", "window": "a_new_window",
+        "last_delivery": {"run_date": "2026-08-01", "status": "COMPLETED"},
+        "outcomes": {"applied": 9, "ignored": 3}, "suppressions": 4,
+        "support_minutes": 15, "review_count": 2,
+    }))
+    check("business", *views.render_business("30", {
+        "subs_by_plan": {"professional": 3, "a_plan_nobody_mapped": 1},
+        "revenue_sar": 1245, "funnel_upgrades": 2,
+        "searches_this_month": 1340, "delivered_days": 27,
+        "outcomes": {"applied": 9, "ignored": 3},
+        "llm_generations": 41, "llm_cost_usd": "1.83",
+        "message_statuses": {"read": 118, "delivered": 12, "sent": 4,
+                             "failed": 1},
+    }))
+    check("business/unknown range", *views.render_business("99", {}))
+
+    from datetime import date as _date
+
+    from career.telegram.weekly_report import format_weekly_report
+
+    check("weekly", format_weekly_report(
+        _date(2026, 8, 2),
+        {"subs_by_plan": {"professional": 3, "a_plan_nobody_mapped": 1},
+         "revenue_sar": 1245, "funnel_upgrades": 2,
+         "outcomes": {"applied": 9, "ignored": 3},
+         "message_statuses": {"read": 118},
+         "llm_generations": 41, "llm_cost_usd": "1.83"},
+        {"DELIVERED": 24, "A_STATE_NOBODY_MAPPED": 2},
+        covering_through=_date(2026, 8, 5),
+    ))
+
+
+def test_counts_are_arabic_indic_and_screens_did_not_double_in_height() -> None:
+    """WHICH cure was applied, pinned — because the other one also passes the
+    purity check and is the wrong answer here.
+
+    A count can be made safe two ways: give it a line of its own, or write it
+    in Arabic-Indic digits. On a dashboard read in two seconds the second is
+    the only one that is still a dashboard afterwards, so the counts stay in
+    their sentences and it is IDENTIFIERS — the TEN code, the ISO date, an
+    unmapped token — that get the lines. If someone ever «fixes» this by
+    splitting the counts out, every purity test stays green and this one does
+    not.
+    """
+    text, _ = views.render_business("30", {
+        "subs_by_plan": {"professional": 3}, "revenue_sar": 1245,
+        "searches_this_month": 1340, "outcomes": {"applied": 9, "ignored": 3},
+    })
+    assert "💰 اشتراكات جديدة: لمّاح: ٣" in text
+    assert "الإيراد: ١٢٤٥ ريال" in text
+    assert "بحثات هذا الشهر: ١٣٤٠ من ١٠٠٠٠" in text
+    assert "قرارات العملاء: قدّم ٩ · تجاهل ٣ (٧٥٪ تقديم)" in text
+    # …and no Western digit is left anywhere in the Arabic block
+    assert not any(ch.isdigit() and ch.isascii() for ch in text)
+
+    # the identifier rule, the other half of the same judgement: the TEN code
+    # takes the line above its row rather than dragging the row around with it
+    today, _ = views.render_today(
+        NOW.date(), {"status": "completed", "counts": {}},
+        [("TEN-0002", "DELIVERED", {"delivered": 2, "failed_sends": 1})],
+    )
+    lines = today.split("\n")
+    assert "TEN-0002" in lines
+    assert "✅ سُلّم · سُلّم ٢ · فشل ١" in lines
+
+
 def test_manual_usage_buttons_log_and_rerender(
     owner_session: Session, two_tenants: tuple[str, str]
 ) -> None:
@@ -336,12 +460,12 @@ def test_manual_usage_buttons_log_and_rerender(
         admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
     )
     assert out[1].kind == "edit"
-    assert "دقائق دعم: 5" in out[1].text
+    assert "دقائق دعم: ٥" in out[1].text
     out2 = handle_update(
         owner_session, _cbq(ADMIN, f"v1|log|{code}|review"),
         admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
     )
-    assert "مراجعات بشرية: 1" in out2[1].text
+    assert "مراجعات بشرية: ١" in out2[1].text
     owner_session.execute(sql_text(
         "DELETE FROM usage_events WHERE tenant_id = :t"), {"t": t1})
     owner_session.commit()
@@ -703,11 +827,14 @@ def test_weekly_report_format_is_arabic_and_complete() -> None:
         {"DELIVERED": 9, "SKIPPED_OPTED_OUT": 1, "NO_MATCHES": 2},
     )
     assert "التقرير الأسبوعي" in report
-    assert "لمّاح: 2" in report          # the product's ONE name (see below)
-    assert "558 ريال" in report
-    assert "قدّم 3/4 (75٪)" in report
-    assert "موقف الرسائل: 1" in report
-    assert "$0.40" in report
+    assert "لمّاح: ٢" in report          # the product's ONE name (see below)
+    assert "٥٥٨ ريال" in report
+    assert "قدّم ٣/٤ (٧٥٪)" in report
+    assert "موقف الرسائل: ١" in report
+    # «$0.40» was a Latin run inside an Arabic line; the money is said in
+    # Arabic instead, which is the one cure a digit fold cannot give a WORD
+    assert "٠.٤٠ دولار" in report
+    assert "$" not in report
 
 
 def test_week_day_states_tally(
@@ -1692,7 +1819,7 @@ def test_the_business_screen_shows_the_search_allowance(
         )
         text, _ = views.render_business("30", data)
         assert "بحثات هذا الشهر" in text
-        assert "13 من 10000" in text
+        assert "بحثات هذا الشهر: ١٣ من ١٠٠٠٠" in text
     finally:
         owner_session.rollback()
         owner_session.execute(_sql(
@@ -2268,7 +2395,7 @@ def test_weekly_report_and_customer_card_cannot_name_a_plan_differently() -> Non
         report = format_weekly_report(
             date(2026, 7, 26), {"subs_by_plan": {code: 1}}, {}
         )
-        assert f"{expected}: 1" in report, code
+        assert f"{expected}: ١" in report, code
         assert code not in report          # never the raw Latin plan code
 
 
@@ -2291,7 +2418,7 @@ def test_weekly_report_speaks_every_plan_and_every_day_state() -> None:
         {"subs_by_plan": {"executive": 1, "cv_analysis": 2}},
         dict.fromkeys(DAILY_STATES, 1),
     )
-    assert "لمّاح+: 1" in report
+    assert "لمّاح+: ١" in report
     for state in DAILY_STATES:
         assert state not in report
 
@@ -2310,7 +2437,10 @@ def test_weekly_report_carries_no_second_plan_map() -> None:
     # and the labels must be the console's own function, not a lookalike.
     assert [v for v in vars(wr).values()
             if isinstance(v, dict) and "professional" in v] == []
-    assert wr._plan_ar is views._plan
+    # The whole breakdown, not only the names: the two screens write the sales
+    # line with ONE function, so a plan the report cannot name behaves the same
+    # way on both (its own line, never dropped) instead of twice differently.
+    assert wr.plan_counts_lines is views.plan_counts_lines
 
 
 # ── the Sunday report remembers the week, not the process (0023) ────────────
@@ -2473,3 +2603,382 @@ def test_a_late_report_says_which_day_its_numbers_end_on() -> None:
         _date(2026, 8, 2), {}, {}, covering_through=_date(2026, 8, 5))
     assert "متأخر" in late
     assert "2026-08-05" in late.split("\n")
+
+
+# ── the business screen reads the money functions, not its own copies ────────
+
+
+def test_business_revenue_excludes_the_money_that_went_back(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """«الإيراد» is the money that arrived and STAYED.
+
+    This screen used to sum `amount_sar` over every subscription row with no
+    status predicate at all, so a refunded order, a cancelled one and a
+    chargeback each counted forever — and a chargeback is money that left the
+    account twice. On the rows below that reads 826 riyals against a true 199:
+    an overstatement of 312%, on the number the operator prices the product
+    from. The correct definition already lived in cv.close, derived from the
+    state machine's own TERMINAL_STATES; this asserts the screen uses it.
+    """
+    import uuid as _uuid
+
+    from sqlalchemy import text as _sql
+
+    import career.telegram.console as console
+
+    t1, _ = two_tenants
+    rows = (
+        ("professional", "ACTIVE", "199"),      # the only real revenue
+        ("professional", "REFUNDED", "199"),    # money returned
+        ("professional", "CANCELED", "199"),    # order cancelled
+        ("professional", "CHARGEBACK", "229"),  # left the account twice
+    )
+    for plan, status, amount in rows:
+        owner_session.execute(_sql(
+            "INSERT INTO subscriptions (id, tenant_id, plan_code, status,"
+            " salla_order_id, amount_sar, currency)"
+            " VALUES (:i, :t, :p, :s, :o, :a, 'SAR')"),
+            {"i": str(_uuid.uuid4()), "t": str(t1), "p": plan, "s": status,
+             "o": f"O-{_uuid.uuid4()}", "a": amount})
+    owner_session.commit()
+
+    data = console._business_data(owner_session, "30", now=NOW)
+    assert int(data["revenue_sar"]) == 199
+    # the COUNT is filtered by the same rule as the sum — a plan showing four
+    # subscriptions against one order's riyals is the screen contradicting
+    # itself in front of the reader
+    assert data["subs_by_plan"].get("professional") == 1
+
+    text, _ = views.render_business("30", data)
+    assert "الإيراد: ١٩٩ ريال" in text
+
+
+def test_business_spend_is_the_one_definition_including_the_whatsapp_half(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """The screen no longer spells the spend expression out by hand.
+
+    Two expressions for one number lived in two files (this screen and
+    close.rollup_costs) and disagreed about which kinds count; only the screen
+    was ever looked at. It now calls close.spend_by_kind, which is that one
+    expression — metered usage_events plus the WhatsApp half derived from the
+    delivery ledger, which is where the newly-recorded lifecycle templates
+    land.
+    """
+    import uuid as _uuid
+
+    from sqlalchemy import text as _sql
+
+    import career.telegram.console as console
+    from career.cv import close as close_mod
+
+    t1, _ = two_tenants
+    channel = str(_uuid.uuid4())
+    owner_session.execute(_sql(
+        "INSERT INTO customer_channels (id, tenant_id, provider, phone_e164)"
+        " VALUES (:i, :t, 'whatsapp', :p)"),
+        {"i": channel, "t": str(t1), "p": f"+96650{_uuid.uuid4().int % 10**7:07d}"})
+    owner_session.execute(_sql(
+        "INSERT INTO usage_events (id, tenant_id, kind, cost_usd, occurred_at)"
+        " VALUES (:i, :t, 'llm_generation', 0.25, now())"),
+        {"i": str(_uuid.uuid4()), "t": str(t1)})
+    # one billed template with a channel, one WITHOUT — the pre-activation
+    # shape 0028 made recordable at all
+    for chan in (channel, None):
+        owner_session.execute(_sql(
+            "INSERT INTO delivery_messages (id, tenant_id, channel_id, kind,"
+            " template_name, status, wa_message_id)"
+            " VALUES (:i, :t, :c, 'template', 'renewal_reminder', 'sent', :m)"),
+            {"i": str(_uuid.uuid4()), "t": str(t1), "c": chan,
+             "m": f"wamid-{_uuid.uuid4()}"})
+    owner_session.commit()
+
+    data = console._business_data(owner_session, "30", now=NOW)
+    spend = data["spend_by_category"]
+    assert spend["llm_generation"][0] == 1
+    # both templates are billed — the channel-less one is not a second-class row
+    assert spend["wa_utility"][0] == 2
+    # and the screen agrees with the function, exactly
+    canonical = close_mod.spend_by_kind(owner_session, since=NOW - timedelta(days=30))
+    assert {k: v for k, v in spend.items()} == canonical
+
+
+# ── the لمّاح+ pass, both halves of it, on the operator's screens ────────────
+#
+# Two promises from the same 449-riyal page were built and reachable by nobody
+# (STORE-PAGES-AR §6, and the refund page's own deduction sentence). Both are
+# operator-facing, so both are proven from the operator's own screens here.
+
+
+class _FakeAdmin:
+    """The admin channel, captured. Nothing is sent anywhere."""
+
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    def send_admin(self, text: str) -> None:
+        self.sent.append(text)
+
+
+def _seed_plus(
+    session: Session, tenant_id: str, *, plan: str = "executive",
+    status: str = "ACTIVE", period_start: datetime | None = None,
+) -> str:
+    """A real pass row: plan + status + the period the refund would be about."""
+    sub_id = str(uuid.uuid4())
+    start = period_start if period_start is not None else NOW - timedelta(days=3)
+    session.execute(sql_text(
+        "INSERT INTO subscriptions (id, tenant_id, plan_code, status,"
+        " salla_order_id, amount_sar, currency, current_period_start,"
+        " current_period_end) VALUES (:i, :t, :p, :s, :o, 449.00, 'SAR',"
+        " :ps, :pe)"),
+        {"i": sub_id, "t": tenant_id, "p": plan, "s": status,
+         "o": f"O-{uuid.uuid4()}", "ps": start, "pe": start + timedelta(days=30)})
+    session.commit()
+    return sub_id
+
+
+def _drop_sessions(session: Session, tenant_id: str) -> None:
+    session.rollback()
+    session.execute(sql_text(
+        "DELETE FROM career_sessions WHERE tenant_id = :t"), {"t": tenant_id})
+    session.commit()
+
+
+def _card(session: Session, code: str) -> str:
+    return handle_update(
+        session, _cbq(ADMIN, f"v1|tenant|{code}"), admin_chat_id=ADMIN,
+        probes=FakeProbes(), now=NOW,
+    )[1].text
+
+
+def test_the_card_deduction_is_read_from_the_ledger_and_names_its_period(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """«تُخصم قيمة الخدمات البشرية اللي استلمتها فعليًا» — actually received,
+    and for the period being refunded.
+
+    The card printed a constant, `f"{SESSION_VALUE_SAR} SAR"`, under a comment
+    that called it computed, while `career_session.refund_deduction_sar` — the
+    function that reads the ledger — had no production caller at all. And it
+    printed a number with no period attached, on a card whose session line can
+    belong to a DIFFERENT period than the current one (the cross-period
+    fallback), so «how much» arrived without «for which order».
+    """
+    from career.promises import career_session
+
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    start = NOW - timedelta(days=5)
+    try:
+        _seed_plus(owner_session, t1, period_start=start)
+        career_session.request_session(
+            owner_session, tenant_id=uuid.UUID(t1), now=NOW - timedelta(days=2))
+        career_session.mark_completed(
+            owner_session, tenant_id=uuid.UUID(t1), now=NOW - timedelta(days=1))
+        owner_session.commit()
+
+        text = _card(owner_session, code)
+        assert "وتُخصم قيمتها من أي استرداد:" in text
+        assert "150 SAR" in text
+        # WHICH period, said on the screen: the count that produced the
+        # number, and the period that count was scoped to.
+        assert "عن جلسات فترة اشتراك واحدة، عددها المحسوب: ١" in text
+        assert start.date().isoformat() in text
+        assert "واسترداد أي فترة ثانية يُحسب على حدة" in text
+        # and the number is the ledger's own answer for that one period
+        assert career_session.refund_deduction_sar(
+            owner_session, tenant_id=uuid.UUID(t1)) == Decimal("150")
+    finally:
+        _drop_sessions(owner_session, t1)
+        _drop_subscriptions(owner_session, t1)
+
+
+def test_the_card_prints_what_the_refund_function_answers(
+    owner_session: Session, two_tenants: tuple[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wiring itself, pinned.
+
+    Today the constant and the computation agree in every reachable state —
+    `uq_career_sessions_live_per_subscription` allows one live session per
+    period, so the count is always 1 when this line renders. That agreement is
+    a property of the catalog, not of the screen, and it is exactly why the
+    defect survived: a coincidence reads like a correct answer. This asserts
+    the screen prints whatever the ledger function returns, and that it asks
+    it about the period of the session being displayed.
+    """
+    from career.promises import career_session
+
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    seen: dict[str, Any] = {}
+    try:
+        sub_id = _seed_plus(owner_session, t1)
+        career_session.request_session(
+            owner_session, tenant_id=uuid.UUID(t1), now=NOW - timedelta(days=2))
+        career_session.mark_completed(
+            owner_session, tenant_id=uuid.UUID(t1), now=NOW - timedelta(days=1))
+        owner_session.commit()
+
+        def _fake(session: Any, **kw: Any) -> Decimal:
+            seen.update(kw)
+            return Decimal("300")
+
+        monkeypatch.setattr(career_session, "refund_deduction_sar", _fake)
+        text = _card(owner_session, code)
+        assert "300 SAR" in text                      # never a constant again
+        assert "150 SAR" not in text
+        assert str(seen.get("subscription_id")) == sub_id   # that period only
+        assert str(seen.get("tenant_id")) == t1
+    finally:
+        _drop_sessions(owner_session, t1)
+        _drop_subscriptions(owner_session, t1)
+
+
+def test_a_plus_customers_ordinary_message_reaches_the_operator(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """«تواصل مباشر معي … اكتب لي وقت ما تحتاج» — the 449 tier's headline.
+
+    An ACTIVE customer's ordinary sentence classifies as OTHER, the worker
+    answers it with a template, and nothing reached a human: the only escape
+    hatch was the word «دعم», which every 199 customer has too. So the higher
+    tier bought a star on somebody else's alert, not access. The escalation
+    lands in `support_events` — the queue the operator already works — and the
+    alert carries the TEN code and not one character of what was written.
+    """
+    from career.promises import career_session
+
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    channel = _seed_channel(owner_session, t1)
+    admin = _FakeAdmin()
+    try:
+        _seed_plus(owner_session, t1)
+        outcome = career_session.escalate_direct_message(
+            owner_session, tenant_id=uuid.UUID(t1),
+            channel_id=uuid.UUID(channel), now=NOW - timedelta(hours=2),
+            admin_client=admin,
+        )
+        owner_session.commit()
+        assert outcome == "escalated"
+
+        # it is on the screen the operator already reads, with its age
+        screen = _tickets(owner_session).text
+        assert "⭐ رسالة مباشرة من مشترك لمّاح+" in screen
+        assert code in screen
+        assert "منذ ٢ ساعة" in screen
+
+        # and the page names who, never what — no phone, no body (§15.13)
+        assert len(admin.sent) == 1
+        assert code in admin.sent[0] and "⭐" in admin.sent[0]
+        assert "+966" not in admin.sent[0]
+
+        # four messages are one human waiting, not four tickets
+        assert career_session.escalate_direct_message(
+            owner_session, tenant_id=uuid.UUID(t1),
+            channel_id=uuid.UUID(channel), now=NOW, admin_client=admin,
+        ) == "already_open"
+        owner_session.commit()
+        assert len(admin.sent) == 1
+        assert owner_session.execute(sql_text(
+            "SELECT count(*) FROM support_events WHERE tenant_id = :t"),
+            {"t": t1}).scalar_one() == 1
+
+        # closing it re-arms the line — the next message pages again
+        ticket = str(owner_session.execute(sql_text(
+            "SELECT id FROM support_events WHERE tenant_id = :t"),
+            {"t": t1}).scalar_one())
+        _close_ticket(owner_session, ticket)
+        assert career_session.escalate_direct_message(
+            owner_session, tenant_id=uuid.UUID(t1),
+            channel_id=uuid.UUID(channel), now=NOW, admin_client=admin,
+        ) == "escalated"
+        owner_session.commit()
+        assert len(admin.sent) == 2
+    finally:
+        _drop_tickets(owner_session, t1)
+        _drop_subscriptions(owner_session, t1)
+        _clear_delivery(owner_session, t1)
+
+
+def test_the_direct_line_is_the_tier_and_never_an_answer_being_swallowed(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """The three refusals, each with its own name.
+
+    A 199 customer does not buy the direct line — if he did, the 449 page
+    would be selling a star again. A lapsed pass is not «مشترك لمّاح+». And a
+    customer in the middle of a conversation WE started is ANSWERING, not
+    writing: `whatsapp.inbound` has two live incidents of exactly that
+    mistake, and both times a paying customer's answer was thrown away and a
+    ticket was raised against someone who had asked for nothing.
+    """
+    from career.promises import career_session
+
+    t1, t2 = two_tenants
+    channel1 = _seed_channel(owner_session, t1)
+    channel2 = _seed_channel(owner_session, t2)
+    admin = _FakeAdmin()
+
+    def _escalate(tenant: str, channel: str) -> str:
+        return career_session.escalate_direct_message(
+            owner_session, tenant_id=uuid.UUID(tenant),
+            channel_id=uuid.UUID(channel), now=NOW, admin_client=admin,
+        )
+
+    try:
+        # nobody at all — no order, nothing to be a subscriber of
+        assert _escalate(t1, channel1) == "no_subscription"
+        # the 199 tier — the whole point of the difference
+        _seed_plus(owner_session, t2, plan="professional")
+        assert _escalate(t2, channel2) == "not_entitled"
+        # a pass that ended
+        _seed_plus(owner_session, t1, status="EXPIRED")
+        assert _escalate(t1, channel1) == "lapsed"
+        _drop_subscriptions(owner_session, t1)
+        # mid-onboarding: this is an ANSWER, and it must not become a ticket
+        _seed_plus(owner_session, t1)
+        owner_session.execute(sql_text(
+            "INSERT INTO onboarding_sessions (id, tenant_id, subscription_id,"
+            " channel_id, state) SELECT :i, :t, s.id, :c, 'CV_UPLOAD_PENDING'"
+            " FROM subscriptions s WHERE s.tenant_id = :t"),
+            {"i": str(uuid.uuid4()), "t": t1, "c": channel1})
+        owner_session.commit()
+        assert _escalate(t1, channel1) == "in_flow"
+
+        assert admin.sent == []
+        assert owner_session.execute(sql_text(
+            "SELECT count(*) FROM support_events WHERE tenant_id IN (:a, :b)"),
+            {"a": t1, "b": t2}).scalar_one() == 0
+    finally:
+        owner_session.rollback()
+        owner_session.execute(sql_text(
+            "DELETE FROM onboarding_sessions WHERE tenant_id = :t"), {"t": t1})
+        owner_session.commit()
+        _drop_tickets(owner_session, t1, t2)
+        _drop_subscriptions(owner_session, t1)
+        _drop_subscriptions(owner_session, t2)
+        _clear_delivery(owner_session, t1)
+        _clear_delivery(owner_session, t2)
+
+
+def test_the_direct_line_alert_and_its_ticket_line_are_direction_pure(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """§16: an Arabic line carrying a Latin run arrives scrambled on the
+    operator's client, and the TEN code is the one thing he must read right."""
+    import re
+
+    from career.promises import career_session
+
+    arabic = re.compile(r"[؀-ۿ]")
+    latin_or_digit = re.compile(r"[A-Za-z0-9]")
+    for text in (career_session.DIRECT_MESSAGE_ALERT_AR.format(code=""),
+                 console._TICKET_KIND_AR["executive_direct_message"],
+                 console._TICKET_KIND_AR["career_session_overdue"]):
+        for line in text.splitlines():
+            if arabic.search(line):
+                assert not latin_or_digit.search(line), line

@@ -76,6 +76,31 @@ _RESUME_CONFIRM = (
     "بنكمل معك عادي من هنا"
 )
 
+#: What a SILENCED customer hears when he writes to us and it is not a
+#: standing privacy command.
+#:
+#: This branch used to commit and return with zero outbound, and the argument
+#: for that was ``classify_inbound``'s: RESUME is matched on the WHOLE message
+#: — deliberately, because a false resume un-mutes someone on record as having
+#: asked for silence — and «the miss costs nothing to speak of, because the
+#: opt-out confirmation prints تشغيل الرسائل». That holds for a customer who
+#: still has that message on screen. «طيب تشغيل الرسائل من فضلك» is OTHER, and
+#: the customer who typed it had asked to come back, in words, and heard
+#: NOTHING. So the way back is re-printed instead of assumed remembered.
+#:
+#: It is a reply, not a send: it answers a message he just wrote, inside the
+#: window he just opened, and it changes nothing about his instruction — the
+#: narrow RESUME match still owns the only switch, and no guess here un-mutes
+#: anybody. «دعم» is named because SUPPORT is resolved before this branch, so
+#: it genuinely still reaches a human while he is silenced.
+_OPTED_OUT_WAY_BACK = (
+    "وصلتني رسالتك 👌\n"
+    "بس رسائلنا موقوفة بطلبك، فما راح يوصلك شي منا\n"
+    "ترجع بأي وقت — أرسل:\n"
+    "تشغيل الرسائل\n"
+    "وإذا تبي تكلم أحد من الفريق أرسل: دعم"
+)
+
 
 #: «دعم» is promised everywhere as the way to reach a human — so it must
 #: answer the customer, not just page the operator (closure audit).
@@ -155,6 +180,28 @@ _DOCUMENT_ACTIVE = (
     "بس ما أقدر أحدّث ملفك المهني من هنا — ما دخل شي على بياناتك\n"
     "إذا كان الملف سيرتك الجديدة أرسل: دعم — وأحد من الفريق يحدّثها لك"
 )
+
+
+#: Media that is a PERSON speaking to us, and the Arabic noun for it. A voice
+#: note, a photo of a job offer, a clip: each one is somebody putting a
+#: question to us in the only form they had to hand, and each was answered
+#: with «I can only read written text» and reached nobody (D1.2).
+#:
+#: The set is deliberately not «everything that is not text». A sticker is a
+#: 👍, a reaction is a tap by another name, and a location or a contact card
+#: is data — none of them is a message a human is waiting on an answer to, and
+#: escalating them would spend the one open ticket a real question needs. A
+#: DOCUMENT is not here either, and that asymmetry is the point of the branch
+#: below: a file already pages the operator for EVERY tier, because an
+#: unmerged updated CV silently poisons every later CV, so a لمّاح+ document
+#: is already in front of him and a second alert about the same file is noise.
+_SPOKEN_MEDIA: dict[str, str] = {
+    "audio": "رسالة صوتية",
+    "voice": "رسالة صوتية",
+    "ptt": "رسالة صوتية",
+    "image": "صورة",
+    "video": "مقطع",
+}
 
 
 def _ten_code(session: Session, tenant_id: uuid.UUID) -> str:
@@ -256,6 +303,88 @@ def _text_of(msg: dict[str, Any]) -> str | None:
     return raw if isinstance(raw, str) else None
 
 
+def _typed_outcome(text: str | None) -> str | None:
+    """The §20 outcome a customer TYPED instead of tapping, or None.
+
+    The map is derived from ``outcome_followup.BUTTONS`` at call time rather
+    than copied here: the labels the customer sees and the labels we accept
+    are then the same object, and a relabelled button cannot leave a stale
+    second spelling behind in this file.
+
+    Matched on the WHOLE folded message and nothing less. `normalize_ar`
+    collapses «ما ردّوا» / «ما ردوا» and drops the emoji off «جاني مقابلة 🎉»,
+    so the three labels arrive here in one form each — but a message that
+    merely CONTAINS one of them is not an answer, and this module's two live
+    incidents were both a substring reading of an ordinary word.
+    """
+    from career.arabic import normalize_ar
+    from career.cv import outcome_followup as followup
+
+    folded = normalize_ar(text)
+    if not folded:
+        return None
+    for button_id, label in followup.BUTTONS:
+        if normalize_ar(label) == folded:
+            return followup.parse_answer(button_id)
+    return None
+
+
+def _start_handover(
+    session: Session, *, tenant_id: uuid.UUID, subscription_id: uuid.UUID,
+    channel_id: uuid.UUID, onboarding: orchestrator.Deps, now: datetime,
+) -> None:
+    """Whitepaper §05: the funnel (cv_analysis) or the onboarding journey.
+
+    Extracted so the two callers cannot drift. It runs from
+    :func:`_handle_message`'s activation path normally, and from the RESUME
+    branch for the one customer the activation path deliberately refused to
+    run it for — see :func:`_deferred_handover`.
+    """
+    from career.db.models import Subscription
+    from career.funnel import flow as funnel_flow
+
+    sub = session.get(Subscription, subscription_id)
+    start = (
+        funnel_flow.start_funnel
+        if sub is not None and sub.plan_code == "cv_analysis"
+        else orchestrator.start_journey
+    )
+    start(session, tenant_id=tenant_id, subscription_id=subscription_id,
+          channel_id=channel_id, deps=onboarding, now=now)
+
+
+def _deferred_handover(
+    session: Session, channel: CustomerChannel, *,
+    onboarding: orchestrator.Deps | None, now: datetime,
+) -> None:
+    """The handover a silenced buyer's activation held back, run now that he
+    has un-silenced himself.
+
+    Held back, never dropped: without this, refusing to onboard him at
+    activation would leave a paying customer activated and permanently
+    un-onboarded, which is a worse failure than the one it fixes.
+
+    It runs at most once, and the condition is the honest one — NEITHER a
+    journey NOR a funnel row exists, i.e. the handover has never run for this
+    tenant. A customer who opted out AFTER onboarding has both rows and is
+    untouched: nothing here re-prompts anybody who is already somewhere.
+    """
+    from career.db.models import FunnelSession
+
+    if onboarding is None or channel.subscription_id is None:
+        return
+    for model in (OnboardingSession, FunnelSession):
+        if session.execute(
+            select(model.id).where(model.tenant_id == channel.tenant_id).limit(1)
+        ).first() is not None:
+            return
+    _start_handover(
+        session, tenant_id=channel.tenant_id,
+        subscription_id=channel.subscription_id, channel_id=channel.id,
+        onboarding=onboarding, now=now,
+    )
+
+
 def _incomplete_journey(session: Session, tenant_id: uuid.UUID) -> OnboardingSession | None:
     journey = session.execute(
         select(OnboardingSession).where(OnboardingSession.tenant_id == tenant_id)
@@ -326,7 +455,28 @@ def _handle_message(
 
     def _finish_activation(result: Any) -> None:
         """Shared post-activation handover (whitepaper §05): record the
-        inbound, then start the funnel (cv_analysis) or the onboarding."""
+        inbound, then start the funnel (cv_analysis) or the onboarding.
+
+        ``result.opted_out`` — a customer who paid while his channel is STILL
+        silenced by his own standing instruction — is the field
+        `activation_flow` added «for the worker's owner to decide», and until
+        now nothing in the tree read it. Three things were wrong with running
+        the handover for him, and they compound:
+
+        * the activation sends him ONE line saying why nothing will arrive,
+          and the consent gate went out on top of it seconds later. The order
+          is proven, and it buries the only sentence that explains his silence
+          under a conversation he did not ask for;
+        * the journey is a CONVERSATION with someone who told us to stop
+          talking. Every prompt is a send to a channel on record as opted out;
+        * and it runs to completion, so he reaches ACTIVE — «fully onboarded»
+          — with every prompt unread, which is a lie told to our own operator
+          screens as much as to him.
+
+        So the handover is DEFERRED, not skipped: :func:`_deferred_handover`
+        runs it the moment he sends «تشغيل الرسائل». Skipping it outright
+        would leave a paying customer activated and permanently un-onboarded.
+        """
         if not (result.tenant_id and result.channel_id):
             return
         _record_inbound(
@@ -338,29 +488,17 @@ def _handle_message(
         if (
             onboarding is not None
             and result.subscription_id is not None
+            and not result.opted_out
             and result.status
             in (ActivationStatus.ACTIVATED, ActivationStatus.ALREADY_LINKED)
         ):
-            from career.db.models import Subscription
-            from career.funnel import flow as funnel_flow
-
-            sub = session.get(Subscription, uuid.UUID(result.subscription_id))
-            if sub is not None and sub.plan_code == "cv_analysis":
-                funnel_flow.start_funnel(
-                    session,
-                    tenant_id=uuid.UUID(result.tenant_id),
-                    subscription_id=uuid.UUID(result.subscription_id),
-                    channel_id=uuid.UUID(result.channel_id),
-                    deps=onboarding, now=now,
-                )
-            else:
-                orchestrator.start_journey(
-                    session,
-                    tenant_id=uuid.UUID(result.tenant_id),
-                    subscription_id=uuid.UUID(result.subscription_id),
-                    channel_id=uuid.UUID(result.channel_id),
-                    deps=onboarding, now=now,
-                )
+            _start_handover(
+                session,
+                tenant_id=uuid.UUID(result.tenant_id),
+                subscription_id=uuid.UUID(result.subscription_id),
+                channel_id=uuid.UUID(result.channel_id),
+                onboarding=onboarding, now=now,
+            )
         session.commit()
 
     if kind is InboundKind.ACTIVATION and token is not None:
@@ -416,10 +554,15 @@ def _handle_message(
         # A paying customer going quiet is the single loudest churn signal we
         # get, and «إلغاء الاشتراك» is in the STOP set — they may well mean
         # cancel the BILLING, which no message of ours can do. The operator
-        # hears about it (TEN code only, §15.13).
+        # hears about it (TEN code only, §15.13). The code gets a LINE of its
+        # own (§16, the same shape as `salla.provisioning._announce_renewal`):
+        # Fahad's client reverses any line that mixes Arabic with Latin, and
+        # the code — the only part that says WHOSE line just went quiet — is
+        # exactly the part that moves when it does.
         try:
             admin_client.send_admin(
-                f"🔇 عميل أوقف الرسائل {_ten_code(session, tenant_id)} — "
+                "🔇 عميل أوقف الرسائل\n"
+                f"{_ten_code(session, tenant_id)}\n"
                 "لو كان قصده إلغاء الاشتراك فالفوترة ما زالت شغالة، راجعه"
             )
         except Exception:  # noqa: BLE001 — alerting never blocks the opt-out
@@ -447,6 +590,12 @@ def _handle_message(
         # already know rather than making them guess a second word.
         session.commit()
         _reply(whatsapp_client, from_phone, _RESUME_CONFIRM)
+        # The handover his activation held back, if he is that customer.
+        # AFTER the confirmation, so «رجعت لك الرسائل» is what he reads first
+        # and the consent gate follows it rather than burying it — the exact
+        # ordering mistake `_finish_activation` was fixed for.
+        _deferred_handover(session, channel, onboarding=onboarding, now=now)
+        session.commit()
         return
 
     if kind is InboundKind.SUPPORT:
@@ -488,9 +637,10 @@ def _handle_message(
 
     # OTHER — record; route to the onboarding journey when one is running,
     # else this tap descends a pending delivery (the post-ACTIVE behavior).
-    _record_inbound(session, tenant_id=channel.tenant_id, channel_id=channel.id,
-                    wamid=wamid, message_type=message_type, text_body=text_body,
-                    classification="other", payload=msg, now=now)
+    inbound = _record_inbound(
+        session, tenant_id=channel.tenant_id, channel_id=channel.id,
+        wamid=wamid, message_type=message_type, text_body=text_body,
+        classification="other", payload=msg, now=now)
     from career.funnel import flow as funnel_flow
 
     if opted_out:
@@ -505,6 +655,11 @@ def _handle_message(
             session.commit()
             return
         session.commit()
+        # …and everything else used to be answered with NOTHING AT ALL. See
+        # `_OPTED_OUT_WAY_BACK`: a near-miss resume («طيب تشغيل الرسائل من
+        # فضلك») lands here, and silence to a customer asking to come back is
+        # the one reply we cannot defend.
+        _reply(whatsapp_client, channel.phone_e164, _OPTED_OUT_WAY_BACK)
         return
 
     # AUDIT ك-7: standing privacy commands work for EVERY paying customer at
@@ -590,6 +745,15 @@ def _handle_message(
         # open enrichment session eats «قدمت» taps (outcome never recorded)
         # and blocks a held delivery from landing for up to 72h.
         effective = _button_id_of(msg) or text_body
+        # Did this arrive from a CARD, or from a person typing? The two are
+        # answered and escalated by different rules below, and the question
+        # cannot be asked of `effective` — an interactive reply carries the
+        # human label as its title, so it is «readable» text by every other
+        # test in this file.
+        tapped = (
+            message_type in ("button", "interactive")
+            or _button_id_of(msg) is not None
+        )
 
         # §20: the answer to the outcome question. Checked BEFORE the delivery
         # buttons and before enrichment for the same reason those two beat
@@ -598,15 +762,38 @@ def _handle_message(
         from career.cv import outcome_followup as followup
 
         answer = followup.parse_answer(effective)
+        # CONSUMES the tap either way. Falling through when nothing was
+        # pending sent «oc_interview» into the enrichment branch, whose
+        # final else treats unmatched text as the customer's achievement
+        # — so a double tap, or a tap on an old card (WhatsApp keeps them
+        # tappable forever), wrote a button id into the achievement bank
+        # and paid for an LLM call to render it. Constant 5.
+        pending = (
+            followup.pending_job_ref(session, tenant_id=channel.tenant_id)
+            if answer is not None else None
+        )
+        if answer is None and not tapped:
+            # …and the same question answered by TYPING what the button says.
+            # `parse_answer` reads machine ids only, so «ما ردّوا» typed by a
+            # customer who scrolled past the card — or whose client rendered
+            # the buttons as plain text — fell through everything and became a
+            # direct-line ticket raised against him: our own question turned
+            # into a complaint, and the §20 datum that can never be
+            # re-collected thrown away.
+            #
+            # Unlike a tap, a typed label is consumed ONLY while a question is
+            # actually open. A tap can only have come from our card; a
+            # sentence is just a sentence, and answering «مسجّلة عندنا 👍» to
+            # someone who happened to write «اعتذروا» about something else is
+            # the over-eager reading this file has already paid for twice. So
+            # a typed label with nothing pending falls through untouched, and
+            # is heard as the ordinary message it is.
+            typed = _typed_outcome(text_body)
+            if typed is not None:
+                pending = followup.pending_job_ref(
+                    session, tenant_id=channel.tenant_id)
+                answer = typed if pending is not None else None
         if answer is not None:
-            # CONSUMES the tap either way. Falling through when nothing was
-            # pending sent «oc_interview» into the enrichment branch, whose
-            # final else treats unmatched text as the customer's achievement
-            # — so a double tap, or a tap on an old card (WhatsApp keeps them
-            # tappable forever), wrote a button id into the achievement bank
-            # and paid for an LLM call to render it. Constant 5.
-            pending = followup.pending_job_ref(
-                session, tenant_id=channel.tenant_id)
             if pending is not None:
                 thanks = followup.record_answer(
                     session, tenant_id=channel.tenant_id, job_ref=pending,
@@ -669,14 +856,80 @@ def _handle_message(
             session.commit()
             return
 
+        # ── did the customer actually SAY something to us? ──────────────────
+        #
+        # These two lines used to be one condition with `landed` in it, and
+        # that was my mistake and the expensive one. `landed` is a DELIVERY
+        # event: it says a held bundle went out on the back of this inbound.
+        # It says nothing whatever about what the customer wrote — and since
+        # `descend_pending_delivery` fires on ANY inbound while a bundle sits
+        # PENDING_WINDOW, the FIRST message after a quiet day is exactly the
+        # message that lands one. So the single likeliest message a
+        # re-engaging لمّاح+ customer sends — a real question, on the morning
+        # his held bundle is waiting — reached NOBODY: no ticket, no page, no
+        # card, and the only thing he got back was a wall of unrelated jobs.
+        # The two facts are now computed independently and neither can hide
+        # the other.
+        wrote = readable and not tapped              # he typed words
+        spoke = not tapped and message_type in _SPOKEN_MEDIA   # …or recorded them
+
+        if wrote or spoke:
+            # لمّاح+ sells «اكتب لي وقت ما تحتاج», and before this the tier had
+            # no direct line at all: an ACTIVE customer's ordinary message
+            # classified as OTHER, got the fallback, and reached nobody — so the
+            # 449 plan reduced to what 199 buys plus a star. It is escalated
+            # HERE, the last branch, and not by a keyword: this file carries two
+            # live incidents of a command set built on a common Arabic noun
+            # («مساعده», and a comma-separated skills answer), and a keyword
+            # tight enough to be safe matches almost nothing a person writes.
+            #
+            # A TAP is never escalated, and that is a rule now rather than an
+            # accident of branch order. A tap can only have come from a card WE
+            # sent, so it is by construction a reply to our own question — and
+            # WhatsApp keeps every card tappable forever, so «مضبوط ✅» from an
+            # enrichment card three months old used to open a ticket about a
+            # customer who had said nothing. With one open ticket per customer
+            # that stale tap then SPENT the slot his real question needed the
+            # following week. Nothing is lost by refusing: the operator cannot
+            # act on «he tapped a button», and the tier sells writing to him.
+            #
+            # By the time control reaches here the funnel, the journey, the
+            # standing commands, the outcome buttons (tapped AND typed) and the
+            # enrichment session have each declined this message, so it is not
+            # an answer to a question of ours. `escalate_direct_message` refuses
+            # again on its own terms — including, since this audit, while an
+            # enrichment session is open — so the guarantee is structural and
+            # not an artefact of this branch's position.
+            from career.promises import career_session as _career_session
+
+            _career_session.escalate_direct_message(
+                session,
+                tenant_id=channel.tenant_id,
+                channel_id=channel.id,
+                now=now,
+                # the ticket points at the message that caused it: without it
+                # the operator's queue says «somebody is waiting» and nothing
+                # about what he is waiting on.
+                inbound_message_id=inbound.id,
+                unreadable=None if wrote else _SPOKEN_MEDIA[message_type],
+                admin_client=admin_client,
+            )
+            # …and nothing is added to what the customer hears. Whatever the
+            # branches below would have said to him, they still say: nothing
+            # here guarantees a human is awake, and «أحد من الفريق بيتواصل
+            # معك» from a robot at 2am is the promise this escalation exists
+            # to stop making falsely.
+
         # closure audit: an ACTIVE customer who typed anything else got NO
         # reply at all — five realistic messages produced zero outbound. A
         # paying customer must never wonder whether we are still here. The
         # reply now tells THIS customer what they will actually receive:
         # only a live pass hears the daily promise.
-        if landed is None and (readable or effective):
-            # `effective` covers a tap whose payload carried no title — an
-            # intent we could read, just not one we matched.
+        if wrote:
+            # Answered even when a bundle just landed, for the same reason the
+            # escalation is: the bundle is tonight's scheduled delivery, not a
+            # reply to a sentence somebody typed. «وصلتني رسالتك 👌» is the only
+            # line in this system that answers the message itself.
             _reply(whatsapp_client, channel.phone_e164,
                    _fallback_text(session, channel.tenant_id))
         elif is_document:
@@ -686,17 +939,28 @@ def _handle_message(
             _reply(whatsapp_client, channel.phone_e164, _DOCUMENT_ACTIVE)
             try:
                 admin_client.send_admin(
-                    f"📎 عميل أرسل ملفًا بعد التفعيل "
-                    f"{_ten_code(session, channel.tenant_id)} — "
+                    "📎 عميل أرسل ملفًا بعد التفعيل\n"
+                    f"{_ten_code(session, channel.tenant_id)}\n"
                     "قد تكون سيرة محدّثة، راجعه"
                 )
             except Exception:  # noqa: BLE001 — alerting never blocks the reply
                 logger.warning("document notice failed", exc_info=True)
-        elif landed is None:
-            # a voice note / photo / sticker from a paying customer: the same
-            # silence, one type further out — answered, never pretended.
+        elif spoke:
+            # a voice note / photo / clip from a paying customer: the same
+            # silence, one type further out — answered, never pretended. Not
+            # gated on `landed` either: he is being told we cannot open what he
+            # sent, and a bundle landing does not make that less true.
             _reply(whatsapp_client, channel.phone_e164,
                    _media_reply(message_type, _MEDIA_ACTIVE))
+        elif landed is None:
+            # What is left is a TAP we matched nothing to, or a shape that is
+            # not a message at all — a sticker, a reaction, a location, a
+            # contact card. Both are answered only when no bundle landed:
+            # a tap's whole purpose is to open the window, and the bundle it
+            # just pulled down IS its answer.
+            _reply(whatsapp_client, channel.phone_e164,
+                   _fallback_text(session, channel.tenant_id) if tapped
+                   else _media_reply(message_type, _MEDIA_ACTIVE))
     session.commit()
 
 

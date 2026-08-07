@@ -8,6 +8,7 @@ require.
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -34,6 +35,18 @@ _PR = {"prod_pro": (Decimal("279.00"), "SAR"),
 
 def _phone() -> str:
     return f"+96650{uuid.uuid4().int % 10_000_000:07d}"
+
+
+def _mixes_direction(line: str) -> bool:
+    """One line, both scripts — what Fahad's client reverses.
+
+    The definition, and every operator string in the tree, are enforced
+    statically by ``tests/test_alert_direction_purity.py``; this is the
+    behavioural half, asserting on the message the worker actually produced.
+    """
+    from tests.test_alert_direction_purity import line_is_mixed
+
+    return line_is_mixed(line)
 
 
 def _buy(
@@ -284,6 +297,24 @@ def test_the_renewing_customer_is_told_and_the_operator_too(
     assert not [m for m in wa.sent if m.kind == "template"]
     assert any("تجديد" in m for m in admin.messages)
     assert not any("رابط التفعيل" in m for m in admin.messages)
+
+    # ── and the operator can actually READ it ────────────────────────────
+    #
+    # This notice fires on every single renewal, and it used to be one line:
+    # «↻ تجديد TEN-0002 — الفترة الجديدة تنتهي», Arabic and a Latin tenant
+    # code together. Fahad's client reverses any line that mixes the two, so
+    # the one alert he was guaranteed to receive was the one guaranteed to
+    # arrive scrambled — and the scrambled part is the code that says WHOSE
+    # renewal it is. The old assertion here only looked for the word
+    # «تجديد», which the broken shape satisfied perfectly.
+    notice = next(m for m in admin.messages if m.startswith("↻ تجديد"))
+    lines = notice.splitlines()
+    assert lines[0] == "↻ تجديد"
+    assert lines[1].startswith("TEN-")     # the code stands alone
+    assert lines[2] == "الفترة الجديدة تنتهي"
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", lines[3])   # so does the date
+    for line in lines:
+        assert not _mixes_direction(line), f"scrambles in his client: {line!r}"
 
 
 # ── the adversarial review's findings, each pinned as a requirement ──────────

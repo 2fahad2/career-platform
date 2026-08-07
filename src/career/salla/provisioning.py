@@ -14,9 +14,10 @@ only its hash stored).
 from __future__ import annotations
 
 import logging
+import re
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
@@ -31,6 +32,7 @@ from career.salla.client import (
     SallaApiError,
     SallaAuthError,
     SallaClient,
+    SallaOrder,
 )
 from career.tokens import hash_token, new_activation_token
 
@@ -143,6 +145,108 @@ def _code_of(session: Session, tenant_id: uuid.UUID) -> str:
     return tenant.code if tenant is not None else "?"
 
 
+def _record_provision_audit(
+    owner_session: Session,
+    *,
+    tenant_id: uuid.UUID,
+    subscription_id: uuid.UUID,
+    order: SallaOrder,
+    plan_code: str,
+    renewal: bool,
+) -> None:
+    """Constant 4, written down: this order was re-verified against the Salla
+    API and it said ``paid``.
+
+    The constant has always been enforced — ``provision_order`` calls
+    ``salla_client.get_order`` and refuses anything that is not ``paid`` — but
+    nothing recorded that the re-check HAPPENED for a given order. The
+    subscription row proves a subscription exists; ``subscription_events``
+    proves what state it moved through; neither can distinguish a provision
+    that re-verified from one that believed a webhook. For a money control the
+    difference is the whole control, and «we always do» is not evidence.
+
+    In the caller's transaction on purpose. This row is created microseconds
+    before ``owner_session.commit()``, in the same transaction as the
+    subscription, the activation token and the webhook's ``processed`` mark. If
+    that commit fails there is no subscription to have audited; binding the two
+    is what stops the trail from claiming a sale the database does not have.
+
+    No PII: the tenant is carried as a uuid the operator only ever sees as a
+    TEN code, and the details are an order id, a plan and an amount.
+    """
+    from career.audit import ACTION_SUBSCRIPTION_PROVISIONED, record_audit
+
+    try:
+        record_audit(
+            owner_session,
+            tenant_id=tenant_id,
+            actor="salla_worker",
+            action=ACTION_SUBSCRIPTION_PROVISIONED,
+            resource_type="subscription",
+            resource_id=subscription_id,
+            details={
+                "salla_order_id": str(order.order_id),
+                "plan_code": plan_code,
+                "amount": str(order.amount),
+                "currency": str(order.currency or ""),
+                # The claim being recorded, not decoration: the status came
+                # back from the Salla API, not from the webhook body.
+                "reverified_status": str(order.status),
+                "renewal": renewal,
+            },
+        )
+    except Exception:  # noqa: BLE001 — a landed sale is never lost over a log
+        logger.error("subscription provisioned but NOT audited", exc_info=True)
+
+
+def _record_refund_audit(
+    owner_session: Session,
+    *,
+    subscription: Subscription,
+    event_type: str,
+    source: str,
+) -> None:
+    """The money went back and the service stopped — recorded where it happens.
+
+    One action for all three reversals (refund, cancellation, chargeback) with
+    the event name in the details, because they are one fact from the only side
+    that matters: the customer is no longer paying and we are no longer serving
+    them. Splitting it into three actions would split the answer to «show me
+    every reversal» across three queries and guarantee one of them is forgotten.
+
+    Written from BOTH reversal paths, which is the point — ``_apply_lifecycle``
+    handles an event that arrives under its own name, and ``_reconcile_existing``
+    handles the one this store actually sends (``order.status.updated`` carrying
+    a refunded status). A trail that only covered the first would be blind to
+    the shape that occurs in production.
+
+    In the caller's transaction, for the same reason as the provision row: it
+    commits with the state change it describes.
+    """
+    from career.audit import ACTION_SUBSCRIPTION_REFUNDED, record_audit
+
+    try:
+        record_audit(
+            owner_session,
+            tenant_id=subscription.tenant_id,
+            actor="salla_worker",
+            action=ACTION_SUBSCRIPTION_REFUNDED,
+            resource_type="subscription",
+            resource_id=subscription.id,
+            details={
+                "salla_order_id": str(subscription.salla_order_id or ""),
+                "event_type": event_type,
+                "amount_charged": str(subscription.amount_sar or ""),
+                "status_after": str(subscription.status),
+                # Which path saw it — see the docstring.
+                "source": source,
+            },
+        )
+    except Exception:  # noqa: BLE001 — stopping service is never blocked
+        logger.error("service stopped for a reversal but NOT audited",
+                     exc_info=True)
+
+
 def _reconcile_existing(
     owner_session: Session,
     existing: Subscription,
@@ -187,6 +291,10 @@ def _reconcile_existing(
         charged = existing.amount_sar
         sub_states.apply_order_lifecycle(
             owner_session, existing, event_type, salla_order_id=order_id,
+        )
+        _record_refund_audit(
+            owner_session, subscription=existing, event_type=event_type,
+            source="status_reconcile",
         )
         _mark_webhook(owner_session, webhook_event, "processed")
         owner_session.commit()
@@ -427,6 +535,42 @@ def provision_order(
                 },
             )
         )
+        _record_provision_audit(
+            owner_session, tenant_id=target.tenant_id,
+            subscription_id=renewed.id, order=order, plan_code=plan_code,
+            renewal=True,
+        )
+        # ── he paid again while his messages are switched off (§08 + D2.1) ──
+        #
+        # Activation raises this ticket too, but activation only happens on the
+        # §04 upgrade or a re-buy — the RARE route. THIS is the common one: a
+        # customer who silences us without cancelling his BILLING renews for as
+        # long as his card lasts, and nothing downstream ever notices. The
+        # night that follows closes SKIPPED_OPTED_OUT, which `engine/cli` lists
+        # as an honest day state, so the run exits 0 — correctly, for a state
+        # the customer chose — and the only alert he ever produced was the
+        # opt-out page a month earlier.
+        #
+        # Imported rather than re-decided: same ticket kind, same dedupe on an
+        # OPEN ticket for the CHANNEL (not the tenant — the §04 upgrade moves
+        # the subscription to another tenant, and the channel is the identity
+        # that survives it), same write-then-page ordering. Only the tail
+        # differs, because on a renewal we have said nothing to him and cannot.
+        #
+        # INSIDE this transaction, before the commit below: the ticket and the
+        # money land together or not at all, so there is no window in which the
+        # renewal exists and the reason nobody knows about it does too.
+        if order_phone is not None:
+            from career.whatsapp.activation_flow import (
+                RENEWAL_OPTED_OUT_TAIL,
+                ticket_if_silenced,
+            )
+            ticket_if_silenced(
+                owner_session, phone=order_phone,
+                ten_code=_code_of(owner_session, target.tenant_id),
+                admin_client=admin_client_hint,
+                now=now or datetime.now(UTC), tail=RENEWAL_OPTED_OUT_TAIL,
+            )
         _mark_webhook(owner_session, webhook_event, "processed")
         owner_session.commit()
         return ProvisionResult(
@@ -484,6 +628,10 @@ def provision_order(
         )
     )
 
+    _record_provision_audit(
+        owner_session, tenant_id=tenant.id, subscription_id=subscription.id,
+        order=order, plan_code=plan_code, renewal=False,
+    )
     _mark_webhook(owner_session, webhook_event, "processed")
     owner_session.commit()
     return ProvisionResult(
@@ -503,11 +651,36 @@ _PROVISION_EVENTS = frozenset(
 )
 _LIFECYCLE_EVENTS = frozenset(sub_states._ORDER_EVENT_TO_STATE)
 
-#: Salla's own token delivery. We do not consume it (storing a live credential
-#: from a webhook payload is a decision with its own security design), but it
-#: must never pass in silence: it is the ONLY moment a replacement credential
-#: is ever offered to us.
+#: Salla's own token delivery, and the ONLY moment a replacement credential is
+#: ever offered to us: «Easy Mode» never displays the token for anyone to copy.
+#:
+#: This used to be defined and never used, so the event fell through to the
+#: final ``else`` and was marked ``ignored`` — terminal, re-read by nothing.
+#: The comment that stood here called consuming it «a decision with its own
+#: security design» and deferred it; the deferral then cost precisely what it
+#: warned about, because the token captured by hand on 2026-07-15 expired on
+#: 2026-07-29 with no refresh path and paid orders stopped provisioning.
+#: CHANGELOG §29 settles the design (signature first, env file not database,
+#: zero leakage, honest failure) and this module implements it in
+#: :func:`_apply_authorize`.
 _AUTHORIZE_EVENT = "app.store.authorize"
+
+#: The other two app-lifecycle events, and what they actually carry —
+#: read off the live rows this store delivered on 2026-07-15 rather than
+#: assumed (``webhook_events`` in staging, keys only):
+#:
+#: * ``app.installed`` → data: id, app_name, app_type, app_description,
+#:   app_scopes, installation_date, store_type. **No credential, nothing to
+#:   act on** — it is the click before the authorize event, which arrives about
+#:   a second later carrying everything. It keeps falling to the ``else`` and
+#:   is marked ``ignored``, which is the honest status for an event we
+#:   deliberately do nothing with.
+#: * ``app.uninstalled`` → data: the same app fields plus installation_date,
+#:   uninstallation_date and a ``refunded`` boolean. Also no credential — and
+#:   that IS the news: the token we hold is dead from that moment, so every
+#:   paid order from then on will wait forever. Nothing else in the system
+#:   would say so.
+_UNINSTALLED_EVENT = "app.uninstalled"
 
 #: The one value of ``webhook_events.provider`` this worker owns.
 #:
@@ -535,17 +708,55 @@ SALLA_PROVIDER = "salla"
 SALLA_BACKOFF_SECONDS = 60.0
 _NOTIFY_INTERVALS = {"salla_down": SALLA_BACKOFF_SECONDS,
                      "token_expiring": 12 * 3600.0,
-                     "authorize": 12 * 3600.0}
+                     "authorize": 12 * 3600.0,
+                     # A credential for another store is NOT a write failure and
+                     # must not share the write failure's budget: one pending
+                     # identity decision would otherwise silence a real disk
+                     # error for twelve hours, and vice versa. Its own key, its
+                     # own interval, and — unlike the others — text that changes
+                     # as it ages (see _foreign_store_alert).
+                     "authorize_foreign": 12 * 3600.0}
 _last_notified: dict[str, float] = {}
 _backoff_until: float = 0.0
+
+
+@dataclass
+class _StoreDecision:
+    """One unresolved «whose credential is this?» question, while it lasts.
+
+    Process-local and deliberately so: it holds nothing that must survive a
+    restart. The row in ``webhook_events`` is the durable record — this is only
+    what turns a repeated alert into an ageing one, exactly as
+    ``scripts/alert_unit_failure.sh`` keeps first-seen/kills/last-sent beside a
+    verdict so the second message can say «still», not say it again. That
+    script needs a file because each alert is a new PROCESS; here the worker is
+    one long-lived process and the alert timers beside this are already
+    process-local, so a second mechanism would only be a second thing to get
+    wrong. A restart re-bases the incident, which is honest: the operator is
+    also the one who restarts.
+    """
+
+    #: (held store, offered store) — a change in either is a NEW question.
+    stores: tuple[str | None, str | None]
+    first_seen: float
+    #: Distinct webhook rows refused for this pair. The retry loop touches the
+    #: same row every three seconds, so counting attempts would report the
+    #: worker's diligence; counting rows reports how many deliveries are
+    #: actually waiting for a decision.
+    events: set[str] = field(default_factory=set)
+    alerts_sent: int = 0
+
+
+_pending_store_decision: _StoreDecision | None = None
 
 
 def reset_salla_backoff() -> None:
     """Clear the process-local backoff and alert timers (tests, and a manual
     kick after the operator renews the token)."""
-    global _backoff_until
+    global _backoff_until, _pending_store_decision
     _backoff_until = 0.0
     _last_notified.clear()
+    _pending_store_decision = None
 
 
 def _due(key: str) -> bool:
@@ -617,8 +828,13 @@ def _warn_if_token_expiring(admin_client: Any) -> None:
             f"{_token_expiry_line()}"
         ))
         return
+    # The count on its own line (§16). A Latin numeral wedged between «خلال»
+    # and «يومًا» reverses the whole sentence in the operator's client, and a
+    # warning he cannot read is a warning that did not happen.
     _alert(admin_client, (
-        f"⚠️ توكن سلة يخلص خلال {days_left} يومًا — جدّده قبل ما يقف البيع"
+        "⚠️ توكن سلة قارب على الانتهاء — جدّده قبل ما يقف البيع\n"
+        "الأيام المتبقية:\n"
+        f"{days_left}"
         f"{_token_expiry_line()}"
     ))
 
@@ -650,6 +866,466 @@ def _defer_webhook(session: Session, ev: WebhookEvent) -> None:
     that has been waiting.
     """
     ev.attempt_count = ev.attempt_count + 1
+
+
+#: The units that hold a Salla access token in memory. Both build their client
+#: at boot (``HttpSallaClient`` bakes the token into an Authorization header),
+#: so a freshly stored credential does not reach a running process. Restarting
+#: is the operator's action — never this worker's.
+_RESTART_HINT = "systemctl restart career-worker career-admin-bot"
+
+
+def _verified(ev: WebhookEvent) -> bool:
+    """Is this row allowed to have its payload read at all?
+
+    **Called before every read of an authorize payload, and that ordering is
+    not stylistic.** Every other event in this module carries a claim about
+    money that we re-verify against the Salla API before acting; this one
+    carries a live CREDENTIAL that nothing downstream can re-verify, so an
+    unsigned body is not doubtful data — it is an attempted credential
+    injection, and the only safe moment to refuse it is before we have looked
+    at it. Parse first and «check later» would already have handed an attacker
+    the shape of the branch: a token substring in an exception message, a
+    length in a log line, a stored value one early-return away.
+
+    Two conditions, because two things can be wrong. ``provider`` guards
+    against a WhatsApp (or future provider) row reaching Salla's credential
+    path — ``webhook_events`` is one shared table and that exact confusion
+    destroyed four rows on 2026-08-03. ``signature_valid`` is the HMAC verdict
+    recorded by ``webhooks/intake.py``, which is the ONLY writer of these rows
+    and only ever writes True after ``salla/webhook.receive_webhook`` has
+    verified the raw body against ``SALLA_WEBHOOK_SECRET``. Re-reading the
+    recorded verdict here costs nothing and means the invariant survives a
+    future intake path — a replay tool, a backfill, a fixture — that inserts
+    rows without going through that door.
+    """
+    return ev.provider == SALLA_PROVIDER and bool(ev.signature_valid)
+
+
+#: A Salla store id as every live row has ever carried it: a merchant number
+#: (``1275699954``, ``855028708``), delivered as a JSON int. The pattern is
+#: wider than «digits» so a future account id with a dash or a dot is still
+#: read, and narrow enough that nothing which is not an identifier can pass:
+#: no spaces, no newline (the env file is one KEY=VALUE per line), no braces
+#: from a dict that ``str()`` would happily render into a stored value.
+_STORE_ID_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+
+#: Every place a STORE id may be read from, in order.
+#:
+#: Today all six live rows carry ``merchant`` at the top level, so the first
+#: path is the one that fires. The others are here because the whole point of
+#: the guard below is that the payload SHAPE can move under us, and a fix that
+#: only ever looks in one place converts a renamed key into a stopped sale
+#: path. Every entry is a key whose NAME can only mean a store, so reading it
+#: is not a guess: ``merchant`` may also arrive as Salla's merchant OBJECT
+#: (``{"id": …, "domain": …}``), which is why a dict is followed to its ``id``.
+#:
+#: ``data.id`` is deliberately NOT here, and that omission is the important
+#: one: it is the APP id (1410006361 on every delivery). Reading it would give
+#: every credential from every store the same «store id» — a label that is
+#: always present, always equal, and always wrong, which is worse than the
+#: absence this guard is built to catch.
+_STORE_ID_PATHS = (
+    ("merchant",),
+    ("store_id",),
+    ("data", "merchant"),
+    ("data", "store_id"),
+)
+
+
+def _offered_store_id(payload: dict[str, Any]) -> str | None:
+    """Which store is this credential for? ``None`` when nothing can say.
+
+    ``None`` is a verdict here, not a default. Salla signs every store's
+    authorize with the SAME app secret, so a valid signature proves the body
+    came from Salla and says nothing about whose grant is inside it; the store
+    id is the only discriminator there is. Handing ``None`` to
+    ``tokens.store_credentials`` reaches ``StoreIdentity.UNCLAIMED``, which
+    means «the refresh path, rotating the grant we already hold» — a sentence
+    that is true of the refresh timer and false of a webhook.
+    """
+    for path in _STORE_ID_PATHS:
+        node: Any = payload
+        for key in path:
+            node = node.get(key) if isinstance(node, dict) else None
+        if isinstance(node, dict):
+            node = node.get("id")
+        if isinstance(node, bool) or not isinstance(node, (int, str)):
+            continue
+        candidate = str(node).strip()
+        if _STORE_ID_RE.match(candidate):
+            return candidate
+    return None
+
+
+def _operator_confirmed(writer: Any) -> bool:
+    """Has a human already signed for an identity this code cannot prove?
+
+    ``scripts/consume_stored_authorize.py`` runs this very function with the
+    operator's ``--allow-store-change`` bound onto ``tokens.store_credentials``
+    as a ``functools.partial`` — documented there as «THE ONE ADDITION»,
+    precisely so the consumption sequence is never duplicated. That flag
+    already means «I accept an identity that cannot be proved»: the script
+    treats ``UNKNOWN`` — a stored credential whose store was never recorded —
+    as a crossing needing exactly this confirmation. A payload that names no
+    store asks the same question from the other side, so it takes the same
+    answer, and the operator sees both stores (or their absence) printed
+    before he types it.
+
+    Anything that is not that binding reads as «not confirmed»: the worker,
+    a test double, any future caller. The guard fails closed.
+    """
+    bound = getattr(writer, "keywords", None) or {}
+    return bool(bound.get("allow_store_change"))
+
+
+#: What the operator actually types to resolve a store decision. Its own line
+#: in every alert: a Latin command inside an Arabic sentence arrives scrambled
+#: in his client (§16), and a command he has to re-assemble is a command he
+#: will not run at 03:00.
+_CONSUME_HINT = (
+    ".venv/bin/python scripts/consume_stored_authorize.py "
+    "--db-host 127.0.0.1 --db-port 5433 --event-id {event_id} "
+    "--apply --allow-store-change"
+)
+
+
+def _foreign_store_alert(
+    held_store: str | None, offered_store: str | None, event_id: Any,
+    state: _StoreDecision,
+) -> str:
+    """The refusal, in the operator's words, and it ages.
+
+    THIS IS NOT A WRITE FAILURE. The disk is fine, the permissions are fine,
+    and the retry the worker keeps making can never succeed on its own —
+    nothing changes until a human decides. Sending him to
+    «راجع مساحة القرص» (the write-failure text this branch used to inherit)
+    costs him a trip to the server to find nothing wrong, and it repeated
+    unchanged twice a day for as long as he did not act.
+
+    Three stages, and the reason there are three is that this state PERSISTS
+    until somebody chooses:
+
+    * **new** — what happened, what was not lost, and the command that accepts
+      it. Sent immediately: a credential arriving for another store is often
+      the operator himself, one minute ago, clicking install on the demo
+      store, and that is the minute the message is worth most.
+    * **reminder** — after twelve hours, and it says it is a reminder, how
+      long the question has been open and how many deliveries are waiting.
+      Identical text would have taught him to stop reading it.
+    * **still open** — from the second reminder on (a full day of no
+      decision), the message stops assuming the decision is merely pending and
+      names the OTHER way out: removing the app from that store, which is the
+      right answer when the install was a mistake and the one thing the first
+      message does not say.
+
+    Twelve hours is kept rather than shortened. Nothing is broken while this
+    is open — the live credential is intact and paid orders keep provisioning
+    — so this is a question, not an outage, and a question that shouts every
+    hour is how the channel gets muted for the alert that IS an outage.
+    """
+    held_line = held_store or "غير مسجّل"
+    offered_line = offered_store or "غير معروف"
+    command = _CONSUME_HINT.format(event_id=event_id)
+    hours = int((time.monotonic() - state.first_seen) // 3600)
+
+    if state.alerts_sent == 0:
+        return (
+            "🟠 وصل توكن سلة لمتجر غير المتجر الذي نخدمه — ما انحفظ وما ضاع\n"
+            "المتجر المحفوظ:\n"
+            f"{held_line}\n"
+            "المتجر في الحدث الواصل:\n"
+            f"{offered_line}\n"
+            "ما تغيّر شيء في ملف الأسرار، والبيع ماشي بالتوكن الحالي.\n"
+            "التوكن الواصل محفوظ في سجل الحدث ولا يضيع، والقرار قرارك.\n"
+            "إذا كنت تبي المنصة تشتغل على المتجر الواصل، شغّل على السيرفر:\n"
+            f"{command}"
+        )
+    if state.alerts_sent == 1:
+        return (
+            "🔁 ما زال توكن متجر ثانٍ ينتظر قرارك — هذا تذكير وليس حدثًا "
+            "جديدًا\n"
+            "المتجر المحفوظ:\n"
+            f"{held_line}\n"
+            "المتجر في الحدث الواصل:\n"
+            f"{offered_line}\n"
+            "معلّق منذ ساعات عددها:\n"
+            f"{hours}\n"
+            "عدد الأحداث المنتظرة:\n"
+            f"{len(state.events)}\n"
+            "ولا شيء متعطل: التوكن الحالي سليم والطلبات تُزوَّد.\n"
+            "لقبول المتجر الواصل، شغّل على السيرفر:\n"
+            f"{command}"
+        )
+    return (
+        "🟠 قرار متجر سلة ما زال مفتوحًا ولن ينحل من نفسه\n"
+        "المتجر المحفوظ:\n"
+        f"{held_line}\n"
+        "المتجر في الحدث الواصل:\n"
+        f"{offered_line}\n"
+        "معلّق منذ ساعات عددها:\n"
+        f"{hours}\n"
+        "عدد الأحداث المنتظرة:\n"
+        f"{len(state.events)}\n"
+        "أمامك طريقان، وكلاهما ينهي التكرار:\n"
+        "الأول: تقبل المتجر الواصل بهذا الأمر على السيرفر:\n"
+        f"{command}\n"
+        "الثاني: إذا كان التثبيت غلط، أزل التطبيق من ذاك المتجر وينتهي "
+        "الموضوع.\n"
+        "وإلى أن تختار، الحدث محفوظ كما هو وهذه الرسالة تتكرر."
+    )
+
+
+def _apply_authorize(
+    owner_session: Session, ev: WebhookEvent, admin_client: Any
+) -> None:
+    """Consume Salla's Easy-Mode credential delivery (CHANGELOG §29).
+
+    Six outcomes, and each one leaves the row in the status that is true:
+
+    * **unsigned** → ``failed`` and a red alert. Terminal: a forged body will
+      not become genuine on retry.
+    * **no credential in the payload** → ``failed`` and a red alert. Also
+      terminal, and also loud, because it means Salla changed the shape of the
+      one event the sale path depends on.
+    * **no store id in the payload** → ``failed`` and a red alert. Terminal
+      for the same reason and one more: see the guard below.
+    * **a credential for another store** → the row is left ``received``, the
+      credential stays in it, and the operator gets a message about an
+      identity decision — not about the disk.
+    * **stored / already stored / superseded** → ``processed``.
+    * **could not be written** → the row is left ``received``, exactly like a
+      paid order Salla could not confirm. It is retried on the next pass and
+      nothing about it is final. §29's fourth condition is this line: a
+      persistence failure must never be marked processed as if it had worked.
+
+    No branch logs, alerts or raises with a token in it. The values reach
+    exactly one place — the 0600 env file — and are registered with the
+    redaction filter on the way (``salla.tokens``).
+    """
+    global _pending_store_decision
+    if not _verified(ev):
+        # Nothing above this line has touched ev.payload, and nothing below
+        # this branch does either.
+        logger.error("unsigned salla app.store.authorize refused — the "
+                     "credential in it was never read")
+        _mark_webhook(owner_session, ev, "failed")
+        owner_session.commit()
+        _alert(admin_client, (
+            "🔴 وصل حدث توكن سلة بلا توقيع صحيح — رُفض ولم يُقرأ\n"
+            "لم يُحفظ منه شيء. إن كنت ثبّت التطبيق الآن فأعد التثبيت، "
+            "وإلا فهذه محاولة حقن اعتماد"
+        ))
+        return
+
+    from career.salla import tokens as salla_tokens
+
+    payload = ev.payload if isinstance(ev.payload, dict) else {}
+    data = payload.get("data")
+    data = data if isinstance(data, dict) else {}
+    # Field names read off the live 2026-07-15 delivery, not from memory:
+    # data.access_token / data.refresh_token / data.expires (an ABSOLUTE unix
+    # epoch — 1785334959 decoded to the very day the operator recorded by
+    # hand), and the store is `merchant` at the TOP level. `data.id` is the
+    # APP id, not the store's, which is why it is not read here.
+    access_token = data.get("access_token")
+    refresh_token = data.get("refresh_token")
+    expires_at = salla_tokens.parse_expiry(data.get("expires"))
+    store_id = _offered_store_id(payload)
+
+    if store_id is None and not _operator_confirmed(
+        salla_tokens.store_credentials
+    ):
+        # A CREDENTIAL WE CANNOT ATTRIBUTE IS NOT STORED. It used to be: the
+        # missing key produced store_id=None, which is StoreIdentity.UNCLAIMED
+        # — «the refresh path, rotating the grant we already hold» — so a
+        # signed body carrying any store's token replaced the live credential
+        # of the store we sell from, marked the row processed and sent the
+        # GREEN «a new token landed» alert. One payload change was the whole
+        # distance to that, because the signature does not carry an identity:
+        # Salla signs every store's authorize with the same app secret.
+        #
+        # TERMINAL, not deferred, and that is the argument the retry settles:
+        # the row keeps the payload it arrived with, so every future pass
+        # reads the same absent key and takes the same branch. A deferral
+        # would be a three-second loop that cannot ever succeed, an
+        # attempt_count climbing forever, and a repeating alert with no new
+        # information in it — which is precisely the pathology fixed for the
+        # foreign-store branch below. `failed` is what `_quarantine` reserves
+        # for «we could look at it and could not process it», and this is that
+        # case exactly. Nothing is destroyed by saying so: `failed` is not
+        # deletion, the credential is still in the row, and
+        # consume_stored_authorize.py reaches a non-pending row by name
+        # (`--event-id`) — which is why the alert carries the id.
+        logger.error("salla authorize event named no store — the credential in "
+                     "it was not stored")
+        _mark_webhook(owner_session, ev, "failed")
+        owner_session.commit()
+        # Said conditionally because «nothing was replaced» is only reassuring
+        # while something is held: on a fresh host the same event means the
+        # sale path is still not open, and telling him it is fine would be the
+        # green alert's lie in another colour.
+        kept_line = (
+            "الاعتماد المحفوظ عندنا ما تغيّر، والبيع ماشي عليه.\n"
+            if salla_tokens.current().present else
+            "وما عندنا اعتماد محفوظ أصلًا — البيع ما زال متوقفًا.\n"
+        )
+        _alert(admin_client, (
+            "🔴 وصل توكن سلة بلا رقم متجر — ما انحفظ ولا استبدل شيئًا\n"
+            "التوقيع يثبت أن سلة أرسلته، لكنه لا يثبت لأي متجر هو، ورقم "
+            "المتجر هو الدليل الوحيد.\n"
+            f"{kept_line}"
+            "التوكن الواصل محفوظ في سجل الحدث:\n"
+            f"{ev.id}\n"
+            "إذا كنت متأكدًا أنه لمتجرك، شغّل على السيرفر:\n"
+            f"{_CONSUME_HINT.format(event_id=ev.id)}\n"
+            "وإلا فأعد تثبيت التطبيق على المتجر ليصل تفويض جديد."
+        ))
+        return
+
+    try:
+        outcome = salla_tokens.store_credentials(
+            access_token if isinstance(access_token, str) else "",
+            refresh_token=(
+                refresh_token if isinstance(refresh_token, str) else None
+            ),
+            expires_at=expires_at,
+            store_id=store_id,
+        )
+    except salla_tokens.CredentialError:
+        # The payload is not going to improve. Say what it means, not what it
+        # contained: this is the sale path, and nothing else reports it.
+        logger.error("salla authorize event carried no usable credential",
+                     exc_info=True)
+        _mark_webhook(owner_session, ev, "failed")
+        owner_session.commit()
+        _alert(admin_client, (
+            "🔴 وصل حدث تفويض سلة بلا توكن صالح — البيع ما زال متوقفًا\n"
+            "أعد تثبيت التطبيق على المتجر لإطلاق الحدث من جديد"
+        ))
+        return
+    except salla_tokens.ForeignStoreCredential:
+        # NOT a write failure, however it is classified. `ForeignStoreCredential`
+        # subclasses `CredentialWriteError` on purpose — a new StoreOutcome
+        # member would fall through to the GREEN «a new token landed» alert,
+        # which is the one message that must never be sent when nothing was
+        # written — and the row handling it inherits is right: keep it
+        # `received`, keep the credential in it, count the attempt. Only the
+        # WORDS were wrong, and they sent the operator to check disk space for
+        # an identity decision that no disk can take.
+        owner_session.rollback()
+        _defer_webhook(owner_session, ev)
+        owner_session.commit()
+        held_store = salla_tokens.current().store_id
+        state = _pending_store_decision
+        if state is None or state.stores != (held_store, store_id):
+            # A different pair is a different question: re-based rather than
+            # continued, so «still open for 30 hours» can never be said about
+            # something first seen a minute ago.
+            state = _StoreDecision(stores=(held_store, store_id),
+                                   first_seen=time.monotonic())
+            _pending_store_decision = state
+        state.events.add(str(ev.id))
+        logger.warning("salla authorize event refused — it belongs to another "
+                       "store; the credential is kept in the row and the "
+                       "operator decides")
+        if _due("authorize_foreign"):
+            _alert(admin_client,
+                   _foreign_store_alert(held_store, store_id, ev.id, state))
+            state.alerts_sent += 1
+        return
+    except Exception:  # noqa: BLE001 — write failure, ours not Salla's
+        # The credential is still sitting in this row. Leave it there.
+        owner_session.rollback()
+        _defer_webhook(owner_session, ev)
+        owner_session.commit()
+        logger.error("salla credential could not be persisted — the event is "
+                     "kept and will be retried", exc_info=True)
+        if _due("authorize"):
+            _alert(admin_client, (
+                "🔴 وصل توكن سلة ولم نتمكن من حفظه — الحدث محفوظ وسنعيد "
+                "المحاولة\n"
+                "راجع مساحة القرص وصلاحيات ملف الأسرار على السيرفر"
+            ))
+        return
+
+    _mark_webhook(owner_session, ev, "processed")
+    owner_session.commit()
+
+    if outcome is salla_tokens.StoreOutcome.STALE:
+        # A redelivered install event arriving after something newer was
+        # stored. Nothing was written, and that is the correct result — but it
+        # is worth one quiet line, because «Salla resent it and nothing
+        # happened» must not be something the operator has to infer.
+        logger.info("older salla authorize event ignored — a newer credential "
+                    "is already stored")
+        return
+    if outcome is salla_tokens.StoreOutcome.UNCHANGED:
+        logger.info("salla authorize event redelivered — stored credential "
+                    "unchanged")
+        return
+
+    # A credential landed, so whatever store question was open is answered:
+    # the next refusal is a new incident and says «new», not «still».
+    _pending_store_decision = None
+
+    left = salla_tokens.days_left()
+    expiry_line = (
+        f"\nتنتهي صلاحيته:\n{expires_at.date().isoformat()}" if expires_at else ""
+    )
+    # A negative number would print a LATIN minus inside an Arabic line — the
+    # exact shape that scrambles the operator's client (§16, and the storm
+    # alert learned it the hard way). An already-expired delivery is nearly
+    # impossible and gets words instead of a signed number.
+    # ...and «يومًا» trailing the number put the Latin digits back INSIDE an
+    # Arabic line, which is the same defect one word further along. The unit
+    # goes in the label, the number stands alone.
+    left_line = (
+        "\n⚠️ التوكن الواصل منتهي الصلاحية أصلًا" if left is not None and left < 0
+        else f"\nالمتبقي بالأيام:\n{left}" if left is not None else ""
+    )
+    store_line = f"\nالمتجر:\n{store_id}" if store_id else ""
+    _alert(admin_client, (
+        "🟢 وصل توكن سلة جديد وانحفظ في ملف الأسرار"
+        f"{store_line}{expiry_line}{left_line}\n"
+        "لن تستعمله الخدمات قبل إعادة تشغيلها:\n"
+        f"{_RESTART_HINT}"
+    ))
+
+
+def _apply_uninstalled(
+    owner_session: Session, ev: WebhookEvent, admin_client: Any
+) -> None:
+    """The app was removed from the store: our credential is dead as of now.
+
+    **Nothing is deleted.** Wiping the stored token here was considered and
+    rejected: Salla redelivers app events (four arrived for one install on
+    2026-07-15), so an uninstall redelivered AFTER a reinstall would destroy
+    the credential the reinstall had just delivered — turning a recovered sale
+    path back into a dead one, from a webhook about an event that was already
+    over. The token stops working by itself the moment the merchant uninstalls;
+    there is nothing for us to revoke, and a stale copy in a 0600 file is a
+    smaller problem than a wiped live one.
+
+    So the whole action is to be LOUD. Continuing to take orders on a store
+    that has removed us is selling something we cannot deliver, and no other
+    part of the system reports this: the symptom would be paid orders quietly
+    deferring behind 401s.
+    """
+    if not _verified(ev):
+        logger.error("unsigned salla app.uninstalled refused")
+        _mark_webhook(owner_session, ev, "failed")
+        owner_session.commit()
+        return
+    logger.error("the salla app was uninstalled — our access token is dead "
+                 "and paid orders can no longer be provisioned")
+    _mark_webhook(owner_session, ev, "processed")
+    owner_session.commit()
+    _alert(admin_client, (
+        "🔴 أُزيل التطبيق من متجر سلة — التوكن مات والبيع واقف\n"
+        "أي طلب مدفوع من الآن ينتظر ولا يُزوَّد. أعد تثبيت التطبيق ليصلنا "
+        "توكن جديد تلقائيًا"
+    ))
 
 
 def process_pending_webhooks(
@@ -709,6 +1385,31 @@ def process_pending_webhooks(
     )
     results: list[ProvisionResult] = []
     for ev in events:
+        if ev.event_type in (_AUTHORIZE_EVENT, _UNINSTALLED_EVENT):
+            # First branch on purpose: the credential event must not be able
+            # to sit behind anything, and it produces no ProvisionResult —
+            # it is not an order, it is what makes orders possible.
+            handler = (
+                _apply_authorize if ev.event_type == _AUTHORIZE_EVENT
+                else _apply_uninstalled
+            )
+            try:
+                handler(owner_session, ev, admin_client)
+            except Exception:  # noqa: BLE001 — one bad row never jams the queue
+                # NOT _quarantine: that marks the row ``failed``, which is
+                # terminal, and this row may be holding the only copy of a
+                # live credential. An unexpected crash here is ours, so the
+                # event is kept and retried exactly like a deferred order.
+                owner_session.rollback()
+                _defer_webhook(owner_session, ev)
+                owner_session.commit()
+                logger.error("salla app-lifecycle event crashed — kept for "
+                             "retry", exc_info=True)
+                if _due("authorize"):
+                    _alert(admin_client,
+                           "🔴 تعذّرت معالجة حدث تفويض/إزالة من سلة — الحدث "
+                           "محفوظ وسنعيد المحاولة، راجع السجل")
+            continue
         if ev.event_type in _PROVISION_EVENTS:
             try:
                 result = provision_order(
@@ -740,18 +1441,24 @@ def process_pending_webhooks(
                             WebhookEvent.processing_status == "received",
                         )
                     ).scalar_one())
+                    # The count is the whole point of these two alerts — «is
+                    # this one stuck order or my entire morning?» — and it was
+                    # the part his client scrambled, because Latin digits sat
+                    # inside the Arabic sentence. Its own line (§16).
                     if isinstance(exc, SallaAuthError):
                         _alert(admin_client,
                                "🔴 سلة ترفض بيانات دخولنا — التوكن منتهٍ أو "
                                "ملغى\nالطلبات المدفوعة محفوظة ولم يُفقد منها "
                                "شيء، وتُعالج تلقائيًا بمجرد تجديد التوكن\n"
-                               f"أحداث تنتظر الآن: {waiting}"
+                               "أحداث تنتظر الآن:\n"
+                               f"{waiting}"
                                + _token_expiry_line())
                     else:
                         _alert(admin_client,
                                "🟠 سلة لا تستجيب — الطلبات المدفوعة محفوظة "
                                "وسنعيد المحاولة تلقائيًا\n"
-                               f"أحداث تنتظر الآن: {waiting}")
+                               "أحداث تنتظر الآن:\n"
+                               f"{waiting}")
                 # every remaining event would hit the same wall
                 break
             except Exception:  # noqa: BLE001 — AUDIT ك-19: a poisoned event
@@ -807,6 +1514,16 @@ def process_pending_webhooks(
     return results
 
 
+#: The renewal notice's tail when the customer has switched our messages OFF —
+#: a different fact from a shut 24h window, and one he cannot undo by writing
+#: to us. Direction-pure lines (§15.13 + the bidi rule); no phone, ever.
+RENEWED_SILENCED_ADMIN_AR = (
+    "⛔ موقف الرسائل بطلبه — ما وصلته رسالة ولا راح توصله فرص\n"
+    "ما تنفتح إلا لما يرسل «تشغيل الرسائل» بنفسه — كلّمه بقناة ثانية\n"
+    "التذكرة مفتوحة في شاشة التذاكر، وقرار الفلوس لك"
+)
+
+
 def _announce_renewal(
     owner_session: Session,
     result: ProvisionResult,
@@ -841,7 +1558,8 @@ def _announce_renewal(
     # window is usually shut — tell the operator that plainly instead of
     # pretending the customer was informed.
     told = False
-    if whatsapp_client is not None and sub.order_phone_e164:
+    silenced = False
+    if sub.order_phone_e164:
         from career.db.models import CustomerChannel
         from career.salla.renewal import (
             RENEWED_CUSTOMER_AR,
@@ -864,6 +1582,11 @@ def _announce_renewal(
             opt_out_at=channel.opt_out_at,
             now=datetime.now(UTC),
         ) if channel is not None else None
+        # Read WITHOUT the WhatsApp client, deliberately: whether the customer
+        # can be reached at all is a fact about him, not about which transports
+        # this caller happened to wire, and the operator's line below is wrong
+        # if it depends on that.
+        silenced = state is WindowState.OPTED_OUT
         # A disputed account renews into SUSPENDED and waits for a human, so
         # «وبنكمل عادي» would be a promise of a daily service that is not
         # going to arrive. Tell them the truth: the payment landed, and
@@ -874,7 +1597,13 @@ def _announce_renewal(
             head = RENEWED_PAUSED_AR
         else:
             head = RENEWED_CUSTOMER_AR
-        if state is WindowState.OPEN:
+        # OPTED_OUT never reaches here (window_state returns it before OPEN),
+        # and that is the whole customer-facing answer on this path: he is sent
+        # NOTHING. The activation welcome could go to a silenced number because
+        # it was a direct reply to a message he had just typed; a renewal is a
+        # charge from the storefront, so the same send would be us breaking his
+        # instruction to make ourselves feel informed.
+        if whatsapp_client is not None and state is WindowState.OPEN:
             try:
                 whatsapp_client.send_text(
                     sub.order_phone_e164, f"{head}\n{until}"
@@ -886,12 +1615,35 @@ def _announce_renewal(
 
     if admin_client is not None:
         review = sub.status == sub_states.SUSPENDED
+        # Every line direction-pure (§16): the TEN code and the date each get
+        # a line of their own. This notice fires on EVERY renewal, so it was
+        # the one alert Fahad was guaranteed to receive scrambled — «↻ تجديد
+        # TEN-0002 — الفترة الجديدة تنتهي» reverses in his client, and the
+        # code he needs in order to know WHOSE renewal this is is the part
+        # that moves. The fresh-provision notice beside it (_announce_provision)
+        # has always been written this way; the renewal path was simply never
+        # brought in line with it.
         line = (
-            f"⚠️ تجديد على حساب موقوف {code} — الاشتراك مربوط وينتظر مراجعتك "
-            "قبل أي استئناف للخدمة"
-        ) if review else f"↻ تجديد {code} — الفترة الجديدة تنتهي\n{until}"
+            "⚠️ تجديد على حساب موقوف\n"
+            f"{code}\n"
+            "الاشتراك مربوط وينتظر مراجعتك قبل أي استئناف للخدمة"
+        ) if review else (
+            "↻ تجديد\n"
+            f"{code}\n"
+            "الفترة الجديدة تنتهي\n"
+            f"{until}"
+        )
         if not review and not told:
-            line += "\nنافذة واتساب مقفلة — ما وصلت العميل رسالة تأكيد"
+            # AUDIT D2.1. Both cases used to read «نافذة واتساب مقفلة — ما
+            # وصلت العميل رسالة تأكيد», which is TRUE of a silenced customer
+            # and tells the operator the wrong thing: a shut window reopens the
+            # moment the customer writes anything, and this one never reopens
+            # by itself — only he can lift it, and he has to be asked on some
+            # other channel. Reported as the ordinary case, it was invisible.
+            line += "\n" + (
+                RENEWED_SILENCED_ADMIN_AR if silenced
+                else "نافذة واتساب مقفلة — ما وصلت العميل رسالة تأكيد"
+            )
         try:
             admin_client.send_admin(line)
         except Exception:  # noqa: BLE001
@@ -1062,14 +1814,43 @@ def _announce_provision(
 
     zero_touch = sub is not None and bool(sub.order_phone_e164)
     if whatsapp_client is not None and zero_touch and sub is not None:
+        from career.whatsapp.delivery import record_out
         from career.whatsapp.templates import WELCOME_ACTIVATION
         try:
-            whatsapp_client.send_template(
+            mid = whatsapp_client.send_template(
                 sub.order_phone_e164,
                 WELCOME_ACTIVATION.name, WELCOME_ACTIVATION.language,
             )
         except Exception:  # noqa: BLE001
             logger.warning("welcome template send failed", exc_info=True)
+        else:
+            # The sharpest corner of the unbilled-template hole. This send
+            # happens BEFORE any CustomerChannel exists — that is the entire
+            # point of zero-touch: the buyer's reply is what creates the
+            # channel — so `delivery_messages.channel_id NOT NULL` made it
+            # literally unrecordable, and an order that is paid and never
+            # activated therefore cost us one Meta template and appeared in the
+            # bill as nothing at all. 100% of that order's template spend,
+            # invisible. 0028 made the column nullable for this row and the
+            # claim reminder that chases it.
+            #
+            # Its own commit: provision_order has already committed the money,
+            # and this announcement runs after it. Accounting never undoes a
+            # sale, so a failure here is logged and swallowed like every other
+            # best-effort step in this function.
+            try:
+                record_out(
+                    owner_session, tenant_id=sub.tenant_id, channel_id=None,
+                    kind="template", wa_message_id=mid,
+                    template_name=WELCOME_ACTIVATION.name,
+                    now=datetime.now(UTC),
+                )
+                owner_session.commit()
+            except Exception:  # noqa: BLE001 — never blocks a landed sale
+                owner_session.rollback()
+                logger.error("welcome template sent but NOT recorded — the "
+                             "WhatsApp bill will under-report by one",
+                             exc_info=True)
 
     if admin_client is not None:
         # Every line direction-pure (§16): the TEN code stands alone.
@@ -1097,8 +1878,18 @@ def _apply_lifecycle(owner_session: Session, ev: WebhookEvent) -> None:
         _mark_webhook(owner_session, ev, "ignored")  # nothing to suspend
         owner_session.commit()
         return
+    # Read BEFORE the transition: apply_order_lifecycle is idempotent and
+    # leaves an already-terminal subscription untouched, so without this the
+    # audit trail would grow a fresh «the money went back» row every time a
+    # reversal webhook was redelivered. One reversal, one row.
+    already_reversed = sub.status in sub_states.TERMINAL_STATES
     sub_states.apply_order_lifecycle(
         owner_session, sub, ev.event_type, salla_order_id=ev.salla_order_id
     )
+    if not already_reversed:
+        _record_refund_audit(
+            owner_session, subscription=sub, event_type=ev.event_type,
+            source="lifecycle_webhook",
+        )
     _mark_webhook(owner_session, ev, "processed")
     owner_session.commit()

@@ -12,7 +12,8 @@ Exit codes are honest and boring, and §15 constant 12 («ورموز الخرو�
 الحقيقة») decides what «honest» means: the code reports what happened to the
 CUSTOMERS' day, not what happened to the process. 0 when every tenant's day
 closed in a truthful state, 1 when discovery collapsed, 3 when at least one
-tenant's delivery genuinely failed. See :func:`exit_code_for`.
+tenant's delivery genuinely failed, 5 when the §05 subscription lifecycle did
+not complete for somebody. See :func:`exit_code_for`.
 """
 
 from __future__ import annotations
@@ -22,18 +23,20 @@ import json
 import logging
 import sys
 import uuid
-from collections.abc import Iterable
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from decimal import Decimal
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 from sqlalchemy import create_engine, select
-from sqlalchemy.orm import Session
+from sqlalchemy import event as sa_event
+from sqlalchemy.orm import Session, with_loader_criteria
 
 from career.config import get_settings
-from career.db.models import DiscoveryRun, PlanEntitlement, Tenant
+from career.db.models import DiscoveryRun, PlanEntitlement, Subscription, Tenant
 from career.engine.enrichment import UrllibPageFetcher
 from career.engine.run import RunReport, run_nightly
 from career.engine.sources import HttpSearchApiClient, PythonJobSpyClient
@@ -171,6 +174,14 @@ EXIT_DELIVERY_FAILED = 3
 #: to do. It is NOT 3 — 3 sends the operator hunting for which customer broke,
 #: and here nobody broke: nobody was served at all.
 EXIT_NO_WHATSAPP_TOKEN = 4
+#: 5 is the §05 subscription lifecycle — the sweep that runs BEFORE the engine
+#: and moves periods to grace, expires them, and sends the renewal and recovery
+#: nudges. Its own runbook entry, because what the operator has to do about it
+#: is nothing like 3: nobody's CV is missing, a customer's renewal CLOCK did not
+#: tick, and the journal line names which customer so the next run can be
+#: watched. Until 2026-08-07 this failure had no number at all — the sweep was
+#: wrapped in a broad `except` that logged and let the night exit 0.
+EXIT_LIFECYCLE_FAILED = 5
 
 #: The four things ``delivery_phase`` can say, named rather than spelled out at
 #: every call site: the exit code now keys off one of them, and a verdict that
@@ -221,6 +232,7 @@ def exit_code_for(
     delivery_states: Iterable[str] | None = None,
     *,
     delivery_phase: str | None = None,
+    lifecycle_failed: bool = False,
 ) -> int:
     """The night's verdict as one number — §15 constant 12.
 
@@ -265,6 +277,20 @@ def exit_code_for(
     broke». ``--no-deliver`` (a digest run the operator asked for) and «no
     tenants tonight» stay 0: both are intended.
 
+    ``lifecycle_failed`` is the §05 sweep, and it is here because of what the
+    2026-08-07 fix changed UNDERNEATH it. That sweep used to run every customer
+    in one transaction under one broad ``except``, so any failure discarded the
+    whole night's `subscription_events` marks — and then the run carried on and
+    exited 0. It now commits per customer and keeps going, which is the right
+    behaviour and is also exactly how a failure becomes invisible: the night
+    finishes, most customers were swept, and the one whose transaction rolled
+    back is a log line nobody reads. «أي عميل يفشل ← الليلة تفشل» is not
+    satisfied by surviving a customer's failure, so the survival is paid for
+    with a number. It ranks BELOW delivery: a customer who received nothing
+    today (3) outranks a customer whose renewal clock did not tick tonight (5),
+    and the sweep is idempotent, so tomorrow's run redoes exactly the work that
+    rolled back.
+
     An unrecognised state counts as a failure: a ninth day state added
     without deciding its side of this line should shout, not go quiet.
     """
@@ -276,6 +302,8 @@ def exit_code_for(
         return EXIT_NO_WHATSAPP_TOKEN
     if any(state not in HONEST_DAY_STATES for state in (delivery_states or ())):
         return EXIT_DELIVERY_FAILED
+    if lifecycle_failed:
+        return EXIT_LIFECYCLE_FAILED
     return EXIT_OK
 
 
@@ -345,6 +373,104 @@ class EnvProblem:
     key: str
     english: str
     arabic: str
+
+
+class TokenState(StrEnum):
+    """The four answers the credential store can give, as four names.
+
+    They were three names and a ``None`` until 2026-08-07, and the collapsed
+    pair cost the worst instruction this file can print — see
+    :attr:`ABSENT` and :attr:`UNDATED`.
+    """
+
+    #: The store said how many days are left. ``days_left`` is a number.
+    MEASURED = "measured"
+    #: A credential IS held and its expiry was never recorded. The sale path
+    #: works right now; what is missing is a date. `store_credentials` creates
+    #: this state deliberately (``expires_at=None`` clears the expiry rather
+    #: than keeping a wrong one), so it is a normal state, not a corruption.
+    UNDATED = "undated"
+    #: The store answered and holds no credential at all. THE ONE STATE that
+    #: earns «reinstall the app», because reinstalling is the only way a new
+    #: credential is ever issued — and because there is nothing to lose.
+    ABSENT = "absent"
+    #: Nobody could be asked: the module is not deployed on this host, or it
+    #: raised. The check degrades to the configured date.
+    UNREADABLE = "unreadable"
+
+
+@dataclass(frozen=True)
+class TokenLife:
+    """What the credential store answers about the token that EXISTS.
+
+    The boot check used to read ``SALLA_TOKEN_EXPIRES_AT`` — a date a human
+    typed into a file — and that is a report about what was CONFIGURED, not
+    about what is left. On 2026-07-29 the two parted company: the file kept
+    saying what somebody had written down while the credential itself died,
+    and nine days of paid orders failed to provision. So the check now asks
+    the store that holds the live credential, and falls back to the file only
+    when there is no store to ask.
+
+    WHY THIS IS A STATE AND NOT AN ``int | None``. It used to be exactly that,
+    and it documented ``days_left is None`` as «the store answered, and its
+    answer is that it holds NO credential». ``tokens.days_left()`` returns
+    ``None`` for two facts, and the other one is «a credential we cannot
+    date» — so with a live token stored, this check printed «the credential
+    store holds NO Salla token … only reinstalling the app on the store issues
+    a new one». Reinstalling fires ``app.uninstalled`` and the red «البيع
+    واقف» alert: the instruction for the emptiest state was being given for a
+    working one. ``scripts/refresh_salla_token.py`` read the same ``None`` as
+    «we do not know». The fix is not a comment reminding the next caller which
+    it is — it is that there is nothing left to remember: construct one of the
+    four states, and the invariant below refuses the pairs that mean nothing.
+    """
+
+    state: TokenState
+    days_left: int | None = None
+
+    def __post_init__(self) -> None:
+        measured = self.state is TokenState.MEASURED
+        if measured != (self.days_left is not None):
+            raise ValueError(
+                f"TokenLife({self.state}) cannot carry days_left="
+                f"{self.days_left!r}"
+            )
+
+    @property
+    def readable(self) -> bool:
+        """Was the store asked at all? The fallback to the configured date
+        hangs on this, and on nothing else."""
+        return self.state is not TokenState.UNREADABLE
+
+    @classmethod
+    def measured(cls, days_left: int) -> TokenLife:
+        return cls(TokenState.MEASURED, days_left)
+
+    @classmethod
+    def undated(cls) -> TokenLife:
+        return cls(TokenState.UNDATED)
+
+    @classmethod
+    def absent(cls) -> TokenLife:
+        return cls(TokenState.ABSENT)
+
+    @classmethod
+    def unreadable(cls) -> TokenLife:
+        return cls(TokenState.UNREADABLE)
+
+    @classmethod
+    def from_store(cls, life: Any) -> TokenLife:
+        """Translate ``career.salla.tokens.CredentialLife``.
+
+        Duck-typed on purpose: this module must import the credential store
+        lazily (see :func:`read_token_life`) and a boot check that cannot start
+        on a host without it is a boot check that stops a boot.
+        """
+        if not life.present:
+            return cls.absent()
+        if life.days_left is None:
+            return cls.undated()
+        return cls.measured(int(life.days_left))
 
 
 def parse_product_catalog(raw: str) -> dict[str, str]:
@@ -423,6 +549,7 @@ def verify_environment(
     sale_plans: dict[str, Decimal],
     today: date,
     warn_days: int = TOKEN_EXPIRY_WARN_DAYS,
+    token_life: TokenLife | None = None,
 ) -> list[EnvProblem]:
     """Every way the selling environment can contradict the database.
 
@@ -502,7 +629,9 @@ def verify_environment(
                 "جدول الأسعار المعتمد وقاعدة البيانات لا يتفقان على سعر باقة",
             ))
 
-    problems.extend(_token_expiry_problems(settings, today, warn_days))
+    problems.extend(
+        _token_expiry_problems(settings, today, warn_days, token_life)
+    )
 
     # The credential the whole product speaks through, and the one this check
     # did not look at. It watched four Salla facts — all of them about SELLING,
@@ -542,13 +671,49 @@ def verify_environment(
     return problems
 
 
+#: What the operator can actually DO, in one Arabic clause, on every line that
+#: reports a dying credential. Salla's Easy Mode never shows the token to a
+#: human, so «renew it» is not an instruction anyone can follow: reinstalling
+#: the app on the store re-fires `app.store.authorize`, which is the only
+#: moment a replacement credential is ever offered (CHANGELOG §29).
+_REINSTALL_AR = "أعد تثبيت التطبيق على متجرك من لوحة سلة"
+
+#: The English half of the same instruction, for the journal line.
+_REINSTALL_HINT = (
+    "reinstall the app on the store (that re-fires app.store.authorize, which "
+    "is the only way a new credential is ever issued)"
+)
+
+
 def _token_expiry_problems(
-    settings: Any, today: date, warn_days: int
+    settings: Any, today: date, warn_days: int,
+    token_life: TokenLife | None = None,
 ) -> list[EnvProblem]:
     """A Salla token dies quietly: the first symptom is a paid order that
     provisions nothing. The existing warning lives inside the provisioning
     path, so it only speaks when an order is already being handled — too late
-    to be a warning. This one speaks at boot, before anyone buys."""
+    to be a warning. This one speaks at boot, before anyone buys.
+
+    TWO SOURCES, AND THEY ARE NOT EQUAL. When the credential store can be
+    asked, its answer wins: it measures what is LEFT of the token that
+    actually exists, and the environment variable measures what a human wrote
+    down once. The 2026-07-29 outage is precisely the gap between the two.
+    The file remains the fallback for a host where the store is not deployed,
+    and there its wording and thresholds are unchanged.
+
+    WHY THE LADDER, AND WHY IT IS SILENT ABOVE THE MARGIN. The refresher
+    (scripts/refresh_salla_token.py) renews at five days or fewer, daily, at
+    09:00 Riyadh. A boot check that finds five days left at 11:00 is therefore
+    looking at a day the automation ALREADY failed — which is why the
+    threshold is the margin itself and not something larger: above it, a
+    healthy system would be warned about every single day, and a warning that
+    fires for weeks while nothing is wrong is how a channel gets muted. Below
+    it, the sentence escalates as the days run out — «قارب» then «يوشك»
+    then «منتهي» — and each one carries a number that has changed since the
+    last, so a reminder can never be mistaken for a repetition.
+    """
+    if token_life is not None and token_life.readable:
+        return _stored_token_problems(token_life, warn_days)
     raw = (settings.salla_token_expires_at or "").strip()
     if not raw:
         return [EnvProblem(
@@ -580,6 +745,82 @@ def _token_expiry_problems(
     return []
 
 
+def _stored_token_problems(
+    life: TokenLife, warn_days: int
+) -> list[EnvProblem]:
+    """The store's answer, turned into an escalating ladder.
+
+    It takes the whole :class:`TokenLife` and not a bare ``int | None``, which
+    is the point of the 2026-08-07 fix: the argument that used to be passed
+    here could not distinguish «no credential» from «a credential with no
+    recorded expiry», and this function printed the reinstall instruction for
+    both. There is no such argument any more.
+
+    Nothing here is fatal and nothing here can be — see
+    :func:`report_environment`. Every rung is a warning that names what is
+    left and what to do about it.
+    """
+    if life.state is TokenState.ABSENT:
+        # The store answered and it holds nothing. Not «we do not know»: we
+        # know, and the answer is that there is no credential at all, so no
+        # order can be provisioned and no refresh can even be attempted. This
+        # is the ONE rung that may ask for a reinstall — everywhere else a
+        # live credential is on disk and reinstalling would fire
+        # `app.uninstalled` and take it down.
+        return [EnvProblem(
+            "SALLA_TOKEN_EXPIRES_AT",
+            "the credential store holds NO Salla token — paid orders cannot "
+            "provision and there is nothing for the refresher to renew; only "
+            "reinstalling the app on the store issues a new one",
+            f"لا يوجد اعتماد سلة محفوظ إطلاقًا — {_REINSTALL_AR}",
+        )]
+    if life.state is TokenState.UNDATED:
+        # A CREDENTIAL IS HELD. Nothing is down, and the operator must not be
+        # sent to do the one thing that would take it down. What is missing is
+        # a date: `store_credentials` clears the expiry when an authorize
+        # payload carries none, and the refresher treats an unknown runway as
+        # urgent, so a renewal is already scheduled for tonight. The instruction
+        # is therefore «wait for it, and look if it does not happen» — not
+        # «reinstall».
+        return [EnvProblem(
+            "SALLA_TOKEN_EXPIRES_AT",
+            "a Salla credential IS stored but its expiry was never recorded — "
+            "nothing can say how long it has; the automatic refresh reads an "
+            "unknown runway as urgent and will attempt a renewal at its next "
+            "run. Do NOT reinstall the app: that would revoke the credential "
+            "that is working right now",
+            "يوجد اعتماد سلة محفوظ لكن تاريخ انتهائه غير مسجّل — "
+            "التجديد التلقائي سيحاول تجديده في تشغيله القادم، ولا داعي لإعادة "
+            "تثبيت التطبيق",
+        )]
+    # MEASURED, and the invariant in `TokenLife.__post_init__` is what makes
+    # that a fact rather than a hope: the other three states returned above.
+    days_left = life.days_left if life.days_left is not None else 0
+    if days_left < 0:
+        return [EnvProblem(
+            "SALLA_TOKEN_EXPIRES_AT",
+            f"EXPIRED {-days_left} days ago — paid orders will not provision; "
+            f"the automatic refresh has not recovered it, so {_REINSTALL_HINT}",
+            f"توكن سلة منتهي والطلبات المدفوعة لا تُزوَّد — {_REINSTALL_AR}",
+        )]
+    if days_left <= 1:
+        return [EnvProblem(
+            "SALLA_TOKEN_EXPIRES_AT",
+            f"expires in {days_left} days and the automatic refresh has "
+            f"failed every attempt inside the margin — {_REINSTALL_HINT}",
+            f"توكن سلة يوشك أن ينتهي والتجديد التلقائي يفشل — {_REINSTALL_AR}",
+        )]
+    if days_left <= warn_days:
+        return [EnvProblem(
+            "SALLA_TOKEN_EXPIRES_AT",
+            f"expires in {days_left} days — inside the refresh margin, so the "
+            "automatic renewal should already have happened and did not; if "
+            f"it does not recover today, {_REINSTALL_HINT}",
+            f"توكن سلة قارب على الانتهاء والتجديد التلقائي لم ينجح — {_REINSTALL_AR}",
+        )]
+    return []
+
+
 def format_env_alert(problems: list[EnvProblem]) -> str:
     """The admin-channel message. Arabic prose and Latin variable names never
     share a line — mixing them reverses the line in the operator's client."""
@@ -595,6 +836,43 @@ def format_env_alert(problems: list[EnvProblem]) -> str:
     return "\n".join(lines)
 
 
+def read_token_life() -> TokenLife:
+    """Ask the credential store how much of the live token is LEFT.
+
+    Imported here rather than at module scope on purpose. This is a boot
+    check: it must survive a host where ``career.salla.tokens`` is not
+    deployed yet, and it must survive a store that raises. Either way the
+    answer is «unreadable», the caller degrades to the date in the
+    environment file, and nothing anywhere refuses to start — a boot check
+    that can stop a process turns «sales are stopped» into «the product is
+    down for the people who already paid» (see :func:`report_environment`).
+    """
+    if "pytest" in sys.modules:
+        # A test process must not read the operator's live credential file.
+        # Recognised the same way `career.db.session._process_escape` decides
+        # a process is pytest — by the module, not by argv — and for the same
+        # class of reason: otherwise every unit test of this pure check would
+        # silently depend on the state of one machine's secrets, and a real
+        # expired credential on the host would turn unrelated suites red while
+        # a green suite would prove nothing about either. The ladder itself is
+        # exercised by injecting :class:`TokenLife` (tests/
+        # test_salla_token_refresh.py), which is what the argument is for.
+        return TokenLife.unreadable()
+    try:
+        from career.salla import tokens
+
+        # `tokens.life()`, not `tokens.days_left()`: the latter cannot tell
+        # «no credential» from «a credential we cannot date», and this check
+        # prints a different — and destructive — instruction for the two.
+        return TokenLife.from_store(tokens.life())
+    except Exception:  # noqa: BLE001 — an unreadable store is a fallback, not a fault
+        logger.info(
+            "no readable Salla credential store — falling back to the "
+            "configured expiry date", exc_info=True,
+        )
+        return TokenLife.unreadable()
+
+
 def report_environment(
     *,
     settings: Any,
@@ -602,6 +880,7 @@ def report_environment(
     admin_client: Any,
     today: date | None = None,
     alert: bool = True,
+    token_life: TokenLife | None = None,
 ) -> list[EnvProblem]:
     """Run the boot check and shout — but NEVER stop the process.
 
@@ -639,6 +918,7 @@ def report_environment(
             approved_prices=approved_plan_prices(session),
             sale_plans=canonical_sale_plans(),
             today=today or datetime.now(UTC).astimezone().date(),
+            token_life=token_life if token_life is not None else read_token_life(),
         )
     except Exception:  # noqa: BLE001 — a boot check never blocks a boot
         logger.error("boot environment check could not run", exc_info=True)
@@ -674,6 +954,200 @@ def admin_client_for(settings: Any) -> Any:
     return JournalAdmin()
 
 
+# ── the §05 lifecycle sweep, one customer per transaction ───────────────────
+
+
+@dataclass(frozen=True)
+class LifecycleSweep:
+    """What the §05 sweep managed, and whose night it could not finish.
+
+    ``failed`` carries TEN codes and never a tenant uuid (§15.13 / AUDIT ك-17):
+    this object is printed into the journal.
+    """
+
+    counts: dict[str, int] = field(default_factory=dict)
+    #: How many customers the sweep opened a transaction for.
+    attempted: int = 0
+    #: The TEN codes whose transaction was rolled back.
+    failed: tuple[str, ...] = ()
+    #: True when the sweep never got as far as a customer at all.
+    aborted: bool = False
+
+    @property
+    def clean(self) -> bool:
+        return not self.failed and not self.aborted
+
+    def summary(self) -> dict[str, Any]:
+        """The journal shape — the same silences named as in `summarize_delivery`."""
+        return {
+            "customers": self.attempted,
+            "counts": self.counts,
+            "failed": list(self.failed),
+            "aborted": self.aborted,
+        }
+
+
+def _scope_to_one_customer(session: Session, tenant_id: uuid.UUID) -> None:
+    """Make every ``Subscription`` this session can SEE belong to one customer.
+
+    ``with_loader_criteria`` through ``do_orm_execute`` is SQLAlchemy's own
+    «global WHERE criteria» recipe, and it is used here rather than a new
+    argument on ``sweep_subscription_lifecycle`` because the sweep is §05's
+    authority and must keep deciding what it decides: this changes what it is
+    shown, never what it concludes.
+
+    WHY THE SCOPE IS THE CUSTOMER AND NOT THE SUBSCRIPTION. Every question the
+    sweep asks about a row is answered from that row, its own events, the
+    tenant's channel — or from the tenant's OTHER subscriptions:
+    ``_superseded_by_renewal`` exists to find «a live row of the same customer
+    with a later period», and it is what stops an ACTIVE paying customer being
+    walked through their previous period all over again. Scope a session to a
+    single subscription id and that question silently answers «no», and the
+    renewed customer gets a «نفتقدك» recovery template. Scoped to the tenant
+    it is asked and answered exactly as it is in one global pass, because it
+    was always a within-tenant question. So is `_live_channel`, so is
+    `_event_exists`. There is no cross-customer read in the sweep for this to
+    break, which is the property that makes one-transaction-per-customer
+    equivalent to one transaction for everybody — minus the amplification.
+    """
+
+    @sa_event.listens_for(session, "do_orm_execute")
+    def _one_customer_only(state: Any) -> None:
+        if state.is_select:
+            state.statement = state.statement.options(
+                with_loader_criteria(
+                    Subscription,
+                    Subscription.tenant_id == tenant_id,
+                    include_aliases=True,
+                )
+            )
+
+
+def sweep_lifecycle_per_customer(
+    new_session: Callable[[], Session],
+    *,
+    now: datetime,
+    whatsapp_client: Any = None,
+    store_url: str | None = None,
+    sweep: Callable[..., dict[str, int]] | None = None,
+) -> LifecycleSweep:
+    """Run §05 for every customer, each in its own transaction.
+
+    THE AMPLIFIER THIS REPLACES. Until 2026-08-07 this was four lines in
+    ``main()``: one ``Session``, the whole sweep, one ``session.commit()`` at
+    the end, all of it inside ``except Exception: logger.error(...)``. The
+    sweep marks each send it makes with a ``subscription_events`` row, and
+    those marks ARE its idempotency — «this customer has already had their
+    day-27 reminder» is a row and nothing else. So one exception anywhere in
+    the pass rolled back the marks for every customer already processed that
+    night. Meta had been charged for those templates, the database recorded
+    none of them, and the next night re-sent and re-paid for all of them. The
+    2026-08-06 fix removed one TRIGGER of that (a Meta message id too long for
+    its column, `salla.lifecycle._record_send`) and said in as many words that
+    the amplifier was not its to change. This is the amplifier.
+
+    A commit per customer makes the sweep's own idempotency DURABLE: a mark
+    written for TEN-0002 survives whatever happens to TEN-0009 four rows later,
+    and the customers after the failure are still swept instead of never being
+    reached at all.
+
+    THE BOUNDARY IS THE CUSTOMER, NOT THE STEP, and that is the whole of the
+    design. Committing at every flush would be finer and would be WRONG: the
+    grace path transitions ACTIVE→GRACE and only then sends the renewal
+    reminder that the transition is the trigger for. Commit between those two
+    and a failure in the second leaves a customer parked in GRACE, which the
+    next sweep reads as «already handled» — the reminder is not retried, it is
+    lost, and the customer is never asked to renew. Per customer, the unit is
+    all-or-nothing: a rollback restores exactly the state tomorrow's run
+    expects, which is why a partial sweep leaves nothing that reads as done.
+
+    WHAT IS STILL NOT TRANSACTIONAL, said out loud: the SENDS. A template that
+    went to Meta and then lost its mark to a rollback is a template that will
+    be sent, and paid for, again tomorrow. That residue is not removed here —
+    it is bounded. It used to be every customer the sweep had reached; it is
+    now the one customer whose transaction failed.
+
+    ``sweep`` is injectable so a test can fail one customer deliberately; it
+    defaults to the real §05 authority, imported late for the same reason
+    ``main()`` always imported it late (this module must import on a host where
+    the Salla side is not deployed).
+    """
+    if sweep is None:
+        from career.salla.lifecycle import sweep_subscription_lifecycle
+
+        sweep = sweep_subscription_lifecycle
+
+    try:
+        with new_session() as session:
+            # EVERY tenant that holds a subscription, not just the states §05
+            # currently sweeps. The status filter belongs to the sweep and
+            # only to the sweep: a copy of it here would be a second authority
+            # on «who is in scope» and would go stale the first time §05 adds
+            # a state (PAUSED was added once already). The cost of the
+            # drift-proof version is two indexed selects for a customer with
+            # nothing due.
+            tenant_ids = list(
+                session.execute(
+                    select(Subscription.tenant_id).distinct()
+                ).scalars()
+            )
+            # TEN codes, resolved once, so no log line below can print a uuid.
+            codes: dict[uuid.UUID, str] = {
+                row.id: row.code
+                for row in session.execute(
+                    select(Tenant.id, Tenant.code).where(
+                        Tenant.id.in_(tenant_ids)
+                    )
+                ).all()
+            } if tenant_ids else {}
+    except Exception:  # noqa: BLE001 — the sweep never blocks the run
+        logger.error(
+            "subscription lifecycle: could not even list the customers to "
+            "sweep — NOBODY was swept tonight", exc_info=True,
+        )
+        return LifecycleSweep(aborted=True)
+
+    # TEN codes only, from here down: every log line below is a journal line.
+    def code_for(tenant_id: uuid.UUID) -> str:
+        return codes.get(tenant_id, "TEN-????")
+
+    totals: dict[str, int] = {}
+    failed: list[str] = []
+    for tenant_id in sorted(tenant_ids, key=code_for):
+        try:
+            with new_session() as session:
+                _scope_to_one_customer(session, tenant_id)
+                counts = sweep(
+                    session, now=now, whatsapp_client=whatsapp_client,
+                    store_url=store_url,
+                )
+                session.commit()
+        except Exception:  # noqa: BLE001 — one customer, not the night
+            failed.append(code_for(tenant_id))
+            logger.error(
+                "subscription lifecycle sweep failed for %s — that customer's "
+                "marks were rolled back and tomorrow's run redoes them; every "
+                "other customer's are committed",
+                code_for(tenant_id), exc_info=True,
+            )
+            continue
+        for key, value in counts.items():
+            totals[key] = totals.get(key, 0) + value
+
+    if any(totals.values()):
+        logger.info("subscription lifecycle sweep: %s", totals)
+    if failed:
+        # ERROR because it is the level the operator's journal harvester
+        # forwards, and named because the exit code below is only a summons.
+        logger.error(
+            "subscription lifecycle sweep did not complete for %d of %d "
+            "customers: %s", len(failed), len(tenant_ids), ", ".join(failed),
+        )
+    return LifecycleSweep(
+        counts=totals, attempted=len(tenant_ids), failed=tuple(failed),
+    )
+
+
 def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
     # composition over tested parts; exercised live by the C6 exit gate.
     logging.basicConfig(level=logging.INFO)
@@ -699,8 +1173,12 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
 
     # §05 lifecycle sweep BEFORE the engine: a just-expired subscription
     # must not seed tonight's query families.
+    #
+    # One transaction PER CUSTOMER, and a verdict that survives to the exit
+    # code. Until 2026-08-07 these were four lines that ran every customer in
+    # one Session under one broad `except` — see
+    # :func:`sweep_lifecycle_per_customer` for what that cost.
     try:
-        from career.salla.lifecycle import sweep_subscription_lifecycle
         from career.whatsapp.client import HttpWhatsAppClient as _WaClient
 
         lifecycle_wa = (
@@ -708,15 +1186,18 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
                       settings.whatsapp_phone_number_id)
             if settings.whatsapp_access_token else None
         )
-        with Session(engine) as session:
-            sweep_subscription_lifecycle(
-                session, now=datetime.now(UTC),
-                whatsapp_client=lifecycle_wa,
-                store_url=settings.salla_store_url,
-            )
-            session.commit()
+        lifecycle = sweep_lifecycle_per_customer(
+            lambda: Session(engine), now=datetime.now(UTC),
+            whatsapp_client=lifecycle_wa,
+            store_url=settings.salla_store_url,
+        )
     except Exception:  # noqa: BLE001 — the sweep never blocks the run
-        logger.error("subscription lifecycle sweep failed", exc_info=True)
+        # Everything INSIDE the sweep is already per-customer; reaching here
+        # means it never started (the WhatsApp client, the import), so nobody
+        # was swept and the night says so.
+        logger.error("subscription lifecycle sweep failed to start",
+                     exc_info=True)
+        lifecycle = LifecycleSweep(aborted=True)
 
     # §12 retention: kept in full while subscribed, 90 days after it ends,
     # then professionally deleted. That was a published promise in the consent
@@ -764,11 +1245,20 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
         engine.dispose()
 
     summary = summarize(report, codes)
+    # Named in the journal beside the delivery, and for the same reason: a
+    # sweep that half-completed and a sweep that did everything used to print
+    # identically, which is nothing.
+    summary["lifecycle"] = lifecycle.summary()
 
     if report.status in ("discovery_failed", "partial"):
         try:
             admin.send_admin(
-                f"⚠️ التشغيلة الليلية: {report.status} — "
+                # Direction-pure, one fact per line: his client REVERSES any
+                # line that mixes Arabic with Latin letters or digits, and both
+                # the status and the counts are Latin (bidi guard,
+                # tests/test_alert_direction_purity.py).
+                "⚠️ التشغيلة الليلية لم تكتمل كما ينبغي\n"
+                f"{report.status}\n"
                 f"counts={report.counts}"
             )
         except Exception:  # noqa: BLE001 — alerting never breaks the run
@@ -937,7 +1427,8 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
             "and no customer was served tonight"
         )
     return exit_code_for(report.status, closed_states,
-                         delivery_phase=summary["delivery_phase"])
+                         delivery_phase=summary["delivery_phase"],
+                         lifecycle_failed=not lifecycle.clean)
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -42,6 +42,7 @@ from career.db.models import (
     TenantJobSuppression,
     UsageEvent,
 )
+from career.salla import subscriptions as _sub_states
 from career.telegram import views
 from career.telegram.admin import Keyboard
 from career.whatsapp.client import WhatsAppClient
@@ -60,7 +61,9 @@ logger = logging.getLogger("career.telegram.console")
 
 _RIYADH = ZoneInfo("Asia/Riyadh")
 
-EXPIRED_BUTTON_AR = "انتهت صلاحية الزر — أرسل /start"
+#: The command goes on a LINE OF ITS OWN — inside the Arabic sentence the
+#: operator's client reversed it, and alone it is also tappable.
+EXPIRED_BUTTON_AR = "انتهت صلاحية الزر — أرسل\n/start"
 ACTION_EXPIRED_AR = "انتهت صلاحية التأكيد (٥ دقائق) — أعد المحاولة"
 
 #: Double-confirm nonces for mutating actions (design doc §4). Single operator,
@@ -259,9 +262,24 @@ _ACTIONS = {
 TICKETS_TITLE_AR = "🎫 التذاكر المفتوحة"
 TICKETS_NONE_AR = "🟢 لا توجد تذاكر مفتوحة"
 #: Ticket kinds, in the words of what actually happened to the customer.
+#: The لمّاح+ direct line carries the star, here and on the alert, for the
+#: reason `telegram.messages._PRIORITY_PLANS` gives: the operator picks who to
+#: answer from THIS list, so a tier he only learns by opening a card is a tier
+#: he learns too late. The kind string itself is
+#: `promises.career_session.DIRECT_MESSAGE_TICKET_KIND`; it is written out
+#: rather than imported because this table is a pure render map and the module
+#: is imported lazily everywhere else in this file.
 _TICKET_KIND_AR = {
     "support_request": "طلب التواصل مع الدعم",
     "funnel_consent_stuck": "متعثّر عند بوابة الموافقة",
+    "executive_direct_message": "⭐ رسالة مباشرة من مشترك لمّاح+",
+    "career_session_overdue": "📅 طلب جلسة مسار تجاوز مهلة الرد",
+    # Money taken for a service that cannot be delivered: he silenced his
+    # messages and then bought, or renewed. Nothing else says it — the night
+    # closes him SKIPPED_OPTED_OUT, which is an honest state and exits zero, so
+    # the operator's screens read it as the customer's own choice rather than
+    # as a charge against a service he will not receive.
+    "paid_while_opted_out": "💸 دفع أو جدّد وهو موقف الرسائل",
 }
 #: How many tickets one screen shows. A watchtower screen the operator has to
 #: scroll is a screen they stop reading; the count line stays truthful about
@@ -595,20 +613,33 @@ def _fact_lines_ar(facts: dict[str, Any]) -> list[str]:
     lines: list[str] = []
     day_states = facts.get("day_states") or {}
     for state, count in sorted(day_states.items()):
-        label = views.state_label(str(state))
-        # a translated state is pure Arabic and safe inline; an unknown one is
-        # a raw Latin token and gets its own line
-        if label == str(state):
+        # `day_state_ar` rather than `state_label`: it RETURNS None instead of
+        # the raw token, so «is this word safe inside an Arabic line?» is
+        # answered by the type instead of by comparing two strings.
+        label_ar = views.day_state_ar(str(state))
+        if label_ar is None:
+            # no Arabic word for this state — the Latin token gets its own line
             lines.append(str(state))
-            lines.append(f"x{_ar_digits(count)}")
+            # `×` (U+00D7), not an ASCII `x`: the same multiplication sign the
+            # translated branch already uses, so the two read alike — and a
+            # Latin letter beside an Arabic numeral reversed this line.
+            lines.append(f"× {_ar_digits(count)}")
         else:
-            lines.append(f"{label} × {_ar_digits(count)}")
+            lines.append(f"{label_ar} × {_ar_digits(count)}")
     if facts.get("weekend_days"):
         lines.append("ومرت المهلة على عطلة نهاية الأسبوع")
     if facts.get("paused"):
         lines.append("وكان موقوفًا مؤقتًا بطلبه")
     if facts.get("opted_out"):
         lines.append("وكان موقفًا للرسائل")
+    elif facts.get("opted_out_before_window"):
+        lines.append("ودخل المهلة وهو موقف للرسائل")
+    if facts.get("subscription_status") in _sub_states.TERMINAL_STATES:
+        # Read LIVE by `open_breaches`, not out of the frozen packet: this
+        # screen sits days after the breach and beside the remedy buttons, and
+        # a refund that landed yesterday must not still read as an open
+        # account here.
+        lines.append("واشتراكه منتهٍ ماليًا الآن — راجع حالته قبل أي تعويض")
     return lines
 
 
@@ -825,6 +856,70 @@ def _customers_data(
     return rows, page, total
 
 
+def _deduction_lines(session: Session, *, row: Any) -> str:
+    """«كم يُخصم من استرداده» — and, inseparably, «عن أي فترة».
+
+    AUDIT 2026-08-07. This line printed a CONSTANT: `f"{SESSION_VALUE_SAR}
+    SAR"`, under a comment claiming it was computed, while
+    ``career_session.refund_deduction_sar`` — the function that actually reads
+    the ledger, and the one the refund page's «تُخصم قيمة الخدمات البشرية اللي
+    استلمتها فعليًا» describes — had no production caller anywhere. Two
+    separate things were wrong with that, and only one of them is arithmetic:
+
+    * The number was not a fact about this customer. It happens to agree with
+      the ledger in every state reachable today, and that is a coincidence of
+      the catalog, not a property of the screen: `uq_career_sessions_live_per_
+      subscription` allows one live row per period, so «completed sessions in
+      this period» is 1 whenever this line renders at all. Nothing about that
+      is visible from here, nothing keeps it true (a cancel path, a second
+      session, a price change), and a screen that would keep printing 150
+      after the ledger stopped agreeing is a screen the operator cannot use
+      to answer a customer who is disputing money.
+    * The screen never said WHICH period it had counted. «150 will be
+      deducted» is not an answer without «from the refund of which order» —
+      and this same card can show a session belonging to a DIFFERENT period
+      than the current one (`career_session.current_session` deliberately
+      falls back across periods so a renewal cannot hide an unanswered
+      request), so the operator had no way to know the two lines above and
+      below each other were even about the same subscription.
+
+    There is no ambiguity to resolve at this call site, and that is worth
+    writing down rather than assuming: the fallback only ever returns an OPEN
+    row (REQUESTED/SCHEDULED), so a COMPLETED row on this card always came
+    from the current period. The deduction is therefore scoped to
+    ``row.subscription_id`` — the very row being displayed — instead of
+    re-resolving «the current subscription» independently and risking the two
+    halves of one screen describing two different worlds, which is the exact
+    defect the 2026-08-06 audit fixed inside `career_session` itself.
+
+    What the screen CANNOT know is which order the operator is refunding: a
+    customer may be asking about a period that ended months ago. So the last
+    line says so outright instead of letting a single number be read as «the
+    deduction», full stop.
+    """
+    from career.db.models import Subscription
+    from career.promises import career_session
+
+    amount = career_session.refund_deduction_sar(
+        session, tenant_id=row.tenant_id, subscription_id=row.subscription_id,
+    )
+    count = career_session.completed_sessions_count(
+        session, tenant_id=row.tenant_id, subscription_id=row.subscription_id,
+    )
+    subscription = session.get(Subscription, row.subscription_id)
+    start = getattr(subscription, "current_period_start", None)
+    # Every line is direction-pure (§16): the amount is Latin and sits alone,
+    # the period start is a date and sits alone, the counts are Arabic-Indic.
+    lines = [f"{amount} SAR", f"عن جلسات فترة اشتراك واحدة، عددها المحسوب: "
+             f"{_ar_digits(count)}"]
+    if start is not None:
+        lines.append("وهي الفترة التي تبدأ في")
+        lines.append(start.astimezone(_RIYADH).date().isoformat()
+                     if start.tzinfo else start.date().isoformat())
+    lines.append("واسترداد أي فترة ثانية يُحسب على حدة")
+    return "\n".join(lines)
+
+
 def _promise_facts(
     session: Session, *, tenant_id: Any, now: datetime
 ) -> dict[str, Any]:
@@ -869,7 +964,7 @@ def _promise_facts(
             # The published deduction, computed rather than remembered — the
             # refund page promises «ونعرض عليك الأرقام قبل موافقتك».
             "deduction": (
-                f"{career_session.SESSION_VALUE_SAR} SAR"
+                _deduction_lines(session, row=session_row)
                 if session_row.status == career_session.COMPLETED else None
             ),
         }
@@ -1063,17 +1158,20 @@ def _business_data(
     if range_key in ("7", "30"):
         cutoff = now - timedelta(days=int(range_key))
 
-    subs_query = select(Subscription.plan_code, func.count(),
-                        func.coalesce(func.sum(Subscription.amount_sar), 0))
-    if cutoff is not None:
-        subs_query = subs_query.where(Subscription.created_at >= cutoff)
-    subs_by_plan: dict[str, int] = {}
-    revenue = 0
-    for plan_code, count, amount in session.execute(
-        subs_query.group_by(Subscription.plan_code)
-    ).all():
-        subs_by_plan[str(plan_code)] = int(count)
-        revenue += int(amount or 0)
+    # Revenue is «the money that arrived and STAYED», and this screen used to
+    # compute it here with no status predicate at all: a refunded order, a
+    # cancelled one and a chargeback each counted forever, and a chargeback is
+    # money that left the account twice. On the seeded data that overstated the
+    # number by 312%. The correct definition already existed one module away —
+    # cv.close.paid_subscriptions_by_plan, derived from the state machine's own
+    # TERMINAL_STATES so a twelfth state cannot quietly become revenue — and
+    # the operator prices the product off this figure. One definition, in the
+    # file that owns money, read by everything that shows money.
+    from career.cv import close as close_mod
+
+    subs_by_plan, revenue = close_mod.paid_subscriptions_by_plan(
+        session, since=cutoff
+    )
 
     outcomes_query = select(OutcomeEvent.outcome, func.count())
     if cutoff is not None:
@@ -1098,31 +1196,18 @@ def _business_data(
         )
     delivered_days = int(session.execute(delivered_query).scalar_one())
 
-    # §14 spend. Closure audit: this used to count exactly TWO categories, so
-    # the operator's «نداءات Claude» number silently ignored the panel, the
-    # judge, the examples writer, the intent classifier, every SearchAPI credit
-    # and every billed WhatsApp template. Now every metered kind lands here.
+    # §14 spend, from the ONE definition of «what did this cost» — the metered
+    # usage_events kinds plus the WhatsApp half derived from the delivery
+    # ledger. This screen used to spell that expression out by hand, which is
+    # how the codebase came to hold two of them: the same sum lived here and in
+    # close.rollup_costs, they disagreed about which kinds count, and only this
+    # one was ever looked at. close.spend_by_kind is now that expression, and a
+    # screen that re-implements money is a screen that will drift from it.
     from career.cv import close as close_mod
 
-    spend_query = select(
-        UsageEvent.kind, func.count(),
-        func.coalesce(func.sum(UsageEvent.cost_usd), 0),
-    ).where(UsageEvent.kind.in_(close_mod.SPEND_KINDS))
-    if cutoff is not None:
-        spend_query = spend_query.where(UsageEvent.occurred_at >= cutoff)
-    spend: dict[str, tuple[int, Decimal]] = {
-        str(kind): (int(events), Decimal(cost))
-        for kind, events, cost in session.execute(
-            spend_query.group_by(UsageEvent.kind)
-        ).all()
-    }
-    # WhatsApp is derived from the delivery ledger (its send sites live in
-    # modules this layer must not reach into) — same truth, same table.
-    for kind, (events, cost) in close_mod.whatsapp_spend(
+    spend: dict[str, tuple[int, Decimal]] = close_mod.spend_by_kind(
         session, since=cutoff
-    ).items():
-        prior_events, prior_cost = spend.get(kind, (0, Decimal("0")))
-        spend[kind] = (prior_events + events, prior_cost + cost)
+    )
 
     llm_calls = sum(spend.get(k, (0, Decimal("0")))[0] for k in close_mod.LLM_KINDS)
     llm_cost = sum(

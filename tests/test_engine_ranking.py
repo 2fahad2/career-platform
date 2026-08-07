@@ -19,6 +19,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
 from career.engine import ranking
+from career_core.identity import derive_canonical_job_identity
 
 NOW = datetime(2026, 7, 15, 23, 30, tzinfo=UTC)
 
@@ -175,6 +176,117 @@ def test_recording_suppression_upserts_and_prunes(owner_engine: Engine) -> None:
                 days=ranking.SUPPRESSION_TTL_DAYS
             )
         finally:
+            s.execute(sql_text("DELETE FROM tenants WHERE id = :id"), {"id": tenant_id})
+            s.commit()
+
+
+def _seed_posting(
+    owner: Session, *, url: str, group: str, source: str = "searchapi_google_jobs"
+) -> None:
+    """One posting in the shared pool, stored with its URL exactly as the
+    source handed it over — which is what engine.run does."""
+    owner.execute(
+        sql_text(
+            "INSERT INTO job_postings "
+            "(id, url_identity, url, repost_group_id, title, company, source, "
+            " route, first_seen_at, last_seen_at) "
+            "VALUES (:id, :ident, :url, :grp, :t, :c, :s, '{}'::jsonb, :n, :n)"
+        ),
+        {"id": str(uuid.uuid4()),
+         "ident": derive_canonical_job_identity(url),
+         "url": url, "grp": group, "t": "Business Analyst",
+         "c": "Example Co", "s": source, "n": NOW},
+    )
+
+
+def test_tracked_delivered_url_still_suppresses_the_whole_repost_group(
+    owner_engine: Engine,
+) -> None:
+    """A delivered link carrying tracking parameters must suppress the GROUP.
+
+    The repost group used to be resolved with ``JobPosting.url == url`` — a raw
+    string comparison against the URL the source handed over. A delivered link
+    picks up ``utm_*``/``gclid`` and a host the customer's client lower-cases,
+    so the exact match found nothing, the suppression row landed with a NULL
+    group, and group-level suppression silently degraded to URL-only: the very
+    same job, discovered again under its repost's URL, came back to the
+    customer inside the TTL with nothing reporting it.
+    """
+    tenant_id = str(uuid.uuid4())
+    group = "joburl:v1:" + "a" * 64          # the shared group of one repost pair
+    delivered_raw = "https://jobs.example.com/Careers/BA-7712"
+    # what actually left the building: the same job, tracked and lower-cased
+    delivered_tracked = (
+        "https://jobs.example.com/careers/BA-7712"
+        "?utm_source=whatsapp&utm_campaign=daily&gclid=Cj0KxYZ/"
+    )
+    repost_url = "https://aggregator.example.com/j/9931"
+    with Session(owner_engine) as s:
+        s.execute(sql_text("INSERT INTO tenants (id, code) VALUES (:id, :c)"),
+                  {"id": tenant_id, "c": f"TEN-R{uuid.uuid4().hex[:4]}"})
+        _seed_posting(s, url=delivered_raw, group=group)
+        _seed_posting(s, url=repost_url, group=group, source="jobspy")
+        s.commit()
+        try:
+            ranking.record_suppression_by_url(
+                s, tenant_id=uuid.UUID(tenant_id), url=delivered_tracked, now=NOW
+            )
+            s.commit()
+            row = s.execute(
+                sql_text(
+                    "SELECT suppression_key, repost_group_id "
+                    "FROM tenant_job_suppressions WHERE tenant_id = :tid"
+                ),
+                {"tid": tenant_id},
+            ).one()
+            # the group was resolved DESPITE the tracking parameters
+            assert row.repost_group_id == group
+            # …and the key is still the §8.1 normalized delivered key
+            assert row.suppression_key == "https://jobs.example.com/careers/ba-7712"
+
+            # the repost — a DIFFERENT url, same group — must not come back
+            repost = _candidate(
+                "repost", repost_group_id=group, dedupe_url_key=repost_url,
+            )
+            kept = ranking.filter_suppressed(
+                s, tenant_id=uuid.UUID(tenant_id), candidates=[repost], now=NOW
+            )
+            assert kept == []
+        finally:
+            s.rollback()
+            s.execute(sql_text("DELETE FROM tenants WHERE id = :id"), {"id": tenant_id})
+            s.execute(
+                sql_text("DELETE FROM job_postings WHERE repost_group_id = :g"),
+                {"g": group},
+            )
+            s.commit()
+
+
+def test_unusable_delivered_url_never_crashes_the_close(owner_engine: Engine) -> None:
+    """Fail-open at the identity boundary: a delivered string that is not an
+    http(s) URL has no posting to find, so the row is written with the URL key
+    alone rather than raising inside the day's ledger write (§8.1/§15.12)."""
+    tenant_id = str(uuid.uuid4())
+    with Session(owner_engine) as s:
+        s.execute(sql_text("INSERT INTO tenants (id, code) VALUES (:id, :c)"),
+                  {"id": tenant_id, "c": f"TEN-R{uuid.uuid4().hex[:4]}"})
+        s.commit()
+        try:
+            ranking.record_suppression_by_url(
+                s, tenant_id=uuid.UUID(tenant_id), url="ftp://x.example/j/1", now=NOW
+            )
+            s.commit()
+            row = s.execute(
+                sql_text(
+                    "SELECT suppression_key, repost_group_id "
+                    "FROM tenant_job_suppressions WHERE tenant_id = :tid"
+                ),
+                {"tid": tenant_id},
+            ).one()
+            assert row.suppression_key == "ftp://x.example/j/1"
+            assert row.repost_group_id is None
+        finally:
+            s.rollback()
             s.execute(sql_text("DELETE FROM tenants WHERE id = :id"), {"id": tenant_id})
             s.commit()
 

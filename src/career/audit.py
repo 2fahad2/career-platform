@@ -23,7 +23,9 @@ operational telemetry», the answer is the journal, not this table.
 
 The registry is derived from what the code actually emits, never from what it
 might one day emit: an action registered with no caller is the same vacuum in
-a different shape. Today two events are live, both SECURITY:
+a different shape. Six events are live.
+
+SECURITY:
 
 * ``activation_link_issued`` — salla.provisioning.issue_activation_link. The
   link IS the credential for a paid subscription; issuing one on demand is an
@@ -31,18 +33,30 @@ a different shape. Today two events are live, both SECURITY:
 * ``cv_pair_quarantined`` — cv.publish. A customer-facing artifact failed the
   §7.1 acceptance authority and was removed from the live path (Constant 6).
 
-STILL OWED, and named here so the gap is visible rather than forgotten. Each
-belongs to a call site in a module this file's author does not own, and each
-is squarely inside the three categories:
+PRIVACY — ``onboarding/privacy.py``. These two closed the sharpest gap this
+table had: the retention exemption above says `audit_events` survives a
+customer's «حذف بياناتي» BY DESIGN, and the deletion itself was the one event
+nobody wrote. An exemption whose justification is a trail that does not exist
+is not an exemption, it is data we simply kept.
 
-* ``privacy_export_fulfilled`` / ``privacy_deletion_executed`` (PRIVACY) —
-  ``onboarding/privacy.py``. The trail this table's retention exemption exists
-  for is precisely the record of the deletion, and it is the one event we do
-  not currently write.
-* ``subscription_provisioned`` / ``subscription_refunded`` (MONEY) —
-  ``salla/provisioning.py`` and ``salla/renewal.py``. Constant 4 says a
-  subscription is created only on ``payment = paid`` after a re-check against
-  the Salla API; nothing records that the re-check happened.
+* ``privacy_deletion_executed`` — which tables lost how many rows, and how many
+  storage objects were purged. Counts, never contents.
+* ``privacy_export_fulfilled`` — a complete copy of everything personal we hold
+  was materialised into object storage. That is a disclosure, and a disclosure
+  with no record is indistinguishable from a leak.
+
+MONEY — ``salla/provisioning.py`` (the renewal half runs through the same
+function, ``salla/renewal.py`` only decides WHOSE it is):
+
+* ``subscription_provisioned`` — Constant 4 says a subscription is created only
+  on ``payment = paid`` after a re-verification against the Salla API, and
+  nothing anywhere recorded that the re-check had actually happened for a given
+  order. It does now, with the order id, the plan and the amount that was
+  matched.
+* ``subscription_refunded`` — the money went back and service stopped. Written
+  for every reversal (refund, cancellation, chargeback), with the event name in
+  the details, because from the customer's side they are one fact: they are no
+  longer paying and we are no longer serving them.
 """
 
 from __future__ import annotations
@@ -70,11 +84,23 @@ class AuditCategory(StrEnum):
 ACTION_ACTIVATION_LINK_ISSUED = "activation_link_issued"
 #: A published CV pair failed binding validation and left the live prefix.
 ACTION_CV_PAIR_QUARANTINED = "cv_pair_quarantined"
+#: §12 «حذف بياناتي» was executed — the personal tables for one tenant are gone.
+ACTION_PRIVACY_DELETION_EXECUTED = "privacy_deletion_executed"
+#: §12 «بياناتي» was fulfilled — a full personal copy left for object storage.
+ACTION_PRIVACY_EXPORT_FULFILLED = "privacy_export_fulfilled"
+#: A paid Salla order was re-verified against the API and became a subscription.
+ACTION_SUBSCRIPTION_PROVISIONED = "subscription_provisioned"
+#: A reversal (refund / cancellation / chargeback) stopped a paid subscription.
+ACTION_SUBSCRIPTION_REFUNDED = "subscription_refunded"
 
 #: action → category. A write with an action outside this map is refused.
 AUDIT_ACTIONS: dict[str, AuditCategory] = {
     ACTION_ACTIVATION_LINK_ISSUED: AuditCategory.SECURITY,
     ACTION_CV_PAIR_QUARANTINED: AuditCategory.SECURITY,
+    ACTION_PRIVACY_DELETION_EXECUTED: AuditCategory.PRIVACY,
+    ACTION_PRIVACY_EXPORT_FULFILLED: AuditCategory.PRIVACY,
+    ACTION_SUBSCRIPTION_PROVISIONED: AuditCategory.MONEY,
+    ACTION_SUBSCRIPTION_REFUNDED: AuditCategory.MONEY,
 }
 
 

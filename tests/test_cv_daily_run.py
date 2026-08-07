@@ -926,3 +926,18 @@ def test_delivered_day_arms_enrichment_for_thin_role(
             owner_session.execute(sql_text(
                 f"DELETE FROM {table} WHERE tenant_id = :t"), {"t": str(tid)})
         owner_session.commit()
+
+
+def test_the_expiry_notice_does_not_reverse_for_the_operator() -> None:
+    """The stale-bundle notice: the count folds into the Arabic sentence in
+    Arabic-Indic digits, and `WHATSAPP_FAILED` — the §15.12 day state the
+    operator greps the journal for — keeps its exact spelling on a line of
+    its own. Green counterpart to the tree-wide bidi guard, which is red for
+    other owners' files; see the same test in `test_whatsapp_worker`.
+    """
+    from tests.test_alert_direction_purity import SLOT, verdict
+
+    hits = verdict().get("src/career/cv/daily_run.py", [])
+    assert not hits, "mixed-direction operator line(s) — " + " ; ".join(
+        f"L{n}: {line.replace(SLOT, '{…}')!r}" for n, line in hits
+    )

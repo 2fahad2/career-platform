@@ -643,6 +643,7 @@ def test_intake_links_a_whatsapp_body_to_the_customer_it_is_about(
         event_id = intake.persist_deduped_event(
             s, provider="whatsapp", event_type="messages",
             fingerprint=f"wa:{uuid.uuid4()}", payload=_wa_body(phone),
+            signature_valid=True,
         )
         subject = s.execute(
             sql_text("SELECT subject_tenant_id::text FROM webhook_events WHERE id = :i"),
@@ -695,6 +696,7 @@ def test_intake_still_records_the_event_when_the_link_cannot_be_resolved(
         event_id = intake.persist_deduped_event(
             s, provider="whatsapp", event_type="messages",
             fingerprint=f"wa:{uuid.uuid4()}", payload=_wa_body("+966500000001"),
+            signature_valid=True,
         )
         assert event_id is not None
         assert s.execute(
@@ -722,6 +724,7 @@ def test_deletion_erases_the_raw_bodies_and_keeps_the_fingerprint(
         intake.persist_deduped_event(
             s, provider="whatsapp", event_type="messages",
             fingerprint=fingerprint, payload=_wa_body(phone),
+            signature_valid=True,
         )
 
     with tenant_session(a) as s:
@@ -757,12 +760,14 @@ def test_a_replayed_webhook_is_still_a_no_op_after_its_body_was_erased(
         first = intake.persist_deduped_event(
             s, provider="whatsapp", event_type="messages",
             fingerprint=fingerprint, payload=_wa_body(phone),
+            signature_valid=True,
         )
         intake.redact_for_tenant(s, tenant_id=uuid.UUID(a), now=NOW)
         s.commit()
         replay = intake.persist_deduped_event(
             s, provider="whatsapp", event_type="messages",
             fingerprint=fingerprint, payload=_wa_body(phone),
+            signature_valid=True,
         )
     assert first is not None
     assert replay is None, "the replay was accepted as a fresh event"
@@ -847,6 +852,7 @@ def test_the_export_names_the_wire_record_without_handing_over_the_body(
         intake.persist_deduped_event(
             s, provider="whatsapp", event_type="messages",
             fingerprint=f"wa:{uuid.uuid4()}", payload=_wa_body(phone),
+            signature_valid=True,
         )
     with tenant_session(a) as s:
         bundle = privacy.export_bundle(s, tenant_id=tid)
@@ -881,6 +887,128 @@ def test_a_real_postgres_error_in_the_link_does_not_poison_the_intake(
         event_id = intake.persist_deduped_event(
             s, provider="whatsapp", event_type="messages",
             fingerprint=f"wa:{uuid.uuid4()}", payload=_wa_body("+966500000002"),
+            signature_valid=True,
         )
         assert event_id is not None, "the event was lost to a failed lookup"
     assert two_tenants
+
+
+# ── the audit trail's own reason for existing ────────────────────────────────
+
+
+def _audit_rows(tenant: str) -> list:
+    with tenant_session(tenant) as s:
+        return list(s.execute(sql_text(
+            "SELECT action, actor, resource_type, details FROM audit_events"
+            " ORDER BY created_at")).all())
+
+
+def test_deletion_writes_the_row_the_retention_exemption_exists_for(
+    two_tenants: tuple[str, str],
+) -> None:
+    """`audit_events` is in RETAINED_TABLES: we tell the customer we delete
+    their data and then keep this table, and the justification is that it holds
+    the record they or a regulator could ask us to produce. The deletion itself
+    was the one event nobody wrote — so the exemption was vacuous, and the row
+    that survives is the row that proves the erasure happened.
+
+    It survives BECAUSE it is written in the same transaction as the deletion
+    and its table is not in the deletion order — asserted here rather than
+    assumed, since «written, then deleted by the very act it records» is the
+    obvious way for this to be wrong.
+    """
+    a, _ = two_tenants
+    tid = uuid.UUID(a)
+    with tenant_session(a) as s:
+        _seed_personal_data(s, tid)
+        req = privacy.open_request(s, tenant_id=tid, kind="delete", now=NOW)
+        privacy.execute_deletion(s, tenant_id=tid, request_id=req.id, now=NOW)
+
+    rows = [r for r in _audit_rows(a) if r.action == "privacy_deletion_executed"]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.actor == "customer"
+    assert row.resource_type == "privacy_request"
+    # counts and table names — never a phone, a name or a storage key's contents
+    assert row.details["deleted"]["customer_profiles"] == 1
+    assert row.details["deleted"]["customer_channels"] == 1
+    assert isinstance(row.details["storage_objects_purged"], int)
+    assert "audit_events" in row.details["retained_tables"]
+    blob = json.dumps(row.details, ensure_ascii=False)
+    assert "+9665" not in blob and "Fahad" not in blob
+
+
+def test_the_deletion_audit_row_is_atomic_with_the_deletion(
+    two_tenants: tuple[str, str],
+) -> None:
+    """The opposite call from the export beside it, and worth pinning.
+
+    Every delete is inside the caller's transaction, so a row written in its
+    OWN transaction could outlive a rollback and claim an erasure that never
+    happened — a worse lie than a missing row, because this one would be
+    believed. Roll the turn back and nothing is left saying we deleted anything.
+    """
+    a, _ = two_tenants
+    tid = uuid.UUID(a)
+    with tenant_session(a) as s:
+        _seed_personal_data(s, tid)
+    with pytest.raises(RuntimeError, match="turn blew up"):
+        with tenant_session(a) as s:
+            req = privacy.open_request(s, tenant_id=tid, kind="delete", now=NOW)
+            privacy.execute_deletion(s, tenant_id=tid, request_id=req.id, now=NOW)
+            raise RuntimeError("turn blew up after the deletion")
+
+    assert _audit_rows(a) == []
+    with tenant_session(a) as s:
+        # and the customer's data is still there — nothing happened at all
+        assert s.execute(sql_text(
+            "SELECT count(*) FROM customer_profiles")).scalar_one() == 1
+
+
+def test_export_is_audited_even_when_the_turn_that_asked_for_it_rolls_back(
+    two_tenants: tuple[str, str], tmp_path,
+) -> None:
+    """The export's audit row is written in its OWN transaction, on purpose.
+
+    `storage.put` has already written a complete copy of everything personal we
+    hold, and object storage is not in this transaction. If the WhatsApp turn
+    that asked for it then fails, the request row, its `storage_key` and any
+    in-transaction audit row all vanish — while the bundle sits in storage
+    exactly where we put it. A disclosure whose only record can disappear while
+    the disclosure survives is indistinguishable from a leak.
+    """
+    a, _ = two_tenants
+    tid = uuid.UUID(a)
+    storage = FilesystemStorageAdapter(tmp_path)
+    with tenant_session(a) as s:
+        _seed_personal_data(s, tid)
+
+    with pytest.raises(RuntimeError, match="turn blew up"):
+        with tenant_session(a) as s:
+            req = privacy.open_request(s, tenant_id=tid, kind="export", now=NOW)
+            privacy.fulfill_export(
+                s, tenant_id=tid, request_id=req.id, storage=storage, now=NOW
+            )
+            raise RuntimeError("turn blew up after the bundle was written")
+
+    rows = [r for r in _audit_rows(a) if r.action == "privacy_export_fulfilled"]
+    assert len(rows) == 1
+    assert rows[0].details["storage_key"].startswith(f"tenants/{tid}/exports/")
+    with tenant_session(a) as s:
+        # the request itself went with the rollback — the audit row is all that
+        # is left, which is exactly why it must not be in that transaction
+        assert s.execute(sql_text(
+            "SELECT count(*) FROM privacy_requests")).scalar_one() == 0
+
+
+def test_an_unregistered_action_is_still_refused(
+    two_tenants: tuple[str, str],
+) -> None:
+    """The vocabulary stays closed. Four actions were added, not the door."""
+    from career.audit import UnregisteredAuditAction, record_audit
+
+    a, _ = two_tenants
+    with pytest.raises(UnregisteredAuditAction):
+        with tenant_session(a) as s:
+            record_audit(s, tenant_id=a, actor="operator",
+                         action="customer_opened_the_app")

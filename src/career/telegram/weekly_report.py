@@ -27,14 +27,30 @@ from sqlalchemy.orm import Session
 
 from career.db.models import AdminBotState
 
-# The underscore is deliberate and temporary: ``views._plan`` is the authority
-# today, views.py belongs to another change in flight, and inventing a second
-# public name here would be the third copy. The architect note asks for it to
-# be renamed ``views.plan_label`` (or moved whole to ``telegram/plans.py``) —
-# one import line moves with it.
-from career.telegram.views import _plan as _plan_ar
+# ``views`` is the authority on what a product is called AND on how a sales
+# breakdown is written; this file states neither. It used to state the first,
+# and the drift is documented above.
+from career.telegram.views import plan_counts_lines
 
 logger = logging.getLogger("career.telegram")
+
+#: Western digits → Arabic-Indic. See ``views._ar_digits`` for why the table
+#: is two lines here rather than an import: it is what makes the report's
+#: counts safe INSIDE their Arabic sentences, and safety is a property of the
+#: place the number is written.
+_WESTERN_TO_ARABIC = str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩")
+
+
+def _ar_digits(value: Any) -> str:
+    """A count that can live inside an Arabic line without scrambling it.
+
+    The Sunday report is read at a glance, and it is almost entirely counts.
+    Splitting each one onto its own line would have doubled the report's
+    height to fix a problem the numeral system already solves; identifiers —
+    the week-ending date, an unmapped plan code, a spend line's Latin key —
+    are not counts and still get lines of their own.
+    """
+    return str(value).translate(_WESTERN_TO_ARABIC)
 
 #: The day-state words for the TALLY LINE, which is why they are not
 #: ``views._STATE_AR`` and why importing that map here would be a regression
@@ -150,6 +166,32 @@ def release_weekly_report(session: Session, *, restore_to: date | None) -> None:
     session.commit()
 
 
+def _tally_lines(day_states: dict[str, int]) -> list[str]:
+    """The week's day states on ONE line — «الحالات: سُلّم: ٩ · لا فرص: ٢».
+
+    One line and not eight: this is the line the operator scans on a Sunday
+    morning, and it can stay one line only because the counts are Arabic-Indic
+    and therefore safe inside it. A state we have no Arabic word for is a raw
+    Latin token, so it drops to the line underneath rather than reversing the
+    tally around itself.
+    """
+    named: list[str] = []
+    raw: list[str] = []
+    for state, count in sorted(day_states.items(), key=lambda kv: -kv[1]):
+        word = _STATE_AR.get(state)
+        if word:
+            named.append(f"{word}: {_ar_digits(count)}")
+        else:
+            raw.append(f"{state}: {count}")
+    if named and raw:
+        return ["الحالات: " + " · ".join(named), " · ".join(raw)]
+    if named:
+        return ["الحالات: " + " · ".join(named)]
+    if raw:
+        return ["الحالات:", " · ".join(raw)]
+    return []
+
+
 def format_weekly_report(
     week_ending: date,
     business: dict[str, Any],
@@ -161,38 +203,29 @@ def format_weekly_report(
     run to — passed only when the report is late, because a catch-up report
     headed «حتى الأحد» carrying Wednesday's numbers is a lie the reader has no
     way of catching."""
-    lines = [f"🗓 التقرير الأسبوعي — حتى {week_ending.isoformat()}"]
+    # the week-ending date on its own line: an ISO date is a Latin run, and
+    # folding ITS digits would be worse than leaving them — the hyphens
+    # between Arabic-Indic groups are what re-order a date silently
+    lines = ["🗓 التقرير الأسبوعي — حتى", week_ending.isoformat()]
     if covering_through is not None and covering_through != week_ending:
         # the date on its own line — a digit inside an Arabic line is scrambled
         lines.append("⏰ تقرير متأخر، والأرقام لغاية")
         lines.append(covering_through.isoformat())
     lines.append("━━━━━━━━━━━━━━")
 
-    subs = business.get("subs_by_plan") or {}
-    if subs:
-        parts = " · ".join(
-            f"{_plan_ar(k)}: {v}" for k, v in sorted(subs.items())
-        )
-        lines.append(f"💰 اشتراكات جديدة: {parts}")
-    else:
-        lines.append("💰 اشتراكات جديدة: لا شيء")
+    lines.extend(plan_counts_lines(business.get("subs_by_plan") or {}))
     revenue = business.get("revenue_sar")
     if revenue is not None:
-        lines.append(f"الإيراد: {revenue} ريال")
+        lines.append(f"الإيراد: {_ar_digits(revenue)} ريال")
     upgrades = business.get("funnel_upgrades")
     if upgrades:
-        lines.append(f"ترقيات القمع: {upgrades}")
+        lines.append(f"ترقيات القمع: {_ar_digits(upgrades)}")
 
     lines.append("━━━━━━━━━━━━━━")
     delivered_days = int(day_states.get("DELIVERED", 0)) + \
         int(day_states.get("PARTIAL_DELIVERY", 0))
-    lines.append(f"📦 أيام تسليم: {delivered_days}")
-    if day_states:
-        tally = " · ".join(
-            f"{_STATE_AR.get(s, s)}: {n}"
-            for s, n in sorted(day_states.items(), key=lambda kv: -kv[1])
-        )
-        lines.append(f"الحالات: {tally}")
+    lines.append(f"📦 أيام تسليم: {_ar_digits(delivered_days)}")
+    lines.extend(_tally_lines(day_states))
 
     outcomes = business.get("outcomes") or {}
     applied = int(outcomes.get("applied", 0))
@@ -200,18 +233,23 @@ def format_weekly_report(
     total = applied + ignored
     if total:
         rate = round(100 * applied / total)
-        lines.append(f"🎯 قرارات العملاء: قدّم {applied}/{total} ({rate}٪)")
+        lines.append(
+            f"🎯 قرارات العملاء: قدّم {_ar_digits(applied)}/{_ar_digits(total)}"
+            f" ({_ar_digits(rate)}٪)"
+        )
 
     statuses = business.get("message_statuses") or {}
     if statuses:
         read = int(statuses.get("read", 0))
-        lines.append(f"👁 رسائل مقروءة: {read}")
+        lines.append(f"👁 رسائل مقروءة: {_ar_digits(read)}")
 
     llm = business.get("llm_generations")
     cost = business.get("llm_cost_usd")
     if llm is not None:
-        cost_part = f" (${cost})" if cost is not None else ""
-        lines.append(f"🧠 نداءات Claude: {llm}{cost_part}")
+        # «كلود» / «دولار» rather than «Claude» / «$» — the Latin here is a
+        # word, and a word can simply be said in Arabic
+        cost_part = f" ({_ar_digits(cost)} دولار)" if cost is not None else ""
+        lines.append(f"🧠 نداءات كلود: {_ar_digits(llm)}{cost_part}")
 
     # §14: the same spend block the business screen shows — ONE set of
     # numbers, and bidi-pure (numbers and Latin keys on their own lines).

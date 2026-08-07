@@ -7,8 +7,11 @@ refused by the triple match — the highest-cost failure the system has.
 
 from __future__ import annotations
 
+import ast
+import functools
 import pathlib
 import re
+from collections.abc import Iterator
 
 APPROVED = {"29": "تقييم لمّاح", "199": "لمّاح", "449": "لمّاح+"}
 #: Prices from the pre-approval draft. Retired from sale on 2 August.
@@ -156,46 +159,487 @@ def test_the_products_sheet_says_which_pricing_is_live() -> None:
     assert "لا شيء منها ساري" in head
 
 
-#: Each paid entitlement column, with the Arabic phrases that SELL it on the
-#: store pages. Deliberately a mapping and not a blacklist: the test permits a
-#: phrase the moment its column is actually read by the product, so
-#: implementing the feature un-blocks the copy automatically instead of
-#: requiring somebody to remember this file.
+#: Each paid entitlement column, with the Arabic phrases that SELL it — on the
+#: store pages AND in the whitepaper those pages are written from. Deliberately
+#: a mapping and not a blacklist: the test permits a phrase the moment its
+#: column is actually read by a module the product LOADS, so implementing the
+#: feature un-blocks
+#: the copy automatically instead of requiring somebody to remember this file.
+#:
+#: The COLUMN side of this map is no longer hand-maintained — see
+#: `test_the_map_covers_every_paid_entitlement_column`, which derives the set
+#: from `plan_entitlements` itself. Only the phrases are written by hand, and
+#: they have to carry every wording the two documents actually use: the store
+#: page says «٢٤» in Arabic-Indic digits and the whitepaper says «24» in Latin
+#: ones, and a guard narrower than the language it polices reports success.
 _SOLD_ENTITLEMENTS: dict[str, tuple[str, ...]] = {
-    "human_review_monthly": ("مراجعة بشرية شهرية", "المراجعة الشهرية"),
+    # «مراجعتك البشرية» ALONE is not a sale: §11 lists the owner reading CVs
+    # during the alpha as a hallucination MITIGATION, and §14 prices the waves
+    # by how many he can read. What the 449 card sells is the recurring one,
+    # so the phrase has to carry what makes it recurring and contractual.
+    "human_review_monthly": ("مراجعة بشرية شهرية", "المراجعة الشهرية",
+                             "مراجعتك البشرية للـMaster CV"),
     "queue_priority": ("أولوية في الطابور", "أولوية معالجة"),
     "intro_blurb": ("نبذة تمهيدية", "نبذة تقديم"),
     "weekly_report": ("تقرير أسبوعي",),
     # Found by a later sweep, all of the same class as the three above and all
     # missed because the map was written from the three we already knew:
-    "support_sla_hours": ("دعم خلال ٢٤ ساعة",),
+    "support_sla_hours": ("دعم خلال ٢٤ ساعة", "دعم خلال 24 ساعة",
+                          "دعم خلال 48 ساعة"),
     "banned_companies": ("الشركات اللي ما تبي سيرتك توصلها",),
     "cover_letter": ("خطاب تقديم", "خطاب التغطية"),
+    # Latin «15» on the whitepaper's card and Arabic-Indic «١٥» in the banner
+    # that supersedes it — both wordings, because the guard has to police the
+    # language the documents are actually written in (DEVIATIONS D26 / §04).
+    "seats_cap": ("١٥ مقعدًا فقط", "15 مقعدًا فقط"),
 }
 
 
-#: Columns the grep below finds and must NOT count as implemented, with the
-#: reason. The heuristic — «mentioned outside models.py» — is right for most
-#: entitlements and wrong for these, and a guard that quietly says yes is worse
-#: than no guard: `banned_companies` is written as a hardcoded empty dict at
-#: policy.py and copied by the privacy export, so it is «mentioned» twice and
-#: consulted never. Nothing asks the customer for it and the gate never
-#: receives it. Delete an entry here the day the column genuinely does
+#: Columns that ARE read by the letter of the rule below and must still not
+#: count as implemented, with the reason. `banned_companies` is written as a
+#: hardcoded empty dict in `policy.py` (a write, which the reader below already
+#: dismisses) and then genuinely read off the row by the privacy export — a
+#: real read that consults nothing, because nothing ever asks the customer for
+#: the list and the gate never receives it. Copying a column into an export is
+#: not a feature. Delete an entry here the day the column genuinely does
 #: something.
-_MENTIONED_BUT_INERT: frozenset[str] = frozenset({"banned_companies"})
+#:
+#: `seats_cap` is here for a different and sharper reason, and it is the one
+#: shape no amount of reachability can catch: a literal NAME COLLISION. The
+#: two loads the reader sees are `"seats_cap": seats.cap` in the console and
+#: `data.get("seats_cap")` in the view that renders it — a dictionary key
+#: carrying `FOUNDING_SEATS_CAP`, the shared founding-seat pool, which has
+#: nothing to do with the per-plan column. `grep -rn "PlanEntitlement.seats_cap"
+#: src/` is empty and has been since migration 0004. Both halves of the guard
+#: opened on that spelling (DEVIATIONS D26 / whitepaper §04): one excused the
+#: column from the sold-phrase map, the other excused it from needing a marker.
+#: A reader that answers «yes» to a matching STRING is measuring spelling, and
+#: the only honest answer to a collision is a written-down exemption.
+_MENTIONED_BUT_INERT: frozenset[str] = frozenset({"banned_companies", "seats_cap"})
 
 
-def _read_by_product(column: str) -> bool:
-    """Does any module outside the schema itself consult this entitlement?"""
+# ── read, or merely mentioned? ───────────────────────────────────────────────
+#
+# This asked `re.search(rf"\b{column}\b", line)` over every line of every
+# module, skipping only imports. That is a MENTION detector, and an adversarial
+# review walked it three ways in a minute: a comment naming `cover_letter`, a
+# `return intro_blurb` sitting after a `raise`, a column name inside an error
+# string. Every one of them flipped the verdict to «implemented» and re-opened
+# the sales copy for a feature that does not exist. A guard that says yes to a
+# comment is worse than no guard at all, because the copy then ships with its
+# blessing.
+#
+# So the question is put to the syntax tree instead, and answered by what a
+# running interpreter could actually TAKE:
+#
+#   plan.cover_letter               an attribute load off a row or off the
+#                                   mapped class — how a real entitlement is read
+#   row["daily_job_limit"]          a mapping load
+#   row.get("daily_job_limit")      the same, via the method the views use
+#   getattr(row, "daily_job_limit") the same, spelled dynamically
+#
+# The examples are a LIVE column on purpose: what the tree cannot tell you is
+# whether the dictionary being subscripted is the entitlement row at all, and
+# that is exactly how `seats_cap` walked through — see `_MENTIONED_BUT_INERT`.
+#
+# and by what it could not: assignment targets and keyword arguments (writes),
+# docstrings, comments, error messages, f-strings (prose), and imports. A bare
+# NAME is deliberately not a read either — that is what keeps the
+# `telegram/weekly_report.py` collision harmless, structurally this time: one
+# `from career.telegram import weekly_report` used to tell this guard the
+# feature was implemented, and now `weekly_report.build(...)` parses as an
+# attribute named `build` on a name nobody inspects.
+
+_UNREACHABLE_AFTER = (ast.Return, ast.Raise, ast.Continue, ast.Break)
+
+#: Conditions whose value is settled before the program starts.
+#: `TYPE_CHECKING` is False at runtime by definition, so a block guarded by it
+#: is text for a type checker and nothing an interpreter ever enters — and it
+#: is the cheapest way to put a read into a module that really is loaded.
+_NEVER_TRUE_NAMES = frozenset({"TYPE_CHECKING"})
+
+
+def _is_never_true(test: ast.expr) -> bool:
+    if isinstance(test, ast.Constant):
+        return not test.value                      # `if False:`, `while 0:`
+    if isinstance(test, ast.Name):
+        return test.id in _NEVER_TRUE_NAMES
+    if isinstance(test, ast.Attribute):
+        return test.attr in _NEVER_TRUE_NAMES      # `typing.TYPE_CHECKING`
+    return False
+
+
+def _ends_its_block(statement: ast.stmt) -> bool:
+    """Can anything AFTER this statement, in the same block, still run?
+
+    `return`/`raise`/`continue`/`break` are the obvious four. The other two
+    shapes an adversarial review used are a process that is already gone —
+    `sys.exit(...)` / `os._exit(...)` — and `assert False`, which raises on
+    every interpreter this project runs on.
+    """
+    if isinstance(statement, _UNREACHABLE_AFTER):
+        return True
+    if isinstance(statement, ast.Assert):
+        return _is_never_true(statement.test)
+    if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call):
+        function = statement.value.func
+        if isinstance(function, ast.Attribute) and isinstance(function.value, ast.Name):
+            return (function.value.id, function.attr) in {
+                ("sys", "exit"), ("os", "_exit"), ("os", "abort"),
+            }
+    return False
+
+
+def _live_blocks(node: ast.AST) -> Iterator[list[ast.stmt]]:
+    """The statement blocks hanging off one node that can be entered at all.
+
+    `cases` is here because `ast.match_case` is neither a statement nor an
+    expression: a `match` walked by `body`/`orelse`/`finalbody` alone shows
+    NOTHING of itself, so every case body was invisible — a whole statement
+    form the guard could not see. Zero `match` statements in `src/career`
+    today, which is precisely why it had to be fixed before there is one.
+    """
+    dead = {"body"} if (isinstance(node, (ast.If, ast.While))
+                        and _is_never_true(node.test)) else frozenset[str]()
+    for field in ("body", "orelse", "finalbody"):
+        if field in dead:
+            continue
+        block = getattr(node, field, None)
+        if isinstance(block, list):
+            yield block
+    for handler in getattr(node, "handlers", ()) or ():
+        yield from _live_blocks(handler)
+    for case in getattr(node, "cases", ()) or ():
+        yield case.body
+
+
+def _live_statements(node: ast.AST) -> Iterator[ast.stmt]:
+    """Every statement under `node` that a running interpreter could reach.
+
+    The cheap half of reachability, and only that: each block stops at its
+    first terminator, and a block whose condition is decided at parse time is
+    never entered. It does NOT know whether anything ever CALLS the function a
+    statement lives in — see `_read_by_reachable_module` for what that leaves
+    open, said in words rather than implied away.
+    """
+    for block in _live_blocks(node):
+        for statement in block:
+            if not isinstance(statement, ast.stmt):
+                continue
+            yield statement
+            yield from _live_statements(statement)
+            if _ends_its_block(statement):
+                break
+
+
+def _evaluated_by(statement: ast.stmt) -> Iterator[ast.AST]:
+    """The nodes one statement evaluates in its own right.
+
+    Its expression children, plus the two places an evaluation hides in a node
+    that is NOT an `ast.expr` and was therefore invisible:
+
+      def f(x=row.cover_letter)   `ast.arguments`. A default is evaluated once,
+                                  when the `def` runs — a real read. Type
+                                  ANNOTATIONS are deliberately excluded: this
+                                  repository is `from __future__ import
+                                  annotations` throughout, so they are strings
+                                  that never evaluate, and counting one would
+                                  be an error in the expensive direction.
+
+      case _ if row.cover_letter: `ast.match_case`. The guard, and the value of
+                                  a `case row.cover_letter:` pattern, are real
+                                  loads. The case BODIES arrive by the other
+                                  route, through `_live_statements`.
+    """
+    for _, value in ast.iter_fields(statement):
+        for item in value if isinstance(value, list) else [value]:
+            if isinstance(item, (ast.expr, ast.keyword,
+                                 ast.withitem, ast.comprehension)):
+                yield item
+    if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        arguments = statement.args
+        yield from (default
+                    for default in [*arguments.defaults, *arguments.kw_defaults]
+                    if default is not None)
+    if isinstance(statement, ast.Match):
+        for case in statement.cases:
+            yield case.pattern
+            if case.guard is not None:
+                yield case.guard
+
+
+def _live_expressions(tree: ast.Module) -> Iterator[ast.expr]:
+    """Every expression a reachable statement evaluates.
+
+    Walking the expression children of each live statement — rather than
+    `ast.walk` over the whole module — is what keeps dead code dead: neither a
+    Python expression nor a `match` pattern can contain a statement, so nothing
+    yielded here can re-enter a block `_live_statements` already cut off.
+    """
+    for statement in _live_statements(tree):
+        for item in _evaluated_by(statement):
+            yield from (node for node in ast.walk(item)
+                        if isinstance(node, ast.expr))
+
+
+def _is_literal(node: ast.expr | None, text: str) -> bool:
+    return isinstance(node, ast.Constant) and node.value == text
+
+
+def _expression_reads(node: ast.expr, column: str) -> bool:
+    """Would evaluating this one expression take the column's VALUE?"""
+    if isinstance(node, ast.Attribute):
+        # Store/Del contexts are writes; only a load is a read.
+        return node.attr == column and isinstance(node.ctx, ast.Load)
+    if isinstance(node, ast.Subscript):
+        return isinstance(node.ctx, ast.Load) and _is_literal(node.slice, column)
+    if isinstance(node, ast.Call):
+        function = node.func
+        if isinstance(function, ast.Attribute) and function.attr == "get" and node.args:
+            return _is_literal(node.args[0], column)
+        if (isinstance(function, ast.Name) and function.id == "getattr"
+                and len(node.args) >= 2):
+            return _is_literal(node.args[1], column)
+    return False
+
+
+# ── which modules the product actually LOADS ─────────────────────────────────
+#
+# The reader below used to walk every `.py` under `src/career` with no notion
+# of imports at all, and called the result «read by the product». An
+# adversarial review put fifteen lines in a NEW module — one function, called
+# by nobody, in a file imported by nobody — and `intro_blurb`, `cover_letter`
+# and `weekly_report` all read as implemented, which re-opens the sales copy
+# for three features that do not exist, with the whole file green. It did not
+# even need `if TYPE_CHECKING:`; an ordinary orphan was enough.
+#
+# So the claim is made true at MODULE granularity: a file may vouch for a
+# column only if starting one of the real processes would import it. What that
+# still does not prove is written on `_read_by_reachable_module` in words.
+
+_SRC = pathlib.Path("src")
+_PACKAGE = _SRC / "career"
+
+#: The processes, and why each one is a root. `scripts/run_*.py` is globbed
+#: rather than listed because that is how the three systemd units name them
+#: (career-worker → run_worker_loop, career-admin-bot → run_admin_bot,
+#: career-engine-nightly → run_nightly), and a fourth runner added tomorrow
+#: must not be silently missing from the graph.
+#:
+#: This mapping is the one place a module can be declared reachable by hand,
+#: which makes it the place to look first if this guard is ever walked around
+#: again: an entry here is a claim that a PROCESS starts at that file, and it
+#: is three lines long on purpose.
+_ENTRYPOINTS: dict[str, str] = {
+    "src/career/main.py":
+        "the ASGI app — both webhooks are served out of it",
+    "src/career/engine/cli.py":
+        "the CLI: verify-environment, the drills, the boot checks",
+    "src/career/onboarding/extract_worker.py":
+        "a process in its own right — upload.py spawns `python -m "
+        "career.onboarding.extract_worker` for every uploaded file, so no "
+        "import edge anywhere in the repository points at it",
+}
+
+
+@functools.cache
+def _parsed(path: pathlib.Path) -> ast.Module:
+    return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+
+@functools.cache
+def _module_file(dotted: str) -> pathlib.Path | None:
+    """`career.cv.deliver` → the file that runs when it is imported."""
+    base = _SRC.joinpath(*dotted.split("."))
+    for candidate in (base.with_suffix(".py"), base / "__init__.py"):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _imported_modules(path: pathlib.Path) -> set[str]:
+    """Every dotted name that importing this file would load.
+
+    Read off `_live_statements`, not `ast.walk`, and that is the whole point:
+    an import inside a function still counts (it loads the moment the function
+    runs), while `if TYPE_CHECKING: from career.x import y` does not — that
+    module is never loaded by anything, so it cannot vouch for a column. The
+    same rule as the reads themselves, applied to the edges.
+    """
+    names: set[str] = set()
+    for statement in _live_statements(_parsed(path)):
+        if isinstance(statement, ast.Import):
+            names.update(alias.name for alias in statement.names)
+        elif isinstance(statement, ast.ImportFrom):
+            if statement.level or not statement.module:
+                continue                  # no relative imports in this package
+            names.add(statement.module)
+            # `from career.telegram import weekly_report` — the name may be a
+            # submodule rather than an attribute, and only the filesystem knows.
+            names.update(f"{statement.module}.{alias.name}"
+                         for alias in statement.names)
+    return names
+
+
+@functools.cache
+def _reachable_modules() -> frozenset[pathlib.Path]:
+    """Every file under `src/` that starting an entrypoint would load."""
+    stack = [pathlib.Path(name) for name in _ENTRYPOINTS]
+    stack += sorted(pathlib.Path("scripts").glob("run_*.py"))
+    seen: set[pathlib.Path] = set()
+    while stack:
+        path = stack.pop()
+        if path in seen or not path.is_file():
+            continue
+        seen.add(path)
+        for dotted in _imported_modules(path):
+            parts = dotted.split(".")
+            if parts[0] != "career":
+                continue
+            # importing `career.cv.deliver` runs `career/__init__.py` and
+            # `career/cv/__init__.py` on the way, so every prefix is loaded too
+            for depth in range(1, len(parts) + 1):
+                loaded = _module_file(".".join(parts[:depth]))
+                if loaded is not None:
+                    stack.append(loaded)
+    return frozenset(seen)
+
+
+def _read_by_reachable_module(column: str) -> bool:
+    """Does a module the product actually LOADS take this entitlement's value?
+
+    Named for what it computes. The previous name, `_read_by_product`, claimed
+    one thing more than it delivered, and sales copy is released on the
+    strength of that claim.
+
+    WHAT IT PROVES: some module on the import graph of a real entrypoint
+    evaluates a load of this column, in a statement an interpreter can reach.
+
+    WHAT IT DOES NOT: that the FUNCTION holding that statement is ever CALLED.
+    A dead function inside a live module still counts, and that is the one
+    residual hole. Closing it needs a call graph, and a call graph over this
+    codebase would be wrong in the direction that matters: handlers reached by
+    framework dispatch, callbacks passed as values, `Deps` objects assembled at
+    runtime would all read as uncalled, legitimate modules would start failing,
+    and a guard that cries wolf gets switched off — which is worse than a guard
+    that is honest about its own limit. So the limit is stated here and
+    narrowed elsewhere: `test_every_module_is_reached_from_an_entrypoint`
+    makes an orphan FILE fail loudly instead of quietly vouching.
+
+    Wrong in the safe direction otherwise, by construction: a read this cannot
+    see — `getattr(row, name)` with a computed `name`, an ORM helper that
+    reflects the column list — returns False, which blocks the sales copy until
+    a human looks. The expensive mistake is the other one.
+    """
     if column in _MENTIONED_BUT_INERT:
         return False
-    root = pathlib.Path("src/career")
-    for path in root.rglob("*.py"):
-        if path.name == "models.py":
+    for path in sorted(_reachable_modules()):
+        if path.name == "models.py" or not path.is_relative_to(_PACKAGE):
             continue          # declaring a column is not reading it
-        if re.search(rf"\b{column}\b", path.read_text(encoding="utf-8")):
+        if any(_expression_reads(node, column)
+               for node in _live_expressions(_parsed(path))):
             return True
     return False
+
+
+def test_the_declared_entrypoints_are_real() -> None:
+    """The graph is only as wide as its roots.
+
+    Rename `main.py` and forget the entry here and every module downstream of
+    it silently stops counting — which fails safe (more copy blocked, not
+    less) but fails CONFUSINGLY, three tests away from the cause. Say it here
+    instead.
+    """
+    missing = sorted(path for path in _ENTRYPOINTS
+                     if not pathlib.Path(path).is_file())
+    assert not missing, (
+        f"these declared entrypoints do not exist: {missing} — the import "
+        "graph is rooted at them, so a stale entry quietly shrinks it"
+    )
+    assert sorted(pathlib.Path("scripts").glob("run_*.py")), (
+        "no scripts/run_*.py at all, and three systemd units start one each — "
+        "if the runners were renamed, this glob is now rooting the graph at "
+        "nothing"
+    )
+
+
+def test_every_module_is_reached_from_an_entrypoint() -> None:
+    """An orphan module is how the reader above was walked around.
+
+    Fifteen lines in a file nobody imports made three unbuilt entitlements
+    read as implemented, and the sales copy for all three legal again.
+    `_read_by_reachable_module` no longer believes such a file — but merely
+    ignoring it leaves it sitting in the tree looking like product code, so it
+    is named here too: a module under `src/career` that no entrypoint reaches
+    is either dead code to delete or a process to declare in `_ENTRYPOINTS`
+    with the reason it is one.
+    """
+    orphans = sorted(
+        path.as_posix()
+        for path in set(_PACKAGE.rglob("*.py")) - _reachable_modules()
+    )
+    assert not orphans, (
+        f"nothing the product starts would import these modules: {orphans} — "
+        "delete them, wire them, or (if one is a process of its own) declare "
+        "it in _ENTRYPOINTS. An unimported module under src/ reads as shipped "
+        "code and can vouch for nothing"
+    )
+
+
+def test_a_mention_is_not_a_read() -> None:
+    """The guard's own guard, written from the walk-arounds that worked.
+
+    Each source below «names» the column the way some earlier version of this
+    reader accepted, and none of them is an implementation. They are asserted
+    here rather than described, because the next rewrite has to keep refusing
+    every one of them — and because the list only ever grows by somebody
+    finding a new way through.
+    """
+    mentions = (
+        "# TODO: one day honour cover_letter here\n",
+        '"""The cover_letter entitlement, documented and unbuilt."""\n',
+        'def f():\n    raise NotImplementedError("cover_letter is not built")\n',
+        "def f():\n    raise NotImplementedError\n    return cover_letter\n",
+        "def f():\n    return 1\n    x = row.cover_letter\n",
+        "from career.telegram import cover_letter\n\ncover_letter.build()\n",
+        "row.cover_letter = None\n",
+        "make_plan(cover_letter=False)\n",
+        # decided before the interpreter starts: a block that never opens
+        "if False:\n    value = row.cover_letter\n",
+        "if TYPE_CHECKING:\n    value = row.cover_letter\n",
+        "if typing.TYPE_CHECKING:\n    value = row.cover_letter\n",
+        "while False:\n    value = row.cover_letter\n",
+        # a process that is already gone
+        "def f():\n    sys.exit(2)\n    value = row.cover_letter\n",
+        "def f():\n    os._exit(2)\n    value = row.cover_letter\n",
+        "def f():\n    assert False\n    value = row.cover_letter\n",
+    )
+    for source in mentions:
+        tree = ast.parse(source)
+        assert not any(_expression_reads(node, "cover_letter")
+                       for node in _live_expressions(tree)), source
+
+    reads = (
+        "value = plan.cover_letter\n",
+        'value = row["cover_letter"]\n',
+        'value = row.get("cover_letter")\n',
+        'value = getattr(row, "cover_letter")\n',
+        "if plan.cover_letter:\n    send()\n",
+        "def f():\n    return plan.cover_letter\n",
+        # the two shapes that were invisible: a `match` case, and a parameter
+        # default. Neither occurs in src/career today, and both would have
+        # read as «nothing implements this» — the direction that blocks copy
+        # for a feature that IS built, which is how a guard loses its owner.
+        "match plan.plan_code:\n    case _:\n        value = row.cover_letter\n",
+        "match value:\n    case _ if plan.cover_letter:\n        send()\n",
+        "def f(value=plan.cover_letter):\n    return value\n",
+        "def f(*, value=plan.cover_letter):\n    return value\n",
+        "f = lambda value=plan.cover_letter: value\n",
+    )
+    for source in reads:
+        tree = ast.parse(source)
+        assert any(_expression_reads(node, "cover_letter")
+                   for node in _live_expressions(tree)), source
 
 
 def test_the_store_never_sells_an_entitlement_no_code_reads() -> None:
@@ -207,18 +651,510 @@ def test_the_store_never_sells_an_entitlement_no_code_reads() -> None:
     double received exactly what the 199 customer received, and would have
     discovered it a month later.
 
-    The guard is structural rather than a list of banned words — a column the
-    product genuinely reads may be sold freely.
+    WHAT THIS COVERS: the exact wordings below, wherever they appear in the
+    store sheet, for as long as no module the product loads reads their column.
+
+    WHAT IT DOES NOT: any other wording. The phrase side of the map is a
+    blocklist and a blocklist of a natural language can never be complete —
+    «رسالة تعريفية» sells `intro_blurb`, «معالجتك تسبق غيرك في الطابور» sells
+    `queue_priority`, and neither is written below. An adversarial review put
+    all three unbacked promises back on the page in reworded Arabic and this
+    test returned green. The answer to that is NOT a longer list: it is
+    `test_every_promise_on_a_plan_card_names_what_backs_it`, which reads the
+    document instead of the vocabulary, so a sentence nobody anticipated fails
+    by DEFAULT. This test remains because it also polices the whitepaper and
+    because a known wording is worth naming where it can be seen.
+
+    A column the product genuinely reads may be sold freely, in any words.
     """
     text = pathlib.Path("docs/STORE-PAGES-AR.md").read_text(encoding="utf-8")
     for column, phrases in _SOLD_ENTITLEMENTS.items():
-        if _read_by_product(column):
+        if _read_by_reachable_module(column):
             continue
         for phrase in phrases:
             assert phrase not in text, (
-                f"the store sells «{phrase}» but nothing reads {column} — "
+                f"the store sells «{phrase}» and no module the product loads "
+                f"reads {column} — "
                 "either implement it or stop selling it"
             )
+
+
+def test_the_map_covers_every_paid_entitlement_column() -> None:
+    """The map was written from the entitlements somebody already suspected.
+
+    That is why it took three passes to find them all: `human_review_monthly`,
+    `queue_priority` and `intro_blurb` were caught by the pre-launch check;
+    `weekly_report`, `support_sla_hours` and `cover_letter` were caught two
+    days later by the guard the first pass produced — every one of them the
+    same class of defect, and every one of them missed because a human listed
+    what a human remembered.
+
+    So the column side stops being a list and becomes a DERIVATION: every
+    column of `plan_entitlements` is either read by a loaded module or carries the
+    phrases that sell it. A column added to the plan table tomorrow and wired
+    to nothing fails here, before it can be sold.
+
+    `plan_code` is the key, not a feature. `banned_companies` legitimately has
+    no row here — it is sold like an entitlement but lives on `search_policies`,
+    which is why the map is a superset of this table rather than equal to it.
+
+    Presence of the KEY was once the whole check, and that was a hole with a
+    one-character exploit: `"cover_letter": ()` satisfied it while policing
+    nothing at all, so the wording that sells an unbuilt feature could be
+    restored verbatim under a green suite. An entry with no phrases is not an
+    entry — it is the column silently opted out.
+    """
+    from career.db.models import PlanEntitlement
+
+    columns = {
+        column.name for column in PlanEntitlement.__table__.columns
+        if column.name != "plan_code"
+    }
+    unaccounted = sorted(
+        column for column in columns
+        if column not in _SOLD_ENTITLEMENTS and not _read_by_reachable_module(column)
+    )
+    assert not unaccounted, (
+        f"these plan_entitlements columns are neither read by any module the "
+        f"product loads nor "
+        f"mapped to the wording that sells them: {unaccounted} — a paid column "
+        "with no reader and no entry here is a promise nothing can catch"
+    )
+
+    disarmed = sorted(
+        column for column, phrases in _SOLD_ENTITLEMENTS.items()
+        if not _read_by_reachable_module(column)
+        and not [phrase for phrase in phrases if phrase.strip()]
+    )
+    assert not disarmed, (
+        f"these columns are in the map with no wording to police: {disarmed} — "
+        "an empty phrase tuple keeps the key and drops the guard. Either write "
+        "the phrases that sell the column or delete the entry, which fails the "
+        "coverage check above and puts the decision in front of a human"
+    )
+
+
+# ── the promises, counted from the PAGE ──────────────────────────────────────
+#
+# Everything above polices the store sheet with a vocabulary, and a vocabulary
+# is only ever as complete as the person who wrote it. `_SOLD_ENTITLEMENTS`
+# knows «نبذة تمهيدية»; it does not know «رسالة تعريفية», and the two sell the
+# same unbuilt column. Add a phrase and the review finds a synonym; that race
+# has one ending.
+#
+# So the direction is reversed. The register below is keyed by the plan, and
+# the test asserts a BIJECTION with what §6 of the store sheet actually says:
+# every line on a product page is registered, and every registered row still
+# matches a line. A promise nobody anticipated does not have to be recognised
+# to be caught — it is caught by not being here, which is what «unknown fails
+# safe» means and what a blocklist can never do.
+#
+# Each row also names what MAKES IT TRUE, and the test resolves that name: the
+# file must exist and must define that symbol. Not proof the sentence is kept —
+# no test can be — but it turns «somebody wrote a promise» into «somebody
+# wrote a promise and had to point at the thing that keeps it».
+#
+# EVERY LINE, and a WHOLE line. Both words were bought with an exploit:
+#
+#   * The rows used to be FRAGMENTS, matched with `in`. So a registered bullet
+#     could be EXTENDED and stay green — the review appended «…ونقدّم عنك على
+#     البوابة نيابةً عنك… ونضمن لك مقابلة خلال ٣٠ يومًا» to a signed bullet,
+#     which promises automated applying (Constant 1, the one thing this
+#     project may never do) plus an interview guarantee, and the guard said
+#     nothing because the fragment it knew was still in there. A row is now the
+#     whole line, compared after formatting is stripped: a comma or a bold
+#     marker moving is still not a new promise, and an added clause is.
+#
+#   * The lines used to be `line.startswith("- ")`. So an indented `  - `, a
+#     `* ` bullet, a `**bold**` line and a plain prose paragraph were all
+#     invisible — and that was not hypothetical: the strongest quantitative
+#     claims on the live page were never bullets at all («حتى فرصتين كل يوم»,
+#     «شهر كامل … أربع وأربعين سيرة مفصّلة», «يُنفَّذ فور الشراء»). Every
+#     non-blank line of a card is now a line to account for, whatever shape it
+#     came in.
+#
+# WHAT THIS STILL CANNOT DO: judge the Arabic. A row says a human read that
+# sentence and named what keeps it; nothing here checks that the named symbol
+# does what the sentence says, and nothing here can tell a promise from a
+# turn of phrase — which is why `_NO_CLAIM` exists and why it is policed by
+# the one property a quantitative promise cannot hide from, a digit.
+
+#: The one backer that is not code. The 449 card was deliberately rebuilt
+#: around promises a HUMAN keeps (CHANGELOG-v1.1 §23 / PROGRESS, 6 August): the
+#: alternative was building a monthly-reminder machine nobody would run and a
+#: queue nobody would re-order. Written down as a distinct value so it can be
+#: counted — the day this list grows, the plan is drifting back toward selling
+#: intentions, and that is visible here before it is visible to a customer.
+_OPERATOR = "OPERATOR"
+
+#: A promise kept by code that must NEVER EXIST. «وما نقدّم باسمك لأي وظيفة»
+#: is Constant 1, and the only thing that keeps it is that no Playwright, no
+#: form filler and no portal upload is ever written. Naming a symbol for it
+#: would be a lie in the accountable direction — there is nothing to point at,
+#: and pointing at something would suggest a mechanism exists that could break.
+_ABSENCE = "ABSENCE"
+
+#: A line that promises the customer NOTHING: an argument, a diagnosis of the
+#: problem, a sentence about who the product is for. Registered rather than
+#: skipped, because «this line is not a promise» is a judgement a human makes,
+#: and a judgement nobody wrote down is a judgement nobody can re-check. This
+#: is the softest value in the file and the place a promise could be hidden,
+#: so `test_a_line_that_claims_nothing_carries_no_quantity` holds it to the
+#: one thing prose cannot fake.
+_NO_CLAIM = "NO_CLAIM"
+
+#: The three values above are not `path::symbol` and must not be resolved.
+_NOT_CODE = frozenset({_OPERATOR, _ABSENCE, _NO_CLAIM})
+
+#: plan price → ((the line, exactly as the page says it, what backs it), …)
+#:
+#: Whole lines, compared after `_normalised` removes bullet markers, emphasis
+#: and punctuation: moving a comma or bolding a different word is not a new
+#: promise and must not fail, but adding a clause is a new promise and must.
+#: A NEW line matches no row at all, which is the point.
+_BACKED_PROMISES: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
+    "29": (
+        ("**العنوان:** تقييم سيرتك الذاتية — تقرير صريح خلال دقائق",
+         ("src/career/funnel/flow.py::handle_funnel_document",
+          "src/career/funnel/report.py::render_report_pdf")),
+        ("أرسل سيرتك، ويوصلك تقرير في صفحة واحدة يقول لك بالمكشوف:",
+         ("src/career/funnel/report.py::render_report_pdf",)),
+        ("- **درجة عامة وأربعة محاور**: وضوح المسار، قوة الإنجازات، الملاءمة "
+         "للمسار المطلوب، وجودة القراءة الآلية",
+         ("src/career/funnel/evaluation.py::Report",)),
+        ("- **حتى خمس ملاحظات** على ما يضعّف سيرتك فعلًا — «هذا يقول واجباتك "
+         "ولا يقول إنجازك». سيرة قوية تاخذ ملاحظات أقل، وهذا في صالحك",
+         ("src/career/funnel/evaluation.py::_notes",)),
+        ("- **مقارنة بين مسارين**: المسار اللي تطلبه، ومسار بديل قد يكون أقرب "
+         "لك مما تظن",
+         ("src/career/funnel/evaluation.py::PathVerdict",
+          "src/career/onboarding/paths.py::score_path")),
+        ("- **ثلاث خطوات** تنفّذها اليوم",
+         ("src/career/funnel/evaluation.py::evaluate",)),
+        # two halves: the run starts at the paid order, and the refund is moved
+        # by a human in Salla — see `test_no_refund_is_promised_as_automatic`.
+        ("يُنفَّذ فور الشراء. ما وصلك التقرير؟ راسلنا على واتساب وترجع لك "
+         "فلوسك كاملة عبر سلة.",
+         ("src/career/salla/provisioning.py::provision_order", _OPERATOR)),
+    ),
+    "199": (
+        ("**العنوان:** حتى فرصتين كل يوم، ومع كل وحدة سيرة مكتوبة لها",
+         ("src/career/engine/run.py::run_nightly",
+          "src/career/cv/generate.py::tailor_cv")),
+        ("المشكلة مو إنك ما تلقى وظايف. المشكلة إنك ترسل نفس السيرة لخمسين "
+         "وظيفة، وأنظمة الفرز تقارن سيرتك بالوصف الوظيفي — فتُرفض قبل ما "
+         "يشوفك إنسان.",
+         (_NO_CLAIM,)),
+        ("تفصيل سيرة لكل فرصة يحتاج ساعة. ما أحد يسويها.",
+         (_NO_CLAIM,)),
+        ("**لمّاح يسويها لك كل يوم — عند توفر فرصة تعدّي فلترك:**",
+         ("src/career/cv/daily_run.py::run_daily_delivery",
+          "src/career/engine/gate.py::evaluate")),
+        ("- نبحث لك يوميًا بمعاييرك أنت: مسارك، مدينتك، وراتبك المستهدف",
+         ("src/career/engine/families.py::derive_query_families",
+          "src/career/engine/gate.py::evaluate")),
+        ("- كل فرصة تعدّي فلترك، نكتب لها **سيرة إنجليزية مفصّلة لها بالذات** "
+         "في صفحة واحدة",
+         ("src/career/cv/generate.py::tailor_cv",)),
+        ("- توصلك على واتساب من الأحد إلى الخميس، ومعها سبب اختيارنا لها",
+         ("src/career/cv/deliver.py::build_daily_bundle",)),
+        # two promises in one line: the buttons, and «not shown again for a
+        # month» — which is the suppression ledger, not a wish.
+        ("- تضغط «قدّمت» أو «ما ناسبتني»، وأي فرصة وصلتك ما تتكرر عليك لمدة شهر",
+         ("src/career/cv/deliver.py::parse_outcome_button",
+          "src/career/engine/ranking.py::filter_suppressed")),
+        ("- وبعد أسبوعين من كل «قدّمت» نسألك سؤالًا واحدًا: وش صار؟ — عشان "
+         "نعرف أي الفرص تستاهل وقتك فعلًا",
+         ("src/career/cv/outcome_followup.py::sweep_outcome_questions",)),
+        # the sourcing promise is code; «وما نقدّم باسمك لأي وظيفة» is the
+        # absence of code, and says so rather than borrowing a symbol.
+        ("**بالمكشوف:** كل سطر في سيرتك مصدره كلامك أنت المؤكد منك بالحرف. ما "
+         "نخترع إنجازًا ما صار، وما نقدّم باسمك لأي وظيفة — التقديم بيدك.",
+         ("src/career/cv/generate.py::contains_invented_content",
+          "src/career/cv/publish.py::validate_cv_binding", _ABSENCE)),
+        ("شهر كامل من هذا يوصل إلى أربع وأربعين سيرة مفصّلة — والرقم يعتمد "
+         "على ما يتوفر فعلًا من فرص تعدّي فلترك. كاتب السيرة يأخذ من ١٥٠ إلى "
+         "٥٠٠ ريالًا للسيرة **الواحدة**.",
+         ("src/career/cv/daily_run.py::MonthlyCapBudget",)),
+    ),
+    "449": (
+        ("**العنوان:** كل لمّاح، ومعه رقمي أنا",
+         ("src/career/onboarding/policy.py::build_draft_policy",
+          "src/career/telegram/console.py::_run_reply")),
+        ("كل اللي في لمّاح، وزيادة:",
+         ("src/career/onboarding/policy.py::build_draft_policy",)),
+        ("- **تواصل مباشر معي** — أنا اللي بنيت لمّاح، وتلقاني على نفس "
+         "المحادثة. سيرة تبي تراجعها، فرصة محتار فيها، عرض وصلك وتبي رأي: "
+         "اكتب لي وقت ما تحتاج، بلا موعد وبلا انتظار دورك",
+         ("src/career/telegram/console.py::_run_reply", _OPERATOR)),
+        ("- **جلسة مسار** واحدة متى طلبتها: وين موقعك، ووين تقدر توصل، وش "
+         "ينقصك بالضبط",
+         ("src/career/promises/career_session.py::request_session",)),
+        # «اسمك معلّم عندي بنجمة … والرد خلال ٢٤ ساعة» — one line, two halves.
+        # The star is code and is named. The 24 hours is not, and
+        # `support_sla_hours` remains a column nothing reads: the reply comes
+        # from the operator, and the star is what lets him see whose it is
+        # before he answers. Recorded as an operator promise rather than
+        # quietly counted as an implemented one.
+        ("- **اسمك معلّم عندي بنجمة** في لوحتي — أشوف رسالتك وأعرف مين أنت قبل "
+         "ما أرد، والرد خلال ٢٤ ساعة",
+         ("src/career/telegram/views.py::_plan_marked", _OPERATOR)),
+        ("للي وصل مرحلة يكون فيها القرار أثقل من البحث — ويبي إنسانًا يسأله، "
+         "لا نظامًا يرد عليه.",
+         (_NO_CLAIM,)),
+    ),
+}
+
+_STORE_PAGES = pathlib.Path("docs/STORE-PAGES-AR.md")
+
+#: §6 — the three product pages, from its own heading to the next `## `.
+_SECTION_SIX = re.compile(r"^## ٦\).*?(?=^## |\Z)", re.M | re.S)
+
+#: ANY `### ` heading, priced or not. The price-matching one below cannot be
+#: the only thing that finds a card: a heading it fails to match is a card
+#: this file does not know exists, which is precisely the dangerous case.
+_CARD_HEADING = re.compile(r"^### .*$", re.M)
+
+#: A card heading, and its price. `[٠-٩\d]` and not `[٠-٩]`: the pattern used
+#: to require Arabic-Indic digits, so `### 💎 لمّاح VIP — 999 ريالًا` was not a
+#: product card as far as this file was concerned — a whole fourth plan, with
+#: whatever it promised, seen by nothing.
+_PLAN_HEADING = re.compile(r"^### .*?([٠-٩\d]+)\s*ريال", re.M)
+
+_LATIN_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+
+#: A horizontal rule — layout, not language.
+_RULE = re.compile(r"[-—_*]{3,}")
+
+#: What a line means, without how it is dressed. The marker that makes a line
+#: a bullet, the emphasis around a phrase and the punctuation between clauses
+#: are all formatting: moving them is an edit, not a new promise. Everything
+#: else — every word — is the promise, and must match a signed row exactly.
+_BULLET_MARK = re.compile(r"^[-*+•]\s+")
+_DRESSING = re.compile(r"[*_`~«»\"'()\[\]…،؛,;:.!؟?]+")
+
+
+def _normalised(line: str) -> str:
+    return re.sub(r"\s+", " ", _DRESSING.sub(" ", _BULLET_MARK.sub("", line.strip()))).strip()
+
+
+def _section_six() -> re.Match[str]:
+    """§6 of the store sheet, located rather than assumed."""
+    match = _SECTION_SIX.search(_STORE_PAGES.read_text(encoding="utf-8"))
+    assert match is not None, (
+        "docs/STORE-PAGES-AR.md no longer has a «## ٦)» section — the three "
+        "product pages are what this half of the file reads, and it has just "
+        "become a guard over nothing"
+    )
+    return match
+
+
+def _card_lines(body: str) -> list[str]:
+    """Every line of a card that says something. Blank lines and horizontal
+    rules are layout; everything else is text a customer reads and therefore a
+    claim somebody has to have signed for."""
+    return [line.strip() for line in body.splitlines()
+            if line.strip() and not _RULE.fullmatch(line.strip())]
+
+
+def _plan_cards() -> dict[str, list[str]]:
+    """§6 → {plan price (Latin digits): every line that card sells}."""
+    section = _section_six().group(0)
+    headings = list(_PLAN_HEADING.finditer(section))
+    cards: dict[str, list[str]] = {}
+    for index, heading in enumerate(headings):
+        # from the end of the heading LINE — the tail of the heading itself
+        # («ريالًا شهريًا») is not one of the card's promises
+        start = section.index("\n", heading.end())
+        end = headings[index + 1].start() if index + 1 < len(headings) else len(section)
+        cards[heading.group(1).translate(_LATIN_DIGITS)] = _card_lines(section[start:end])
+    return cards
+
+
+def _defines(target: str) -> bool:
+    """`path::symbol` — does that file define that top-level name?"""
+    path_text, _, symbol = target.partition("::")
+    path = pathlib.Path(path_text)
+    if not path.is_file():
+        return False
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=path_text)
+    return any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        and node.name == symbol
+        for node in tree.body
+    )
+
+
+def test_the_store_sheet_carries_one_card_per_approved_plan() -> None:
+    """The register is keyed by price, so a fourth card — or a renamed one —
+    must not slip through as «no lines to check».
+
+    An adversarial review got a whole fourth product page past every assertion
+    in this file with `### 💎 لمّاح VIP — 999 ريالًا`, and it took two holes at
+    once: the heading pattern demanded Arabic-Indic digits, so a Latin-digit
+    price made it not a card; and anything above the first card belonged to no
+    card, so the same heading placed BEFORE §6 was read by nothing at all.
+    Both are closed by locating every `### ` in the document first and
+    requiring each one to be a card this file knows.
+    """
+    text = _STORE_PAGES.read_text(encoding="utf-8")
+    section = _section_six()
+    start, stop = section.span()
+
+    stray = [heading.group(0).strip()
+             for heading in _CARD_HEADING.finditer(text)
+             if not start <= heading.start() < stop]
+    assert not stray, (
+        f"these `### ` cards are outside §6, where nothing reads them: {stray}"
+        " — §6 is the section pasted into Salla, one page per product. A card "
+        "anywhere else is sold and unguarded"
+    )
+
+    body = section.group(0)
+    priced = {heading.start() for heading in _PLAN_HEADING.finditer(body)}
+    unpriced = [heading.group(0).strip()
+                for heading in _CARD_HEADING.finditer(body)
+                if heading.start() not in priced]
+    assert not unpriced, (
+        f"these §6 cards name no price: {unpriced} — the register is keyed by "
+        "price, so a card without one is a page of promises with no row to "
+        "match and no plan to belong to"
+    )
+
+    preamble = _card_lines(body[body.index("\n"):min(priced, default=len(body))])
+    assert not preamble, (
+        f"§6 says this before its first product card: {preamble} — text above "
+        "the first heading belongs to no card, so it is sold and unregistered. "
+        "Put it inside the card it sells, or outside §6"
+    )
+
+    assert set(_plan_cards()) == set(APPROVED) == set(_BACKED_PROMISES), (
+        f"store cards {sorted(_plan_cards())}, approved {sorted(APPROVED)}, "
+        f"register {sorted(_BACKED_PROMISES)} — these three must agree"
+    )
+
+
+def test_every_promise_on_a_plan_card_names_what_backs_it() -> None:
+    """The guard a reworded promise cannot walk around.
+
+    `_SOLD_ENTITLEMENTS` asks «is this sentence one I was told about?» and a
+    synonym answers no. This asks the opposite question — «is this sentence
+    one somebody signed for?» — and a synonym answers no to that too, which is
+    the direction that fails safely.
+
+    Every LINE of a card and the WHOLE of each line, both bought with an
+    exploit — see the block above `_BACKED_PROMISES`. Briefly: a registered
+    bullet could be extended with «ونقدّم عنك على البوابة نيابةً عنك» and stay
+    green while promising the one thing Constant 1 forbids, and four bullet
+    shapes (indented, `* `, bold, prose) were not bullets at all.
+
+    WHAT REMAINS UNCOVERED, plainly: this reads §6, the three product pages
+    pasted into Salla. The refund page, the privacy summary, the founding
+    block, the guarantee line and the «مين يكتب لك؟» block are prose about the
+    business, not per-plan feature promises, and are not registered — a
+    promise moved into one of those sections leaves this guard entirely, and no
+    amount of matching inside §6 changes that. And a named backer proves a
+    symbol EXISTS, never that it does what the Arabic sentence says — that
+    judgement is a human's, made once, at the moment a row is added here.
+    """
+    for price, lines in sorted(_plan_cards().items()):
+        # `.get` and not `[...]`: an unregistered card must report every line
+        # it sells, not a KeyError two frames away from the reason
+        register = _BACKED_PROMISES.get(price, ())
+        signed = {_normalised(text) for text, _ in register}
+        assert len(signed) == len(register), (
+            f"_BACKED_PROMISES[{price!r}] has two rows that normalise to the "
+            "same line — one of them is guarding nothing"
+        )
+        for line in lines:
+            assert _normalised(line) in signed, (
+                f"the {price} card says «{line[:110]}» and no row of "
+                f"_BACKED_PROMISES accounts for it. A new line on a product "
+                f"page is a new promise, and a CHANGED line is a new promise "
+                f"too — the register holds whole lines precisely so that a "
+                f"clause appended to a signed sentence cannot ride in on it. "
+                f"Add a row naming what makes it true, update the row that "
+                f"moved, or take the line off the page"
+            )
+        on_the_page = {_normalised(line) for line in lines}
+        for text, _ in register:
+            assert _normalised(text) in on_the_page, (
+                f"_BACKED_PROMISES[{price!r}] still registers «{text[:110]}» "
+                "and no line on that card says it — the store copy moved and "
+                "the register did not, so it is now guarding a sentence nobody "
+                "sells"
+            )
+
+
+def test_a_line_that_claims_nothing_carries_no_quantity() -> None:
+    """`_NO_CLAIM` is the register's escape hatch, so it needs a floor.
+
+    Some lines on a product page really are argument rather than offer — «تفصيل
+    سيرة لكل فرصة يحتاج ساعة. ما أحد يسويها.» sells nothing and can name
+    nothing. But «this line promises nothing» is the one verdict a tired author
+    can give any line at all, and it would retire the guard one sentence at a
+    time.
+
+    A machine cannot read the Arabic. It can read a DIGIT, and the promises
+    that cost money when they are wrong are the counted ones: two a day,
+    forty-four a month, twenty-four hours, thirty days. So a line excused as
+    claimless may not contain a number in either script. It is a floor, not a
+    ceiling, and it is deliberately the cheapest thing to check.
+    """
+    quantified = [
+        (price, text)
+        for price, register in _BACKED_PROMISES.items()
+        for text, backers in register
+        if _NO_CLAIM in backers and re.search(r"[0-9٠-٩]", text)
+    ]
+    assert not quantified, (
+        f"these lines are registered as promising nothing and count something: "
+        f"{quantified} — a number on a sales page is a promise the customer can "
+        "hold us to. Name what backs it, or take the number out"
+    )
+
+
+def test_every_backer_a_promise_names_actually_exists() -> None:
+    """A register row that points at a deleted function reads as accountability
+    and resolves to nothing — the same failure as a superseded-by marker citing
+    a changelog entry that was renumbered away."""
+    missing = sorted({
+        backer
+        for register in _BACKED_PROMISES.values()
+        for _, backers in register
+        for backer in backers
+        if backer not in _NOT_CODE and not _defines(backer)
+    })
+    assert not missing, (
+        f"these promises name a backer that does not exist: {missing} — either "
+        "the code moved and the register must follow it, or the promise lost "
+        "what kept it and belongs off the page"
+    )
+
+
+def test_no_promise_rests_on_the_operator_alone_without_saying_so() -> None:
+    """Operator-kept promises are a legitimate product decision — «الوصول
+    المباشر إلى الإنسان الذي بنى لمّاح» is the 449 card's whole argument, and
+    building a reminder machine instead would have been worse.
+
+    They are also the exact shape the pre-launch check caught: a sentence on a
+    page and a human expected to remember. So they are allowed and COUNTED,
+    and every one of them must also name something in code — the star that
+    puts the customer in front of the operator's eyes, the ledger that makes a
+    session one-per-period. A promise resting on memory alone has nothing to
+    fail loudly, and this is where that gets noticed.
+    """
+    bare = [
+        (price, fragment)
+        for price, register in _BACKED_PROMISES.items()
+        for fragment, backers in register
+        if _OPERATOR in backers and set(backers) == {_OPERATOR}
+    ]
+    assert not bare, (
+        f"these promises are kept by the operator remembering, and by nothing "
+        f"else: {bare} — the 449 rewrite exists because that shape breaks "
+        "silently. Give it the piece of code that makes it visible, or reword it"
+    )
 
 
 def test_no_refund_is_promised_as_automatic() -> None:
@@ -411,24 +1347,68 @@ def _sup_blocks(html: str) -> list[str]:
                 break
     return blocks
 
+#: A struck-through line: the smaller marker, for one sentence rather than a
+#: whole passage. `.stale` renders as `line-through` + reduced opacity, which
+#: is what tells a reader THIS line is not on offer while the section around
+#: it still is.
+#:
+#: `span` is in here because the whitepaper now strikes PARTS of sentences —
+#: a line that carries a retired promise and a shipped one in the same breath
+#: («الترقية وسط الدورة …» beside «الوقف المؤقت لا يمدد المدة») is more
+#: honestly marked half-struck than struck whole (DEVIATIONS D26). Requested by
+#: the owner of that file, who could see the marker and this guard could not.
+_STALE = re.compile(r"<(li|tr|span) class=\"stale\">.*?</\1>", re.DOTALL)
+
+
+def _unmarked_text(html: str) -> str:
+    """The whitepaper with every superseded banner and every struck line
+    removed — what is left is what the page still SELLS.
+
+    Depth counting is only needed for the banners: `div`/`span` nest inside
+    each other, `li` and `tr` do not nest in this document, so a non-greedy
+    match to the matching close tag is exact for them.
+    """
+    struck = [match.group(0) for match in _STALE.finditer(html)]
+    for block in _sup_blocks(html) + struck:
+        html = html.replace(block, " ")
+    return html
+
+
 #: Each passage of the whitepaper the changelog overrides:
-#:   section id → (a literal fragment proving the passage is still there,
-#:                 the changelog entry number that governs it,
-#:                 what the reader would otherwise act on)
+#:   (section id,
+#:    a literal fragment proving the passage is still there,
+#:    the changelog entry number that governs it,
+#:    what the reader would otherwise act on)
 #:
 #: The fragment is asserted PRESENT on purpose. Without it the test would pass
 #: by deletion — and deleting a superseded decision is exactly what the
 #: governance rule forbids, because the history is the reason.
-_SUPERSEDED: dict[str, tuple[str, str, str]] = {
-    "s4": ("~149", "19",
-           "a three-tier catalogue at 149/279 — retired on 2 August"),
-    "s5": ("الدفع يمدد 30 يومًا", "16",
-           "renewal described as extending one row; the code writes one row "
-           "per Salla order and retires the previous one"),
-    "s13": ("باقات الاشتراك الثلاث", "19",
-            "a C9 exit criterion that can never be met — the third plan is "
-            "deliberately retired from sale"),
-}
+#:
+#: A SEQUENCE and not a mapping by section, because one section can contradict
+#: the changelog in more than one place and §04 does it three times: the
+#: catalogue, the entitlements table, and the price-measurement framework that
+#: still says the numbers land after thirty alpha days. Keyed by section, the
+#: last one written would have silently replaced the others.
+_SUPERSEDED: tuple[tuple[str, str, str, str], ...] = (
+    ("s3", "سعر واحد 279 ← ثلاث باقات", "19",
+     "the reversal log's own line, reversed a second time — three plans "
+     "became two"),
+    ("s4", "~149", "19",
+     "a three-tier catalogue at 149/279 — retired on 2 August"),
+    ("s4", "خطاب تقديم كامل لكل فرصة", "23",
+     "the تنفيذي card sells a full cover letter per opportunity; nothing "
+     "reads `cover_letter`, and the renderer, its byte-verbatim template and "
+     "that template's guard were all deleted on 6 August (DEVIATIONS D23)"),
+    ("s4", "المرساة الاسترشادية 149/279/449", "19",
+     "prices presented as pending a 30-day alpha measurement; they were "
+     "fixed early on real measured cost"),
+    ("s5", "الدفع يمدد 30 يومًا", "16",
+     "renewal described as extending one row; the code writes one row "
+     "per Salla order and retires the previous one"),
+    ("s13", "باقات الاشتراك الثلاث", "19",
+     "a C9 exit criterion that can never be met — the third plan is "
+     "deliberately retired from sale"),
+)
 
 
 def _sections() -> dict[str, str]:
@@ -455,7 +1435,7 @@ def test_every_superseded_passage_carries_a_visible_marker() -> None:
     the only thing separating those two readings is the marker.
     """
     sections = _sections()
-    for section_id, (fragment, entry, why) in _SUPERSEDED.items():
+    for section_id, fragment, entry, why in _SUPERSEDED:
         body = sections.get(section_id)
         assert body is not None, f"the whitepaper no longer has §{section_id}"
         assert fragment in body, (
@@ -478,7 +1458,7 @@ def test_every_superseded_passage_carries_a_visible_marker() -> None:
 def test_every_marker_points_at_a_changelog_entry_that_exists() -> None:
     """A citation to nothing is worse than no citation: it reads as governance
     while resolving to a section number a later edit renumbered away."""
-    for _, (_, entry, _) in _SUPERSEDED.items():
+    for _, _, entry, _ in _SUPERSEDED:
         assert _changelog_entry(entry) is not None, (
             f"the whitepaper defers to CHANGELOG-v1.1.md §{entry} and no such "
             "numbered entry exists"
@@ -510,16 +1490,34 @@ def test_the_whitepaper_never_sells_an_entitlement_no_code_reads() -> None:
     column inside a marker is enough — that is precisely the reader being told
     it is not sold — and implementing the feature lifts the requirement
     automatically, exactly as it does for the store pages.
+
+    The column name is not the whole of it, and the first version of this guard
+    passed while the page still sold all four. The table rows carry the LATIN
+    column names and were struck; the plan cards above them carry the ARABIC
+    sentences — «نبذة تقديم قصيرة جاهزة للنسخ», «أولوية معالجة في الطابور»,
+    «خطاب تقديم كامل لكل فرصة», «مراجعتك البشرية … شهريًا» — and were not.
+    The sentences are what gets copied into the store, so the sentences are
+    what has to be marked; a struck row above a live promise reads as a
+    formatting change.
     """
     text = _WHITEPAPER.read_text(encoding="utf-8")
     marked = "\n".join(_sup_blocks(text))
-    for column in _SOLD_ENTITLEMENTS:
-        if _read_by_product(column) or column not in text:
+    still_offered = _unmarked_text(text)
+    for column, phrases in _SOLD_ENTITLEMENTS.items():
+        if _read_by_reachable_module(column):
             continue
-        assert column in marked, (
-            f"the whitepaper sells {column} and nothing outside models.py "
-            "reads it — mark the row superseded or implement the feature"
-        )
+        if column in text:
+            assert column in marked, (
+                f"the whitepaper sells {column} and no module the product "
+                f"loads reads it outside models.py "
+                "reads it — mark the row superseded or implement the feature"
+            )
+        for phrase in phrases:
+            assert phrase not in still_offered, (
+                f"the whitepaper still offers «{phrase}» outside any marker "
+                f"while no loaded module reads {column} — strike the line (class="
+                "\"stale\") or name it in the superseded-by banner"
+            )
 
 
 def test_the_whitepaper_states_one_version_number() -> None:

@@ -6,12 +6,14 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
+import pytest
 from sqlalchemy import select
 from sqlalchemy import text as sql_text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from career.db.models import CustomerChannel, DeliveryMessage
+from career.db.models import CustomerChannel, Delivery, DeliveryMessage
 from career.salla.client import FakeSallaClient, SallaOrder
 from career.salla.provisioning import provision_order
 from career.telegram.admin import FakeTelegramAdminClient
@@ -358,3 +360,215 @@ def test_a_resend_never_reaches_someone_who_opted_out(
         now=NOW + timedelta(hours=1),
     ).outcome == RESEND_OPTED_OUT
     assert not healthy.sent
+
+
+# ── the provider's id must never take the ledger row down with it ────────────
+#
+# AUDIT 2026-08-06, second review. `salla/lifecycle._record_send` was taught to
+# check Meta's message id before it enters the session — but `record_out` has
+# twenty-two call sites and that fix guarded ONE. At every other site the row
+# destroyed by a refused INSERT is a DELIVERY LEDGER row: the evidence that a
+# customer was sent his CVs, the source `close.whatsapp_spend` bills from, and
+# the rows `whatsapp/worker._handle_status` writes receipts onto.
+#
+# The reviewer's reproduction, at an unguarded delivery-shaped site:
+#
+#     UNGUARDED commit raised: DataError (StringDataRightTruncation)
+#       value too long for type character varying(128)
+#     ledger row that mattered, persisted: 0
+#
+# Both halves matter. The send REALLY HAPPENED — Meta delivered it and billed
+# us — and the transaction that would have recorded it rolled back whole, so
+# the delivery itself disappeared along with the row.
+
+
+class _OverlongIds(FakeWhatsAppClient):
+    """Meta answers with an id longer than the column that holds it.
+
+    Nothing exotic is being simulated. `delivery_messages.wa_message_id` and
+    `deliveries.template_message_id` are both ``varchar(128)``, the value in
+    them is the PROVIDER's, and no code between the Graph response and the
+    INSERT has ever looked at its length. Two hundred characters is only
+    «longer than a hundred and twenty-eight».
+    """
+
+    def _next_id(self) -> str:
+        self._n += 1
+        return f"wamid.{self._n}." + "H" * 200
+
+
+class _NotEvenAString(FakeWhatsAppClient):
+    """The other shape a provider hands back: not a string at all.
+
+    A client that returns the parsed response body instead of digging the id
+    out of it is one refactor away at all times, and psycopg cannot adapt a
+    dict — so this too is a commit that raises and a delivery that vanishes,
+    without a single character of it being «too long».
+    """
+
+    def _next_id(self):  # type: ignore[no-untyped-def]  # noqa: ANN202
+        self._n += 1
+        return {"messages": [{"id": f"wamid.{self._n}"}]}
+
+
+def _messages_of(owner_engine: Engine, delivery_id: uuid.UUID) -> list[DeliveryMessage]:
+    with Session(owner_engine) as s:
+        return list(s.execute(
+            select(DeliveryMessage)
+            .where(DeliveryMessage.delivery_id == delivery_id)
+            .order_by(DeliveryMessage.created_at)
+        ).scalars().all())
+
+
+def test_an_overlong_provider_id_no_longer_destroys_the_delivery_ledger(
+    owner_session: Session, owner_engine: Engine, clean_billing: None
+) -> None:
+    """The reviewer's failure, at the site the last wave did not reach.
+
+    An open window sends the bundle directly: two real sends, two ledger rows,
+    one commit. Before the fix that commit raised `DataError` and took the
+    `Delivery` row down with the two `DeliveryMessage` rows — the customer had
+    his CVs, and we had no record that anything was ever sent to him.
+    """
+    ch = _channel(owner_session, last_inbound_at=NOW)  # open → direct send
+    wa = _OverlongIds()
+    delivery = deliver_adaptive(owner_session, ch, BUNDLE, run_date=NOW.date(),
+                                whatsapp_client=wa, daily_template=DAILY_UTILITY, now=NOW)
+    owner_session.commit()
+
+    assert [m.kind for m in wa.sent] == ["text", "document"]  # both really went
+    assert delivery.status == DELIVERY_COMPLETED
+    rows = _messages_of(owner_engine, delivery.id)
+    assert [r.kind for r in rows] == ["text", "document"], (
+        "the ledger rows for two sends Meta has already made did not survive "
+        "the commit"
+    )
+    # NULL, never truncated: a truncated id is an id that matches the WRONG
+    # send when a receipt arrives, which is worse than matching nothing.
+    assert [r.wa_message_id for r in rows] == [None, None]
+
+
+def test_an_overlong_id_no_longer_destroys_the_held_bundle(
+    owner_session: Session, owner_engine: Engine, clean_billing: None
+) -> None:
+    """The template path fails in TWO places, and only one of them is
+    `record_out`.
+
+    `deliver_adaptive` also stamps the same provider id onto
+    `deliveries.template_message_id`, which is `varchar(128)` as well — so a
+    fix that funnels every ledger write through one validated door and stops
+    there still loses the whole morning template on this path. The delivery
+    that is lost here is the HELD one: the customer gets a template, taps it,
+    and there is no bundle to descend because the row that held it never
+    committed.
+    """
+    ch = _channel(owner_session, last_inbound_at=NOW - timedelta(hours=25))  # closed
+    wa = _OverlongIds()
+    delivery = deliver_adaptive(owner_session, ch, BUNDLE, run_date=NOW.date(),
+                                whatsapp_client=wa, daily_template=DAILY_UTILITY, now=NOW)
+    owner_session.commit()
+
+    assert delivery.status == DELIVERY_PENDING
+    assert delivery.template_message_id is None   # unusable → NULL, not refused
+    rows = _messages_of(owner_engine, delivery.id)
+    assert [r.kind for r in rows] == ["template"]
+    assert rows[0].wa_message_id is None
+
+    # …and the bundle it holds is still claimable, which is the whole point of
+    # keeping the row: the tap arrives and the CVs go out.
+    later = NOW + timedelta(minutes=5)
+    ch.last_inbound_at = later
+    descended = descend_pending_delivery(owner_session, ch, whatsapp_client=wa, now=later)
+    owner_session.commit()
+    assert descended is not None and descended.status == DELIVERY_COMPLETED
+
+
+def test_an_id_that_is_not_a_string_is_refused_the_same_way(
+    owner_session: Session, owner_engine: Engine, clean_billing: None
+) -> None:
+    """Length is not the only way a provider value poisons a transaction, and
+    a guard that only measures `len()` would call this one «fine» and hand
+    psycopg a dict."""
+    ch = _channel(owner_session, last_inbound_at=NOW)
+    wa = _NotEvenAString()
+    delivery = deliver_adaptive(owner_session, ch, BUNDLE, run_date=NOW.date(),
+                                whatsapp_client=wa, daily_template=DAILY_UTILITY, now=NOW)
+    owner_session.commit()
+
+    rows = _messages_of(owner_engine, delivery.id)
+    assert [r.kind for r in rows] == ["text", "document"]
+    assert [r.wa_message_id for r in rows] == [None, None]
+
+
+def test_a_null_id_is_billed_as_sent_forever_and_that_is_the_price(
+    owner_session: Session, owner_engine: Engine, clean_billing: None
+) -> None:
+    """The cost of the fix, asserted instead of promised.
+
+    `worker._handle_status` matches receipts on `wa_message_id`. A row written
+    with NULL can never be matched, so its status stays `sent` for good — and
+    `close.whatsapp_spend` bills every template row whose status is not
+    `failed`. This template is therefore billed even though Meta told us it
+    FAILED. That over-reports spend, which is the safe direction, and it is
+    the reason the row is kept rather than dropped: an unrecorded send is a
+    template Meta charged us for and we counted at zero.
+
+    If a later change makes this test fail, it has changed the money.
+    """
+    from career.cv.close import whatsapp_spend
+    from career.whatsapp.worker import _handle_status
+
+    ch = _channel(owner_session, last_inbound_at=NOW - timedelta(hours=25))
+    wa = _OverlongIds()
+    deliver_adaptive(owner_session, ch, BUNDLE, run_date=NOW.date(),
+                     whatsapp_client=wa, daily_template=DAILY_UTILITY, now=NOW)
+    owner_session.commit()
+
+    # Meta reports the true id — the full, over-long one it gave us.
+    real_id = wa.sent[-1].message_id
+    assert len(real_id) > 128
+    _handle_status(owner_session, {"id": real_id, "status": "failed"}, now=NOW)
+    owner_session.commit()
+
+    delivery_id = owner_session.execute(
+        select(Delivery.id).where(Delivery.channel_id == ch.id)
+    ).scalars().one()
+    rows = _messages_of(owner_engine, delivery_id)
+    assert [r.status for r in rows] == ["sent"]   # the receipt found nothing
+    billed = whatsapp_spend(owner_session, tenant_id=ch.tenant_id)
+    assert sum(count for count, _ in billed.values()) == 1
+
+
+def test_a_ledger_failure_the_guard_cannot_prevent_still_fails_the_delivery(
+    owner_session: Session, owner_engine: Engine, clean_billing: None
+) -> None:
+    """The savepoint decision, made visible.
+
+    `record_out` deliberately does NOT wrap its row in `begin_nested()`. What
+    validation cannot prevent — a channel deleted underneath us, a tenant id
+    that does not exist — is a ledger row we genuinely cannot write, and on
+    THIS table that row is the evidence of the delivery (constant 3). Swallowing
+    it would commit a delivery we cannot evidence and bill for a send we cannot
+    show; failing the transaction refuses to claim it. `salla/lifecycle` needs
+    the savepoint for the opposite reason — there one row's failure would
+    discard a whole night of OTHER customers' marks.
+    """
+    from career.whatsapp.delivery import record_out
+
+    ch = _channel(owner_session, last_inbound_at=NOW)
+    wa = FakeWhatsAppClient()
+    delivery = deliver_adaptive(owner_session, ch, BUNDLE, run_date=NOW.date(),
+                                whatsapp_client=wa, daily_template=DAILY_UTILITY, now=NOW)
+    delivery_id = delivery.id
+    record_out(owner_session, tenant_id=ch.tenant_id, channel_id=uuid.uuid4(),
+               kind="text", wa_message_id="wamid.orphan", delivery_id=delivery_id,
+               now=NOW)
+    with pytest.raises(IntegrityError):
+        owner_session.commit()
+    owner_session.rollback()
+
+    assert _messages_of(owner_engine, delivery_id) == []
+    with Session(owner_engine) as s:
+        assert s.execute(
+            select(Delivery.id).where(Delivery.id == delivery_id)
+        ).scalars().first() is None

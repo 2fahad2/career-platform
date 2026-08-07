@@ -1,0 +1,45 @@
+# 09:00 Riyadh, daily — both halves chosen, neither inherited.
+#
+# WHY DAILY. The check is cheap and almost always decides «nothing to do»: it
+# acts only when five days or fewer remain (REFRESH_MARGIN_DAYS), and a Salla
+# access token lives one to two weeks. Daily is what turns that margin into a
+# retry budget — six attempts (5, 4, 3, 2, 1, 0 days left) before the
+# credential dies, so a Salla outage, a DNS blip or a host that was switched
+# off costs nothing at all.
+#
+#   Weekly was rejected outright: with a five-day margin a weekly timer gets
+#   AT MOST ONE attempt inside it, so a single failed Sunday is the whole
+#   incident again, with a cron entry to point at afterwards.
+#
+#   Hourly was rejected too. It buys nothing — the margin is measured in days
+#   and the token's life is measured in weeks — while multiplying by
+#   twenty-four the exposure to the one thing that is unrecoverable: Salla's
+#   refresh tokens are SINGLE-USE, and two exchanges racing each other make
+#   its OAuth server revoke everything and require the merchant to reinstall
+#   the app. The script holds a lock against exactly that, and a schedule that
+#   leans on a lock twenty-four times a day for no benefit is a bad trade.
+#
+# WHY 09:00. Two constraints, and they agree.
+#   * It is inside Fahad's working hours. When this job gives up, the only
+#     recovery in existence is HIM reinstalling the app on his store — the
+#     Easy Mode credential is never shown to a human, so there is nothing to
+#     paste and nothing a server can do. An alert that lands at 03:30 next to
+#     the backup is an alert he reads after the credential is dead.
+#   * It is two hours before the 11:00 nightly run. A credential renewed in
+#     the morning is already in place when the delivery run reads it, and the
+#     nightly run's own boot check becomes the second, independent witness the
+#     same day rather than the next one.
+#
+# Persistent=true, for the same reason career-backup.timer has it: a machine
+# that was off at 09:00 is precisely the machine whose credential quietly aged
+# another day, and catching up is harmless — a caught-up run outside the
+# margin still decides «nothing to do».
+[Unit]
+Description=Daily Salla credential refresh at 09:00 Riyadh
+
+[Timer]
+OnCalendar=*-*-* 09:00:00 Asia/Riyadh
+Persistent=true
+
+[Install]
+WantedBy=timers.target

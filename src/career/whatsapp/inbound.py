@@ -391,6 +391,33 @@ def classify_inbound(text: str | None) -> tuple[InboundKind, str | None]:
     reading entirely. Nothing that clause splitting was built for is lost:
     it was built for «لا تراسلوني، إلغاء الاشتراك», and that is STOP.
 
+    OTHER — and 2026-08-07, where the لمّاح+ direct line was wired WITHOUT
+    touching anything above. The 449 tier sells «تواصل مباشر معي … اكتب لي
+    وقت ما تحتاج»: not a word, ANY message. Two things follow, and both point
+    away from this function.
+
+    There is no new keyword, and there will not be one. A keyword would sell
+    the higher tier a spelling instead of access, and this file already paid
+    twice for reading ordinary words as commands — «مساعده» (a customer asking
+    for a human, heard by nobody) and «تسويق، دعم، مبيعات» (a career-field
+    answer read as a support ticket, the answer discarded and a ticket raised
+    against someone who asked for nothing). Nothing here can tell those apart
+    from a request, because nothing here knows what was ASKED.
+
+    And the tier test cannot live here at all: this module is pure — it
+    imports the Arabic fold and nothing else from `career`, deliberately (see
+    the ``normalize_ar`` note above) — so it has no session, no subscription
+    row, and no way to know who is paying. «Which tier is this customer on» is
+    a fact about a database row, not about a string, and reading it here would
+    also make every future edit to these sets an edit to a billing rule.
+
+    So OTHER still means OTHER, and the escalation lives where the
+    subscription is known and where every other consumer of the message has
+    already declined it: `promises.career_session.escalate_direct_message`,
+    called from the worker's LAST branch. That ordering is the guarantee an
+    onboarding answer, a gate reply or a document is never re-read as «a
+    message for the operator».
+
     Activation is extracted from the whitespace-normalised text and never the
     folded one: the token is case-sensitive and carries «-» and «_», all of
     which the Arabic fold would destroy.

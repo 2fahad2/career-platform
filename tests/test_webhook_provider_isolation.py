@@ -253,7 +253,10 @@ class TestTheWaitingCountSpeaksForSallaOnly:
 
         waiting = [m for m in admin.messages if "أحداث تنتظر الآن" in m]
         assert waiting, "the outage alert must still name the backlog"
-        assert "أحداث تنتظر الآن: 1" in waiting[0]
+        # The count sits on its own line: Fahad's client scrambles any line
+        # carrying both Arabic and a Latin digit, and this assertion used to
+        # pin the scrambled shape — a test holding a defect in place.
+        assert "أحداث تنتظر الآن:\n1" in waiting[0]
 
 
 class TestTheBatchLimitIsSallaScoped:

@@ -43,6 +43,19 @@ logger = logging.getLogger("career.retention")
 #: §12 verbatim: «كامل أثناء الاشتراك، 90 يومًا بعده، ثم حذف مهني».
 RETENTION_DAYS_AFTER_END = 90
 
+_ARABIC_DIGITS = str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩")
+
+
+def _ar_num(value: int) -> str:
+    """Arabic-Indic digits, so a count can stay INSIDE its Arabic sentence.
+
+    The sweep notice is one sentence whose whole meaning is «how many, and
+    after how long»; splitting the numbers onto their own lines would break
+    the sentence to save a direction. Same helper as
+    `telegram/console._ar_digits`, local to this module by the same rule.
+    """
+    return str(value).translate(_ARABIC_DIGITS)
+
 #: A tenant holding any of these is still our customer — never swept.
 #:
 #: PAUSED is the one that needed re-justifying. It belongs here ONLY because a
@@ -186,13 +199,13 @@ def sweep_retention(
         if counts["swept"]:
             lines.append(
                 "🧹 كنس الاحتفاظ: حُذفت بيانات "
-                f"{counts['swept']} عميل انتهى اشتراكهم قبل أكثر من "
-                f"{RETENTION_DAYS_AFTER_END} يومًا "
+                f"{_ar_num(counts['swept'])} عميل انتهى اشتراكهم قبل أكثر من "
+                f"{_ar_num(RETENTION_DAYS_AFTER_END)} يومًا "
                 "(السجلات المالية وسجل الموافقات محفوظة نظاميًا)"
             )
         if counts["stale_live"]:
             lines.append(
-                f"⚠️ {counts['stale_live']} حساب ما زال محسوبًا «قائمًا» "
+                f"⚠️ {_ar_num(counts['stale_live'])} حساب ما زال محسوبًا «قائمًا» "
                 "وفترته المدفوعة انتهت من زمان — بياناته محفوظة خارج المهلة "
                 "المعلنة، راجع حالته"
             )

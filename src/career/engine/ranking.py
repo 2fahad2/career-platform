@@ -142,11 +142,38 @@ def record_suppression_by_url(
         # audit fix: the C7 close only knows the delivered URL — resolve the
         # posting's repost group here so group-level suppression actually
         # bites (rows used to land with a NULL group = URL-only suppression).
+        #
+        # AUDIT 2026-08-06 — and it resolves it by IDENTITY, not by the raw
+        # `url` string, which is how that fix was first written. `job_postings`
+        # stores the URL exactly as the source handed it over (engine.run never
+        # rewrites it), and what arrives here is whatever the delivered bundle
+        # carried: `record_suppression` above hands over the NORMALIZED dedupe
+        # key, and a delivered link can pick up `utm_*`/`gclid`/a trailing
+        # slash/a different case that the stored row does not have. Every one
+        # of those makes `JobPosting.url == url` match nothing, the row lands
+        # with a NULL group again, and group-level suppression silently
+        # degrades to URL-only — the exact defect the note above says it
+        # fixed. The customer is then re-sent the same job under its repost's
+        # URL, inside the TTL, with nothing anywhere reporting it.
+        #
+        # `url_identity` is the canonical identity of that same normalized URL
+        # and is the table's UNIQUE key (uq_job_postings_url_identity), so the
+        # match is invariant to exactly the noise that broke it — and it is an
+        # index lookup instead of a sequential scan over an unindexed Text
+        # column, which is the cheaper half of the same fix.
         from career.db.models import JobPosting
+        from career_core.identity import derive_canonical_job_identity
 
-        repost_group_id = owner_session.execute(
-            select(JobPosting.repost_group_id).where(JobPosting.url == url)
-        ).scalar_one_or_none()
+        identity = derive_canonical_job_identity(url)
+        if identity is not None:
+            # No identity ⇒ not a URL we could have discovered under (no
+            # http(s) scheme or no host), so there is no posting to find.
+            # Fail-open: the URL key alone still suppresses.
+            repost_group_id = owner_session.execute(
+                select(JobPosting.repost_group_id).where(
+                    JobPosting.url_identity == identity
+                )
+            ).scalar_one_or_none()
     owner_session.execute(
         delete(TenantJobSuppression).where(
             TenantJobSuppression.tenant_id == tenant_id,

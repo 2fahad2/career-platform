@@ -15,6 +15,20 @@ from typing import Any
 #: lands days before the engine starts failing, not hours.
 MIN_REMAINING_FLOOR = 100
 
+_ARABIC_DIGITS = str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩")
+
+
+def _ar_num(value: int) -> str:
+    """Arabic-Indic digits, so a count can live INSIDE an Arabic sentence.
+
+    Fahad's client reverses any line mixing Arabic with Latin digits, and this
+    is the alert he must be able to act on: it is the only warning that the
+    search credit the whole nightly engine runs on is about to die. Same
+    helper as `telegram/console._ar_digits` and `refresh_salla_token.ar_num`
+    — local by design, because each module states its own numerals.
+    """
+    return str(value).translate(_ARABIC_DIGITS)
+
 
 def quota_alert(account: dict[str, Any]) -> str | None:
     """Arabic admin alert when paid credits run low; None = nothing to say."""
@@ -31,14 +45,20 @@ def quota_alert(account: dict[str, Any]) -> str | None:
     # real headroom from the allowance minus this month's usage instead.
     remaining = max(remaining, allowance - used)
     threshold = max(MIN_REMAINING_FLOOR, allowance // 10)
+    # The top-up URL gets a LINE OF ITS OWN in both branches: inside the
+    # Arabic sentence it arrived reversed — an unreadable link on the one
+    # alert that exists to be acted on — and alone it is also tappable.
     if remaining <= 0:
         return (
             "🔴 رصيد محرك البحث انتهى — التشغيلة الليلية القادمة بتفشل.\n"
-            "جدد الاشتراك الآن: searchapi.io/pricing"
+            "جدد الاشتراك الآن:\n"
+            "searchapi.io/pricing"
         )
     if remaining <= threshold:
         return (
-            f"🟠 رصيد محرك البحث قرب يخلص: باقي {remaining} من {allowance}.\n"
-            "جدد قبل ما تنقطع التشغيلات: searchapi.io/pricing"
+            f"🟠 رصيد محرك البحث قرب يخلص: باقي {_ar_num(remaining)} "
+            f"من {_ar_num(allowance)}.\n"
+            "جدد قبل ما تنقطع التشغيلات:\n"
+            "searchapi.io/pricing"
         )
     return None

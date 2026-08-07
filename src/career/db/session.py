@@ -179,6 +179,16 @@ _ESCAPES: dict[str, _Escape] = {
 #: `ops/systemd/career-*.service` runs each of these by path. A process is the
 #: right key here: the escape is a statement about which PROCESSES may leave
 #: the app role, and a connect-time listener cannot see anything finer.
+#:
+#: BEING STARTED BY SYSTEMD IS NOT WHY A NAME BELONGS HERE. Reaching a database
+#: is. `tests/test_db_engine_guard.py` used to require every unit's entrypoint
+#: to appear on one of these two lists, and `scripts/refresh_salla_token.py` —
+#: a daily oneshot that reads a file, calls Salla's OAuth endpoint and writes
+#: the file back, with no `career.db` anywhere in its import closure — could
+#: only satisfy that by being granted an escape it does not use. It is not
+#: listed, and it is not an omission. The guard now derives «does this process
+#: end up with an engine?» from the source and asks only the ones that do; a
+#: timer that never opens a connection has no role to declare.
 _D20_LEGACY_ENTRYPOINTS: frozenset[str] = frozenset(
     {"run_worker_loop.py", "run_admin_bot.py", "run_nightly.py"}
 )
@@ -296,6 +306,78 @@ def _check_role(username: str, *, escape: str | None, site: str) -> None:
         )
 
 
+# ===========================================================================
+# The connect deadline
+# ===========================================================================
+#
+# `grep -rn connect_timeout src/career/` returned NOTHING before this block,
+# and that absence is the concrete trigger for the hung-start path the worker
+# unit now pays for with TimeoutStartSec=180.
+#
+# libpq's default connect_timeout is ZERO, which means «wait forever». A
+# Postgres that REFUSES the connection is harmless — ECONNREFUSED comes back in
+# microseconds and the caller sees a real error. The dangerous shape is a
+# Postgres that ACCEPTS the TCP connection and never completes the startup
+# handshake: a paused container, a docker-proxy still listening after the
+# backend died, an iptables DROP, a server in the middle of a restart. The
+# socket is open, so nothing times out, and the caller blocks until the heat
+# death of the process. Measured on this host, 2026-08-06: a connect against a
+# socket that accepts and never speaks was still blocked when the observation
+# was abandoned at 60s; with connect_timeout it gave up at 2.01s, 5.02s and
+# 10.04s for values 2, 5 and 10 — psycopg honours it to the centisecond.
+#
+# `report_environment()` in scripts/run_worker_loop.py opens exactly such a
+# session, BEFORE `sd_notify.ready()`. Under the old `Type=simple` that hang
+# was invisible: systemd called the unit started the moment it forked. Under
+# `Type=notify` it becomes a kill at TimeoutStartSec — better, but the operator
+# is told «did not finish starting» and the journal ends mid-boot-check with no
+# reason. A bounded connect turns a mystery into one line naming Postgres.
+#
+#: Seconds. Chosen from measurement, not habit:
+#:
+#:   observed connect, app role, 6 runs   10.4–15.0 ms  (2026-08-06, loopback
+#:                                                       127.0.0.1:5433)
+#:   so 10s is ~660x the slowest connect this host has ever been seen to make.
+#:
+#: Why not smaller. libpq silently promotes anything below 2 to 2, so 1 is a
+#: lie; and the value has to survive a host under real load and a Postgres that
+#: has just accepted its first connection after a container restart. Three
+#: orders of magnitude of headroom is the point — this deadline exists to catch
+#: «never», not «slow», and a connect deadline that fires on a busy afternoon
+#: would be removed by the next person who got paged for it.
+#:
+#: Why not larger. It has to fit inside the budget it is protecting. The
+#: worker's TimeoutStartSec is 180s and its boot checks also send a Telegram
+#: heartbeat (`requests` applies its 30s timeout PER PHASE — connect plus read
+#: is 60s worst case, and neither phase covers DNS resolution, so the real
+#: ceiling there is higher than the unit comment's «30s client timeout»
+#: suggests). A DB deadline of 10s leaves that whole budget intact and still
+#: fails the boot check ~18x faster than systemd would kill it — which is the
+#: difference between an error naming Postgres and a unit killed mid-sentence.
+CONNECT_TIMEOUT_S = 10
+
+#: Dialects this applies to. `connect_timeout` is a libpq conninfo keyword;
+#: handing it to sqlite would be a TypeError at connect time, which is a new way
+#: for a test suite to fail and no way for production to be safer.
+_PG_DIALECTS = ("postgresql",)
+
+
+def _with_connect_timeout(url: str, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Merge the deadline into ``create_engine`` kwargs without clobbering.
+
+    A caller that has thought about it and passed its own ``connect_timeout``
+    keeps it — the point is that NOBODY gets the libpq default of «forever» by
+    saying nothing, which is what every call site in this repository does.
+    """
+    if not make_url(url).get_backend_name().startswith(_PG_DIALECTS):
+        return kwargs
+    merged = dict(kwargs)
+    connect_args = dict(merged.get("connect_args") or {})
+    connect_args.setdefault("connect_timeout", CONNECT_TIMEOUT_S)
+    merged["connect_args"] = connect_args
+    return merged
+
+
 def engine_for(url: str, *, escape: str | None = None, **kwargs: Any) -> Engine:
     """Build an engine, refusing the ones that should not exist.
 
@@ -312,7 +394,7 @@ def engine_for(url: str, *, escape: str | None = None, **kwargs: Any) -> Engine:
     """
     username = make_url(url).username
     _check_role(username or "<no user in the DSN>", escape=escape, site="engine_for")
-    engine = create_engine(url, **kwargs)
+    engine = create_engine(url, **_with_connect_timeout(url, kwargs))
     if escape is not None:
         # Remember the verdict for the listener below. Without this an engine
         # the factory has ALREADY approved would be re-judged at its first
@@ -348,7 +430,33 @@ def _guard_every_connection(
     Returns None in every permitted case so SQLAlchemy connects normally; the
     refusal is an exception, which surfaces at the first connection rather
     than at import for engines that did not come from :func:`engine_for`.
+
+    It is also where the connect deadline is made unmissable — see below.
     """
+    # THE CONNECT DEADLINE, applied where it cannot be skipped.
+    #
+    # `_with_connect_timeout` covers `engine_for`. That is not enough, and the
+    # gap is not hypothetical: nine call sites in this repository build their
+    # engine with a bare `create_engine(settings.owner_database_url,
+    # future=True)` and never come through the factory —
+    # scripts/run_worker_loop.py:98 among them, which is the exact engine
+    # `report_environment()` opens during the boot check that TimeoutStartSec
+    # kills. Fixing only the factory would have left the incident's own code
+    # path on libpq's «wait forever», and the test would still have been green.
+    #
+    # This listener is registered on the Engine CLASS and sees the keywords on
+    # their way into libpq — the last place they are still true, for every
+    # engine in the process whoever built it. Injecting here means the deadline
+    # cannot silently fail to apply: there is no way to open a Postgres
+    # connection in this process that does not pass through this function.
+    if isinstance(cparams, dict) and dialect is not None:
+        name = getattr(dialect, "name", "") or ""
+        if name.startswith(_PG_DIALECTS) and not cparams.get("connect_timeout"):
+            # `not …get(…)` and not `not in`: an explicit 0 is libpq for «wait
+            # forever», which is the default this whole block exists to remove.
+            # Someone passing 0 is asking for the incident by name.
+            cparams["connect_timeout"] = CONNECT_TIMEOUT_S
+
     username = cparams.get("user") if isinstance(cparams, dict) else None
     if username is None:
         for arg in cargs or ():
@@ -522,7 +630,22 @@ def tenant_ids_with_status(session: Session, statuses: list[str]) -> list[str]:
 
 
 def tenants_with_pending_work(session: Session) -> list[str]:
-    """Tenants with an unpublished outbox event, an open journey, or an open delivery."""
+    """Tenants with an unfinished onboarding journey or an incomplete delivery.
+
+    It said «an unpublished outbox event» first, and 0029 removed that branch
+    with the table: the queue subsystem is gone and the two remaining branches
+    are the whole of «pending work» now.
+
+    Kept, though its only caller is a test, and that is the reason to keep it.
+    The database function is not optional — 0029 had to redefine it, because a
+    SQL body carries no dependency on the tables it names and dropping
+    `outbox_events` would have left it raising «relation does not exist» at the
+    retention sweep. This wrapper is the only Python surface that function has,
+    so the test that calls it is the only thing that proves the redefinition
+    parses, that career_sweep still owns it and that career_app may still
+    execute it. Deleting the wrapper would delete that proof and leave a
+    SECURITY DEFINER function in the database with nothing exercising it.
+    """
     rows = session.execute(text("SELECT app.tenants_with_pending_work()")).scalars()
     return [str(r) for r in rows]
 

@@ -24,10 +24,10 @@ SQLAlchemy + Alembic · Docker Compose · pytest · Anthropic API only for LLM.
 | | |
 |---|---|
 | 🧪 Test suite | `pytest -q` prints the count — **do not restate it from memory** (see [Testing](#testing)); disposable `career_test` DB only, enforced by a hard guard |
-| 🗄️ Schema | authored head — `alembic heads`; deployed — `SELECT version_num FROM alembic_version`. **These two do not match today**: staging still reads `0020` while the tree has moved past it, so the code in this checkout expects columns staging does not have. Do not deploy before the gap is closed and re-measured |
-| 🔍 Last full audit | 2026-08-05, five-lens sweep — 16 P0 + 5 P1 fixed (`docs/CHANGELOG-v1.1.md` §24), then **three adversarial rounds** aimed at the fixes themselves, each of which found real regressions in the round before it. The 42-agent sweep of 2026-07-23 is closed (`docs/AUDIT-2026-07-23.md`) |
-| 🚀 Live | worker loop, admin watchtower bot, nightly engine timer (11:00 Riyadh) — real customer journey completed end-to-end incl. first real CV delivery |
-| 🏗️ Phases | C1–C8 **code**-complete; C4 closed live on 2026-07-17 (activation bound an order to a number, adaptive delivery ran both ways, Meta receipts returned) · **C3 is the one open exit condition** — no riyal has been paid yet, no live refund tested, and the Salla token has been expired since 2026-07-29 · C9 gated on the store go-live |
+| 🗄️ Schema | authored head vs deployed head — the two commands that produce them are in [Migrations](#migrationsversions), and neither binary is on `PATH`, so use them as written. **They did not match when this line was last measured**, and the numbers are deliberately not repeated here: run both. The code in this checkout selects `next_attempt_at` in a live path, so `0022` is the floor for the worker to run at all, and the authored head is further on. Do not deploy before the gap is closed and re-measured |
+| 🔍 Last full audit | 2026-08-05, five-lens sweep — 16 P0 + 5 P1 fixed (`docs/CHANGELOG-v1.1.md` §24), then **three adversarial rounds** aimed at the fixes themselves, each of which found real regressions in the round before it. The 42-agent sweep of 2026-07-23 has its own record and its own status box — read it there rather than here (`docs/AUDIT-2026-07-23.md`); the box says stage 4 finished at 25/28 while a bullet below it still lists majors as remaining, and that disagreement has not been resolved |
+| 🚀 Live | **`systemctl is-active` says `active` and the worker is processing nothing.** Every polling cycle raises `column webhook_events.next_attempt_at does not exist` — the code in the running unit is ahead of the staging schema (see 🗄️ Schema above), so no WhatsApp message and no Salla event is being consumed. Do not read this row as the health check; measure it: `journalctl -u career-worker --since '10 min ago' \| grep -c 'does not exist'` should be **0**, and a non-zero count means the migration has still not been applied. `Restart=always` is what keeps the unit *alive* through this, which is precisely why «active» is not an answer. Historically: real customer journey completed end-to-end incl. first real CV delivery; admin watchtower bot and the 11:00 Riyadh nightly timer are armed |
+| 🏗️ Phases | C1–C8 **code**-complete; C4 closed live on 2026-07-17 (activation bound an order to a number, adaptive delivery ran both ways, Meta receipts returned) · **C3 is still the one open exit condition, for a narrower reason than before** — Salla approved on 2026-08-07 and the real store, its three products and a live credential are wired (`grep -o 'SALLA_[A-Z_]*=' .env.staging` names the keys; the values are the answer), so the token is no longer expired — but **no riyal has been paid and no live refund has been tested**, and neither is closed by a successful connection · C9 gated on the store go-live |
 
 ## System overview
 
@@ -61,12 +61,17 @@ SQLAlchemy + Alembic · Docker Compose · pytest · Anthropic API only for LLM.
 ```
 
 Three systemd services on the host share the database with the containerized
-intake API. Every LLM call goes out **PII-free**; every customer-visible send
-passes the gate **structurally**.
+intake API. **They run from this working tree, not from an image** — their
+`ExecStart` points straight at `/root/career/.venv/bin/python` and
+`/root/career/scripts/…` — so a running process carries whatever the files said
+when it started, and editing a file changes nothing until the unit restarts.
+Restart order is not a preference: **migrate first, then restart**, or the
+worker fails on every cycle against a schema it is ahead of. Every LLM call goes
+out **PII-free**; every customer-visible send passes the gate **structurally**.
 
 ---
 
-## The five data flows
+## The data flows
 
 **1 · Purchase → activation (C3/C4).**
 Salla webhook → HMAC verify → dedupe-persist → the worker re-verifies the
@@ -76,7 +81,8 @@ SHA-256) → the customer sends the token on WhatsApp → channel bound to tenan
 
 **2 · Onboarding → ACTIVE (C5).**
 Merged consent (one tap → three ledger events) → 14 Arabic questions with
-progress counters → CV upload through a six-stage hardened pipeline → **PII
+progress counters → CV upload through a six-stage hardened pipeline (size →
+sniff → scan → inspect → sanitize → sandbox) → **PII
 stripped**, then Claude extracts facts → the customer confirms each fact into
 the **achievement bank** (rejected claims land in `forbidden_claims`) →
 three-layer career-path assessment → versioned search policy → `ACTIVE`.
@@ -128,7 +134,7 @@ absent from the raw Arabic → the customer confirms (English + Arabic gloss)
 | `Dockerfile` | The api container image. |
 | `alembic.ini` | Migrations entry point (owner role). |
 | `.env.example` `.env.staging.example` `.env.production.example` | Complete templates for every setting; real `.env*` files are untracked. |
-| _(no root `Caddyfile`)_ | The live gateway config is `/etc/caddy/Caddyfile` on the host — TLS termination, exposing only `/webhooks/*` and `/health`. It is not tracked here; `backup.sh` captures it in the `config` snapshot and `docs/RUNBOOK-DISASTER-RECOVERY.md` restores it. |
+| `ops/caddy/Caddyfile` | The gateway config: TLS termination, exposing only `/webhooks/*` and `/health`. **Tracked here since 2026-08-07 and NOT yet deployed** — the live copy is `/etc/caddy/Caddyfile`, and `diff -q /etc/caddy/Caddyfile ops/caddy/Caddyfile` is the authority on whether they agree (they do not today). The tracked version adds an **access log**, which did not exist at all: during the 26-hour DNS outage a refused request — bad signature, disallowed path — left no trace in either direction, because only requests that become a `webhook_events` row are visible anywhere. Deploy steps are in the file's own header (`reload`, not `restart`). `backup.sh` still captures the live copy in the `config` snapshot and `docs/RUNBOOK-DISASTER-RECOVERY.md` restores it. |
 
 ### `src/career_core/` — pure kernel (no I/O, no DB)
 
@@ -148,25 +154,34 @@ absent from the raw Arabic → the customer confirms (English + Arabic gloss)
 | `main.py` | FastAPI app: webhook intake (verify → dedupe → 200) + `/health`. |
 | `config.py` | Typed `Settings` for every env var; arms the exact-literal secret scrubber on load. |
 | `logging_filters.py` | Secret redaction on every log record (patterns + registered literals). |
-| `audit.py` | Append-only tenant audit-trail writer. |
+| `audit.py` | Append-only tenant audit-trail writer, wired to the security, money and privacy events. |
 | `tokens.py` | Activation tokens — raw shown once, only SHA-256 stored. |
+| `arabic.py` | The single Arabic-folding authority, and a **leaf**: consent classification, the Meta-mandated STOP/RESUME reading, the standing privacy commands. Extracting it is what stopped folding a string from dragging in all of SQLAlchemy — the 569 → 57 measurement in `CHANGELOG-v1.1.md` §25 is `whatsapp/inbound.py`'s, and this line used to quote it as if it were `arabic.py`'s. Measure, don't quote: `PYTHONPATH=src .venv/bin/python -c "import sys, career.arabic; print(len(sys.modules))"` reads 54 here against a bare interpreter's 33 and `career.db.models`'s 540. The property that cannot drift with the interpreter is the one `tests/test_arabic.py` asserts: in a fresh process the only `career.*` module loaded is `career.arabic` itself. |
+| `fingerprint.py` | Content fingerprint of the package source — what is actually RUNNING, compared against what was committed (32 commits once ran unnoticed behind the live container for four days). |
+| `notify.py` | The sd_notify writer: `READY=1`, `WATCHDOG=1`, and the watchdog interval systemd advertises. No dependency and no failure mode — a missing socket means «not under systemd», so the loops run identically when started by hand. |
 
 ### `src/career/db/`
 
 | File | Purpose |
 |------|---------|
 | `base.py` | Declarative base with deterministic naming (identical DDL everywhere). |
-| `models.py` | The full ORM schema (30+ tables) with per-table RLS notes; PDFs never in the DB. |
+| `models.py` | The full ORM schema with per-table RLS notes; PDFs never in the DB. For the table count ask the schema, not this line — and use the venv interpreter, since there is no bare `python` on this host: `.venv/bin/python -c "from career.db.base import Base; import career.db.models; print(len(Base.metadata.tables))"`. |
 | `session.py` | Two-role discipline: `career_app` + transaction-local tenant GUC (fail-closed) vs owner sessions. |
 
-### `src/career/webhooks/` + `src/career/queue/`
+### `src/career/webhooks/`
 
 | File | Purpose |
 |------|---------|
 | `webhooks/intake.py` | Shared fast-intake with fingerprint dedupe. |
-| `queue/adapter.py` | Redis queue adapter behind a protocol. |
-| `queue/message.py` | Queue envelope (PII-free by contract). |
-| `queue/outbox.py` | Transactional outbox relay. |
+
+> **The database IS the queue** (`docs/DEVIATIONS.md` D24). `queue/` and
+> `worker/` were written, tested, and never had a producer or a consumer; they
+> were deleted on 2026-08-06. Every inbound event becomes a `webhook_events`
+> row at the door and the worker polls it, which is why the 3 August incident
+> was **recoverable**: `scripts/replay_lost_events.py` could re-read the rows
+> and refuse anything that might message a customer twice. A Redis list would
+> have let the wrong consumer take them with nothing left to replay — the queue
+> would have turned a recoverable incident into permanent loss.
 
 ### `src/career/salla/` — commerce (C3)
 
@@ -174,9 +189,14 @@ absent from the raw Arabic → the customer confirms (English + Arabic gloss)
 |------|---------|
 | `signature.py` | Constant-time HMAC verification; fail-closed on missing secret. |
 | `webhook.py` | Event parsing + intake. |
-| `client.py` | Salla API client with the **paid-status whitelist** (unknown → never provision). |
-| `provisioning.py` | Order → tenant + subscription + token; idempotent; **re-verifies via API**. |
+| `client.py` | Salla API client with the **paid-status whitelist** (unknown → never provision). Read-only: `get_order` is the only call it makes, which is why nothing in this project can write the remaining-seat count back onto a store page (`docs/DEVIATIONS.md` D26 item 3). |
+| `provisioning.py` | Order → tenant + subscription + token; idempotent; **re-verifies via API**; the triple match (product, amount, currency) refuses anything else. |
 | `subscriptions.py` | 11-state machine with an explicit transition table + event trail. |
+| `renewal.py` | The second payment **continues**: one subscription row per Salla order, the previous retired to `EXPIRED` — extending one row would erase the money trail a later refund has to find (§16, D18). |
+| `lifecycle.py` | The paper's own schedule as one idempotent daily sweep: day-27/29 reminders → `GRACE` 48h → `EXPIRED` → recovery message after 7 days. |
+| `activation_link.py` | The `wa.me` deep link with «تفعيل &lt;token&gt;» pre-filled — issued on demand, never echoed into a permanent transcript. |
+| `seats.py` | The founding-seat counter the store page promises is honest («ما نبيع الكرسي رقم ٣١»). It is computed from real subscription rows and shown to the **operator on Telegram** — the store page's own number is still updated by hand. |
+| `tokens.py` | The Salla credential: captured from the `app.store.authorize` webhook and refreshed **before** expiry by `scripts/refresh_salla_token.py` on a daily timer. It exists because the previous token simply reached its expiry with no renewal path — the one moment Salla ever offers a replacement was defined and deliberately not consumed, and sales stopped for nine days (CHANGELOG-v1.1 §29, §30). Salla's refresh tokens are **single-use**, so the script holds a lock: two exchanges racing each other make Salla revoke everything and require the merchant to reinstall the app. |
 
 ### `src/career/whatsapp/` — messaging (C4)
 
@@ -189,9 +209,11 @@ absent from the raw Arabic → the customer confirms (English + Arabic gloss)
 | `adaptive.py` | Delivery planning: open → direct, closed → template-then-hold, opted-out → nothing. |
 | `delivery.py` | Grouped-bundle execution with per-job failure isolation and honest statuses. |
 | `templates.py` | The template registry with its Meta CATEGORY (utility vs marketing — they are priced ~2.4× apart). Submitted is not approved: the nightly asks the live account which names are actually APPROVED and takes the cheapest, so a name PENDING at Meta degrades rather than silently billing at the marketing rate. |
-| `inbound.py` | Inbound classification (activation / STOP / support / other). |
-| `activation.py` + `activation_flow.py` | Token → tenant binding; checks **before** any mutation; the funnel-inheritance exception. |
-| `worker.py` | Conversation worker: idempotency, DB-verified ownership, routing, outcome buttons, receipts. |
+| `inbound.py` | Inbound classification (activation / STOP / support / other) over the Arabic folding in `arabic.py`. |
+| `activation_flow.py` | Token → tenant binding; checks **before** any mutation; the funnel-inheritance exception. A buyer whose channel is still opted out gets a **different welcome** — one message, not two, saying the subscription is running, that his own earlier stop is why nothing will arrive, and the single word that undoes it — plus a `paid_while_opted_out` ticket on the operator's screen. `opt_out_at` is pointedly NOT cleared: a payment does not override a standing compliance instruction. **Renewal is not covered by this** — `salla/provisioning._announce_renewal` only sends on an OPEN window and raises no ticket for a silenced renewer. (A duplicate `activation.py` was deleted — D25: it stripped only `+` from the phone, so any number an operator typed with a space or a dash produced a dead `wa.me` link.) |
+| `phones.py` | Phone-shape tolerance: Meta sends `from` without the leading `+` while operator settings are written with it, and every literal comparison silently missed. |
+| `samples.py` | The «عينة» request — a prospect asking to see the work before paying, which the store copy promises literally. |
+| `worker.py` | Conversation worker: idempotency, DB-verified ownership, routing, outcome buttons, receipts, retry budget + dead letter. Its **last** branch escalates a لمّاح+ customer's ordinary message to `promises/career_session.escalate_direct_message` — last, and not by keyword, because two live incidents came from command sets built on common Arabic nouns, and a keyword tight enough to be safe matches almost nothing a person writes. **Two gaps are open in that branch as written**: it is guarded by `landed is None`, so the message that lands a held delivery — the likeliest message of the day — escalates nothing; and it fires on any button id, so a tap that matched nothing burns the customer's one open ticket. |
 
 ### `src/career/onboarding/` — C5
 
@@ -201,13 +223,18 @@ absent from the raw Arabic → the customer confirms (English + Arabic gloss)
 | `orchestrator.py` | Conversation brain: consent, 14 questions, batch confirmation, privacy commands, reminders. |
 | `collection.py` | Question bank (labels ≤ 20 chars — WhatsApp cap) + answer parsing. |
 | `consents.py` | Purpose-separated append-only consent ledger + fail-closed gate. |
-| `upload.py` | Six-stage hardened upload pipeline (sniff → scan → inspect → sanitize → sandbox) + the clamd client, its three-way readiness state and the declared policy for a file no engine could read. |
+| `upload.py` | Six-stage hardened upload pipeline (size → sniff → scan → inspect → sanitize → sandbox) + the clamd client, its three-way readiness state and the declared policy for a file no engine could read. |
 | `extract_worker.py` | Sandbox child: rlimits before parsing, defusedxml, output caps. |
 | `extraction.py` | PII strip → assert-absent → Claude structured extraction (results ≠ truth). |
 | `confirmation.py` | Facts → achievement bank; rejections feed `forbidden_claims`. |
 | `paths.py` | Three-layer career-path assessment with weak-fit override. |
 | `policy.py` | Versioned search-policy builder + Arabic summary card. |
-| `privacy.py` | Export / pause / resume / two-step delete honoring retention. |
+| `privacy.py` | Export / pause / resume / two-step delete honoring retention — what deserves deletion deserves delivery, and a structural test holds the two lists equal (D19). |
+| `retention.py` | The 90-day retention promise with an owner at last: three published texts promised it and nothing ran it. |
+| `enrichment.py` | Thin-role enrichment (F-ENRICH): post-activation, opportunity-triggered, once ever per role. |
+| `achievement_render.py` | Colloquial Arabic → one grounded English bullet, behind `bullet_is_grounded` — a deterministic cross-lingual guard that rejects any number or entity absent from the raw Arabic. |
+| `bullet_panel.py` | The quality panel: nothing reaches the customer on a single attempt (F-PANEL). |
+| `intent.py` | «What does this customer WANT?» — the wider question that replaced «is this text an achievement?» (F-INTENT). |
 
 ### `src/career/engine/` — C6
 
@@ -228,8 +255,8 @@ absent from the raw Arabic → the customer confirms (English + Arabic gloss)
 | File | Purpose |
 |------|---------|
 | `schemas.py` | Pydantic models: `MasterCV`, `TailoredCV`, `ContactInfo`. |
-| `template.py` | v5 HTML template, byte-verbatim from the legacy reference, guarded by tests. |
-| `render.py` | WeasyPrint: deterministic bytes, pinned fonts, exactly one A4 page. |
+| `template.py` | The v5 CV HTML template, byte-verbatim from the legacy reference, guarded by a test that re-extracts it. (The cover-letter template went with its renderer — D23.) |
+| `render.py` | WeasyPrint with pinned fonts, exactly one A4 page. Same input → the same **document**, not the same bytes: PDF bytes depend on the font stack and fontconfig cache state, so nothing may key on a PDF hash for identity. |
 | `normalize.py` | Achievement bank → `MasterCV` normalization rules. |
 | `enforce.py` | One-page enforcement: caps, pacing, JD-ranked fill — no invention. |
 | `validate.py` | Pre-render validator: Arabic-leak (blocking) + structure + style; reason codes only. |
@@ -237,8 +264,9 @@ absent from the raw Arabic → the customer confirms (English + Arabic gloss)
 | `generate.py` | Tailoring chain + every guard + rule fallbacks + the Anthropic client with token metering. |
 | `publish.py` | Atomic pair publish; `validate_cv_binding` — the sole send authority; resolver; budget; quarantine. |
 | `deliver.py` | Arabic job cards, display filenames, grouped bundles, outcome buttons. |
-| `close.py` | Seven-state daily authority, admin summary, usage + cost rollups. |
+| `close.py` | The daily-state authority (`DAILY_STATES` is the vocabulary — see invariant 12), sole writer of the day-state table, admin summary, usage + cost rollups with refunded/cancelled/charged-back revenue excluded. |
 | `daily_run.py` | Delivery-day orchestration: tenant isolation, stale-held expiry, honest closes, cost metering. |
+| `outcome_followup.py` | The outcome question 14 days after an application — once ever, free-window only, never a paid template. The only measure the product is judged by. |
 
 ### `src/career/funnel/` — C8
 
@@ -253,17 +281,25 @@ absent from the raw Arabic → the customer confirms (English + Arabic gloss)
 | File | Purpose |
 |------|---------|
 | `admin.py` | Bot API client: sanitized sends, inline keyboards, long-poll, body-free errors. |
-| `console.py` | Stateless router: operator allowlist, self-contained callbacks, PII-free readers. |
-| `views.py` | Pure Arabic screen renderers — golden-tested. |
+| `console.py` | Stateless router: operator allowlist, self-contained callbacks, PII-free readers. The customer card's refund line is **computed** — `refund_deduction_sar` + `completed_sessions_count` scoped to the subscription row being displayed, with that period named on screen — rather than the constant it printed under a comment claiming it was computed. Naming the period is half the fix: «150 will be deducted» is not an answer without «from the refund of which order», and this card can show a session from a different period than the current one. |
+| `views.py` | Pure Arabic screen renderers — golden-tested; carries the health screen (deploy drift, scanner state) and the لمّاح+ star. |
 | `messages.py` | Small admin-message builders (TEN codes only). |
+| `weekly_report.py` | The Sunday operator report — a pure formatter; **the owed week is durable** (`0023`), so a restart cannot re-send it and an outage cannot lose it. This report goes to the OPERATOR: the customer-facing «تقرير أسبوعي» in the whitepaper's 449 tier is an entitlement nothing reads, and the name collision is what hid it. |
 
-### `src/career/storage/` + `src/career/worker/`
+### `src/career/storage/`
 
 | File | Purpose |
 |------|---------|
 | `storage/adapter.py` | `StorageAdapter` protocol (S3-compatible) + tenant key helpers. |
 | `storage/filesystem.py` | Atomic implementation: temp → write → fsync → replace → dir fsync. |
-| `worker/worker.py` | Generic queue-consumer scaffolding. |
+
+### `src/career/promises/` — what the pages sell, kept
+
+| File | Purpose |
+|------|---------|
+| `guarantee.py` | The 72-hour start guarantee, anchored on **onboarding completion** (renewal gives every period a new row, so anchoring there would restart the promise at each renewal); «the first opportunity arrived» means a day state with `delivered > 0`. Refunds stay in the owner's hands. |
+| `career_session.py` | The لمّاح+ career session: a state ledger, one per period enforced by a partial unique index, escalating to a ticket after 24 hours. The trigger is the operator's — the page sells a human. Also the tier's **direct line** (`escalate_direct_message`) and the **refund deduction** (`refund_deduction_sar`, `completed_sessions_count`) the refund page publishes; the deduction is scoped to one subscription because a customer in his fourth period would otherwise have had four sessions deducted from one order's refund. Both return a named outcome rather than a boolean — «not on that tier», «lapsed» and «already has a ticket open» are three different answers, and a caller that cannot tell them apart cannot log the truth about any of them. |
+| `price_lock.py` | The founder price lock: consulted only inside the amount-mismatch branch, one exact amount (never a ceiling), only **below** today's price, lapsing after the continuity window the store page itself states. |
 
 ### `migrations/versions/`
 
@@ -293,9 +329,34 @@ absent from the raw Arabic → the customer confirms (English + Arabic gloss)
 | `0022` | `webhook_events` retry budget + dead letter for the WhatsApp worker (any exception used to be terminal, and nothing ever selects `failed`). |
 | `0023` | `admin_bot_state.weekly_report_sent_for` — the owed week, durable; it was a process local, so a Sunday restart re-sent the report and an outage lost the week. |
 | `0024` | `webhook_events` tenant subject + raw-body redaction date — the table had no tenant column, so raw bodies carrying names and message text were in no §12 deletion, export or pruning path. |
+| `0025` | Delivery-guarantee ledger — the 72-hour start promise, anchored on onboarding completion. |
+| `0026` | `career_sessions` + the partial unique index that makes «one per period» a constraint rather than a date calculation. |
+| `0027` | `price_locks` — the founder's exact amount, with the continuity window the store page states. |
+| `0028` | `delivery_messages.channel_id` optional — the two lifecycle templates that are sent before any channel row exists were billable and unrecordable, so `close.whatsapp_spend` under-counted the WhatsApp bill (100% of it for a paid order that never activates). |
+| `0029` | Drops `outbox_events` + `processed_messages` — the queue subsystem is gone (D24), and it rebuilds `app.tenants_with_pending_work()` first, because a LANGUAGE-sql body carries no catalog dependency and would have started raising at the next retention sweep instead of failing the drop. |
 
-Anything past `0024` was authored after this table was last measured — run
-`alembic heads` rather than trusting the last row here.
+**Authored is not applied.** Ask both sides rather than reading the last row —
+and note the *form* of each command, because neither `alembic` nor `psql` is on
+this host's `PATH`: the first lives only in the venv, the second only inside the
+Postgres container. A command that errors is worse than no command here, since
+the whole point of the section is that the command IS the number.
+
+```bash
+.venv/bin/alembic heads                                  # authored head
+docker exec career_staging-postgres-1 \
+  psql -U career_owner -d career_staging \
+  -tAc 'SELECT version_num FROM alembic_version'         # deployed head
+```
+
+Neither answer is written down here on purpose — a number in this file is a
+number somebody has to remember to change, and the last two that were frozen
+into it were both stale within a day. **They disagreed when this paragraph was
+last measured**, and the code in this checkout queries columns the later
+migrations add (`worker.py` selects `next_attempt_at`, which is `0022`).
+**Migrate before deploying, or the polling loop fails on every cycle** — which
+is not a hypothetical: it is what happened for nine hours on 2026-08-06. Note
+also that `0029` DROPS two tables, so it is not part of a routine catch-up and
+needs its own decision.
 
 ### `scripts/` — live runners
 
@@ -306,16 +367,25 @@ Anything past `0024` was authored after this table was last measured — run
 | `run_admin_bot.py` | Watchtower long-poll + live health probes. |
 | `ci_create_app_role.py` | Non-superuser app role for CI. |
 | `demo_engine_tenants.py` | Demo tenants for live engine proofs. |
+| `replay_lost_events.py` | Recovery for events a broken sweep marked `ignored`: dry-run by default, compares every candidate against `delivery_messages` and refuses anything that could message a customer twice. Written for the 3 August incident. |
+| `refresh_salla_token.py` | Renews the Salla credential inside its expiry margin, on the `career-salla-token` timer. Salla's refresh tokens are single-use, so it holds a lock — two exchanges racing each other make Salla revoke everything and force the merchant to reinstall the app. |
+| `consume_stored_authorize.py` | Applies an `app.store.authorize` webhook still sitting unread in `webhook_events`. Two situations leave one behind, both live history: the event was not handled at all before CHANGELOG §29, and since 2026-08-07 a credential from a merchant we cannot prove is ours is refused rather than swallowed. |
+| `gate.sh` | CI's exact sequence — lint, types, migration drift, pytest. |
+| `deploy_preflight.sh` | The other half of the 2026-08-06 split: `gate.sh` answers «is this code safe to push» and deliberately ignores host drift, because a commit gate that stays red until somebody deploys blocks everyone and gets ignored. This one answers «may this machine be called deployed» — exit 0 only if `/etc/systemd/system` holds this repository's units **and** systemd has actually loaded them. |
+| `alert_unit_failure.sh` | The operator's «a unit stopped doing its job» message, with two callers. `ExecStopPost=` on the two always-on loops is the primary one — systemd hands it `$SERVICE_RESULT` and it speaks only for `watchdog`/`timeout`, staying silent for the ordinary restart of a deploy. `OnFailure=career-alert@%n` is the secondary one and reaches only the oneshots, which are the units that can actually enter `failed`. |
 
 ### `ops/`
 
 | Path | Purpose |
 |------|---------|
-| `systemd/career-worker.service` | Conversation loop (Restart=always). |
+| `systemd/career-worker.service` | Conversation loop, `Type=notify` + `WatchdogSec=300`. `Restart=always` kept it *alive* through both silent incidents — 34 failed cycles against a restarting Postgres on 4 August, then nine hours of every cycle failing on a column staging does not have on 6 August — with `systemctl` reporting active throughout. `READY=1` once after the boot checks and `WATCHDOG=1` at the **end of each completed cycle** is what makes «a cycle finished» observable rather than «the process exists»; `ExecStopPost=` carries the alert because a watchdog kill restarts and by arithmetic never reaches `failed`. The file's own comments hold the measurements and the deploy order. |
 | `systemd/career-engine-nightly.{service,timer}` | 11:00 Riyadh nightly (Persistent=true) — the timer file itself is the authority and carries the why. |
-| `systemd/career-admin-bot.service` | Watchtower (isolated from the worker). |
+| `systemd/career-admin-bot.service` | Watchtower (isolated from the worker); the same `Type=notify` + watchdog + `ExecStopPost=` wiring, at `WatchdogSec=240` read off this bot's own long-poll numbers rather than copied from the worker's. |
 | `systemd/career-backup.{service,timer}` `systemd/career-restore-test.{service,timer}` | Daily backup + monthly restore drill. |
-| `systemd/career-alert@.service` | `OnFailure=` handler: tells the operator a unit stayed down. |
+| `systemd/career-alert@.service` | `OnFailure=` handler: tells the operator a unit stayed down. It could not fire at all until 2026-08-06 — `RestartSec=5` against the default 10-second window allowed two starts, so the rate limit was never exhausted and no always-on unit ever reached `failed`. `tests/test_ops_watchdogs.py` recomputes that arithmetic, **from the unit files in this repository** — that check does not read the host, which is why the deployed copies could stay the old ones for nine hours on 2026-08-06 with the suite green. The host is now read by a separate check in the same file (`TestTheLiveHostRunsWhatTheRepositorySays`), comparing `ops/systemd/` against the installed file AND against systemd's loaded properties, with a bounded grace for a deploy between `cp` and `daemon-reload`. **It is red on this machine today** — see [Operations](#operations) for what has drifted. |
+| `systemd/career-post-boot.service` | Post-reboot self-report: the server says what came back up. |
+| `systemd/career-verify-restore.{service,timer}` | Independent verification that the backup a restore drill produced is the one that would actually be restored. **Authored here and not installed on this host** — `systemctl is-enabled career-verify-restore.timer` answers `not-found`, so the verification described in this row is not running. |
+| `systemd/career-salla-token.{service,timer}` | 09:00 Riyadh daily: renew the Salla credential before it expires, not after. Daily rather than weekly because the script only acts inside a margin of a few days, and daily is what turns that margin into a retry budget — a Salla outage or a host that was off costs nothing. 09:00 because the only recovery that exists when this job gives up is Fahad reinstalling the app on his store, and an alert next to the 03:30 backup is one he reads after the credential is dead. **Authored here and not installed on this host either** — so today the renewal does not run by itself. |
 | `backup/backup.sh` | Encrypted restic backup to B2: pg_dump + host storage root + volume + host config bundle. |
 | `backup/restore-test.sh` | Monthly restore drill (tables, RLS, a real tenant file, the config bundle). |
 
@@ -325,12 +395,15 @@ Anything past `0024` was authored after this table was last measured — run
 |------|---------|
 | `WHITEPAPER.html` | Product constitution: phases + exit conditions, the 15 invariants, pricing. |
 | `CHANGELOG-v1.1.md` | Approved post-v1.0 decisions (override conflicting v1.0 text). |
-| `DEVIATIONS.md` | Approved deviations D1–D19 with rationale. |
+| `DEVIATIONS.md` | Every approved deviation from the legacy reference, with its reason and its approver. Numbered `D1…`; `grep -c '^| D\|^## D' docs/DEVIATIONS.md` counts them, so no count lives here to go stale. |
 | `PLAN.md` | Full execution plan. |
 | `PROGRESS.md` | Session-by-session state + exit gates + pending decisions. |
+| `PRODUCTS-SHEET.md` `STORE-PAGES-AR.md` | What gets pasted into Salla, verbatim. Guarded by `tests/test_docs_truth.py`: a retired price fails CI, and so does a **new or reworded line on a product card** — bullet, headline or prose, compared whole rather than as a substring — every promise on the three plan cards is registered against the code that makes it true, so a reworded sale of an unbuilt feature fails by not being in the register rather than by being recognised. The register covers §6 of that sheet; the refund, privacy and founding blocks are prose and are not covered. **Read the `⛔ اقرأ قبل اللصق` block at the top of `STORE-PAGES-AR.md` before pasting anything**: it holds back the sentences the code does not currently keep, marks which of those have since shipped, and is not itself store copy. Nothing there is a softened sale — no sales sentence in that file has been edited; the argument for that is in `docs/DEVIATIONS.md` D26. |
+| `RUNBOOK-DISASTER-RECOVERY.md` | Restore from nothing: database, storage root, host config, the exact commands. |
 | `ADMIN_BOT_DESIGN.md` | Watchtower design + external-proposal evaluation. |
 | `LEGACY_KNOWLEDGE.md` | Read-only reference from the proven personal engine. |
 | `ARCHITECTURE-AR.md` | Arabic file-by-file walkthrough. |
+| `AUDIT-*.md` `CLOSURE-AUDIT-*.md` `BRAND-NAME-*.md` | Dated audit records — history, not instructions. |
 | `policies/*.md` | Privacy / refund / terms. |
 
 ---
@@ -347,7 +420,11 @@ Anything past `0024` was authored after this table was last measured — run
 8. LLM calls are PII-free — identity injected locally at assembly.
 9. Job descriptions are untrusted input — the analysis model has no tools, secrets, or control.
 10. RLS enabled + FORCE; adversarial cross-tenant tests in CI.
-11. Workers re-verify ownership from the DB — never trust queue payloads.
+11. Workers re-verify ownership from the DB — never trust a payload. There is
+    no queue to trust any more (D24), and the live entry points never read a
+    tenant id out of a request: it is derived from the phone, the order, or the
+    active set, so a forged id is not rejected — it is **never read**. A ratchet
+    test fails the day any entry point starts reading one.
 12. One honest state per customer/day — no silent success. Seven computational
     states, plus the event-driven eighth (`SKIPPED_OPTED_OUT`, CHANGELOG §12).
     `career.cv.close.DAILY_STATES` is the vocabulary; nothing restates it.
@@ -362,6 +439,16 @@ Anything past `0024` was authored after this table was last measured — run
   tests (forged writes, cross-reads, no-context) run in CI. The count is not
   maintained by hand — `tests/test_rls_meta.py` derives the table list from the
   catalog and fails CI if any of them loses ENABLE, FORCE or its policy.
+  **Read D16/D20/D21 before trusting that sentence about the RUNNING system:**
+  the three long-lived processes still open their engine as the owner role,
+  which bypasses RLS by definition, so isolation in production rests today on
+  the hand-written `WHERE tenant_id = …` in ~22 modules. Migration `0021`
+  builds the database half (fail-closed + a narrow named sweep capability +
+  audited break-glass) and is **authored, not applied**; moving the call sites
+  is staged deliberately rather than shipped as a half-applied role change.
+  And RLS here buys a forgotten predicate becoming a visible error — not
+  containment of a compromised process: PostgreSQL 16 does not enforce
+  `GRANT SET ON PARAMETER` for a custom GUC namespace, measured, not assumed.
 - **Webhooks** — constant-time HMAC on both providers; empty secret verifies
   nothing; dedupe before processing.
 - **Uploads** — magic-byte sniffing, structural inspection, metadata
@@ -379,12 +466,41 @@ Anything past `0024` was authored after this table was last measured — run
 ## Operations
 
 ```text
-career-worker.service          conversation loop (3s poll, Restart=always)
+career-worker.service          conversation loop (3s poll, Type=notify, 300s watchdog)
 career-engine-nightly.timer    11:00 Asia/Riyadh, Persistent=true
 career-admin-bot.service       operator console (long-poll)
 career-backup.timer            daily encrypted backup -> Backblaze B2
 career-restore-test.timer      monthly restore drill
+career-post-boot.service       the server reports its own recovery after a reboot
+
+career-salla-token.timer       renew the Salla credential before it expires
+career-verify-restore.timer    independent check that the backup a drill made
+                               is the one that would actually be restored
 ```
+
+`systemctl list-timers 'career-*'` is the authority on what is armed; this
+block says what each one is FOR. **The two are not the same question, and
+today they give different answers**: `ops/systemd/` is the repository's intent,
+`/etc/systemd/system/` is what the host runs. The always-on services are
+DRIFTED on this host — the deployed copies are still `Type=simple`, with no
+watchdog and no `ExecStopPost=` alert — and some units were never installed at
+all, `career-salla-token.{service,timer}` among them since 2026-08-07. That is
+a **half-finished deploy, not a missing feature**. Which units, on which side,
+is measured and never quoted from here — a list in prose goes stale between a
+deploy and a reader, and this one already did:
+
+```bash
+systemctl list-timers 'career-*' --all
+for f in ops/systemd/*; do b=$(basename "$f"); \
+  [ -e "/etc/systemd/system/$b" ] || { echo "NOT-DEPLOYED  $b"; continue; }; \
+  diff -q "/etc/systemd/system/$b" "$f" >/dev/null || echo "DRIFTED       $b"; done
+# and the same comparison as a test, including systemd's loaded properties:
+.venv/bin/python -m pytest tests/test_ops_watchdogs.py -k drift -q
+```
+
+Installing them is a `/etc` write, which the tooling's permission classifier
+refuses — so it waits on the owner's hand, alongside the staging migration and
+`ops/caddy/Caddyfile`.
 
 The Telegram watchtower gives the operator daily summaries, per-tenant cards
 (TEN codes only), platform health, business numbers, sanitized error tails,
@@ -437,7 +553,7 @@ Every variable is documented in [`.env.example`](.env.example):
 | Group | Keys |
 |-------|------|
 | Database | `DB_*` (app role) + `DB_OWNER_*` (migrations/system) |
-| Salla | `SALLA_WEBHOOK_SECRET` · `SALLA_API_KEY` · `SALLA_PRODUCT_CATALOG` · `SALLA_TOKEN_EXPIRES_AT` |
+| Salla | `SALLA_WEBHOOK_SECRET` · `SALLA_API_KEY` · `SALLA_PRODUCT_CATALOG` · `SALLA_PRODUCT_PRICING` · `SALLA_STORE_ID` · `SALLA_STORE_URL` · `SALLA_TOKEN_EXPIRES_AT` · and the three the renewal needs — `SALLA_CLIENT_ID` · `SALLA_CLIENT_SECRET` · `SALLA_REFRESH_TOKEN`. This table is a summary and `.env.example` is the list, so `grep -o '^SALLA_[A-Z_]*' .env.example` settles any disagreement — **including one open today**: `salla/tokens.py` reads `SALLA_STORE_ID` (it is what makes a signed webhook provably ours) and the template does not carry it. |
 | WhatsApp | `WHATSAPP_ACCESS_TOKEN` · `WHATSAPP_PHONE_NUMBER_ID` · `WHATSAPP_WABA_ID` · `WHATSAPP_APP_SECRET` · `WHATSAPP_VERIFY_TOKEN` |
 | LLM / search | `ANTHROPIC_API_KEY` · `SEARCHAPI_API_KEY` |
 | Operator | `TELEGRAM_ADMIN_BOT_TOKEN` · `TELEGRAM_ADMIN_CHAT_ID` · `CANARY_TEST_PHONE` |

@@ -52,8 +52,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from career.db.models import (
-    CustomerChannel,
     DeliveryGuarantee,
+    InboundMessage,
     OnboardingSession,
     Subscription,
     SubscriptionEvent,
@@ -159,6 +159,95 @@ def _first_delivery_at(
     return None
 
 
+def _paused_inside(
+    session: Session, *, tenant_id: uuid.UUID, activated_at: datetime,
+    deadline_at: datetime,
+) -> bool:
+    """Did the customer's own «وقف مؤقت» land inside the window?
+
+    AUDIT 2026-08-06. This used to be ``current_subscription(...).status ==
+    PAUSED`` — the status at SWEEP time, which is days or weeks after the
+    window it claims to describe, and the alert built on it says «كان اشتراكه
+    موقوفًا»: past tense over a present-tense reading. A customer who paused on
+    day one and resumed on day five therefore read as ``paused: false``, so
+    the single fact that most changes the operator's answer — «he asked us to
+    stop delivering, and we are about to refund him for not delivering» — was
+    absent from precisely the case it exists for. The other direction is worse
+    in a quieter way: a customer who paused a month later read as paused
+    inside a window his pause had nothing to do with.
+
+    A pause is a state CHANGE and `subscriptions.transition` records every one
+    of them, so the window is read from the events rather than guessed from
+    the present. Still deliberately coarse — one pause anywhere in seventy-two
+    hours is «كان موقوفًا» — because this is a fact handed to a human, not an
+    entitlement calculation.
+
+    Tenant-wide on purpose, though the row carries a ``subscription_id``.
+    An upgrade inside the window (§C8 keeps the customer's days) creates a NEW
+    subscription row, so a pause that lands after it names an id the guarantee
+    was never anchored to; filtering would answer «ما وقف» about a customer
+    who did. The looser read can only over-report — «somebody paused this
+    tenant's service inside the window» — which is a fact the operator wanted
+    anyway, and delivery is per TENANT, so it is the true one.
+    """
+    return session.execute(
+        select(SubscriptionEvent.id).where(
+            SubscriptionEvent.tenant_id == tenant_id,
+            SubscriptionEvent.to_status == sub_states.PAUSED,
+            SubscriptionEvent.created_at >= activated_at,
+            SubscriptionEvent.created_at <= deadline_at,
+        ).limit(1)
+    ).first() is not None
+
+
+#: `inbound_messages.classification` for the customer's own «إيقاف» and
+#: «استئناف» (whatsapp/worker) — the two rows that carry a TIMESTAMP for a
+#: switch whose column only ever remembers the latest flip.
+_STOP = "stop"
+_RESUME = "resume"
+
+
+def _silence_inside(
+    session: Session, *, tenant_id: uuid.UUID, activated_at: datetime,
+    deadline_at: datetime,
+) -> tuple[bool, bool]:
+    """Was the customer silencing us inside the window — and did he walk into
+    it already silent? Returns ``(inside, before)``.
+
+    AUDIT 2026-08-06. This used to be ``opt_out_at is not None and opt_out_at
+    <= deadline_at``: a column, read at sweep time, with no lower bound — the
+    same snapshot mistake :func:`_paused_inside` was rewritten to remove, and
+    it lied in both directions.
+
+    * `whatsapp/worker` sets `opt_out_at` on «إيقاف» and puts it back to NULL
+      on «استئناف», so it remembers exactly ONE flip. A customer who stopped
+      at hour one and resumed at hour seventy-four therefore read as
+      ``opted_out: False`` for a window he was silent through — the case most
+      likely to explain a breach, missing from the packet that explains it.
+    * With no lower bound, a silence from BEFORE the window (a buyer who
+      replies, says «إيقاف» during onboarding and activates days later) was
+      reported as a fact about the window, and the alert said «داخل المهلة»
+      about something nothing inside the window supports.
+
+    So it is read from `inbound_messages`, which timestamps every stop and
+    resume, and split into the two different sentences it always was: one
+    stop landing inside the window, and the state he entered the window in.
+    Both are handed to the operator; neither pretends to be the other.
+    """
+    rows = session.execute(
+        select(InboundMessage.classification, InboundMessage.received_at)
+        .where(InboundMessage.tenant_id == tenant_id,
+               InboundMessage.classification.in_((_STOP, _RESUME)),
+               InboundMessage.received_at <= deadline_at)
+        .order_by(InboundMessage.received_at)
+    ).all()
+    inside = any(
+        kind == _STOP and at >= activated_at for kind, at in rows
+    )
+    earlier = [kind for kind, at in rows if at < activated_at]
+    return inside, bool(earlier) and earlier[-1] == _STOP
+
+
 def _window_facts(
     session: Session, *, tenant_id: uuid.UUID, activated_at: datetime,
     deadline_at: datetime,
@@ -166,11 +255,17 @@ def _window_facts(
     """The PII-free packet the operator judges with.
 
     A breach line on its own tells him a promise broke and nothing about
-    whose fault it was. These four facts are the difference between «the
-    market had nothing that matched his filter» — which the product says out
-    loud and which he may well answer by extending — and «our WhatsApp was
-    failing for three days», which he answers by refunding before being
-    asked.
+    whose fault it was. These facts are the difference between «the market had
+    nothing that matched his filter» — which the product says out loud and
+    which he may well answer by extending — and «our WhatsApp was failing for
+    three days», which he answers by refunding before being asked.
+
+    Every one of them is a fact about the WINDOW, not about the moment the
+    sweep happens to run. That distinction is not pedantry: this packet is
+    read weeks later, beside a decision to move money, and a snapshot dressed
+    up as history is how an operator ends up refunding a customer who paused
+    the service himself — or refusing one because of something he did long
+    after the promise had already broken.
     """
     rows = session.execute(
         select(TenantDayState.state)
@@ -182,10 +277,10 @@ def _window_facts(
     for state in rows:
         day_states[str(state)] = day_states.get(str(state), 0) + 1
 
-    channel = session.execute(
-        select(CustomerChannel.opt_out_at)
-        .where(CustomerChannel.tenant_id == tenant_id)
-    ).first()
+    silenced_inside, silenced_before = _silence_inside(
+        session, tenant_id=tenant_id, activated_at=activated_at,
+        deadline_at=deadline_at,
+    )
     subscription = current_subscription(session, tenant_id)
     # Riyadh weekdays 4 and 5 are Friday and Saturday: §08 delivers Sunday to
     # Thursday, so a guarantee window can legitimately contain days on which
@@ -200,10 +295,30 @@ def _window_facts(
         day += timedelta(days=1)
     return {
         "day_states": day_states,
-        "opted_out": bool(channel and channel[0] is not None),
-        "paused": bool(subscription is not None
-                       and subscription.status == sub_states.PAUSED),
+        # Two facts, because they are two different sentences to the operator:
+        # «he silenced us inside the window» and «he walked into it silent».
+        "opted_out": silenced_inside,
+        "opted_out_before_window": silenced_before,
+        "paused": _paused_inside(
+            session, tenant_id=tenant_id, activated_at=activated_at,
+            deadline_at=deadline_at,
+        ),
         "weekend_days": weekend,
+        # The status the money is in AT THE ALERT, and the one fact here that
+        # is not a fact about the window: a customer who was already refunded
+        # or charged back must not be offered «استرداد كامل» a second time.
+        # The breach is still recorded — it really did break — but the
+        # operator is told the account is closed before he reads a remedy menu.
+        #
+        # It is frozen with the rest of the packet, so it is exact for the
+        # alert and stale for every later reader; a refund that arrives the
+        # next morning would leave this saying ACTIVE for as long as the
+        # breach sits open. :func:`open_breaches` therefore re-reads it live
+        # and keeps this value as the historical one — the freeze protects
+        # the WINDOW facts, and this was never one of them.
+        "subscription_status": (
+            subscription.status if subscription is not None else None
+        ),
     }
 
 
@@ -251,10 +366,21 @@ def _breach_alert_ar(code: str, row: DeliveryGuarantee) -> str:
     if facts.get("weekend_days"):
         lines.append("والمهلة مرت على عطلة نهاية الأسبوع — لا تسليم فيها")
     if facts.get("paused"):
-        lines.append("وكان اشتراكه موقوفًا مؤقتًا بطلبه")
+        lines.append("وكان اشتراكه موقوفًا مؤقتًا بطلبه داخل المهلة")
     if facts.get("opted_out"):
-        lines.append("وكان موقفًا للرسائل")
-    lines.append("الخيار للعميل: استرداد كامل أو تمديد المدة — وأنت تنفذه")
+        lines.append("وكان موقفًا للرسائل داخل المهلة")
+    elif facts.get("opted_out_before_window"):
+        # A different fact and therefore a different sentence: he did not
+        # silence us during the window, he arrived already silent.
+        lines.append("ودخل المهلة وهو موقف للرسائل من قبلها")
+    if facts.get("subscription_status") in sub_states.TERMINAL_STATES:
+        # A refunded or charged-back account has already had its money moved,
+        # and the remedy menu below would invite the operator to move it
+        # again. The breach stays on the record — it broke — but he reads
+        # «closed» before he reads «choose a remedy».
+        lines.append("لكن اشتراكه منتهٍ ماليًا الآن — راجع حالته قبل أي تعويض")
+    else:
+        lines.append("الخيار للعميل: استرداد كامل أو تمديد المدة — وأنت تنفذه")
     return "\n".join(lines)
 
 
@@ -277,8 +403,24 @@ def sweep_delivery_guarantee(
     Friday — the promise is in hours and does not observe our delivery week.
 
     Idempotent by state: a guarantee that is MET or SETTLED is never looked at
-    again, and a BREACHED one alerts exactly once (``alerted_at``). Returns
-    honest counters for the caller's summary.
+    again, a BREACHED one alerts once (``alerted_at``) and its facts are
+    frozen at the breach. Returns honest counters for the caller's summary.
+
+    One customer, one row, one anchor — and that holds because
+    ``onboarding_sessions`` carries ``uq_onboarding_sessions_tenant_id``. The
+    journeys query below has no ORDER BY and does not need one: a tenant
+    cannot appear twice, so there is no «which activation anchors this
+    guarantee» to get wrong. If that constraint ever goes, this loop starts
+    silently picking an arbitrary anchor per night, and «ضمان البداية» —
+    a customer starts once — stops being true of the row.
+
+    What this sweep does NOT do is decide that a breach is excusable. A
+    customer who cancelled at hour twenty still breaches at hour seventy-two:
+    the promise was made and not kept, and hiding that would leave the one
+    number the operator prices the product from quietly flattering. What the
+    facts do instead is tell him the account is already closed (see
+    :func:`_window_facts`), so he does not offer a refund to somebody who has
+    already had one.
     """
     counts = {"watching": 0, "met": 0, "breached": 0, "alerted": 0}
     journeys = session.execute(
@@ -318,14 +460,35 @@ def sweep_delivery_guarantee(
             row.status = BREACHED
             row.breached_at = now
             counts["breached"] += 1
-        row.facts = _window_facts(
-            session, tenant_id=tenant_id, activated_at=row.activated_at,
-            deadline_at=row.deadline_at,
-        )
+        if not row.facts:
+            # Written ONCE, and that is the point rather than an optimisation.
+            # The facts describe a window that is over, so there is nothing
+            # later for them to learn — but there is plenty for them to catch:
+            # this ran on every sweep, for every breach nobody had settled
+            # yet, so an opt-out or a pause that happened weeks afterwards
+            # kept being folded back into the account of a window it had
+            # nothing to do with, and the packet the operator judged with
+            # drifted every night away from what actually happened.
+            # (The empty test also backfills a row breached before this,
+            # which had no facts at all.)
+            row.facts = _window_facts(
+                session, tenant_id=tenant_id, activated_at=row.activated_at,
+                deadline_at=row.deadline_at,
+            )
         if row.alerted_at is None:
             code = session.execute(
                 select(Tenant.code).where(Tenant.id == tenant_id)
             ).scalars().first() or "TEN-????"
+            # Sent BEFORE the stamp is durable, and that ordering is chosen,
+            # not overlooked. `daily_run.sweep_promises` rolls this session
+            # back on any failure, so a sweep that dies after this line
+            # re-pages the same breach tomorrow — a duplicate, which is loud,
+            # obvious and costs the operator a glance. The other ordering
+            # trades that for a breach that was never announced and whose
+            # record says it was, and this whole module exists because the
+            # customer was the only alarm the promise had. `escalate_overdue`
+            # stamps first for the opposite reason: its durable half is a
+            # support ticket, so the alert there is the redundant copy.
             _alert(admin_client, _breach_alert_ar(str(code), row))
             row.alerted_at = now
             counts["alerted"] += 1
@@ -338,6 +501,14 @@ def open_breaches(session: Session) -> list[BreachRow]:
 
     Oldest first for the same reason the ticket screen is: the customer who
     has been owed an answer longest is the one this product may not lose.
+
+    The facts are the frozen ones — they describe a window that is over —
+    with ONE exception, and it is the one fact that was never about the
+    window: `subscription_status`. Frozen, it says what the account was on
+    the night of the breach, and this screen is read days later beside a
+    button that moves money; a refund that landed yesterday would still read
+    ACTIVE here. It is re-read live, and the frozen value is kept beside it
+    under its own name so the history is not lost.
     """
     rows = session.execute(
         select(DeliveryGuarantee, Tenant.code)
@@ -345,15 +516,22 @@ def open_breaches(session: Session) -> list[BreachRow]:
         .where(DeliveryGuarantee.status == BREACHED)
         .order_by(DeliveryGuarantee.breached_at)
     ).all()
-    return [
-        BreachRow(
+    out: list[BreachRow] = []
+    for row, code in rows:
+        facts = dict(row.facts or {})
+        if "subscription_status" in facts:
+            facts["subscription_status_at_breach"] = facts["subscription_status"]
+        subscription = current_subscription(session, row.tenant_id)
+        facts["subscription_status"] = (
+            subscription.status if subscription is not None else None
+        )
+        out.append(BreachRow(
             code=str(code), tenant_id=row.tenant_id,
             activated_at=row.activated_at, deadline_at=row.deadline_at,
             first_delivery_at=row.first_delivery_at,
-            facts=dict(row.facts or {}), remedy=row.remedy,
-        )
-        for row, code in rows
-    ]
+            facts=facts, remedy=row.remedy,
+        ))
+    return out
 
 
 def lost_days(row: DeliveryGuarantee, *, now: datetime) -> int:

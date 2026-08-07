@@ -1,0 +1,40 @@
+# Renew the Salla credential BEFORE it expires (CHANGELOG §29, condition 4).
+#
+# The credential expired on 2026-07-29 with no path to renew it and nobody was
+# told for nine days; the first symptom was paid orders that provisioned
+# nothing. This unit is the «مؤقّت يملك سببه» that closes it.
+#
+# Type=oneshot with OnFailure=, exactly like career-backup.service and
+# career-engine-nightly.service: a scheduled job that exits non-zero is a job
+# that did not do its work, and career-alert@ puts that fact on the operator's
+# phone once, deduplicated. The ACTIONABLE sentence — «reinstall the app on
+# your store» — comes from the script's own admin message, which escalates by
+# tier instead of repeating; the two are deliberately different messages,
+# because «the refresh job failed» and «the credential is about to die and
+# only you can fix it» need different words and different frequencies.
+#
+# EnvironmentFile carries SALLA_CLIENT_ID / SALLA_CLIENT_SECRET and the
+# Telegram admin credentials. No DB_HOST/REDIS_HOST override ride-along is
+# needed here (unlike career-engine-nightly.service): this job touches neither
+# Postgres nor Redis — it reads the credential store, calls one HTTPS endpoint
+# and writes the credential file back through it.
+#
+# NOT installed by anyone but Fahad: this file is the deliverable, and the
+# `cp` + `daemon-reload` + `enable --now` is his gated step (scripts/gate.sh
+# --host tells him whether the machine is running what this repository says).
+[Unit]
+Description=Refresh the Salla OAuth credential before it expires
+Wants=network-online.target
+After=network-online.target
+OnFailure=career-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/career
+EnvironmentFile=/root/career/.env.staging
+ExecStart=/root/career/.venv/bin/python /root/career/scripts/refresh_salla_token.py
+# The script takes its own single-flight lock (a second refresh presenting the
+# same single-use token is how Salla's OAuth server is made to revoke
+# everything), so a run that overlaps its predecessor exits without asking.
+# This is the outer belt: a hung HTTPS call cannot pile runs up across days.
+TimeoutStartSec=120

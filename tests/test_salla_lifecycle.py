@@ -7,6 +7,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
+import pytest
 from sqlalchemy import text as sql_text
 from sqlalchemy.orm import Session
 
@@ -229,3 +230,274 @@ def test_unclaimed_gets_one_reminder_before_deadline(
     counts2 = sweep_subscription_lifecycle(
         owner_session, now=datetime.now(UTC), whatsapp_client=wa)
     assert counts2["unclaimed_reminded"] == 0
+
+
+# ── the template spend that was never written down ───────────────────────────
+
+
+def _template_rows(s: Session, tenant_id: str) -> list[tuple]:
+    return list(s.execute(sql_text(
+        "SELECT template_name, channel_id, status, wa_message_id FROM"
+        " delivery_messages WHERE tenant_id = :t AND kind = 'template'"
+        " ORDER BY created_at"), {"t": tenant_id}).all())
+
+
+def _tenant_of(s: Session, sub_id: uuid.UUID) -> str:
+    return str(s.execute(sql_text(
+        "SELECT tenant_id FROM subscriptions WHERE id = :i"),
+        {"i": str(sub_id)}).scalar_one())
+
+
+def test_renewal_reminder_is_recorded_and_therefore_billed(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """The reminder Meta charges us for now exists in the ledger we bill from.
+
+    Before this, `_channel_phone` loaded the whole channel, kept the phone and
+    dropped the row, and `_send_template` received a message id and dropped
+    that too — so a renewing customer's three lifecycle templates per period
+    were billed by Meta and counted by nobody. `close.whatsapp_spend` derives
+    the entire WhatsApp bill from `delivery_messages`, so this assertion is
+    the money one: the send is visible to the operator's cost screen.
+    """
+    from career.cv import close as close_mod
+
+    sub_id = _active_sub(owner_session, period_end=NOW + timedelta(days=2, hours=12))
+    tenant_id = _tenant_of(owner_session, sub_id)
+    wa = FakeWhatsAppClient()
+    sweep_subscription_lifecycle(owner_session, now=NOW, whatsapp_client=wa)
+    owner_session.commit()
+
+    rows = _template_rows(owner_session, tenant_id)
+    assert [r.template_name for r in rows] == ["renewal_reminder"]
+    # attributed to the channel it actually went to, and carrying the id Meta
+    # will quote back in its delivery receipt
+    assert rows[0].channel_id is not None
+    assert rows[0].status == "sent"
+    assert rows[0].wa_message_id == [
+        m.message_id for m in wa.sent if m.kind == "template"
+    ][0]
+
+    spend = close_mod.whatsapp_spend(owner_session, tenant_id=uuid.UUID(tenant_id))
+    # renewal_reminder is a UTILITY template — priced, not free
+    assert spend["wa_utility"][0] == 1
+    assert spend["wa_utility"][1] > 0
+
+
+def test_recovery_and_grace_reminders_are_recorded_too(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """The other two channel-bound sites, so «three of five» is a fact."""
+    graced = _active_sub(owner_session, period_end=NOW - timedelta(hours=1))
+    lapsed = _active_sub(owner_session, period_end=NOW - timedelta(days=10))
+    owner_session.execute(sql_text(
+        "UPDATE subscriptions SET status = 'EXPIRED' WHERE id = :id"),
+        {"id": str(lapsed)})
+    owner_session.commit()
+
+    wa = FakeWhatsAppClient()
+    sweep_subscription_lifecycle(owner_session, now=NOW, whatsapp_client=wa)
+    owner_session.commit()
+
+    assert [r.template_name for r in
+            _template_rows(owner_session, _tenant_of(owner_session, graced))] \
+        == ["renewal_reminder"]
+    assert [r.template_name for r in
+            _template_rows(owner_session, _tenant_of(owner_session, lapsed))] \
+        == ["recovery"]
+
+
+def test_claim_reminder_to_an_order_phone_is_recorded_with_no_channel(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """The structural half: this template fires BEFORE any channel exists.
+
+    A buyer who pays and never activates has one CustomerChannel — none — and
+    `delivery_messages.channel_id` was NOT NULL, so 100% of that order's
+    template spend was unrecordable rather than merely unrecorded. 0028 made
+    the column nullable for exactly this row.
+    """
+    order_id = f"ORD-{uuid.uuid4()}"
+    client = FakeSallaClient({
+        order_id: SallaOrder(order_id, "paid", "prod_pro", Decimal("279.00"),
+                             "SAR", customer_phone="0555000222")
+    })
+    result = provision_order(owner_session, order_id, salla_client=client,
+                             product_catalog={"prod_pro": "professional"},
+                             expected_pricing=_PR)
+    owner_session.commit()
+    owner_session.execute(sql_text(
+        "UPDATE subscriptions SET created_at = now() - interval '6 days'"
+        " WHERE id = :i"), {"i": result.subscription_id})
+    owner_session.commit()
+
+    counts = sweep_subscription_lifecycle(
+        owner_session, now=datetime.now(UTC),
+        whatsapp_client=FakeWhatsAppClient())
+    owner_session.commit()
+    assert counts["unclaimed_reminded"] == 1
+
+    rows = _template_rows(owner_session, str(result.tenant_id))
+    assert [r.template_name for r in rows] == ["welcome_activation"]
+    assert rows[0].channel_id is None       # nothing to point at, and that is fine
+
+
+class _OverlongIdClient(FakeWhatsAppClient):
+    """Meta returns, on ONE send of the night, a message id longer than the
+    column that stores it. Everything else about this client is honest.
+
+    This is the shape the probe used, and it is the cheapest way for a
+    provider-controlled value to become an INSERT the database refuses.
+    """
+
+    def __init__(self, poison_call: int = 2) -> None:
+        super().__init__()
+        self.template_calls = 0
+        self._poison = poison_call
+        self.poisoned_phone: str | None = None
+
+    def send_template(self, to_phone, template_name, language,  # type: ignore[no-untyped-def]  # noqa: ANN001,ANN201
+                      variables=None, buttons=()):
+        super().send_template(to_phone, template_name, language,
+                              variables, buttons)
+        self.template_calls += 1
+        if self.template_calls == self._poison:
+            self.poisoned_phone = to_phone
+            return "wamid.HBg" + "X" * 200      # varchar(128) cannot hold it
+        return self.sent[-1].message_id
+
+
+def _template_phones(wa: FakeWhatsAppClient) -> list[str]:
+    return [m.to_phone for m in wa.sent if m.kind == "template"]
+
+
+def _sub_of_phone(s: Session, phone: str) -> str:
+    return str(s.execute(sql_text(
+        "SELECT sub.id FROM subscriptions sub JOIN customer_channels c"
+        " ON c.tenant_id = sub.tenant_id WHERE c.phone_e164 = :p"),
+        {"p": phone}).scalar_one())
+
+
+def _marks(s: Session, sub_ids: list[uuid.UUID]) -> set[str]:
+    return {str(r[0]) for r in s.execute(sql_text(
+        "SELECT subscription_id FROM subscription_events WHERE event_type ="
+        " 'renewal_reminder_d3' AND subscription_id::text = ANY(:ids)"),
+        {"ids": [str(i) for i in sub_ids]})}
+
+
+def test_one_unwritable_ledger_row_never_discards_the_nights_marks(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """«accounting never blocks the lifecycle» — the promise, now true.
+
+    The guard around `record_out` could not fire: `record_out` only calls
+    `session.add()`, so the INSERT is emitted by the NEXT flush — `_mark`'s,
+    one line later and OUTSIDE the try. And `engine/cli.py` runs the whole
+    sweep in ONE Session with ONE commit under one broad `except`, so a single
+    ledger row the database refuses discarded the `subscription_events` marks
+    of EVERY customer already processed that night. Meta had charged for those
+    templates, the database recorded none of them, and the next night re-sent
+    and re-paid for all of them.
+
+    Reproduced exactly: three customers due a reminder, the second one's
+    provider message id too long for its column, one session, one commit.
+    """
+    subs = [_active_sub(owner_session, period_end=NOW + timedelta(days=2, hours=12))
+            for _ in range(3)]
+    wa = _OverlongIdClient(poison_call=2)
+
+    # the nightly caller's shape, verbatim (engine/cli.py)
+    blew_up = False
+    try:
+        sweep_subscription_lifecycle(owner_session, now=NOW, whatsapp_client=wa)
+        owner_session.commit()
+    except Exception:  # noqa: BLE001 — exactly what cli.py does
+        owner_session.rollback()
+        blew_up = True
+
+    assert blew_up is False
+    phones = _template_phones(wa)
+    assert len(phones) == 3
+    assert wa.poisoned_phone == phones[1]
+
+    # the customer served BEFORE the bad row keeps his mark — the blast radius
+    marked = _marks(owner_session, subs)
+    assert _sub_of_phone(owner_session, phones[0]) in marked
+    # and so does everybody else, including the one whose ledger row was bad:
+    # he was charged for, so tomorrow must not send and pay again
+    assert len(marked) == 3
+
+    # the send is still billed — with no receipt id, because the provider gave
+    # us one we cannot store, and inventing a truncated one would be worse
+    rows = list(owner_session.execute(sql_text(
+        "SELECT wa_message_id FROM delivery_messages WHERE kind = 'template'"
+        " AND tenant_id IN (SELECT tenant_id FROM subscriptions WHERE"
+        " id::text = ANY(:ids))"),
+        {"ids": [str(i) for i in subs]}).all())
+    assert len(rows) == 3
+    assert sum(1 for r in rows if r[0] is None) == 1
+
+
+def test_a_ledger_row_the_database_refuses_is_rolled_back_alone(
+    owner_session: Session, clean_billing: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The general case, not just the id length: ANY unwritable ledger row.
+
+    Validation catches the value we know about; the savepoint catches the ones
+    we do not. Here the row names a channel that does not exist — a foreign
+    key the database refuses at flush — and the night's other marks must
+    still be there afterwards.
+    """
+    from career.salla import lifecycle as lc
+
+    subs = [_active_sub(owner_session, period_end=NOW + timedelta(days=2, hours=12))
+            for _ in range(3)]
+    real = lc.record_out
+    calls = {"n": 0}
+
+    def _poisoned(session, **kw):  # type: ignore[no-untyped-def]  # noqa: ANN001,ANN202
+        calls["n"] += 1
+        if calls["n"] == 2:
+            kw = {**kw, "channel_id": uuid.uuid4()}   # no such channel
+        return real(session, **kw)
+
+    monkeypatch.setattr(lc, "record_out", _poisoned)
+
+    blew_up = False
+    try:
+        sweep_subscription_lifecycle(owner_session, now=NOW,
+                                     whatsapp_client=FakeWhatsAppClient())
+        owner_session.commit()
+    except Exception:  # noqa: BLE001
+        owner_session.rollback()
+        blew_up = True
+
+    assert blew_up is False
+    assert len(_marks(owner_session, subs)) == 3
+    # the refused row is gone; the two writable ones are there
+    written = owner_session.execute(sql_text(
+        "SELECT count(*) FROM delivery_messages WHERE kind = 'template' AND"
+        " tenant_id IN (SELECT tenant_id FROM subscriptions WHERE"
+        " id::text = ANY(:ids))"),
+        {"ids": [str(i) for i in subs]}).scalar_one()
+    assert written == 2
+
+
+def test_a_template_that_failed_to_send_is_never_billed(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """The mirror image of the hole, and the reason the row is written AFTER
+    the client returns: a bill we were never charged is as wrong as one we
+    were charged and never counted."""
+    class _Refusing(FakeWhatsAppClient):
+        def send_template(self, *a, **k):  # type: ignore[no-untyped-def]
+            raise RuntimeError("meta refused")
+
+    sub_id = _active_sub(owner_session, period_end=NOW + timedelta(days=2, hours=12))
+    tenant_id = _tenant_of(owner_session, sub_id)
+    counts = sweep_subscription_lifecycle(
+        owner_session, now=NOW, whatsapp_client=_Refusing())
+    owner_session.commit()
+    assert counts["reminded"] == 0
+    assert _template_rows(owner_session, tenant_id) == []

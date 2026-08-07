@@ -219,6 +219,85 @@ for unit in career-worker.service career-admin-bot.service; do
   fi
 done
 
+# A unit file in the repository is not a unit file on the machine. On
+# 2026-08-06 the audit above was written, committed and reviewed while
+# /etc/systemd/system still held the version from 2026-07-31 — the fix existed
+# everywhere except where it runs. Every check on this page reads the LIVE
+# unit, so drift is exactly what it cannot see by itself.
+for unit_file in "$REPO_ROOT"/ops/systemd/*.service "$REPO_ROOT"/ops/systemd/*.timer; do
+  name=$(basename "$unit_file")
+  installed="/etc/systemd/system/$name"
+  if [[ ! -e "$installed" ]]; then
+    bad "$name: in the repository but NOT installed — run: cp $unit_file $installed && systemctl daemon-reload"
+  elif cmp -s "$unit_file" "$installed"; then
+    pass "$name: installed copy matches the repository"
+  else
+    bad "$name: the installed copy DIFFERS from the repository — the fix is not running (diff $installed $unit_file)"
+  fi
+done
+
+# The wedge cover itself, asserted on the LIVE units: both loops send
+# WATCHDOG=1 only after a cycle completes, so a deadline of zero means a
+# process that spins forever without processing anything still reports
+# `active` — the 2026-08-04 and 2026-08-06 shape. See career-worker.service.
+for unit in career-worker.service career-admin-bot.service; do
+  svc_type=$(systemctl show "$unit" -p Type --value 2>/dev/null)
+  watchdog=$(to_usec "$(systemctl show "$unit" -p WatchdogUSec --value 2>/dev/null)")
+  if [[ "$svc_type" != "notify" ]]; then
+    bad "$unit: Type=$svc_type — systemd cannot hear this loop, so a wedged cycle is invisible"
+  elif [[ "$watchdog" -le 0 ]]; then
+    bad "$unit: Type=notify but NO watchdog deadline — nothing enforces the heartbeat"
+  else
+    pass "$unit: watchdog armed at $((watchdog / 1000000))s"
+  fi
+done
+
+# A matching FILE is not a matching MACHINE, and `cmp` above cannot tell the
+# difference. Two ways for every check on this page to pass while systemd runs
+# something else entirely:
+#
+#   the daemon-reload that never came — the deploy copied the file and stopped.
+#     systemd keeps serving the old unit out of memory, `cmp` is green because
+#     it reads the disk, and the machine is on the previous release. This is
+#     the 2026-08-06 shape with the copy step done.
+#   a drop-in — /etc/systemd/system/<unit>.d/*.conf overrides any directive in
+#     the unit without changing one byte of it, so `WatchdogSec=0` can be added
+#     from outside the repository and every file comparison stays green.
+#
+# Both are visible only in what systemd has LOADED, which is what this asks.
+for unit in career-worker.service career-admin-bot.service; do
+  stale=$(systemctl show "$unit" -p NeedDaemonReload --value 2>/dev/null)
+  dropins=$(systemctl show "$unit" -p DropInPaths --value 2>/dev/null)
+  if [[ "$stale" == "yes" ]]; then
+    bad "$unit: systemd is NOT running the file on disk — finish the deploy: systemctl daemon-reload && systemctl restart $unit"
+  else
+    pass "$unit: systemd is running the file on disk"
+  fi
+  if [[ -n "$dropins" ]]; then
+    bad "$unit: overridden by drop-in(s), so the unit file in git is not the last word — $dropins"
+  else
+    pass "$unit: no drop-in overrides"
+  fi
+done
+
+# The wedge alert hook, asserted on the LIVE unit rather than on the file.
+# Without it a wedged worker is killed and restarted every WatchdogSec+RestartSec
+# forever and never reaches `failed`, so OnFailure= never fires and nobody is
+# told — a watchdog that heals the symptom and hides the illness.
+for unit in career-worker.service career-admin-bot.service; do
+  hook=$(systemctl show "$unit" -p ExecStopPost --value 2>/dev/null)
+  case "$hook" in
+    *alert_unit_failure.sh*ignore_exit_status=yes*)
+      pass "$unit: watchdog alert hook armed and non-fatal" ;;
+    *alert_unit_failure.sh*)
+      # The leading '-' in the unit file. Without it a Telegram outage turns
+      # the alerting into a failure of the service it was reporting on.
+      bad "$unit: alert hook is loaded WITHOUT the leading '-' — a failed alert would fail the service itself" ;;
+    *)
+      bad "$unit: NO ExecStopPost alert hook loaded — a watchdog kill restarts it silently forever, since WatchdogSec+RestartSec can never exhaust the start limit" ;;
+  esac
+done
+
 section "7. gateway and health"
 caddy_state=$(systemctl is-active caddy 2>/dev/null || echo inactive)
 if [[ "$caddy_state" == "active" ]]; then

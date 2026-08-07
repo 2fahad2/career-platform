@@ -24,6 +24,7 @@ from sqlalchemy import create_engine
 from sqlalchemy import text as sql_text
 from sqlalchemy.orm import Session
 
+from career import notify as sd_notify
 from career.config import get_settings
 from career.fingerprint import source_fingerprint
 from career.logging_filters import install_secret_redaction
@@ -395,10 +396,27 @@ def main() -> None:  # pragma: no cover — live runner over tested parts
     )
     probes = LiveProbes(settings)
     try:
-        client.send_admin("🏰 برج المراقبة جاهز — أرسل /start")
+        # `/start` on a line of its own: inside the Arabic line the operator's
+        # client reversed it, and alone it is tappable.
+        client.send_admin("🏰 برج المراقبة جاهز — أرسل\n/start")
     except TelegramSendError:
         logger.warning("watchtower heartbeat failed", exc_info=True)
     logger.info("watchtower up — long-polling")
+
+    # ── the heartbeat (career-admin-bot.service, WatchdogSec) ─────────────
+    # After start-up, before the first poll. The asymmetry that makes this
+    # unit matter more than it looks: when the WORKER wedges, customers stop
+    # being answered and someone eventually notices; when the WATCHTOWER
+    # wedges, the operator's screen just goes quiet — and a quiet screen is
+    # what a healthy day looks like.
+    sd_notify.ready()
+    armed = sd_notify.watchdog_interval_s()
+    if armed:
+        logger.info("systemd watchdog armed: a poll cycle must complete every "
+                    "%.0fs or this watchtower is killed and restarted", armed)
+    else:
+        logger.warning("no systemd watchdog on this process — a wedged poll "
+                       "will NOT be noticed by anything")
 
     while True:
         try:
@@ -430,6 +448,14 @@ def main() -> None:  # pragma: no cover — live runner over tested parts
                     on_skip=lambda: _skip_poisoned_update(client),
                 )
                 deliver_outcomes(client, outcomes)
+            # THE LAST STATEMENT OF THE CYCLE — see run_worker_loop.py for the
+            # full reasoning. Here it means: getUpdates RETURNED (an empty
+            # long poll is a completed cycle, which is why a quiet day still
+            # beats every ~50s) and every update it carried was delivered. A
+            # poll that blocks forever, a Telegram token that stopped being
+            # accepted, a database the cursor cannot be read from — none of
+            # them reach this line, and none of them stop this loop either.
+            sd_notify.watchdog()
         except Exception:  # noqa: BLE001 — the console must survive anything
             logger.error("watchtower cycle failed", exc_info=True)
             time.sleep(ERROR_PAUSE)

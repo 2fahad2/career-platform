@@ -275,6 +275,37 @@ A6 رابط التفعيل ما زال يصل محادثة ذات سجل دائ�
 | **F1** | `src/career/salla/provisioning.py` · `tests/test_salla_provisioning.py` | **C1 (الأخطر)**: حدث موقَّع بلا `merchant` يبلغ فرع UNCLAIMED **فيستبدل الاعتماد الحيّ ويرسل إنذارًا أخضر** · **C2**: رفض متجر أجنبي يُرسل المشغّل إلى «راجع مساحة القرص»، **ويتكرر بلا تصعيد** |
 | **F2** | `src/career/engine/cli.py` · `src/career/webhooks/intake.py` · `src/career/salla/tokens.py` · `scripts/refresh_salla_token.py` · `tests/test_salla_tokens.py` · `tests/test_salla_token_refresh.py` | **C3**: `days_left=None` تعني «لا توكن» و«لا تاريخ» معًا، فيُؤمر المشغّل بإعادة تثبيت مدمّرة · **C4**: المكنسة تُتلف الاعتماد الذي وعد الرفض بحفظه · **C5**: `.bak` توكن حيّ بلا دورة حياة · **C6**: `repr` يحمل التوكنين |
 
+### الموجة الحادية عشرة — سُجّلت قبل الإطلاق (٧ أغسطس، بكامل القوى)
+
+| # | الملكية الحصرية | المهمة |
+|---|---|---|
+| **G1** | `scripts/consume_stored_authorize.py` · `tests/test_consume_authorize.py` (جديد) | قارئ المتجر في السكربت **يخالف قارئ العامل** بعد إصلاح F1 — فتقريره التمهيدي يتنبّأ بغير ما سيقع، وبوابته تختلف عن الكاتب الذي وُجدت لتتنبأ به |
+| **G2** | `src/career/telegram/console.py` · `src/career/whatsapp/inbound.py` · `src/career/promises/career_session.py` · `tests/test_admin_console.py` | **مبنيّ ولا يُنادى**: اقتطاع الاسترداد الصحيح لا نداء إنتاجي له والبرج يطبع قيمة ثابتة **فيُنقص من حساب العميل** · ورسالة عميل لمّاح+ الحرّة **لا تبلغ المشغّل أبدًا**، فالباقية ٤٤٩ تعود «ما يأخذه ١٩٩ زائد نجمة» |
+| **G3** | `src/career/whatsapp/activation_flow.py` · `tests/test_activation_flow.py` | من قال «إيقاف» ثم **اشترى من جديد** يُفعَّل ويستقبل الترحيب **ثم يُتخطّى كل ليلة إلى الأبد ولا شيء يخبره**. ولا يُمسح الإيقاف تلقائيًا — **تعليمة امتثال قائمة** |
+
+### الموجة الثانية عشرة — عيوب المراجعة على موجة الوصل (سُجّلت قبل الإطلاق، ٧ أغسطس)
+
+| # | الملكية الحصرية | المهمة |
+|---|---|---|
+| **H1** | `src/career/whatsapp/worker.py` · `src/career/promises/career_session.py` · `tests/test_whatsapp_worker.py` | **D1.1 (الأخطر)**: شرط `landed is None` يعني أن **أول رسالة بعد يوم صامت** — وهي التي تُنزل الحزمة المحجوزة — **لا تُصعَّد أبدًا** · بصمة صوتية لا تُصعَّد بينما المستند يُصعَّد بلا حجّة · جواب نتيجة **مكتوب** وضغطة **بطاقة قديمة** يفتحان تذكرة خاطئة · **وضغطة خاطئة تحرق المكان الوحيد** · و`inbound_message_id` مفقود · و`opted_out` **بلا قارئ** فالإشعار يُدفن · وقرب-الاستئناف يُقابَل بصمت تام |
+| **H2** | `src/career/salla/provisioning.py` · `src/career/whatsapp/activation_flow.py` · `tests/test_salla_provisioning.py` · `tests/test_activation_flow.py` | **D2.1**: **التجديد غير مغطّى وهو الطريق الأشيع** — من يُسكِت ولا يلغي يُجدَّد شهورًا بلا إشعار ولا تذكرة ولا ليلة تفشل · و`ALREADY_LINKED` يدّعي أنه إعادة محاولة «تكلّمت وذكّرت» وهو غير صحيح إن جاء الإسكات بعد التفعيل · **وخطأ mypy عند 900** |
+| **H3** | `scripts/consume_stored_authorize.py` · `tests/test_consume_authorize.py` | عشرة أخطاء أنواع، منها أن `__str__` **مكتوب حقلًا في NamedTuple** — فالإخفاء الذي يحمي التوكن **قد لا يعمل أصلًا**، وهذا يُفحص لا يُصلَح بالثقة |
+
+| **H4** | `src/career/engine/cli.py` · `src/career/webhooks/intake.py` · `tests/test_engine_cli_exit.py` | **المضخّم**: أي استثناء في منتصف كنس دورة الحياة **يُلغي علامات كل عميل عولج تلك الليلة** — أُزيل الزناد ولم يُزَل المضخّم · و`signature_valid` **ثابت مكتوب لا حكم محسوب** فاسمه يَعِد بما لا يفعل · و«الاعتماد ما زال صالحًا» **محدود برقم يرسله طرف ثالث** |
+| **H5** | `docs/DEVIATIONS.md` · `docs/STORE-PAGES-AR.md` · `docs/PROGRESS.md` · `README.md` | ثلاثة من «يُباع ولا يُشحن» **صارت موصولة اليوم** — والوثائق ما زالت تصفها معلَّقة، وكتلة الحجر فوق صفحة المتجر تحجر ما لم يعد محجورًا |
+
+### الموجة الثالثة عشرة — ٦٣ سطرًا مخربطًا (سُجّلت قبل الإطلاق، ٧ أغسطس)
+
+**القرار**: الحارس الجديد أحمر بحقّ. **رُفضت قائمة الأساس** — ٤٦ من الـ٦٣ في الشاشات والتقرير الأسبوعي، أي **في ما يقرؤه فهد نفسه كل أحد**. فتُصلَح لا تُسكَّت.
+
+| # | الملكية الحصرية | العدد |
+|---|---|---|
+| **J1** | `src/career/telegram/views.py` · `src/career/telegram/weekly_report.py` · اختباراتهما | ٤٦ |
+| **J2** | `src/career/whatsapp/worker.py` · `src/career/whatsapp/activation_flow.py` · `src/career/promises/career_session.py` · `src/career/cv/daily_run.py` · اختباراتها | ٧ |
+| **J3** | `src/career/engine/quota.py` · `src/career/onboarding/retention.py` · `src/career/salla/lifecycle.py` · `src/career/telegram/console.py` · `scripts/run_admin_bot.py` · اختباراتها | ١٠ |
+
+**ممنوع على الثلاثة**: `tests/test_alert_direction_purity.py` — الحارس نفسه لا يُعدَّل ليُخضِر شيئًا.
+
 **ملاحظة للمراجعة القادمة**: `refund_deduction_sar` و`breach_notice_ar` و`record_suppression` **بلا نداء إنتاجي واحد** — فما وُصف بأنه إصلاح مالٍ خطير كان في شيفرة لا يبلغها أحد. **التحقق من وجود نداء حيّ يسبق تقدير الخطورة.**
 
 ### الموجة الرابعة (اكتملت — أُطلقت ٦ أغسطس بعد `566b935`)

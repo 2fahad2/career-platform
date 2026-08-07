@@ -44,6 +44,7 @@ from sqlalchemy.orm import Session
 
 from career.db.models import CustomerChannel, Subscription, SubscriptionEvent
 from career.salla import subscriptions as sub_states
+from career.whatsapp.delivery import record_out
 from career.whatsapp.templates import (
     RECOVERY,
     RENEWAL_REMINDER,
@@ -52,6 +53,20 @@ from career.whatsapp.templates import (
 
 logger = logging.getLogger("career.salla")
 
+_ARABIC_DIGITS = str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩")
+
+
+def _ar_num(value: int) -> str:
+    """Arabic-Indic digits, so a tally can stay on ONE Arabic line.
+
+    The nightly lifecycle note is four numbers read at a glance; Latin digits
+    reversed the whole line in the operator's client, and four lines of one
+    number each would cost more than they buy. Same helper as
+    `telegram/console._ar_digits`, local to this module by the same rule.
+    """
+    return str(value).translate(_ARABIC_DIGITS)
+
+
 #: §05 verbatim: GRACE 48 ساعة, تذكير يوم 27 و29, رسالة استرجاع بعد 7 أيام.
 GRACE_HOURS = 48
 REMINDER_DAYS_BEFORE = (3, 1)
@@ -59,6 +74,12 @@ RECOVERY_DAYS_AFTER = 7
 
 #: Lifecycle plans only — the one-shot cv_analysis product has no period.
 _TIMED_PLANS_EXCLUDED = ("cv_analysis",)
+
+#: ``delivery_messages.wa_message_id`` is ``varchar(128)`` and what goes in it
+#: comes from META, not from us. A provider-controlled value that does not fit
+#: its column is an INSERT the database refuses — see :func:`_record_send` for
+#: why that used to cost a whole night of lifecycle marks.
+_WA_MESSAGE_ID_MAX = 128
 
 
 def _event_exists(session: Session, subscription_id: uuid.UUID, event_type: str) -> bool:
@@ -78,14 +99,25 @@ def _mark(session: Session, sub: Subscription, event_type: str) -> None:
     session.flush()
 
 
-def _channel_phone(session: Session, tenant_id: uuid.UUID) -> str | None:
-    channel = session.execute(
+def _live_channel(session: Session, tenant_id: uuid.UUID) -> CustomerChannel | None:
+    """The channel a lifecycle template goes to — the whole row, not the phone.
+
+    It used to return ``channel.phone_e164`` and drop everything else, and that
+    single discarded field is why none of these sends was ever billed to
+    anybody. ``delivery_messages`` is where a template send is recorded, it
+    keys on ``channel_id``, and by the time the caller had a phone it no longer
+    had a channel to name — so the cheapest thing to do was record nothing.
+    Since delivery moved to 11:00 most bundles land free-form inside the open
+    window, which makes these lifecycle templates the MAJORITY of the billed
+    template traffic; `close.whatsapp_spend` derives the WhatsApp bill from
+    that table, so the majority of it was invisible.
+    """
+    return session.execute(
         select(CustomerChannel).where(
             CustomerChannel.tenant_id == tenant_id,
             CustomerChannel.opt_out_at.is_(None),
         )
     ).scalars().first()
-    return channel.phone_e164 if channel else None
 
 
 #: States that prove the tenant is a customer RIGHT NOW, whatever some older
@@ -133,17 +165,117 @@ def _superseded_by_renewal(session: Session, sub: Subscription) -> bool:
     return newer is not None
 
 
+def _record_send(
+    session: Session,
+    *,
+    tenant_id: uuid.UUID,
+    channel_id: uuid.UUID | None,
+    template_name: str,
+    message_id: Any,
+    now: datetime,
+) -> None:
+    """Write the ledger row for a template we have already been charged for,
+    and make «accounting never blocks the lifecycle» TRUE instead of merely
+    written down.
+
+    AUDIT 2026-08-06. It was not true. The old guard wrapped `record_out`,
+    which only calls ``session.add()`` — no round trip, nothing that can fail —
+    so the INSERT was emitted by the NEXT flush, which is `_mark`'s, one line
+    later and OUTSIDE the try. And the nightly caller (`engine/cli.py`) runs
+    this entire sweep in ONE Session with ONE commit under one broad
+    ``except``: a single ledger row the database refused therefore discarded
+    the `subscription_events` marks of EVERY customer already processed that
+    night. Meta had charged for those templates, we recorded none of them, and
+    — because the marks are what makes the sweep idempotent — the next night
+    sent and paid for all of them again.
+
+    Two changes, because the failure has two halves:
+
+    * **The write happens where the guard is.** The row is flushed inside a
+      SAVEPOINT, so a refused INSERT rolls back that row and nothing else; the
+      marks already flushed in this transaction survive, and the session is
+      still usable for the customers who come after.
+    * **Provider-controlled values are checked before they enter the
+      session.** The message id is Meta's, and the column that holds it is
+      ``varchar(128)``. One that does not fit is stored as NULL — the column
+      is nullable, the SEND still counts in the bill (`close.whatsapp_spend`
+      counts rows, not ids), and the receipt simply has nothing to match on.
+      Truncating it would be worse: a receipt that matches the wrong send.
+    """
+    mid: str | None = message_id if isinstance(message_id, str) else None
+    if mid is not None and len(mid) > _WA_MESSAGE_ID_MAX:
+        mid = None
+    if mid is None:
+        logger.error(
+            "provider message id unusable for template %s — the send is still "
+            "billed, but its delivery receipt can never be matched",
+            template_name,
+        )
+    try:
+        with session.begin_nested():
+            record_out(
+                session, tenant_id=tenant_id, channel_id=channel_id,
+                kind="template",
+                # the column is nullable (0028); `record_out` types the
+                # parameter narrower than the column it writes
+                wa_message_id=mid,  # type: ignore[arg-type]
+                template_name=template_name, now=now,
+            )
+            # INSIDE the savepoint, so the database's answer arrives while the
+            # guard below can still hear it.
+            session.flush()
+    except Exception:  # noqa: BLE001 — accounting never blocks the lifecycle
+        # Loud: an unbilled send is exactly the silence this function exists to
+        # end, so it must not become a quiet one in a different place.
+        logger.error("lifecycle template sent but NOT recorded — the WhatsApp "
+                     "bill will under-report by one %s", template_name,
+                     exc_info=True)
+
+
 def _send_template(
-    whatsapp_client: Any, phone: str | None, template: Any
+    session: Session,
+    whatsapp_client: Any,
+    phone: str | None,
+    template: Any,
+    *,
+    tenant_id: uuid.UUID,
+    channel: CustomerChannel | None,
+    now: datetime,
 ) -> bool:
+    """Send one approved template AND record that it was sent.
+
+    Meta bills every one of these. The send already got a message id back and
+    threw it away, so the ledger row costs one INSERT and no extra call — the
+    money was never hard to count, it was simply never written down.
+
+    ``channel`` is None for the claim reminder, which goes to the phone on the
+    Salla order before the buyer has replied even once; the row is written
+    anyway, because a template we paid for is a template we paid for whether or
+    not there is a channel to hang it on (0028 made the column nullable for
+    exactly these two sends).
+
+    The ledger row is deliberately written only AFTER the client returns. A row
+    for a send that raised would be a bill we were never charged, which is the
+    same defect as the missing rows pointing the other way — and
+    ``whatsapp_spend`` counts everything whose status is not ``failed``.
+    """
     if whatsapp_client is None or not phone:
         return False
+    # Read the id BEFORE the network call. `channel` is a live ORM object and
+    # the send is the one slow thing in this function; reaching back into it
+    # afterwards is an attribute load that can go to the database at the worst
+    # possible moment. A uuid costs nothing to carry.
+    channel_id = channel.id if channel is not None else None
     try:
-        whatsapp_client.send_template(phone, template.name, template.language)
-        return True
+        mid = whatsapp_client.send_template(phone, template.name, template.language)
     except Exception:  # noqa: BLE001 — messaging never blocks the lifecycle
         logger.warning("lifecycle template send failed", exc_info=True)
         return False
+    _record_send(
+        session, tenant_id=tenant_id, channel_id=channel_id,
+        template_name=template.name, message_id=mid, now=now,
+    )
+    return True
 
 
 _RENEW_LINK_AR = "تقدر تجدد من هنا:"
@@ -226,8 +358,18 @@ def sweep_subscription_lifecycle(
             now > paid_at + timedelta(days=DEFAULT_CLAIM_DEADLINE_DAYS - 2)
             and not _event_exists(session, sub.id, "claim_reminder")
         ):
-            phone = sub.order_phone_e164 or _channel_phone(session, sub.tenant_id)
-            if _send_template(whatsapp_client, phone, WELCOME_ACTIVATION):
+            # The order phone still wins, exactly as before — but the channel
+            # is only looked up when the order phone is missing, so the ledger
+            # row can never name a channel the template did not go to.
+            claim_channel: CustomerChannel | None = None
+            phone = sub.order_phone_e164
+            if not phone:
+                claim_channel = _live_channel(session, sub.tenant_id)
+                phone = claim_channel.phone_e164 if claim_channel else None
+            if _send_template(
+                session, whatsapp_client, phone, WELCOME_ACTIVATION,
+                tenant_id=sub.tenant_id, channel=claim_channel, now=now,
+            ):
                 _mark(session, sub, "claim_reminder")
                 counts["unclaimed_reminded"] += 1
 
@@ -260,9 +402,13 @@ def sweep_subscription_lifecycle(
                     salla_order_id=sub.salla_order_id,
                 )
                 counts["graced"] += 1
-                grace_phone = _channel_phone(session, sub.tenant_id)
+                grace_channel = _live_channel(session, sub.tenant_id)
+                grace_phone = (
+                    grace_channel.phone_e164 if grace_channel else None
+                )
                 if _send_template(
-                    whatsapp_client, grace_phone, RENEWAL_REMINDER,
+                    session, whatsapp_client, grace_phone, RENEWAL_REMINDER,
+                    tenant_id=sub.tenant_id, channel=grace_channel, now=now,
                 ):
                     _mark(session, sub, "renewal_reminder_grace")
                     if not _send_renew_link(
@@ -275,9 +421,14 @@ def sweep_subscription_lifecycle(
                     if days_left < mark_day and not _event_exists(
                         session, sub.id, f"renewal_reminder_d{mark_day}"
                     ):
-                        due_phone = _channel_phone(session, sub.tenant_id)
+                        due_channel = _live_channel(session, sub.tenant_id)
+                        due_phone = (
+                            due_channel.phone_e164 if due_channel else None
+                        )
                         if _send_template(
-                            whatsapp_client, due_phone, RENEWAL_REMINDER,
+                            session, whatsapp_client, due_phone,
+                            RENEWAL_REMINDER, tenant_id=sub.tenant_id,
+                            channel=due_channel, now=now,
                         ):
                             _mark(session, sub, f"renewal_reminder_d{mark_day}")
                             counts["reminded"] += 1
@@ -304,8 +455,12 @@ def sweep_subscription_lifecycle(
             if now >= recovery_at and not _event_exists(
                 session, sub.id, "recovery_sent"
             ):
-                rec_phone = _channel_phone(session, sub.tenant_id)
-                if _send_template(whatsapp_client, rec_phone, RECOVERY):
+                rec_channel = _live_channel(session, sub.tenant_id)
+                rec_phone = rec_channel.phone_e164 if rec_channel else None
+                if _send_template(
+                    session, whatsapp_client, rec_phone, RECOVERY,
+                    tenant_id=sub.tenant_id, channel=rec_channel, now=now,
+                ):
                     _mark(session, sub, "recovery_sent")
                     counts["recovered"] += 1
                     if not _send_renew_link(
@@ -323,15 +478,17 @@ def sweep_subscription_lifecycle(
     if admin_client is not None and any(counts.values()):
         line = (
             "⏳ دورة الاشتراكات: "
-            f"تذكير {counts['reminded']} · سماح {counts['graced']} · "
-            f"انتهى {counts['expired']} · استرجاع {counts['recovered']}"
+            f"تذكير {_ar_num(counts['reminded'])} · "
+            f"سماح {_ar_num(counts['graced'])} · "
+            f"انتهى {_ar_num(counts['expired'])} · "
+            f"استرجاع {_ar_num(counts['recovered'])}"
         )
         if counts["nudged_without_link"]:
             # The operator hears it the night it happens, not from a customer
             # who tapped «جدّد» and found nothing behind it.
             line += (
                 "\n⚠️ رابط الشراء غير مضبوط في الإعدادات — "
-                f"{counts['nudged_without_link']} تذكير خرج بلا رابط"
+                f"{_ar_num(counts['nudged_without_link'])} تذكير خرج بلا رابط"
             )
         try:
             admin_client.send_admin(line)

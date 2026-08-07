@@ -119,7 +119,11 @@ def test_no_tenant_context_refuses(two_tenants: tuple[str, str]) -> None:
 _ENTRY_POINT_TABLES = (
     ("worker loop — inbound routing", "customer_channels", True),
     ("worker loop — the journey", "onboarding_sessions", True),
-    ("worker loop — inbound dedupe", "processed_messages", True),
+    # ("worker loop — inbound dedupe", "processed_messages", True) stood here
+    # and asserted something that was never true: the WhatsApp worker dedupes
+    # on the unique `inbound_messages.wa_message_id`, and nothing in this
+    # codebase has ever written a `processed_messages` row. The table went with
+    # the deleted queue subsystem in 0029; the claim went with it.
     ("salla provisioning", "subscriptions", True),
     ("salla provisioning", "activation_tokens", True),
     ("salla provisioning", "subscription_events", False),
@@ -171,9 +175,9 @@ def shared_discovery(owner_engine) -> Iterator[tuple[str, str]]:  # type: ignore
 def _seed_one_row_everywhere(
     session, tenant_id: str, shared: tuple[str, str]
 ) -> None:
-    """Exactly ONE row in each of the seventeen entry-point tables.
+    """Exactly ONE row in each of the sixteen entry-point tables.
 
-    Written as one ordered function rather than seventeen fixtures because the
+    Written as one ordered function rather than sixteen fixtures because the
     tables are a graph: an onboarding session needs a subscription, a delivery
     needs a channel, a decision needs a run and a posting. The row contents are
     deliberately dull — none of this is asserted on, the only thing that
@@ -195,9 +199,6 @@ def _seed_one_row_everywhere(
         ("INSERT INTO onboarding_sessions (id, tenant_id, subscription_id, "
          " channel_id, state) VALUES (gen_random_uuid(), :t, :sub, :ch, 'ASK_NAME')",
          {"t": tenant_id, "sub": sub, "ch": channel}),
-        ("INSERT INTO processed_messages (id, tenant_id, idempotency_key) "
-         " VALUES (gen_random_uuid(), :t, :key)",
-         {"t": tenant_id, "key": f"wamid-{marker}"}),
         ("INSERT INTO activation_tokens (id, tenant_id, subscription_id, "
          " token_hash, expires_at) VALUES (gen_random_uuid(), :t, :sub, :hash, "
          " now() + interval '1 day')",
@@ -276,7 +277,7 @@ def test_every_entry_point_table_refuses_cross_tenant_reads_and_writes(
     explicit ``tenant_id = B`` under A's scope cannot match whether or not B
     has rows. True, and beside the point: with B's side of every table empty,
     ``count == 0`` and ``rowcount == 0`` are what an EMPTY TABLE returns too.
-    Twelve of the seventeen cases could not fail if the policy were dropped,
+    Twelve of them could not fail if the policy were dropped,
     which is the one event they exist to catch. A test that cannot fail is not
     evidence, it is furniture.
 

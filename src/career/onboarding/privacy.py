@@ -329,7 +329,52 @@ def fulfill_export(
     request.fulfilled_at = now
     request.details = {"storage_key": key}
     session.flush()
+    _record_export_audit(tenant_id=tenant_id, request_id=request_id, key=key)
     return key
+
+
+def _record_export_audit(
+    *, tenant_id: uuid.UUID, request_id: uuid.UUID, key: str
+) -> None:
+    """§12 audit row for a fulfilled export — in its OWN transaction.
+
+    The same reasoning as the CV quarantine (cv.publish._record_quarantine_audit),
+    and it applies here for a sharper reason. ``storage.put`` above has already
+    written a complete copy of everything personal we hold to object storage,
+    and object storage is not in this transaction. The caller is one WhatsApp
+    turn: it goes on to send the file as a document, and any failure after this
+    point — a rolled-back turn, a poisoned event — takes the request row, the
+    ``storage_key`` in its details AND the audit row with it, while the bundle
+    itself stays exactly where we put it. A disclosure with no record left is
+    indistinguishable from a leak, so the record must not be able to disappear
+    while the disclosure survives.
+
+    Contrast :func:`execute_deletion`, whose audit row is deliberately bound to
+    the caller's transaction: there the act IS the transaction, so an atomic row
+    is the honest one.
+
+    Loud on failure, never fatal: refusing a customer their own data because we
+    could not write a log line would be the larger harm.
+    """
+    try:
+        from career.audit import ACTION_PRIVACY_EXPORT_FULFILLED, record_audit
+        from career.db.session import tenant_session
+
+        with tenant_session(str(tenant_id)) as audit_session:
+            record_audit(
+                audit_session,
+                tenant_id=tenant_id,
+                actor="customer",
+                action=ACTION_PRIVACY_EXPORT_FULFILLED,
+                resource_type="privacy_request",
+                resource_id=request_id,
+                # An id-shaped path and nothing else. The bundle's CONTENTS are
+                # the customer's whole file; naming what was in it would put
+                # the export's own PII into the one table deletion keeps.
+                details={"storage_key": key},
+            )
+    except Exception:  # noqa: BLE001 — see the docstring
+        logger.error("privacy export audit row NOT written", exc_info=True)
 
 
 # ── deletion ─────────────────────────────────────────────────────────────────
@@ -451,6 +496,41 @@ def execute_deletion(
     request.details = {
         "deleted": deleted, "redacted": redacted, "storage_keys": keys,
     }
+
+    # The event this table's retention exemption exists FOR.
+    #
+    # `audit_events` is in RETAINED_TABLES: we tell a customer we delete their
+    # data and then keep this table, and the justification is that it holds the
+    # security, money and privacy record a regulator — or the customer — could
+    # ask us to produce. The deletion was the one such event nobody wrote, so
+    # the exemption was vacuous: we kept the table precisely so it could answer
+    # «when did you erase me, and what went?», and it could not.
+    #
+    # In the CALLER's transaction, deliberately, and this is the opposite call
+    # from the export beside it. Every delete above is inside this transaction
+    # (the object-storage keys are only RETURNED here; the caller purges them
+    # after commit), so the act and its record stand or fall together. A row in
+    # its own transaction could outlive a rollback and claim a deletion that
+    # never happened — a worse lie than a missing row, because this one would
+    # be believed.
+    #
+    # Counts only. Constant 13: no phone, no name, no key contents.
+    from career.audit import ACTION_PRIVACY_DELETION_EXECUTED, record_audit
+
+    record_audit(
+        session,
+        tenant_id=tenant_id,
+        actor="customer",
+        action=ACTION_PRIVACY_DELETION_EXECUTED,
+        resource_type="privacy_request",
+        resource_id=request_id,
+        details={
+            "deleted": deleted,
+            "redacted": redacted,
+            "storage_objects_purged": len(keys),
+            "retained_tables": list(RETAINED_TABLES),
+        },
+    )
     session.flush()
     return DeletionReport(
         deleted=deleted,

@@ -669,7 +669,12 @@ def test_the_sweep_role_can_never_write_anything(owner_engine: Engine) -> None:
 _FORBIDDEN_TO_SWEEP = (
     ("customer_channels", "display_name"),
     ("onboarding_sessions", "context"),
-    ("outbox_events", "payload"),
+    # ("outbox_events", "payload") was here until 0029 dropped the table with
+    # the rest of the deleted queue subsystem. The row is gone rather than
+    # relaxed: this test asks the catalog whether a grant EXISTS, and against a
+    # relation that no longer exists the question has no answer to give — it
+    # would pass for the wrong reason, which is the shape of a security test
+    # that has quietly stopped testing anything.
     ("deliveries", "bundle"),
     ("subscriptions", "amount_sar"),
     ("tenants", "code"),

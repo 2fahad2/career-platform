@@ -20,7 +20,16 @@ StartLimitIntervalSec=600
 StartLimitBurst=20
 
 [Service]
-Type=simple
+# The wedge, closed the same way as the worker's and for the sharper reason
+# above: run_admin_bot.py sends READY=1 after start-up and WATCHDOG=1 at the
+# end of every poll cycle — after getUpdates RETURNED and every update it
+# carried was delivered. See career-worker.service for the two incidents and
+# for why the beat must never come from a `finally`.
+Type=notify
+# Implicit under WatchdogSec=; stated because it rests on /usr/bin/env EXECing
+# the interpreter in the same PID. Wrap ExecStart in a shell and the
+# notifications stop being accepted.
+NotifyAccess=main
 WorkingDirectory=/root/career
 EnvironmentFile=/root/career/.env.staging
 # EnvironmentFile beats Environment= — overrides ride inside ExecStart.
@@ -28,12 +37,53 @@ ExecStart=/usr/bin/env DB_HOST=127.0.0.1 DB_PORT=5433 REDIS_HOST=127.0.0.1 REDIS
 Restart=always
 RestartSec=5
 
-# The wedge case is uncovered here too, and needs the same heartbeat in
-# scripts/run_admin_bot.py: notify("READY=1") after startup, then
-# notify("WATCHDOG=1") after each completed long-poll cycle, and only then
-# Type=notify + WatchdogSec here. Pick the watchdog interval from the poll
-# timeout the bot actually uses — a long-poll that legitimately blocks for 30s
-# must not be read as a wedge. See career-worker.service for the full note.
+# WatchdogSec — read off this bot's own numbers, not the worker's.
+#
+#   POLL_TIMEOUT = 50            the Telegram long poll: on a quiet day the
+#                                cycle IS this, so the beat is every ~50s even
+#                                when nobody touches the console
+#   transport ceiling      60s   get_updates() gives the socket timeout+10
+#   one health screen     ~75s   if every live probe hangs to its own timeout:
+#                                systemctl 3×5s, Graph 10s, SearchAPI 10s,
+#                                templates 10s, API /health 5s, journalctl 10s,
+#                                backup age 5s, scanner ping
+#   the screen's own send   30s   HttpTelegramAdminClient's per-call timeout
+#
+# 240s = 4× the transport ceiling, and it clears a full poll plus a health
+# screen in which every external service is simultaneously timing out
+# (60+75+30 = 165s) with room to spare. The residual, stated rather than
+# hidden: a single batch carrying TWO such worst-case screens could exceed it.
+# The cost of that is a watchtower restart — no customer sees it, the cursor
+# lives in admin_bot_state, and nothing is re-sent — which is the cheap side of
+# the trade against a console that is quietly dead.
+WatchdogSec=240
+# No READY=1 in this window and systemd kills it at boot. Start-up opens the
+# database, builds the clients and sends the «🏰» heartbeat.
+#
+# «30s timeout» was the old note here and it understated the budget: `requests`
+# applies its timeout per PHASE, so 30s means 30s to connect plus 30s to read —
+# 60s worst case — and DNS resolution happens before either timer starts and is
+# bounded only by the resolver. The database term IS bounded now:
+# connect_timeout=10 from career.db.session applies to every engine in the
+# process, including the ones built with a bare create_engine.
+TimeoutStartSec=180
+
+# Same as the worker: a watchdog kill restarts but never reaches `failed`, so
+# the alert has to come from the path that always runs. Silent unless
+# $SERVICE_RESULT is `watchdog` or `timeout`; the `-` keeps a failed alert from
+# failing the unit. See career-worker.service for the arithmetic, for why the
+# start limit is deliberately left unreachable rather than retuned to make a
+# persistent wedge stay down, and for the de-duplication that keeps a permanent
+# wedge from sending 283 identical messages a day (240+5=245s here, so this
+# unit's untreated rate would be 86400/245 ≈ 352 a day).
+ExecStopPost=-/root/career/scripts/alert_unit_failure.sh %n
+
+# DEPLOY ORDER — src/career/notify.py, scripts/run_admin_bot.py and
+# scripts/alert_unit_failure.sh MUST all be in place before this file. Without
+# the first two systemd waits for a READY=1 that never comes and kills the
+# watchtower at start; without the third the ExecStopPost hook above pages the
+# operator on every ordinary restart. Proof it took: the journal line «systemd
+# watchdog armed: a poll cycle must complete every 240s».
 
 [Install]
 WantedBy=multi-user.target

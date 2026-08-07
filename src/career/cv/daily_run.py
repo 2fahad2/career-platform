@@ -70,6 +70,22 @@ DELIVERY_EXPIRED = "EXPIRED_WINDOW"
 _WEEKEND = (4, 5)
 _RIYADH = ZoneInfo("Asia/Riyadh")
 
+#: §16, the operator channel only. Fahad's client reverses any line that mixes
+#: Arabic with Latin letters or European digits, and a COUNT is the one thing
+#: that genuinely belongs inside the Arabic sentence rather than on a line of
+#: its own — «أُغلقت ٣ تسليمة» reads at a glance where «أُغلقت\n3\nتسليمة»
+#: does not. Arabic-Indic digits are Arabic script, so the line stays pure.
+#: Deliberately local rather than imported from `telegram.console._ar_digits`:
+#: the delivery engine does not depend on the operator console, and the bidi
+#: guard proves a helper by its shape (a module-level table whose output
+#: alphabet is Arabic-Indic), never by its name — so a second one is expected.
+_WESTERN_TO_ARABIC = str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩")
+
+
+def _ar_digits(value: object) -> str:
+    """A number that can live INSIDE an Arabic line without scrambling it."""
+    return str(value).translate(_WESTERN_TO_ARABIC)
+
 
 @dataclass
 class DailyDeps:
@@ -381,6 +397,14 @@ def _run_tenant(
             deps.storage, tenant_id=str(tenant_id), job_url=str(job["url"]),
             generation_enabled=True, dry_run=False, contact=contact,
             generator=_generator,
+            # the RUN's clock, not the wall clock. resolve_tailored_cv only
+            # uses it to stamp the quarantine directory, and that stamp is
+            # forensic: when a night is re-run, or the process crosses
+            # midnight between the run's `now` and the moment a broken pair is
+            # quarantined, a wall-clock default files the evidence under a day
+            # the run report never mentions — so the one artefact of a failed
+            # CV sits in a directory nobody looking at that night would open.
+            now=now,
         )
 
     processed = publish.generate_missing_cvs(
@@ -648,8 +672,12 @@ def run_daily_delivery(
     if expired:
         try:
             deps.admin_client.send_admin(
-                f"⌛ أُغلقت {len(expired)} تسليمة معلقة من يوم سابق — "
-                "النافذة لم تُفتح (WHATSAPP_FAILED)"
+                # The count folds into the sentence in Arabic-Indic digits;
+                # the day state is an IDENTIFIER the operator greps the
+                # journal for, so it keeps its exact spelling on its own line.
+                f"⌛ أُغلقت {_ar_digits(len(expired))} تسليمة معلقة من يوم سابق"
+                " — النافذة لم تُفتح\n"
+                "WHATSAPP_FAILED"
             )
         except Exception:  # noqa: BLE001 — reporting never breaks the day
             logger.warning("expiry admin note failed", exc_info=True)

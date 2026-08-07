@@ -1,21 +1,34 @@
-"""Two live incidents, pinned: the exit code that lied (P0-7) and the selling
-environment that went stale in silence (P0-8).
+"""Three live incidents, pinned: the exit code that lied (P0-7), the selling
+environment that went stale in silence (P0-8), and the §05 lifecycle sweep
+that threw away a whole night of idempotency marks on one bad row.
 
-Both are tested against the smallest honest seam. ``main()`` is thin
+Most of it is tested against the smallest honest seam. ``main()`` is thin
 composition over these functions — it has exactly one ``return
 exit_code_for(...)`` and one ``report_environment(...)`` call — so the
 decisions are what get exercised here, at every state mix that has actually
 occurred on the box or plausibly can.
+
+The last section is different in kind and deliberately so. «One customer's
+failure no longer costs every other customer their marks» is a statement about
+TRANSACTIONS, and a fake session proves nothing about a transaction: it needs a
+real Postgres, a real rollback, and a real row that is still there afterwards.
 """
 
 from __future__ import annotations
 
 import uuid
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
+from typing import Any
+
+from sqlalchemy import select
+from sqlalchemy import text as sql_text
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session
 
 from career.cv.close import DAILY_STATES
+from career.db.models import Subscription, Tenant
 from career.engine import cli
 
 # ── P0-7: the night's verdict ────────────────────────────────────────────────
@@ -537,3 +550,365 @@ def test_the_sale_table_is_read_from_the_wiring_tool() -> None:
     assert "basic" not in plans
     assert plans["professional"] == Decimal("199.00")
     assert set(plans) == {"cv_analysis", "professional", "executive"}
+
+
+# ── the §05 sweep: one bad row used to cost the whole night's marks ─────────
+
+
+def test_a_lifecycle_sweep_that_did_not_finish_can_never_be_a_success() -> None:
+    """THE POINT OF THE WHOLE FIX, and the part that is easiest to lose.
+
+    Before 2026-08-07 the sweep ran every customer in ONE transaction under
+    one broad `except Exception: logger.error(...)`, and the night carried on
+    and exited 0. Making it commit per customer fixes the amplification and
+    creates a new way to be silent: the sweep now SURVIVES a customer's
+    failure, so «most customers were swept» would look exactly like «all
+    customers were swept» to systemd. «أي عميل يفشل ← الليلة تفشل» is not
+    satisfied by surviving.
+    """
+    assert cli.exit_code_for(
+        "completed", ["DELIVERED"], delivery_phase=cli.PHASE_RAN,
+        lifecycle_failed=True,
+    ) == cli.EXIT_LIFECYCLE_FAILED
+
+
+def test_a_completed_sweep_leaves_an_honest_night_at_zero() -> None:
+    """The other side of the line — a guard that only ever proves «this fails»
+    gets muted the first time it fires on a good night."""
+    assert cli.exit_code_for(
+        "completed", ["DELIVERED", "NO_MATCHES"], delivery_phase=cli.PHASE_RAN,
+        lifecycle_failed=False,
+    ) == cli.EXIT_OK
+    # and the argument is optional, so every existing caller still answers
+    assert cli.exit_code_for("completed", ["DELIVERED"]) == cli.EXIT_OK
+
+
+def test_the_lifecycle_number_is_ranked_below_the_ones_it_shares_a_night_with(
+) -> None:
+    """A customer who received nothing today outranks a customer whose renewal
+    clock did not tick tonight; a total outage and a collapsed discovery
+    outrank both. One number, one runbook entry — so the ORDER matters as much
+    as the number does."""
+    assert cli.exit_code_for(
+        "completed", ["WHATSAPP_FAILED"], delivery_phase=cli.PHASE_RAN,
+        lifecycle_failed=True,
+    ) == cli.EXIT_DELIVERY_FAILED
+    assert cli.exit_code_for(
+        "completed", [], delivery_phase=cli.PHASE_NO_CREDENTIALS,
+        lifecycle_failed=True,
+    ) == cli.EXIT_NO_WHATSAPP_TOKEN
+    assert cli.exit_code_for(
+        "discovery_failed", [], lifecycle_failed=True,
+    ) == cli.EXIT_DISCOVERY_FAILED
+
+
+def test_the_sweep_result_answers_the_verdict_in_one_word() -> None:
+    """`clean` is what `main()` reads. A sweep that never started is not a
+    clean one — that was the old behaviour and it exited 0 every night."""
+    assert cli.LifecycleSweep().clean is True
+    assert cli.LifecycleSweep(failed=("TEN-0002",)).clean is False
+    assert cli.LifecycleSweep(aborted=True).clean is False
+
+
+def test_the_sweep_summary_never_prints_a_raw_tenant_uuid() -> None:
+    """§15.13 / AUDIT ك-17. This object goes into the journal line."""
+    swept = cli.LifecycleSweep(
+        counts={"reminded": 1}, attempted=2, failed=("TEN-0002",),
+    )
+    assert swept.summary() == {
+        "customers": 2, "counts": {"reminded": 1},
+        "failed": ["TEN-0002"], "aborted": False,
+    }
+
+
+# ── the same thing against a real transaction ──────────────────────────────
+
+
+def _customer(owner_session: Session, *, period_end: Any) -> tuple[str, str]:
+    """One paying customer, provisioned and activated the way the product does
+    it. Returns (tenant_id, TEN code)."""
+    from tests.test_salla_lifecycle import _active_sub
+
+    sub_id = _active_sub(owner_session, period_end=period_end)
+    row = owner_session.execute(sql_text(
+        "SELECT s.tenant_id::text, t.code FROM subscriptions s"
+        " JOIN tenants t ON t.id = s.tenant_id WHERE s.id = :id"),
+        {"id": str(sub_id)}).one()
+    return str(row[0]), str(row[1])
+
+
+def _marks(owner_session: Session, tenant_id: str) -> list[str]:
+    owner_session.expire_all()
+    return [r[0] for r in owner_session.execute(sql_text(
+        "SELECT event_type FROM subscription_events WHERE tenant_id = :t"
+        " ORDER BY created_at"), {"t": tenant_id}).all()]
+
+
+def test_one_customers_failure_no_longer_discards_the_others_marks(
+    owner_engine: Engine, owner_session: Session, clean_billing: None
+) -> None:
+    """THE INCIDENT, reproduced and then refuted.
+
+    Three customers all due their day-27 renewal reminder. The sweep raises on
+    the middle one — which is what a Meta message id too long for
+    `delivery_messages.wa_message_id` did on 2026-08-06, and what anything at
+    all can do again.
+
+    Under the old shape (one Session, one commit at the end, one broad
+    `except`) the exception unwound the whole transaction: the first
+    customer's `renewal_reminder_d3` mark was rolled back although Meta had
+    already been paid for that template, and the third customer was never
+    reached at all. The next night re-sent and re-paid for both.
+
+    What is asserted here is the mark, not the counter: the mark IS the
+    idempotency, so a mark that did not survive the transaction is a template
+    that will be bought twice.
+    """
+    from career.salla.lifecycle import sweep_subscription_lifecycle
+    from career.whatsapp.client import FakeWhatsAppClient
+    from tests.test_salla_lifecycle import NOW
+
+    due = NOW + timedelta(days=2, hours=12)          # inside the d27 window
+    customers = dict(
+        _customer(owner_session, period_end=due) for _ in range(3)
+    )
+    by_code = {code: tid for tid, code in customers.items()}
+    doomed_code = sorted(by_code)[1]                 # swept second of three
+    doomed = by_code[doomed_code]
+
+    def flaky(session: Session, **kwargs: Any) -> dict[str, int]:
+        counts = sweep_subscription_lifecycle(session, **kwargs)
+        # Which customer is this? Ask the scoped session THROUGH THE ORM,
+        # which is the only way the scope is visible at all — it is a
+        # `with_loader_criteria` option, so a raw SELECT walks past it.
+        mine = {
+            str(t) for t in session.execute(
+                select(Subscription.tenant_id).distinct()
+            ).scalars()
+        }
+        if doomed in mine:
+            raise RuntimeError("value too long for type character varying(128)")
+        return counts
+
+    result = cli.sweep_lifecycle_per_customer(
+        lambda: Session(owner_engine), now=NOW,
+        whatsapp_client=FakeWhatsAppClient(), sweep=flaky,
+    )
+
+    # The marks first, deliberately: they are the claim, and a run that fails
+    # on `result.failed` instead has answered a smaller question.
+    for tenant_id, code in customers.items():
+        marks = _marks(owner_session, tenant_id)
+        if code == doomed_code:
+            assert "renewal_reminder_d3" not in marks, (
+                "the failed customer's transaction did not roll back"
+            )
+        else:
+            assert "renewal_reminder_d3" in marks, (
+                f"{code} lost a mark to a DIFFERENT customer's failure — that "
+                "is the amplifier, and Meta was already paid for that template"
+            )
+    assert doomed_code in result.failed
+    assert result.clean is False
+
+
+def test_the_customers_after_the_failure_are_still_swept(
+    owner_engine: Engine, owner_session: Session, clean_billing: None
+) -> None:
+    """The old shape did not merely lose the marks behind it: the exception
+    left `sweep_subscription_lifecycle` entirely, so everybody after the bad
+    row was never looked at. Their period did not end, their grace did not
+    elapse, and nothing said so."""
+    from career.salla.lifecycle import sweep_subscription_lifecycle
+    from career.whatsapp.client import FakeWhatsAppClient
+    from tests.test_salla_lifecycle import NOW
+
+    customers = dict(
+        _customer(owner_session, period_end=NOW - timedelta(hours=1))
+        for _ in range(2)
+    )
+    by_code = {code: tid for tid, code in customers.items()}
+    first_code = sorted(by_code)[0]
+
+    def explode_on_the_first(session: Session, **kwargs: Any) -> dict[str, int]:
+        mine = {
+            str(t) for t in session.execute(
+                select(Subscription.tenant_id).distinct()
+            ).scalars()
+        }
+        if by_code[first_code] in mine:
+            raise RuntimeError("the first customer of the night")
+        return sweep_subscription_lifecycle(session, **kwargs)
+
+    result = cli.sweep_lifecycle_per_customer(
+        lambda: Session(owner_engine), now=NOW,
+        whatsapp_client=FakeWhatsAppClient(), sweep=explode_on_the_first,
+    )
+
+    assert first_code in result.failed
+    owner_session.expire_all()
+    statuses = {
+        code: owner_session.execute(sql_text(
+            "SELECT status FROM subscriptions WHERE tenant_id = :t"),
+            {"t": tid}).scalars().all()
+        for tid, code in customers.items()
+    }
+    assert statuses[first_code] == ["ACTIVE"], "the failure was not rolled back"
+    later = sorted(by_code)[1]
+    assert statuses[later] == ["GRACE"], (
+        "the customer after the failure was never reached"
+    )
+
+
+def test_a_rolled_back_customer_is_redone_by_the_next_run(
+    owner_engine: Engine, owner_session: Session, clean_billing: None
+) -> None:
+    """«Does a partial sweep leave any state the next run reads as already
+    done?» — the question that decides the commit BOUNDARY.
+
+    Per customer it cannot: the unit is all-or-nothing, so a rollback restores
+    exactly the state tomorrow's run expects. A finer boundary would not be
+    safe, and that is not a matter of taste — commit between the ACTIVE→GRACE
+    transition and the renewal reminder it triggers, and a failure in the
+    second leaves the customer parked in GRACE, which the next sweep reads as
+    handled. The reminder is not retried, it is LOST.
+    """
+    from career.salla.lifecycle import sweep_subscription_lifecycle
+    from career.whatsapp.client import FakeWhatsAppClient
+    from tests.test_salla_lifecycle import NOW
+
+    tenant_id, code = _customer(
+        owner_session, period_end=NOW - timedelta(hours=1)
+    )
+
+    def always_fails(session: Session, **kwargs: Any) -> dict[str, int]:
+        sweep_subscription_lifecycle(session, **kwargs)
+        raise RuntimeError("after the work, before the commit")
+
+    first = cli.sweep_lifecycle_per_customer(
+        lambda: Session(owner_engine), now=NOW,
+        whatsapp_client=FakeWhatsAppClient(), sweep=always_fails,
+    )
+    assert code in first.failed
+    owner_session.expire_all()
+    assert owner_session.execute(sql_text(
+        "SELECT status FROM subscriptions WHERE tenant_id = :t"),
+        {"t": tenant_id}).scalar_one() == "ACTIVE"
+
+    wa = FakeWhatsAppClient()
+    second = cli.sweep_lifecycle_per_customer(
+        lambda: Session(owner_engine), now=NOW, whatsapp_client=wa,
+    )
+
+    assert second.clean is True
+    owner_session.expire_all()
+    assert owner_session.execute(sql_text(
+        "SELECT status FROM subscriptions WHERE tenant_id = :t"),
+        {"t": tenant_id}).scalar_one() == "GRACE"
+    assert "renewal_reminder_grace" in _marks(owner_session, tenant_id), (
+        "the reminder the transition exists to trigger never went out"
+    )
+
+
+def test_the_scope_is_the_customer_so_a_renewed_row_is_still_recognised(
+    owner_engine: Engine, owner_session: Session, clean_billing: None
+) -> None:
+    """The one way this refactor could have broken §16 silently.
+
+    `_superseded_by_renewal` asks «does this customer hold a LIVE row with a
+    later period?» — a within-tenant question, and the only thing that stops an
+    ACTIVE paying customer being walked through their previous period again.
+    Scope a session to one SUBSCRIPTION and that question answers «no» for
+    every row, and the renewed customer gets a «نفتقدك» recovery template about
+    a period they already paid to replace. Scoped to the CUSTOMER it is
+    answered exactly as it is in one global pass.
+    """
+    from career.whatsapp.client import FakeWhatsAppClient
+    from tests.test_salla_lifecycle import NOW
+
+    period_end = NOW - timedelta(days=10)            # recovery is due today
+    tenant_id, _code = _customer(owner_session, period_end=period_end)
+    owner_session.execute(sql_text(
+        "UPDATE subscriptions SET status = 'EXPIRED' WHERE tenant_id = :t"),
+        {"t": tenant_id})
+    owner_session.execute(sql_text(
+        "INSERT INTO subscriptions (id, tenant_id, plan_code, status,"
+        " salla_order_id, amount_sar, currency, current_period_end)"
+        " VALUES (gen_random_uuid(), :t, 'professional', 'ACTIVE', :o,"
+        " 279.00, 'SAR', :e)"),
+        {"t": tenant_id, "o": f"ORD-{uuid.uuid4()}",
+         "e": NOW + timedelta(days=20)})
+    owner_session.commit()
+
+    wa = FakeWhatsAppClient()
+    result = cli.sweep_lifecycle_per_customer(
+        lambda: Session(owner_engine), now=NOW, whatsapp_client=wa,
+    )
+
+    assert result.clean is True
+    assert [m.template_name for m in wa.sent if m.kind == "template"] == []
+    assert "recovery_sent" not in _marks(owner_session, tenant_id)
+
+
+def test_each_sweep_gets_a_session_that_can_see_exactly_one_customer(
+    owner_engine: Engine, owner_session: Session, clean_billing: None
+) -> None:
+    """What makes the per-customer transaction a per-customer transaction.
+
+    Without the scope the sweep would do the whole night's work inside each
+    session and a rollback would still discard everybody's marks — the
+    amplifier back through the door, with a commit count that looks fixed.
+    """
+    from tests.test_salla_lifecycle import NOW
+
+    seen: list[set[str]] = []
+    mine = {
+        code for _tid, code in (
+            _customer(owner_session, period_end=NOW + timedelta(days=30))
+            for _ in range(2)
+        )
+    }
+
+    def observe(session: Session, **_kwargs: Any) -> dict[str, int]:
+        seen.append({
+            str(t) for t in session.execute(
+                select(Tenant.code)
+                .join(Subscription, Subscription.tenant_id == Tenant.id)
+                .distinct()
+            ).scalars()
+        })
+        return {}
+
+    cli.sweep_lifecycle_per_customer(
+        lambda: Session(owner_engine), now=NOW, sweep=observe,
+    )
+
+    for one in seen:
+        assert len(one) <= 1, f"a sweep saw more than one customer: {one}"
+    assert mine <= {code for one in seen for code in one}
+
+
+def test_the_sweep_reads_its_subscriptions_through_the_orm() -> None:
+    """The scope is `with_loader_criteria`, which is an ORM-level filter: a
+    raw ``text("SELECT ... FROM subscriptions")`` inside the sweep would walk
+    straight past it, and one customer's transaction would silently carry
+    another customer's work again. §05 uses the ORM for every one of its
+    reads today; this is the guard that says it has to keep doing so."""
+    import ast as _ast
+    import pathlib as _pathlib
+
+    from career.salla import lifecycle
+
+    tree = _ast.parse(
+        _pathlib.Path(lifecycle.__file__).read_text(encoding="utf-8")
+    )
+    imported = {
+        alias.name
+        for node in _ast.walk(tree) if isinstance(node, _ast.ImportFrom)
+        for alias in node.names
+    }
+    assert "text" not in imported, (
+        "the §05 sweep imported sqlalchemy.text — if it now reads "
+        "subscriptions with raw SQL, `cli._scope_to_one_customer` no longer "
+        "bounds what one transaction touches"
+    )
