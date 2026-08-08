@@ -31,6 +31,7 @@ from career.cv.daily_run import close_from_delivery
 from career.db.models import (
     CustomerChannel,
     Delivery,
+    DeliveryMessage,
     DiscoveryRun,
     FunnelSession,
     InboundMessage,
@@ -1287,10 +1288,52 @@ def _tenant_card(
         .where(CustomerChannel.tenant_id == tenant.id)
     ).first()
     delivery = session.execute(
-        select(Delivery.run_date, Delivery.status, Delivery.bundle)
+        # `Delivery.id` is selected for one reason and it is not display: it is
+        # the join key for the refusal predicate below. Nothing renders it.
+        select(Delivery.id, Delivery.run_date, Delivery.status, Delivery.bundle)
         .where(Delivery.tenant_id == tenant.id)
         .order_by(Delivery.created_at.desc()).limit(1)
     ).first()
+    # What LANDED on the last bundle, counted once and used twice — the number
+    # the card shows and the number the refusal predicate reads.
+    landed = 0 if delivery is None else len(
+        ((delivery[3] or {}).get("results") or {}).get("delivered") or []
+    )
+    # ── «إما ما رد العميل أو ميتا رفضت الإرسال» → a definite sentence ────────
+    #
+    # `views._delivery_ar` hedges because the card could not tell the two
+    # causes of an expiry apart: a customer who never wrote back, and a
+    # re-engagement template Meta DECLINED to hand over (131047/131049/131050
+    # — `whatsapp.worker.META_REFUSAL_CODES`). Two of the six live expiries
+    # were the second one, and the operator read «he ignored us» about all six.
+    #
+    # `delivery_messages.status == 'failed'` IS that fact, in full: every one
+    # of Meta's refusal codes lands on that one word, deliberately — the
+    # status column is load-bearing for money (`cv/close.whatsapp_spend` bills
+    # everything not exactly `failed`), so the worker refused to invent a
+    # «refused» rung for it. There is nothing else to join on.
+    #
+    # AND NOTHING LANDED, which is narrower than «any failed row» and is the
+    # honest width. The sentence this unlocks is «ما وصلت العميل» — it did not
+    # reach him — and on a bundle that delivered three CVs and had a fourth
+    # refused that sentence is a NEW lie, in the opposite direction, on the one
+    # screen whose entire purpose is not lying. Where a message DID land the
+    # card keeps «وصل جزء منها»/«وصلت كاملة», which is true if less pointed;
+    # where nothing landed the refusal is both true and the whole story. On the
+    # expiries this change exists for the two predicates agree exactly (an
+    # expired bundle delivered nothing), so the narrowing costs no case it was
+    # written for and forecloses the one it was not.
+    refused_by_meta = bool(
+        delivery is not None
+        and landed == 0
+        and session.execute(
+            select(func.count()).select_from(DeliveryMessage).where(
+                DeliveryMessage.tenant_id == tenant.id,
+                DeliveryMessage.delivery_id == delivery[0],
+                DeliveryMessage.status == "failed",
+            )
+        ).scalar_one()
+    )
     outcomes = {
         outcome: count for outcome, count in session.execute(
             select(OutcomeEvent.outcome, func.count())
@@ -1364,16 +1407,16 @@ def _tenant_card(
         # list is empty must never read as «وصل جزء منها» (§15.12).
         "last_delivery": (
             {
-                "run_date": delivery[0].isoformat(),
-                "status": delivery[1],
-                "delivered": len(
-                    ((delivery[2] or {}).get("results") or {}).get("delivered")
-                    or []
-                ),
+                "run_date": delivery[1].isoformat(),
+                "status": delivery[2],
+                "delivered": landed,
                 "failed": len(
-                    ((delivery[2] or {}).get("results") or {}).get("failed")
+                    ((delivery[3] or {}).get("results") or {}).get("failed")
                     or []
                 ),
+                # the fact that settles the expiry sentence; `views.REFUSED_KEY`
+                # is the name the renderer reads it by.
+                views.REFUSED_KEY: refused_by_meta,
             }
             if delivery else None
         ),

@@ -2194,3 +2194,301 @@ def test_the_two_readings_of_the_phone_column_pick_the_same_row(
     assert named == older_code, (
         "the operator's failure notice names a different customer than the "
         f"one the message was routed to: {named} vs {older_code}")
+
+
+# ── «did the hourly block run at all» ───────────────────────────────────────
+#
+# THE INCIDENT. On 2026-08-07 the worker unit was ACTIVE, watchdog-fed, with
+# no ERROR line for seven hours — and `delivery_guarantees` was empty,
+# `/run/career/worker-housekeeping` did not exist, and
+# `journalctl -u career-worker | grep "guarantee sweep"` had never matched.
+# The cause was not in the block: the RUNNING PROCESS predated it. PID
+# 1831439 started 19:29:46 from the checkout at 47bbf9d, whose
+# `run_worker_loop.py` has no `HousekeepingGate`, no `sweep_and_commit` and no
+# SLA sweep at all; the tracebacks it logged put `process_pending_whatsapp` at
+# line 327, which is where that revision has it and 293 lines from where the
+# current file does. The block was added at 01:19 the next morning and the
+# unit was never restarted.
+#
+# What made it INVISIBLE for that long is the thing these tests hold shut:
+# every stanza logs only when its count is non-zero, so an idle hour and a
+# binary with no housekeeping in it produce byte-identical journals. A
+# question that cannot distinguish «nothing was due» from «nothing ran» is not
+# a question, and it was the only one anybody had.
+#
+# These live here rather than beside the gate's other tests in
+# `test_promises.py` because that file is another agent's working tree today;
+# `_worker_loop` above already loads the same script for the same reason.
+
+
+def _gate(tmp_path: Any, *, wall: float = 1_754_600_000.0) -> Any:
+    """A gate on a private `/run`, with a wall clock a test can hold still."""
+    return _worker_loop().HousekeepingGate(
+        path=str(tmp_path / "career" / "worker-housekeeping"),
+        wall=lambda: wall, mono=lambda: 2_170_615.0,
+    )
+
+
+def test_a_claimed_hour_and_a_finished_pass_are_different_facts(
+    tmp_path: Any,
+) -> None:
+    """`mark()` is written BEFORE the block, deliberately — so it says «an
+    hour was taken», never «the work happened». Nothing recorded the second
+    fact, so a pass that raised inside the enrichment sweep left behind a
+    stamp indistinguishable from one that swept all six promises: the only
+    durable record of housekeeping read «fresh» for an hour in which no
+    promise was measured."""
+    gate = _gate(tmp_path)
+
+    gate.mark()
+    assert gate.last_completed() is None, (
+        "a claimed interval reports itself as finished work — the stamp "
+        "cannot tell a pass that died halfway from one that ran")
+
+    gate.completed()
+    assert gate.last_completed() == 1_754_600_000.0
+
+    # …and the claim survives it, because `due()` reads line one and the
+    # gate's whole rate-limiting behaviour hangs off that number.
+    assert gate.due(3600.0) is False
+    stamp = tmp_path / "career" / "worker-housekeeping"
+    assert stamp.read_text(encoding="utf-8").splitlines()[0].startswith(
+        "1754600000 "), "recording the finish rewrote the claim"
+
+    # A NEW hour claimed after it drops the old proof rather than inheriting
+    # it: «claimed, not yet finished» must be readable as exactly that.
+    gate.mark()
+    assert gate.last_completed() is None
+
+
+def test_the_stamp_survives_a_gate_that_cannot_write(tmp_path: Any) -> None:
+    """The degraded path is the one where nothing may raise: a `/run` this
+    process cannot write already costs the block its catch-up, and it must not
+    also cost the loop its cycle."""
+    blocked = tmp_path / "blocked"
+    blocked.write_text("not a directory", encoding="utf-8")
+    gate = _worker_loop().HousekeepingGate(
+        path=str(blocked / "career" / "worker-housekeeping"),
+        wall=lambda: 1_754_600_000.0, mono=lambda: 2_170_615.0,
+    )
+    gate.mark()
+    gate.completed()                       # no raise, and nothing to read
+    assert gate.last_completed() is None
+
+
+def test_an_idle_hour_and_a_block_that_never_ran_are_distinguishable(
+    caplog: Any, monkeypatch: Any,
+) -> None:
+    """The defect that hid the incident, stated as a property.
+
+    The pass publishes itself on counts that are ALL ZERO. Two channels, and
+    neither is an hourly log line: a systemd `STATUS=`, which `systemctl
+    status career-worker` prints and which costs one line of state however
+    idle the week is, and exactly ONE `INFO` line on the first completed pass
+    of a process — the fact the journal could not previously answer, which is
+    that this binary has a housekeeping block and reached the end of it.
+    """
+    loop = _worker_loop()
+    sent: list[str] = []
+    monkeypatch.setattr(loop.sd_notify, "notify",
+                        lambda state: sent.append(state) or True)
+    idle = {"reminders": 0, "enrich": 0, "outcome": 0, "guarantee": 0,
+            "sla": 0, "tickets": 0}
+    when = datetime(2026, 8, 8, 7, 0, tzinfo=UTC)
+
+    with caplog.at_level("INFO"):
+        first = loop.publish_housekeeping(idle, when=when, first=True)
+        loop.publish_housekeeping(idle, when=when, first=False)
+
+    assert len(sent) == 2, "an idle pass told systemd nothing"
+    assert all(s.startswith("STATUS=") for s in sent)
+    assert "2026-08-08T07:00:00" in first and "guarantee=0" in first
+
+    # once per PROCESS, not once per hour: an idle system must not pay a
+    # journal line an hour for the privilege of being observable
+    announcements = [r for r in caplog.records
+                     if "housekeeping" in r.getMessage()]
+    assert len(announcements) == 1, (
+        f"the block announces itself {len(announcements)} times per process — "
+        "an hourly all-quiet line is the alarm nobody reads")
+
+
+def test_the_hourly_block_records_its_completion_unconditionally() -> None:
+    """Read from the TREE, because the claim is about WIRING.
+
+    Two things the incident makes non-negotiable, and neither can be seen from
+    inside a function: the completion record has to be the LAST thing in the
+    hourly block — so a stanza that raises leaves the stamp claimed and
+    unfinished rather than falsely fresh — and it must not sit under an `if`,
+    because «the block ran» is exactly the fact that must not depend on the
+    block having found work.
+    """
+    import ast
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1]
+           / "scripts" / "run_worker_loop.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    gated = [n for n in ast.walk(tree) if isinstance(n, ast.If)
+             and "attr='due'" in ast.dump(n.test)]
+    assert len(gated) == 1, "the hourly block is not gated by the stamp"
+    block = gated[0]
+
+    def _calls(node: Any) -> list[str]:
+        return [n.func.attr if isinstance(n.func, ast.Attribute)
+                else getattr(n.func, "id", "")
+                for n in ast.walk(node) if isinstance(n, ast.Call)]
+
+    assert "completed" in _calls(block), (
+        "the pass never records that it FINISHED — the stamp goes on saying "
+        "«fresh» for an hour that swept nothing")
+    assert "publish_housekeeping" in _calls(block), (
+        "nothing outside the journal can answer «did the block run»")
+
+    # top level of the block only: under an `if`, an idle hour is silent again
+    top = [s for s in block.body if "publish_housekeeping" in _calls(s)]
+    assert len(top) == 1 and isinstance(top[0], ast.Expr), (
+        "the pass publishes itself conditionally — an idle hour and a binary "
+        "with no housekeeping block would look identical again")
+    assert "completed" in _calls(block.body[-2]) or \
+           "completed" in _calls(block.body[-1]), (
+        "the completion record is not at the END of the block, so a stanza "
+        "that raises above it would still stamp the hour as finished")
+
+
+# ── Meta's `errors` array, which this handler used to drop ──────────────────
+#
+# THE HARM. `_handle_status` read `st["status"]` and never `st["errors"]`, so
+# 131049 (the per-user marketing cap), 131050 (the recipient switched
+# «Offers and announcements» off) and 131047 (re-engagement required) all
+# landed as one undifferentiated `failed`. The bundle they suppressed then
+# expired as EXPIRED_WINDOW three hours later, and the console rendered that
+# «⌛ انتهت مهلتها دون تسليم» — so the operator read «the customer ignored us»
+# about a message Meta declined to hand over. Six of sixteen bundles in the
+# live data have expired and the 72-hour start guarantee is a financial
+# promise resting on that number.
+#
+# Note WHERE the defect was, because it is easy to state one step wrong: the
+# code was never FILED as EXPIRED_WINDOW. It was discarded here, at the status
+# webhook, and the expiry sweep then supplied a wrong-by-omission explanation
+# afterwards. This is the discard.
+
+
+def _refusal(owner_session: Session, wamid: str, code: int, *,
+             status: str = "failed", now: datetime = NOW) -> None:
+    """One status callback shaped the way Meta sends a refusal: HTTP 200 was
+    returned at send time, and the reason arrives only here."""
+    _insert_event(owner_session, _payload(statuses=[{
+        "id": wamid, "status": status, "recipient_id": "966500000000",
+        "errors": [{"code": code, "title": "…", "error_data": {}}],
+    }]))
+    _run(owner_session, FakeWhatsAppClient(), FakeTelegramAdminClient(), now=now)
+
+
+def test_a_refused_send_names_the_meta_code_on_the_operators_screen(
+    owner_session: Session, clean_billing: None, caplog: Any
+) -> None:
+    """The reason reaches the one screen he reads, with no migration.
+
+    `run_admin_bot._HealthProbes.error_lines` harvests «ERROR:» lines from
+    this unit onto «🧾 آخر الأخطاء المسجلة», so an ERROR here is on his phone
+    today — which is why the code goes there and not into a new column.
+    """
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    phone = _activate_phone(owner_session, wa, admin)
+    wamid = f"wamid-{uuid.uuid4()}"
+    _seed_outbound(owner_session, phone, wamid, template="daily_opportunities")
+
+    with caplog.at_level("ERROR"):
+        _refusal(owner_session, wamid, 131049)
+
+    errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    named = [m for m in errors if "131049" in m]
+    assert named, f"Meta's reason was discarded again: {errors}"
+    # the code, the customer, and the correction of the wrong reading — the
+    # three things the expiry screen could not say
+    assert "TEN-" in named[0]
+    assert "REFUSED" in named[0]
+    assert "going quiet" in named[0]
+    # §15.13: a TEN code, never the phone
+    assert phone.lstrip("+") not in named[0]
+
+    # …and the STATUS WORD is untouched. `cv/close.whatsapp_spend` bills every
+    # template whose status is not exactly «failed», so spelling a refusal any
+    # other way would start billing us for messages Meta never delivered.
+    assert _receipt_row(owner_session, wamid).status == "failed"
+
+
+def test_a_refusal_we_never_recorded_is_still_reported(
+    owner_session: Session, clean_billing: None, caplog: Any
+) -> None:
+    """Not hypothetical: staging holds a 131047 refusal whose wa_message_id
+    appears in NO `delivery_messages` row — a send we were refused and never
+    wrote down. With the report hung off the row, that one is invisible
+    forever, which is the worst case of the three and the easiest to miss."""
+    orphan = f"wamid-{uuid.uuid4()}"
+
+    with caplog.at_level("ERROR"):
+        _refusal(owner_session, orphan, 131047)
+
+    named = [r.getMessage() for r in caplog.records
+             if r.levelname == "ERROR" and "131047" in r.getMessage()]
+    assert named, "a refusal with no ledger row was swallowed"
+    assert "(no row)" in named[0], \
+        "the line implies a customer we cannot actually name"
+
+
+def test_a_redelivered_refusal_does_not_refill_the_error_screen(
+    owner_session: Session, clean_billing: None, caplog: Any
+) -> None:
+    """Meta redelivers webhooks freely. The report is hung on the TRANSITION —
+    the receipt that actually won — so ten redeliveries of one refusal are one
+    line. A screen that repeats itself is a screen that stops being read, and
+    this repository has spent two days on that lesson."""
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    phone = _activate_phone(owner_session, wa, admin)
+    wamid = f"wamid-{uuid.uuid4()}"
+    _seed_outbound(owner_session, phone, wamid)
+
+    with caplog.at_level("ERROR"):
+        _refusal(owner_session, wamid, 131050)
+        _refusal(owner_session, wamid, 131050, now=LATER)
+
+    named = [r for r in caplog.records if "131050" in r.getMessage()]
+    assert len(named) == 1, f"one refusal reported {len(named)} times"
+
+
+def test_an_unrecognised_meta_code_is_reported_rather_than_guessed_at(
+    owner_session: Session, clean_billing: None, caplog: Any
+) -> None:
+    """The blind spot the known-codes table would otherwise create. A code we
+    have no words for is still a refusal, and the number itself is enough to
+    look up — silence is the only answer that helps nobody."""
+    from career.whatsapp import worker as wa_worker
+
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    phone = _activate_phone(owner_session, wa, admin)
+    wamid = f"wamid-{uuid.uuid4()}"
+    _seed_outbound(owner_session, phone, wamid)
+    assert 133015 not in wa_worker.META_REFUSAL_CODES
+
+    with caplog.at_level("ERROR"):
+        _refusal(owner_session, wamid, 133015)
+
+    named = [r.getMessage() for r in caplog.records if "133015" in r.getMessage()]
+    assert named and "unrecognised" in named[0]
+
+
+def test_the_error_array_is_read_whatever_shape_meta_sends() -> None:
+    """`status_error_codes` is total, because the caller's whole job is to
+    stop throwing this array away — and a parser that raises on an unexpected
+    shape would throw away the cycle instead."""
+    from career.whatsapp.worker import status_error_codes
+
+    assert status_error_codes({}) == []
+    assert status_error_codes({"errors": None}) == []
+    assert status_error_codes({"errors": ["not a dict"]}) == []
+    assert status_error_codes({"errors": [{"title": "no code"}]}) == []
+    assert status_error_codes({"errors": [{"code": "131049"}]}) == [131049]
+    assert status_error_codes(
+        {"errors": [{"code": 131049}, {"code": 131050}]}) == [131049, 131050]

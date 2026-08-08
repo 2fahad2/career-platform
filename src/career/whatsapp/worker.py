@@ -1048,6 +1048,112 @@ def receipt_rank(status: str | None) -> int:
     return RECEIPT_ORDER.get(str(status or "").lower(), 0)
 
 
+#: Meta's own codes for «accepted over HTTP 200, then NOT delivered» — the
+#: ones that mean the message was REFUSED rather than merely unanswered.
+#:
+#: The distinction is the whole point of this table. `delivery_messages.status`
+#: has one word for every one of these — `failed` — and the bundle they
+#: suppressed then expires as `EXPIRED_WINDOW`, which the operator's screen
+#: renders «⌛ انتهت مهلتها دون تسليم». So the console said «the customer let
+#: it lapse» about a message Meta declined to hand over, and the 72-hour start
+#: guarantee — a financial promise — rests on that same expiry count.
+#:
+#: Sourced from the two places in this tree that already knew: the category
+#: analysis in `whatsapp/templates` and the send-side note in
+#: `salla/lifecycle.send_template_and_record`, which names 131049/131050
+#: exactly and says of this handler «the REASON is discarded today and no one
+#: is told». This is the table that stops discarding it.
+#:
+#: Phrases are SHORT on purpose: they travel to the operator's error screen,
+#: where `telegram.views.render_errors` truncates each line at 120 characters.
+#: Code first, TEN code second, meaning third — so a truncated line still says
+#: which customer and which refusal.
+META_REFUSAL_CODES: dict[int, str] = {
+    131026: "undeliverable — that number is not reachable on WhatsApp",
+    131047: "re-engagement required — the 24h window was shut",
+    131049: "per-user marketing cap — Meta withheld it; do not retry",
+    131050: "recipient switched «Offers and announcements» off; do not retry",
+    131051: "unsupported message type",
+}
+
+
+def status_error_codes(st: dict[str, Any]) -> list[int]:
+    """Meta's reason codes on ONE status callback, in arrival order.
+
+    Public and total: it answers for any shape Meta sends, including the empty
+    one, because the caller's whole job is to stop throwing this array away.
+    Non-numeric codes are dropped rather than guessed at — an unparseable code
+    is not a reason, and the raw payload is still on `webhook_events` for
+    anyone who needs to look.
+    """
+    codes: list[int] = []
+    for err in st.get("errors") or []:
+        if not isinstance(err, dict):
+            continue
+        try:
+            codes.append(int(err.get("code")))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+    return codes
+
+
+def _report_refusal(
+    session: Session, *, codes: list[int], status: str,
+    tenant_id: uuid.UUID | None, template_name: str | None,
+) -> None:
+    """Put Meta's reason where the operator will actually meet it.
+
+    ── WHY A LOG LINE AND NOT A COLUMN ──────────────────────────────────────
+    A `meta_error_code` column on `delivery_messages` is the obvious shape and
+    it is the THIRD choice, not the first:
+
+    * the reason is not lost without it — the whole status callback, `errors`
+      array included, is already durable on `webhook_events.payload`, which is
+      how the six historical expiries were attributed at all;
+    * ``ERROR:`` lines from this unit are harvested by the admin bot
+      (`run_admin_bot._HealthProbes.error_lines`) straight onto «🧾 آخر الأخطاء
+      المسجلة», so this reaches the operator's screen TODAY, with no migration,
+      no deploy ordering and no backfill;
+    * a column needs a migration, and a migration is the one thing that cannot
+      be shipped by the process that discovered the problem.
+
+    What a column WOULD buy is the join — «show me every expiry that was
+    actually a refusal» as one query instead of a JSON scan — and that is a
+    real report, worth writing the day the count stops being six. The
+    migration is described in this change's report and deliberately not run.
+
+    ── AND WHY NOT A NEW STATUS WORD ────────────────────────────────────────
+    Putting «refused» into `delivery_messages.status` looks cheapest of all
+    and is the most expensive: `cv/close.whatsapp_spend` bills every template
+    whose status is not exactly ``failed``, so the moment a refusal stops
+    being spelled `failed` we start BILLING ourselves for messages Meta never
+    delivered — and :data:`RECEIPT_ORDER` would need a rung for it, on a
+    ladder whose ordering already had to be argued twice. The status word is
+    load-bearing for money. The reason is not, and does not belong in it.
+    """
+    named = ", ".join(
+        f"{code} {META_REFUSAL_CODES.get(code, 'unrecognised Meta code')}"
+        for code in codes
+    )
+    ten = _ten_code(session, tenant_id) if tenant_id is not None else "(no row)"
+    # ERROR and not WARNING, by the same rule as the unknown-rung line above:
+    # warnings do not leave this box. The harvester forwards «ERROR:» only.
+    #
+    # WORD ORDER IS LOAD-BEARING, because this line is truncated before he
+    # reads it: `run_admin_bot.error_lines` strips «ERROR:» and hands
+    # «career.whatsapp · <message>» to `views.render_errors`, which cuts at
+    # 120 characters — about 100 of them this message's. So WHO and WHICH
+    # REFUSAL come first and fit; the template name and the sentence that
+    # corrects the wrong reading come after, complete in the journal and
+    # expendable on the screen.
+    logger.error(
+        "whatsapp %s REFUSED by Meta — %s — %s (template %s). The send did "
+        "not reach the customer; an expiry on this bundle is NOT the customer "
+        "going quiet",
+        status, ten, named, template_name or "-",
+    )
+
+
 def _handle_status(session: Session, st: dict[str, Any], *, now: datetime) -> None:
     wamid = st.get("id")
     status = st.get("status")
@@ -1072,15 +1178,47 @@ def _handle_status(session: Session, st: dict[str, Any], *, now: datetime) -> No
             "unknown whatsapp receipt status %r — NOT recorded; add it to "
             "RECEIPT_ORDER or the ledger stays blind to it", status,
         )
+    # Meta's `errors` array, which this handler used to drop on the floor.
+    # Read BEFORE the loop because it is a property of the CALLBACK, not of any
+    # row — and it has to be answerable even when no row matches, which is not
+    # hypothetical: staging holds a 131047 refusal whose wa_message_id appears
+    # in no `delivery_messages` row at all, i.e. a send we were refused and
+    # never recorded. That is a hole in the ledger and the only way anyone
+    # learns of it is the line below.
+    codes = status_error_codes(st)
+    reported = False
+    matched = False
     for dm in session.execute(
         select(DeliveryMessage).where(DeliveryMessage.wa_message_id == wamid)
     ).scalars():
+        matched = True
         if rank <= receipt_rank(dm.status):
             continue  # out of order, or the same receipt twice — a no-op
         dm.status = str(status)
         # the stamp belongs to the receipt that actually WON, so a superseded
         # duplicate never makes a row look freshly updated
         dm.status_updated_at = now
+        # Reported on the TRANSITION and not on arrival, so a redelivered
+        # webhook — Meta retries them freely — cannot fill the operator's
+        # error screen with the same refusal ten times. A receipt that loses
+        # to a higher rung says nothing either: a `failed` behind a
+        # `delivered` is Meta talking about a different send attempt, and this
+        # message demonstrably arrived.
+        if codes and not reported:
+            reported = True
+            _report_refusal(
+                session, codes=codes, status=str(status),
+                tenant_id=dm.tenant_id, template_name=dm.template_name,
+            )
+    # `matched` and not `reported`: a callback whose row exists but lost the
+    # rank comparison has already been reported once, on the transition, and a
+    # redelivery must not say it again. A callback with NO row has never been
+    # reported by anyone, and never will be if this is silent.
+    if codes and not matched:
+        _report_refusal(
+            session, codes=codes, status=str(status),
+            tenant_id=None, template_name=None,
+        )
 
 
 #: How many times ONE event may be attempted before the worker stops trying.

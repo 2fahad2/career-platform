@@ -395,6 +395,133 @@ def test_the_two_price_authorities_must_agree_with_each_other() -> None:
     assert any("authorities disagree" in p.english for p in problems)
 
 
+# ── the price-test window: the day the alarm has to be TRUE ────────────────
+#
+# The gateway is proven by dropping the three REAL products to 1.00 SAR for a
+# few days. To this check that is a 1-SAR product on a 199 plan, which it has
+# always reported as «a real order will be refused with AMOUNT_MISMATCH» — a
+# sentence that is FALSE: §09 keys on the product id and that product carries
+# its own price, so the order provisions perfectly. A daily red alert whose
+# text is wrong is worse than no alert; the next true one is read the same way.
+
+#: The environment mid-test: the store, the pricing map and the window agree.
+_TEST_PRICED = {"salla_product_pricing": '{"1": [1.00, "SAR"]}'}
+
+
+def test_an_open_window_replaces_the_false_alarm_with_a_true_line() -> None:
+    problems = _check(**_TEST_PRICED, salla_price_test_until="2026-08-10")
+    assert [p.key for p in problems] == ["SALLA_PRICE_TEST_UNTIL"]
+    assert problems[0].notice is True
+    english = problems[0].english
+    assert "AMOUNT_MISMATCH" not in english          # the false half is gone
+    assert "OPEN until 2026-08-10" in english        # what is actually true
+    assert "NO founder price lock is captured" in english
+
+
+def test_a_window_that_has_passed_over_cheap_products_escalates() -> None:
+    """The date closes itself, and that is only safe if the morning after says
+    so: from that moment locks are captured again, at the test price, into
+    every new customer's permanent record."""
+    problems = _check(**_TEST_PRICED, salla_price_test_until="2026-08-04")
+    assert [p.key for p in problems] == ["SALLA_PRODUCT_PRICING"]
+    assert problems[0].notice is False
+    assert "CLOSED on 2026-08-04" in problems[0].english
+    assert "STILL at 1.0 SAR" in problems[0].english
+    assert "wire_salla_products" in problems[0].english
+
+
+def test_an_expired_window_over_restored_prices_says_nothing() -> None:
+    """Once the prices are back it is the same state as «no window», and a
+    daily reminder about a date that changes nothing is how the three lines
+    above get skimmed past."""
+    assert _check(salla_price_test_until="2026-08-04") == []
+
+
+def test_a_window_open_over_full_prices_is_a_promise_switched_off() -> None:
+    """The mirror of the trap, and the reason this is a date the operator sets
+    rather than a flag the code infers: nothing is broken, and every customer
+    who buys today silently gets no locked price."""
+    problems = _check(salla_price_test_until="2026-08-10")
+    assert [p.key for p in problems] == ["SALLA_PRICE_TEST_UNTIL"]
+    assert problems[0].notice is False
+    assert "suspended for nothing" in problems[0].english
+
+
+def test_a_window_longer_than_the_maximum_is_caught_by_hand_too() -> None:
+    """The wiring tool refuses to write one; the file can still be edited."""
+    problems = _check(**_TEST_PRICED, salla_price_test_until="2027-01-01")
+    keys = [p.key for p in problems]
+    assert keys.count("SALLA_PRICE_TEST_UNTIL") == 2   # the notice, and this
+    assert any("the maximum is" in p.english and not p.notice
+               for p in problems)
+
+
+def test_an_unreadable_window_is_reported_and_read_as_open() -> None:
+    """`price_lock` treats an unparseable date as an open window — a lock not
+    captured is recoverable, a lock captured at a test price is not. That
+    choice is only defensible while it is impossible to sit in unnoticed."""
+    problems = _check(salla_price_test_until="next friday")
+    assert [p.key for p in problems] == ["SALLA_PRICE_TEST_UNTIL"]
+    assert problems[0].notice is False
+    assert "treated as an OPEN price test window" in problems[0].english
+
+
+def test_an_absent_window_is_the_default_and_changes_nothing() -> None:
+    """A settings object that has never heard of the variable — the shape every
+    other caller and every older host has — must behave exactly as before."""
+    assert _check() == []
+    assert _check(**_TEST_PRICED)[0].english.endswith("AMOUNT_MISMATCH")
+
+
+def test_the_window_alert_is_direction_pure_including_its_date() -> None:
+    """The date is the trap here: an ISO date is ASCII digits, and a line that
+    mixes them with Arabic arrives at him reversed. The real repository rule
+    is imported rather than restated — the hand-written checks in this file
+    look only for Latin LETTERS and would pass a scrambled line."""
+    from tests.test_alert_direction_purity import line_is_mixed
+
+    for until in ("2026-08-10", "2026-08-04", "next friday", "2027-01-01"):
+        text = cli.format_env_alert(
+            _check(**_TEST_PRICED, salla_price_test_until=until))
+        assert not [line for line in text.splitlines() if line_is_mixed(line)]
+
+
+def test_a_notice_alone_does_not_wear_the_red_banner() -> None:
+    """A morning whose only news is «the window is open» is not a morning when
+    the configuration contradicts the database, and it must not arrive looking
+    like one — nor list a variable to «correct» when there is nothing to fix."""
+    text = cli.format_env_alert(
+        _check(**_TEST_PRICED, salla_price_test_until="2026-08-10"))
+    assert "🔴" not in text and "🟡" in text
+    assert "المتغيرات المطلوب تصحيحها" not in text
+    # …while a real fault beside it puts the banner back and lists only IT
+    both = cli.format_env_alert(
+        _check(**_TEST_PRICED, salla_price_test_until="2026-08-10",
+               salla_store_url=""))
+    assert "🔴" in both
+    assert "SALLA_STORE_URL" in both and "SALLA_PRICE_TEST_UNTIL" not in both
+
+
+def test_a_notice_is_logged_but_not_as_an_error(monkeypatch, caplog) -> None:
+    """ERROR is the level his journal harvester forwards. A deliberate state
+    that shouts ERROR every morning teaches him to skim the level that carries
+    the outages."""
+    monkeypatch.setattr(cli, "approved_plan_prices", lambda session: APPROVED)
+    monkeypatch.setattr(cli, "canonical_sale_plans", lambda: ON_SALE)
+    admin = _Admin()
+    with caplog.at_level("WARNING"):
+        problems = cli.report_environment(
+            settings=_settings(**_TEST_PRICED,
+                               salla_price_test_until="2026-08-10"),
+            session=None, admin_client=admin, today=TODAY,
+        )
+    assert [p.notice for p in problems] == [True]
+    assert any("BOOT NOTICE" in r.message and r.levelname == "WARNING"
+               for r in caplog.records)
+    assert not any("BOOT CHECK" in r.message for r in caplog.records)
+    assert len(admin.sent) == 1          # he is still told, every morning
+
+
 def test_an_expired_token_is_caught() -> None:
     problems = _check(salla_token_expires_at="2026-08-04")
     assert [p.key for p in problems] == ["SALLA_TOKEN_EXPIRES_AT"]
@@ -576,6 +703,93 @@ def test_an_unreadable_authority_is_logged_not_swallowed(
     assert any("could not run" in r.message for r in caplog.records)
 
 
+# ── «ما نبيع الكرسي رقم ٣١»: the counter nothing ever compared ─────────────
+
+
+def _seat_settings(**overrides: str) -> SimpleNamespace:
+    return _settings(salla_api_key="k", **overrides)
+
+
+def _patch_seats(monkeypatch, *, taken: int, sellable: int, reads: list) -> None:
+    from career.salla import seats
+
+    monkeypatch.setattr(cli, "approved_plan_prices", lambda session: APPROVED)
+    monkeypatch.setattr(cli, "canonical_sale_plans", lambda: ON_SALE)
+    monkeypatch.setattr(
+        seats, "founding_seats",
+        lambda session, **k: seats.Seats(cap=30, taken=taken,
+                                         by_plan={"professional": taken}))
+
+    def _read(**kwargs: Any) -> Any:
+        reads.append(kwargs)
+        return seats.SeatSupply(by_product={"1": sellable})
+
+    monkeypatch.setattr(seats, "read_seat_supply", _read)
+
+
+def test_a_store_that_will_oversell_the_wave_is_reported(monkeypatch) -> None:
+    """The live configuration on 2026-08-08: one seat taken and forty still
+    sellable against a page that says thirty. Constant 4 forbids refusing a
+    paid order, so the dashboard is the only place this can be stopped — which
+    means it has to be SAID before somebody buys the thirty-first seat."""
+    reads: list = []
+    _patch_seats(monkeypatch, taken=1, sellable=40, reads=reads)
+    admin = _Admin()
+    cli.report_environment(settings=_seat_settings(), session=None,
+                           admin_client=admin, today=TODAY)
+    assert len(reads) == 1
+    assert any("كراسي التأسيس" in m for m in admin.sent)
+
+
+def test_two_counters_that_agree_say_nothing(monkeypatch) -> None:
+    """A nightly «all good» beside a boot check is how a channel stops being
+    read."""
+    reads: list = []
+    _patch_seats(monkeypatch, taken=1, sellable=29, reads=reads)
+    admin = _Admin()
+    assert cli.report_environment(settings=_seat_settings(), session=None,
+                                  admin_client=admin, today=TODAY) == []
+    assert admin.sent == []
+
+
+def test_the_worker_never_spends_a_salla_read_on_a_restart(monkeypatch) -> None:
+    """`alert=False` is the conversation worker under Restart=always/
+    RestartSec=5. Two product reads per restart, twelve restarts a minute, is
+    a crash loop hammering Salla — the same argument that keeps the WhatsApp
+    token inspection out of the worker's boot check."""
+    reads: list = []
+    _patch_seats(monkeypatch, taken=1, sellable=40, reads=reads)
+    admin = _Admin()
+    cli.report_environment(settings=_seat_settings(), session=None,
+                           admin_client=admin, today=TODAY, alert=False)
+    assert reads == [] and admin.sent == []
+
+
+def test_no_api_key_reads_nothing_and_repeats_no_emptiness(monkeypatch) -> None:
+    reads: list = []
+    _patch_seats(monkeypatch, taken=1, sellable=40, reads=reads)
+    admin = _Admin()
+    cli.report_environment(settings=_settings(), session=None,
+                           admin_client=admin, today=TODAY)
+    assert reads == [] and admin.sent == []
+
+
+def test_a_seat_read_that_explodes_never_reaches_the_caller(monkeypatch) -> None:
+    """It runs inside the boot check of the two processes that serve people who
+    have already paid, so an unreachable Salla is a log line and nothing more."""
+    from career.salla import seats
+
+    monkeypatch.setattr(cli, "approved_plan_prices", lambda session: APPROVED)
+    monkeypatch.setattr(cli, "canonical_sale_plans", lambda: ON_SALE)
+
+    def _boom(**kwargs: Any) -> Any:
+        raise RuntimeError("salla down")
+
+    monkeypatch.setattr(seats, "read_seat_supply", _boom)
+    assert cli.report_environment(settings=_seat_settings(), session=None,
+                                  admin_client=_Admin(), today=TODAY) == []
+
+
 # ── P0-8: the authorities are real, not restated here ──────────────────────
 
 
@@ -586,6 +800,93 @@ def test_the_sale_table_is_read_from_the_wiring_tool() -> None:
     assert "basic" not in plans
     assert plans["professional"] == Decimal("199.00")
     assert set(plans) == {"cv_analysis", "professional", "executive"}
+
+
+# ── the wiring tool's test price: the same proof, at the price being tested ─
+
+
+def _wiring() -> Any:
+    """The wiring script as a module — loaded exactly the way
+    `cli.canonical_sale_plans` loads it, so this tests the real file."""
+    import importlib.util
+    import pathlib
+
+    path = pathlib.Path(__file__).resolve().parents[1] / "scripts" \
+        / "wire_salla_products.py"
+    spec = importlib.util.spec_from_file_location("_wiring_tool", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_TODAY = date(2026, 8, 8)
+
+
+def test_the_test_price_is_wired_for_every_plan_and_bounded_in_time() -> None:
+    """The pricing map must match what Salla actually charges or every single
+    purchase is refused — so the test price is wired for all three products,
+    and it goes through the same mandatory rehearsal as any other price."""
+    prices, refusals = _wiring().prices_for_window(
+        Decimal("1.00"), date(2026, 8, 12), _TODAY)
+    assert refusals == []
+    assert prices == {"cv_analysis": Decimal("1.00"),
+                      "professional": Decimal("1.00"),
+                      "executive": Decimal("1.00")}
+
+
+def test_the_canonical_table_is_untouched_by_a_test_price() -> None:
+    """`cli.canonical_sale_plans` reads PLANS to check the environment against
+    `plan_entitlements`. Rewriting it for the window would make both
+    authorities agree on 1.00 and silence the boot check that is watching for
+    exactly this."""
+    module = _wiring()
+    module.prices_for_window(Decimal("1.00"), date(2026, 8, 12), _TODAY)
+    assert {plan: price for plan, price in module.PLANS.values()} == {
+        "cv_analysis": Decimal("29.00"), "professional": Decimal("199.00"),
+        "executive": Decimal("449.00")}
+    assert cli.canonical_sale_plans()["professional"] == Decimal("199.00")
+
+
+def test_a_test_price_without_a_closing_date_is_refused() -> None:
+    """The two halves are one flag. A cheap catalog with no window is the trap
+    itself: every buyer's founding price recorded as the test price, forever —
+    and this tool is the only writer that can make that state impossible."""
+    _p, refusals = _wiring().prices_for_window(Decimal("1.00"), None, _TODAY)
+    assert refusals and "one flag in two halves" in refusals[0]
+    _p2, refusals2 = _wiring().prices_for_window(
+        None, date(2026, 8, 12), _TODAY)
+    assert refusals2
+
+
+def test_a_window_that_closes_in_the_past_is_refused() -> None:
+    _p, refusals = _wiring().prices_for_window(
+        Decimal("1.00"), date(2026, 8, 7), _TODAY)
+    assert refusals and "in the past" in refusals[0]
+
+
+def test_a_window_longer_than_the_maximum_is_refused() -> None:
+    """While it is open NO customer records the price they bought at. A few
+    days of that is a rehearsal; a season of it is a broken promise."""
+    module = _wiring()
+    _p, refusals = module.prices_for_window(
+        Decimal("1.00"),
+        _TODAY + timedelta(days=module.PRICE_TEST_MAX_DAYS + 1), _TODAY)
+    assert refusals and "maximum is" in refusals[0]
+
+
+def test_a_test_price_that_is_not_below_the_real_one_is_refused() -> None:
+    """A «test price» at or above the real price is a price CHANGE, and this
+    repository changes prices by editing the whitepaper first."""
+    _p, refusals = _wiring().prices_for_window(
+        Decimal("199.00"), date(2026, 8, 12), _TODAY)
+    assert any("not below the real price" in line for line in refusals)
+
+
+def test_no_flags_at_all_wires_the_real_prices_and_closes_the_window() -> None:
+    prices, refusals = _wiring().prices_for_window(None, None, _TODAY)
+    assert refusals == []
+    assert prices["professional"] == Decimal("199.00")
 
 
 # ── the §05 sweep: one bad row used to cost the whole night's marks ─────────

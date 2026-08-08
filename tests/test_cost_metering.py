@@ -806,3 +806,125 @@ def test_no_cost_block_when_there_is_nothing_to_report() -> None:
     from career.telegram.views import cost_lines
 
     assert cost_lines({}) == []
+
+
+# ── revenue: the decision NOT to filter the test phase out (2026-08-08) ──────
+#
+# These pin a judgement, not a behaviour change. During the 1-riyal test phase
+# every tester adds a 1.00 SAR row on a REAL plan, which inflates a plan's
+# subscription count and craters the average the operator prices the product
+# from. The temptation is a predicate inside `paid_subscriptions_by_plan`; the
+# reasoning against it is written out in that function's docstring. What the
+# tests below are for is the OTHER half of a decision: making it fail loudly
+# if someone quietly implements the tempting version six weeks from now.
+
+
+def _subscription(
+    owner_session: Session, tid: uuid.UUID, *, plan: str, amount: str,
+    status: str = "ACTIVE",
+) -> None:
+    owner_session.execute(
+        sql_text(
+            "INSERT INTO subscriptions (id, tenant_id, plan_code, status,"
+            " salla_order_id, amount_sar, currency, created_at)"
+            " VALUES (:i, :t, :p, :s, :o, :a, 'SAR', :n)"
+        ),
+        {"i": str(uuid.uuid4()), "t": str(tid), "p": plan, "s": status,
+         "o": f"O-{uuid.uuid4()}", "a": Decimal(amount), "n": NOW},
+    )
+
+
+def test_a_one_riyal_sale_is_revenue_and_is_counted(
+    owner_session: Session,
+) -> None:
+    """A 1 SAR order really happened: money arrived and stayed.
+
+    Removing it would be a SECOND definition of revenue in the one file whose
+    docstring exists because there used to be two and they disagreed. The
+    count and the sum stay filtered by the same rule — the state machine's
+    terminal states — and by nothing else.
+    """
+    tid = _seed_tenant(owner_session)
+    try:
+        _subscription(owner_session, tid, plan="professional", amount="1.00")
+        owner_session.commit()
+        by_plan, revenue = close.paid_subscriptions_by_plan(
+            owner_session, since=NOW
+        )
+        assert by_plan.get("professional") == 1
+        assert revenue == Decimal("1")
+    finally:
+        _cleanup(owner_session, tid)
+
+
+def test_no_amount_threshold_hides_a_row_from_either_number(
+    owner_session: Session,
+) -> None:
+    """The shape a «test phase filter» would take, refused.
+
+    Nine testers at one riyal beside one real buyer: ten subscriptions and
+    208 riyals. Both numbers are true and the pair is embarrassing, which is
+    the point — an operator who sees them together can see what happened,
+    and an operator shown «1 subscription, 199 riyals» cannot.
+    """
+    tid = _seed_tenant(owner_session)
+    try:
+        for _ in range(9):
+            _subscription(owner_session, tid, plan="professional", amount="1.00")
+        _subscription(owner_session, tid, plan="professional", amount="199.00")
+        owner_session.commit()
+        by_plan, revenue = close.paid_subscriptions_by_plan(
+            owner_session, since=NOW
+        )
+        assert by_plan.get("professional") == 10
+        assert revenue == Decimal("208")
+    finally:
+        _cleanup(owner_session, tid)
+
+
+def test_an_absurd_amount_is_counted_too_which_is_why_a_threshold_is_wrong(
+    owner_session: Session,
+) -> None:
+    """The live argument against filtering by size.
+
+    career_staging carries TEN-0001 at 34900.00 SAR — a seeding artefact four
+    orders of magnitude wrong — and TEN-0002 at 1.00 SAR, which is honest.
+    Any «ignore small amounts» rule keeps the row that lies and drops the row
+    that does not. Size is not evidence, in either direction.
+    """
+    tid = _seed_tenant(owner_session)
+    try:
+        _subscription(owner_session, tid, plan="basic", amount="34900.00",
+                      status="EXPIRED")
+        _subscription(owner_session, tid, plan="basic", amount="1.00")
+        owner_session.commit()
+        by_plan, revenue = close.paid_subscriptions_by_plan(
+            owner_session, since=NOW
+        )
+        assert by_plan.get("basic") == 2
+        assert revenue == Decimal("34901")
+    finally:
+        _cleanup(owner_session, tid)
+
+
+def test_the_only_predicate_on_revenue_remains_the_state_machines(
+    owner_session: Session,
+) -> None:
+    """Derived, never restated — the property a filter would break."""
+    from career.salla import subscriptions as sub_states
+
+    assert close.NON_REVENUE_STATUSES == (
+        sub_states.TERMINAL_STATES | {sub_states.PENDING_PAYMENT}
+    )
+    tid = _seed_tenant(owner_session)
+    try:
+        for status in sorted(close.NON_REVENUE_STATUSES):
+            _subscription(owner_session, tid, plan="professional",
+                          amount="199.00", status=status)
+        owner_session.commit()
+        by_plan, revenue = close.paid_subscriptions_by_plan(
+            owner_session, since=NOW
+        )
+        assert by_plan == {} and revenue == Decimal("0")
+    finally:
+        _cleanup(owner_session, tid)

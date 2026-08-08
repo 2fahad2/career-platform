@@ -7,11 +7,113 @@ share nothing.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import date
+from enum import StrEnum
 from functools import lru_cache
 from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+#: The longest a price-test window may be opened for, in days. The window
+#: suppresses the founder price lock (see `career.promises.price_lock`), so
+#: while it is open no new customer records the price they bought at — a real
+#: cost, paid deliberately for a few days and never for a season. The wiring
+#: tool refuses a longer window and the boot check escalates one it finds.
+PRICE_TEST_MAX_DAYS = 14
+
+
+class PriceTestState(StrEnum):
+    """What ``SALLA_PRICE_TEST_UNTIL`` says about today.
+
+    Four states rather than a boolean, and the reason is the same one
+    :class:`career.engine.cli.TokenState` was split for: «no window» and «a
+    window nobody can read» are different facts with different instructions,
+    and collapsing them means printing one of the two answers for both.
+    """
+
+    #: No window was ever opened. THE DEFAULT — see :func:`price_test_window`.
+    ABSENT = "absent"
+    #: Today is on or before the last day of the window.
+    OPEN = "open"
+    #: A window was opened and its last day has passed. Identical in effect to
+    #: ABSENT (locks are captured again); kept distinct because the boot check
+    #: has something to say about an expired window over cheap products.
+    EXPIRED = "expired"
+    #: Somebody typed something that is not a date. Treated as OPEN — see
+    #: :func:`price_test_window` for why that direction and not the other.
+    UNREADABLE = "unreadable"
+
+
+@dataclass(frozen=True)
+class PriceTestWindow:
+    """The answer to «are the store's products at a test price right now».
+
+    It cannot be derived from anything the code can observe: during the test
+    the environment's pricing map matches what Salla charges exactly, so every
+    automatic check agrees the configuration is correct — which it is. The
+    only thing that knows a 1.00 SAR sale is a payment-gateway rehearsal
+    rather than a sale is the operator, so this is his declaration and nothing
+    else.
+    """
+
+    state: PriceTestState
+    #: The last day the window covers, inclusive. None unless it parsed.
+    last_day: date | None = None
+    #: Exactly what the environment held, for an operator-facing report.
+    raw: str = ""
+
+    @property
+    def open(self) -> bool:
+        return self.state is PriceTestState.OPEN
+
+    @property
+    def suppresses_capture(self) -> bool:
+        """May a founder price lock be captured today?
+
+        UNREADABLE counts as open, and that is the whole of the fail-safe
+        choice. The two ways to be wrong are not symmetric: a lock NOT captured
+        costs a customer nothing today (his renewal at the real price captures
+        it then, and a lock only ever matters after a price RISE), while a lock
+        captured at a test price is a standing authorisation to buy the real
+        product for one riyal AND the thing that makes his next real payment
+        fail closed and TERMINAL. So an unparseable date suppresses, and the
+        boot check reports it every morning until it is fixed or cleared.
+        """
+        return self.state in (PriceTestState.OPEN, PriceTestState.UNREADABLE)
+
+    def days_remaining(self, today: date) -> int | None:
+        return None if self.last_day is None else (self.last_day - today).days
+
+
+def price_test_window(raw: str | None, today: date) -> PriceTestWindow:
+    """Read ``SALLA_PRICE_TEST_UNTIL`` against a day.
+
+    A DATE and not a flag, deliberately. A boolean switch has to be turned off
+    by the same hand that turned it on, at a moment when the interesting part
+    is already over — and «no new customer records the price he paid» is
+    exactly the kind of quiet that survives a forgotten switch for months. A
+    date closes itself: the day after it passes, capture is armed again with
+    no human step. What that self-closing must NOT do is silently re-arm over
+    products that are still cheap, which is why it has a second half in
+    `engine.cli.verify_environment` — an expired window over a below-approved
+    price escalates every morning.
+
+    An EMPTY or missing value is ABSENT, i.e. no window at all. That is the
+    default in `Settings` and the default here, so a host that has never heard
+    of this variable behaves exactly as it did before it existed.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return PriceTestWindow(PriceTestState.ABSENT)
+    try:
+        last_day = date.fromisoformat(text[:10])
+    except ValueError:
+        return PriceTestWindow(PriceTestState.UNREADABLE, raw=text)
+    state = (PriceTestState.OPEN if today <= last_day
+             else PriceTestState.EXPIRED)
+    return PriceTestWindow(state, last_day=last_day, raw=text)
 
 
 class Settings(BaseSettings):
@@ -93,6 +195,14 @@ class Settings(BaseSettings):
     salla_product_pricing: str = Field(default="{}", alias="SALLA_PRODUCT_PRICING")
     # captured access-token expiry (ISO date) — manual until auto-refresh lands
     salla_token_expires_at: str = Field(default="", alias="SALLA_TOKEN_EXPIRES_AT")
+    # The 1-riyal payment-gateway proof: the LAST DAY (ISO, Riyadh) on which
+    # the three real products are knowingly selling at a test price. Empty —
+    # the default — means «no window», which is the posture of every host that
+    # is not mid-test. While it is open no founder price lock is captured
+    # (`career.promises.price_lock.capture`), because a lock recorded from a
+    # test price would authorise buying the real product for that price
+    # forever and would fail the founder's next real payment closed.
+    salla_price_test_until: str = Field(default="", alias="SALLA_PRICE_TEST_UNTIL")
     # the storefront the customer renews from (§16). Empty until the store is
     # published — every message that would carry it degrades to no link
     # rather than printing a broken one.

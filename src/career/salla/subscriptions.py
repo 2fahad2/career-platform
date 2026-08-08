@@ -8,6 +8,7 @@ transition appends a subscription_event (audit trail).
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import func
@@ -148,16 +149,43 @@ def apply_order_lifecycle(
     salla_event_type: str,
     *,
     salla_order_id: str | None = None,
+    now: datetime | None = None,
 ) -> Subscription:
     """Map a Salla order lifecycle webhook to a state change. Refund/cancel/
     chargeback suspend service immediately. A subscription already in a terminal
-    state is left unchanged (idempotent)."""
+    state is left unchanged (idempotent).
+
+    THE FOUNDER PRICE LAPSES HERE, and here is the point. «انقطعت أكثر؟ الكرسي
+    ينفتح لغيرك، وترجع بسعر يومها» is one sentence with two consequences: the
+    seat opens (`seats._HOLDING_STATES` already reads these states) and the
+    locked price ends with it. Only the first was implemented, so a refunded —
+    or charged-back, never-activated — customer kept a standing right to the
+    founding price forever: `price_lock._continuous` measures from
+    ``current_period_end`` and a buyer who never activated has none, so the
+    lock could not even age out on its own.
+
+    It is called from THIS function rather than from provisioning's reversal
+    paths because a rule a writer must remember to call is a rule the next
+    writer will not call — the same reason `cv.close._record_day_state` is the
+    single writer of a day state. Every route to a terminal state passes
+    through here, including the ones that do not exist yet.
+    """
     target = _ORDER_EVENT_TO_STATE.get(salla_event_type)
     if target is None:
         raise InvalidTransition(f"unhandled order event: {salla_event_type}")
     if subscription.status in TERMINAL_STATES:
-        return subscription  # already off — idempotent
-    return transition(
+        return subscription  # already off — idempotent, and no re-stamp
+    updated = transition(
         session, subscription, target,
         event_type=salla_event_type, salla_order_id=salla_order_id,
     )
+    # AFTER the transition, never before: the lock lapses only once this
+    # customer holds no live row on the plan, and that question is answered
+    # from the status this call just wrote.
+    from career.promises.price_lock import lapse_for_terminal
+
+    lapse_for_terminal(
+        session, tenant_id=updated.tenant_id, plan_code=updated.plan_code,
+        now=now or datetime.now(UTC), reason=salla_event_type,
+    )
+    return updated

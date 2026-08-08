@@ -19,9 +19,11 @@ lapsed.
 from __future__ import annotations
 
 import ast
+import os
 import pathlib
 import re
 import uuid
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -1680,6 +1682,217 @@ def test_a_price_lock_is_never_captured_from_an_unverified_amount(
     assert owner_session.execute(sql_text(
         "SELECT count(*) FROM price_locks WHERE amount_sar = 1.00")
     ).scalar_one() == 0
+
+
+# ── the price-test window: the store is knowingly cheap for a few days ──────
+#
+# Fahad proves the Salla payment gateway with real money by dropping the THREE
+# REAL products to 1.00 SAR, letting a handful of people he knows buy, and
+# restoring the prices. Every automatic check agrees that configuration is
+# correct, because it is: the store, the pricing map and the §09 triple match
+# are all reading the same decision. The one thing none of them can see is
+# that the decision is a rehearsal — so `capture` would record 1.00 SAR as
+# those buyers' FOUNDING price, idempotently and forever.
+#
+# `SALLA_PRICE_TEST_UNTIL` is the operator's declaration that this is what is
+# happening. The tests below are its two halves: while it is open no lock is
+# captured and the refusal is written down, and the moment it lapses the
+# promise works exactly as it did before the variable existed.
+
+#: The same three real products with the test price on them — what the store
+#: and `SALLA_PRODUCT_PRICING` BOTH say during the window.
+_PRICING_TEST = {"prod_pro": (Decimal("1.00"), "SAR"),
+                 "prod_plus": (Decimal("1.00"), "SAR"),
+                 "prod_cv": (Decimal("1.00"), "SAR")}
+
+
+@contextmanager
+def _window(value: str) -> Any:
+    """Open (or close) the price-test window for the code under test."""
+    from career.config import get_settings
+
+    previous = os.environ.get("SALLA_PRICE_TEST_UNTIL")
+    os.environ["SALLA_PRICE_TEST_UNTIL"] = value
+    get_settings.cache_clear()
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("SALLA_PRICE_TEST_UNTIL", None)
+        else:
+            os.environ["SALLA_PRICE_TEST_UNTIL"] = previous
+        get_settings.cache_clear()
+
+
+def _events(session: Session, tenant_id: uuid.UUID, kind: str) -> list[Any]:
+    return session.execute(sql_text(
+        "SELECT details FROM subscription_events WHERE tenant_id = :t"
+        " AND event_type = :k"), {"t": str(tenant_id), "k": kind}).all()
+
+
+def test_the_test_window_stops_the_lock_and_says_so(
+    owner_session: Session, clean_billing: None,
+) -> None:
+    """THE GUARD. A one-riyal purchase of the REAL 199 product provisions
+    normally — the money is real and the buyer must be served — and records no
+    founding price at all.
+
+    Without this, that row is permanent: capture is idempotent per (tenant,
+    plan), so the same tester paying the real 199 later changes nothing, and
+    the 1.00 lock becomes both a standing authorisation to buy the pass for one
+    riyal and the reason his next real payment dies TERMINAL.
+    """
+    with _window("2026-07-16"):                 # NOW is the 15th in Riyadh
+        result, _order = _buy(
+            owner_session, product="prod_pro", phone=_phone(),
+            pricing=_PRICING_TEST, amount=Decimal("1.00"),
+        )
+
+    assert result.status is ProvisionStatus.PROVISIONED
+    tenant_id = uuid.UUID(str(result.tenant_id))
+    assert owner_session.execute(sql_text(
+        "SELECT count(*) FROM price_locks WHERE tenant_id = :t"),
+        {"t": str(tenant_id)}).scalar_one() == 0
+    # the assertion the older test makes about the whole table now holds by
+    # construction rather than by the amount happening to be refused
+    assert owner_session.execute(sql_text(
+        "SELECT count(*) FROM price_locks WHERE amount_sar = 1.00")
+    ).scalar_one() == 0
+    # …and it is NOT a silent no-op: a silent one is how the original defect
+    # hid, since a wrong lock and a missing lock look identical from outside.
+    refusals = _events(owner_session, tenant_id, "price_lock_refused")
+    assert len(refusals) == 1
+    assert refusals[0][0]["amount"] == "1.00"
+    assert refusals[0][0]["window_until"] == "2026-07-16"
+
+
+def test_with_no_window_configured_nothing_changes_at_all(
+    owner_session: Session, clean_billing: None,
+) -> None:
+    """The default is «no window». A host that has never heard of the variable
+    captures locks exactly as it did before it existed — the guard must be the
+    operator's deliberate act, never a new silence everyone inherits."""
+    _p, tenant_id, _s = _customer(owner_session)
+    assert owner_session.execute(sql_text(
+        "SELECT amount_sar FROM price_locks WHERE tenant_id = :t"),
+        {"t": str(tenant_id)}).scalar_one() == Decimal("199.00")
+    assert _events(owner_session, tenant_id, "price_lock_refused") == []
+
+
+def test_the_window_closes_itself_the_day_after_it_passes(
+    owner_session: Session, clean_billing: None,
+) -> None:
+    """A DATE and not a flag: forgetting to clear it cannot keep the promise
+    switched off forever. The day after the last day, capture is armed again
+    with nobody's help."""
+    with _window("2026-07-14"):                 # yesterday, in Riyadh terms
+        result, _order = _buy(
+            owner_session, product="prod_pro", phone=_phone(),
+            pricing=_PRICING, amount=Decimal("199.00"),
+        )
+    tenant_id = uuid.UUID(str(result.tenant_id))
+    assert owner_session.execute(sql_text(
+        "SELECT amount_sar FROM price_locks WHERE tenant_id = :t"),
+        {"t": str(tenant_id)}).scalar_one() == Decimal("199.00")
+
+
+def test_an_unreadable_window_suppresses_instead_of_arming(
+    owner_session: Session, clean_billing: None,
+) -> None:
+    """The two ways to be wrong are not symmetric. A lock not captured costs
+    nothing today; a lock captured at a test price is permanent money. So a
+    date nobody can parse is treated as an OPEN window — and the boot check
+    reports it every morning until it is fixed or cleared."""
+    with _window("next friday"):
+        result, _order = _buy(
+            owner_session, product="prod_pro", phone=_phone(),
+            pricing=_PRICING_TEST, amount=Decimal("1.00"),
+        )
+    tenant_id = uuid.UUID(str(result.tenant_id))
+    assert result.status is ProvisionStatus.PROVISIONED
+    assert owner_session.execute(sql_text(
+        "SELECT count(*) FROM price_locks WHERE tenant_id = :t"),
+        {"t": str(tenant_id)}).scalar_one() == 0
+    assert len(_events(owner_session, tenant_id, "price_lock_refused")) == 1
+
+
+def test_the_tester_is_owed_nothing_and_the_code_gives_him_it(
+    owner_session: Session, clean_billing: None,
+) -> None:
+    """A tester who buys during the window and renews after it closes.
+
+    One riyal was never his founding price, so no lock is owed for it — and
+    nothing about the renewal needs one: a lock is only ever consulted when
+    the paid amount does NOT match today's price, and his renewal matches it
+    exactly. He is provisioned by the ordinary §09 triple match, and THAT
+    purchase is the first real price he has paid, so it is where his founding
+    price is finally recorded.
+    """
+    phone = _phone()
+    with _window("2026-07-16"):
+        first, _o = _buy(owner_session, product="prod_pro", phone=phone,
+                         pricing=_PRICING_TEST, amount=Decimal("1.00"))
+    tenant_id = uuid.UUID(str(first.tenant_id))
+    activate(owner_session, token=first.activation_token, from_phone=phone,
+             display_name=None, now=NOW, whatsapp_client=FakeWhatsAppClient(),
+             admin_client=FakeTelegramAdminClient())
+    owner_session.execute(sql_text(
+        "UPDATE subscriptions SET status = 'ACTIVE', current_period_start = :s,"
+        " current_period_end = :e WHERE tenant_id = :t"),
+        {"s": NOW, "e": NOW + timedelta(days=30), "t": str(tenant_id)})
+    owner_session.commit()
+
+    # the window has closed and the store is back at 199
+    later, _o2 = _buy(owner_session, product="prod_pro", phone=phone,
+                      pricing=_PRICING, amount=Decimal("199.00"),
+                      now=NOW + timedelta(days=25))
+
+    assert later.status is ProvisionStatus.RENEWED
+    assert owner_session.execute(sql_text(
+        "SELECT amount_sar FROM price_locks WHERE tenant_id = :t"),
+        {"t": str(tenant_id)}).scalar_one() == Decimal("199.00")
+
+
+def test_a_real_founders_lock_survives_the_window_untouched(
+    owner_session: Session, clean_billing: None,
+) -> None:
+    """The window suppresses CAPTURE and nothing else. A founder who happens to
+    renew while the store is cheap keeps the price he was promised, and his
+    renewal is not written down as a refusal — nothing was going to be
+    captured for him in the first place."""
+    phone, tenant_id, _s = _customer(owner_session)
+    with _window("2026-08-20"):
+        result, _o = _buy(owner_session, product="prod_pro", phone=phone,
+                          pricing=_PRICING_TEST, amount=Decimal("1.00"),
+                          now=NOW + timedelta(days=29))
+    assert result.status is ProvisionStatus.RENEWED
+    assert owner_session.execute(sql_text(
+        "SELECT amount_sar FROM price_locks WHERE tenant_id = :t"),
+        {"t": str(tenant_id)}).scalar_one() == Decimal("199.00")
+    assert _events(owner_session, tenant_id, "price_lock_refused") == []
+
+
+def test_the_window_is_read_on_the_orders_own_clock(
+    owner_session: Session, clean_billing: None,
+) -> None:
+    """A webhook replayed or swept after the window closed is still judged by
+    the day the money was taken — otherwise the trap arms on exactly the
+    orders that are slowest to be processed."""
+    with _window("2026-07-16"):
+        inside, _o = _buy(owner_session, product="prod_pro", phone=_phone(),
+                          pricing=_PRICING_TEST, amount=Decimal("1.00"),
+                          now=datetime(2026, 7, 16, 20, 0, tzinfo=UTC))
+        after, _o2 = _buy(owner_session, product="prod_pro", phone=_phone(),
+                          pricing=_PRICING_TEST, amount=Decimal("1.00"),
+                          now=datetime(2026, 7, 17, 6, 0, tzinfo=UTC))
+    # 20:00 UTC on the 16th is 23:00 in Riyadh — the last hours of the window
+    assert owner_session.execute(sql_text(
+        "SELECT count(*) FROM price_locks WHERE tenant_id = :t"),
+        {"t": str(inside.tenant_id)}).scalar_one() == 0
+    # …and the morning after it, capture is live again
+    assert owner_session.execute(sql_text(
+        "SELECT amount_sar FROM price_locks WHERE tenant_id = :t"),
+        {"t": str(after.tenant_id)}).scalar_one() == Decimal("1.00")
 
 
 # ── the sweeps are wired to something that actually runs ────────────────────

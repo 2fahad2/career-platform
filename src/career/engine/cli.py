@@ -35,7 +35,12 @@ from sqlalchemy import create_engine, select
 from sqlalchemy import event as sa_event
 from sqlalchemy.orm import Session, with_loader_criteria
 
-from career.config import get_settings
+from career.config import (
+    PRICE_TEST_MAX_DAYS,
+    PriceTestState,
+    get_settings,
+    price_test_window,
+)
 from career.db.models import DiscoveryRun, PlanEntitlement, Subscription, Tenant
 from career.engine.enrichment import UrllibPageFetcher
 from career.engine.run import RunReport, run_nightly
@@ -374,11 +379,21 @@ class EnvProblem:
     ``arabic`` to the admin channel. The Arabic line carries NO Latin token —
     a variable name inside an Arabic sentence breaks the line's direction in
     his client, so the names are listed separately by :func:`format_env_alert`.
+
+    ``notice`` is the one row that is NOT a contradiction: a state the operator
+    put the system into on purpose, which must still be said out loud every
+    morning so it cannot be forgotten. It exists because the alternative was
+    worse in both directions — stay silent about an open price-test window and
+    it outlives the test; print it under «الإعدادات تخالف قاعدة البيانات» with
+    a variable name to «correct» and the daily red alert becomes noise on a day
+    when nothing is wrong. A notice is logged at WARNING, not ERROR, and its
+    key is never listed as a thing to fix.
     """
 
     key: str
     english: str
     arabic: str
+    notice: bool = False
 
 
 class TokenState(StrEnum):
@@ -575,6 +590,15 @@ def verify_environment(
     problems: list[EnvProblem] = []
     catalog = parse_product_catalog(settings.salla_product_catalog)
     pricing = parse_product_pricing(settings.salla_product_pricing)
+    # getattr, not attribute access: the settings object here is whatever the
+    # caller passed, and a boot check that raises AttributeError on a host
+    # whose file predates this variable is a boot check that stops a boot.
+    window = price_test_window(
+        getattr(settings, "salla_price_test_until", ""), today
+    )
+    #: cataloged products currently priced BELOW their plan's approved price —
+    #: i.e. what «the store is at a test price» actually looks like from here.
+    cheap: list[str] = []
 
     for product_id, plan_code in sorted(catalog.items()):
         if plan_code not in approved_prices:
@@ -615,14 +639,61 @@ def verify_environment(
                 "سعر منتج مضبوط بعملة غير الريال",
             ))
         elif amount != expected:
-            problems.append(EnvProblem(
-                "SALLA_PRODUCT_PRICING",
-                f"product {product_id} (plan {plan_code!r}) is priced "
-                f"{amount} SAR; the database approves {expected} SAR — a real "
-                "order will be refused with AMOUNT_MISMATCH",
-                "سعر منتج في الإعدادات لا يطابق السعر المعتمد في قاعدة "
-                "البيانات — الطلب الحقيقي سيُرفض",
-            ))
+            if amount < expected:
+                cheap.append(product_id)
+            if amount < expected and window.suppresses_capture:
+                # THE ALARM THAT USED TO BE FALSE. §09 keys on the product id
+                # and this product carries its own price, so an order at the
+                # test price provisions perfectly — «a real order will be
+                # refused with AMOUNT_MISMATCH» was simply not true, and a
+                # daily ERROR that is not true is how the next true one gets
+                # skipped. What IS true is worth a line of its own: the store
+                # is knowingly cheap, and while it is, nobody's founding price
+                # is being recorded.
+                problems.append(EnvProblem(
+                    "SALLA_PRICE_TEST_UNTIL",
+                    f"price test window OPEN until {window.raw}: product "
+                    f"{product_id} (plan {plan_code!r}) is deliberately at "
+                    f"{amount} SAR instead of {expected} SAR. Its orders "
+                    "provision normally and NO founder price lock is captured "
+                    "while this lasts",
+                    "نافذة سعر الاختبار مفتوحة — المنتجات بسعر رمزي مقصود\n"
+                    "الطلبات تُزوَّد عادي ولا يُسجَّل قفل سعر لأي مشترٍ\n"
+                    "تنتهي النافذة في\n"
+                    f"{window.raw}",
+                    notice=True,
+                ))
+            elif amount < expected and window.state is PriceTestState.EXPIRED:
+                # The self-closing date did its job and the products did not.
+                # From this morning capture is armed again over a test price:
+                # every new buyer is recording one riyal as his founding price,
+                # which authorises buying the real pass for it and fails his
+                # next real payment closed.
+                problems.append(EnvProblem(
+                    "SALLA_PRODUCT_PRICING",
+                    f"the price test window CLOSED on {window.raw} and product "
+                    f"{product_id} (plan {plan_code!r}) is STILL at {amount} "
+                    f"SAR instead of {expected} SAR — founder price locks are "
+                    "being captured again, so every purchase from now records "
+                    "the test price as that customer's permanent founding "
+                    "price. Restore the store price and re-run "
+                    "scripts/wire_salla_products.py",
+                    "انتهت نافذة سعر الاختبار والمنتجات ما زالت بالسعر الرمزي\n"
+                    "كل عملية شراء الآن تُسجّل السعر الرمزي كسعر مقفول دائم "
+                    "للمشتري\n"
+                    "أعد أسعار المتجر ثم أعد تشغيل أداة الربط",
+                ))
+            else:
+                problems.append(EnvProblem(
+                    "SALLA_PRODUCT_PRICING",
+                    f"product {product_id} (plan {plan_code!r}) is priced "
+                    f"{amount} SAR; the database approves {expected} SAR — a "
+                    "real order will be refused with AMOUNT_MISMATCH",
+                    "سعر منتج في الإعدادات لا يطابق السعر المعتمد في قاعدة "
+                    "البيانات — الطلب الحقيقي سيُرفض",
+                ))
+
+    problems.extend(_price_test_window_problems(window, cheap, today))
 
     # The third copy of the same fact: the wiring table and the database must
     # agree about what a plan costs, or fixing one of them fixes nothing.
@@ -681,6 +752,69 @@ def verify_environment(
             "empty — renewal and expiry messages go out with no way for the "
             "customer to renew",
             "رابط المتجر غير مضبوط — رسائل التجديد تصل بلا رابط",
+        ))
+    return problems
+
+
+def _price_test_window_problems(
+    window: Any, cheap: list[str], today: date
+) -> list[EnvProblem]:
+    """The window itself, judged apart from any one product's price.
+
+    Three states are worth a morning of the operator's attention, and all
+    three are ways the window and the store can disagree with each other:
+
+    UNREADABLE — somebody meant to open a window and typed something that is
+    not a date. `price_lock` treats that as OPEN (a lock captured at a test
+    price is permanent money; a lock not captured is not), so the promise is
+    switched off with no closing date at all. Loud, daily, until it is fixed
+    or cleared.
+
+    OPEN with nothing cheap — the mirror of the trap, and the reason a naked
+    boolean flag was rejected: the window is suspending every new customer's
+    founding price while the store charges full price for it. Nothing is
+    broken today; the promise simply is not being kept, silently, and the fix
+    is one line.
+
+    OPEN for too long — the bound the wiring tool refuses to write is asserted
+    again here, because the file can also be edited by hand.
+
+    EXPIRED is deliberately silent when the prices are back: it is then the
+    same state as ABSENT, and nagging about a stale date that changes nothing
+    is how the channel that carries the other three gets muted.
+    """
+    if window.state is PriceTestState.UNREADABLE:
+        return [EnvProblem(
+            "SALLA_PRICE_TEST_UNTIL",
+            f"unreadable date {window.raw!r} — it is treated as an OPEN price "
+            "test window with no closing day, so NO customer's founding price "
+            "is being recorded. Set it to an ISO date or clear it",
+            "تاريخ نافذة سعر الاختبار غير مقروء — قفل سعر المؤسسين معطّل بلا "
+            "موعد انتهاء\n"
+            "اضبط التاريخ أو امسحه",
+        )]
+    if window.state is not PriceTestState.OPEN:
+        return []
+    problems: list[EnvProblem] = []
+    if not cheap:
+        problems.append(EnvProblem(
+            "SALLA_PRICE_TEST_UNTIL",
+            f"a price test window is open until {window.raw} but every "
+            "cataloged product is at its approved price — the founder price "
+            "lock is suspended for nothing, and every customer who buys today "
+            "gets no locked price. Clear it",
+            "نافذة سعر الاختبار مفتوحة والمنتجات بأسعارها الحقيقية\n"
+            "قفل سعر المؤسسين معطّل بلا سبب — امسح تاريخ النافذة",
+        ))
+    remaining = window.days_remaining(today)
+    if remaining is not None and remaining > PRICE_TEST_MAX_DAYS:
+        problems.append(EnvProblem(
+            "SALLA_PRICE_TEST_UNTIL",
+            f"the price test window runs {remaining} more days (until "
+            f"{window.raw}); the maximum is {PRICE_TEST_MAX_DAYS}. Every "
+            "customer who buys before it closes carries no founding price",
+            "نافذة سعر الاختبار مفتوحة لمدة أطول من المسموح\n"
+            "كل من يشترك قبل إغلاقها لن يكون له سعر مقفول",
         ))
     return problems
 
@@ -873,16 +1007,28 @@ def whatsapp_token_problems(
 
 def format_env_alert(problems: list[EnvProblem]) -> str:
     """The admin-channel message. Arabic prose and Latin variable names never
-    share a line — mixing them reverses the line in the operator's client."""
-    lines = ["🔴 فحص الإقلاع: الإعدادات تخالف قاعدة البيانات", ""]
+    share a line — mixing them reverses the line in the operator's client.
+
+    Notices are separated from contradictions, and the header follows: a
+    morning whose only news is «the price test window is open» must not arrive
+    wearing the red banner that means «the configuration is wrong», and its
+    variable must not appear under «المتغيرات المطلوب تصحيحها» — there is
+    nothing to correct, and a list of things to fix that contains a thing that
+    is fine is a list he stops reading.
+    """
+    faults = [problem for problem in problems if not problem.notice]
+    notices = [problem for problem in problems if problem.notice]
+    lines = ["🔴 فحص الإقلاع: الإعدادات تخالف قاعدة البيانات", ""] if faults \
+        else ["🟡 فحص الإقلاع: تنبيه مؤقت", ""]
     seen: list[str] = []
-    for problem in problems:
+    for problem in faults + notices:
         if problem.arabic not in seen:
             seen.append(problem.arabic)
             lines.append(f"• {problem.arabic}")
-    lines.append("")
-    lines.append("المتغيرات المطلوب تصحيحها:")
-    lines.extend(sorted({problem.key for problem in problems}))
+    if faults:
+        lines.append("")
+        lines.append("المتغيرات المطلوب تصحيحها:")
+        lines.extend(sorted({problem.key for problem in faults}))
     return "\n".join(lines)
 
 
@@ -1007,13 +1153,79 @@ def report_environment(
         logger.error("boot environment check could not run", exc_info=True)
         return []
     for problem in problems:
-        logger.error("BOOT CHECK %s: %s", problem.key, problem.english)
+        if problem.notice:
+            # WARNING, not ERROR: the harvester forwards ERROR lines, and a
+            # deliberate state that logs ERROR every morning trains the reader
+            # to skim the level that carries the outages.
+            logger.warning("BOOT NOTICE %s: %s", problem.key, problem.english)
+        else:
+            logger.error("BOOT CHECK %s: %s", problem.key, problem.english)
     if problems and alert:
         try:
             admin_client.send_admin(format_env_alert(problems))
         except Exception:  # noqa: BLE001 — alerting never breaks the boot
             logger.warning("boot check alert failed", exc_info=True)
+    if alert:
+        _report_seat_supply(settings=settings, session=session,
+                            admin_client=admin_client)
     return problems
+
+
+def _report_seat_supply(
+    *, settings: Any, session: Session, admin_client: Any
+) -> None:
+    """«ما نبيع الكرسي رقم ٣١» — the one published promise nothing compared.
+
+    Two counters describe one wave: Salla holds a quantity per seat product and
+    decrements it on every sale, we hold `FOUNDING_SEATS_CAP` and count rows,
+    and nothing in the repository ever read the first. Read live on 2026-08-08
+    the store was configured to sell forty seats against a page that says
+    thirty.
+
+    OUTSIDE :func:`verify_environment`, on purpose. That function is pure and
+    must stay pure — it is the matrix a hundred tests drive without a network,
+    and a check that leaves the machine cannot be one of its rows. And it is
+    guarded by ``alert``: the same reason `read_token_health` is opt-in, one
+    layer up. The worker runs under ``Restart=always``/``RestartSec=5``, so a
+    crash loop would put two Salla product reads a second beside an already
+    failing process; the daily oneshot owns the network copy.
+
+    GET only, silent when the two counters agree, and it never raises: this is
+    a boot check, and a boot check that can stop a boot is how «sales are
+    misconfigured» becomes «the product is down for the people who paid».
+    """
+    try:
+        from career.salla.seats import (
+            founding_seats,
+            read_seat_supply,
+            supply_lines_ar,
+            supply_verdict,
+        )
+
+        api_key = (getattr(settings, "salla_api_key", "") or "").strip()
+        catalog = parse_product_catalog(
+            getattr(settings, "salla_product_catalog", "") or "{}"
+        )
+        if not api_key or not catalog:
+            # Nothing to ask with, or nothing to ask about. Both are already
+            # reported by the rows above; a second sentence about the same
+            # emptiness is noise.
+            return
+        verdict = supply_verdict(
+            founding_seats(session),
+            read_seat_supply(api_key=api_key, product_catalog=catalog),
+        )
+        lines = supply_lines_ar(verdict)
+        if not lines:
+            return
+        logger.error(
+            "SEAT SUPPLY drift %+d: %d taken, %d still sellable, cap %d",
+            verdict.drift, verdict.seats.taken, verdict.supply.sellable,
+            verdict.seats.cap,
+        )
+        admin_client.send_admin("\n".join(lines))
+    except Exception:  # noqa: BLE001 — a counter check never blocks a boot
+        logger.warning("seat supply check could not run", exc_info=True)
 
 
 class JournalAdmin:

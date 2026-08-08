@@ -337,16 +337,47 @@ _DELIVERY_AR = {
     "PENDING_WINDOW": "⏳ محفوظة بانتظار فتح النافذة",
     "OPENED": "⏳ قيد الإرسال",
     "NO_SEND": "🚫 لم تُرسل — العميل أوقف الرسائل",
-    "EXPIRED_WINDOW": "⌛ انتهت مهلتها دون تسليم",
+    # «انتهت مهلتها دون تسليم» said one thing and was READ as another. A bundle
+    # expires when it was held for the 24h window and the next run day arrived
+    # before the window opened, and there are exactly two ways that happens:
+    # the customer never wrote back, or the template we sent to re-open the
+    # window was REFUSED by Meta (131049/131050/131047 — see
+    # `whatsapp.worker.META_REFUSAL_CODES`). The old sentence named neither and
+    # the operator supplied the first one himself, every time. Two of the six
+    # expiries in the live data were the second one. So the line now names both
+    # possibilities instead of implying one; when the card actually knows, the
+    # definite sentence below replaces it.
+    "EXPIRED_WINDOW": "⌛ انتهت المهلة دون تسليم — إما ما رد العميل أو ميتا رفضت الإرسال",
 }
+
+#: What the card must carry for the DEFINITE sentence — a bool, true when the
+#: last outbound message on this bundle carries a Meta refusal code.
+REFUSED_KEY = "refused_by_meta"
 
 
 def _delivery_ar(last: dict[str, Any]) -> str:
-    """The honest one-liner for the last delivery. A PARTIAL that delivered
-    NOTHING is a failure, not a partial success — the operator must not read
-    «وصل جزء منها» when zero messages landed (§15.12)."""
+    """The honest one-liner for the last delivery.
+
+    Two lies this has told the operator, both of the same kind — a sentence
+    about the CUSTOMER covering for a fact about US:
+
+    * a PARTIAL that delivered NOTHING is a failure, not a partial success; he
+      must not read «وصل جزء منها» when zero messages landed (§15.12);
+    * an EXPIRED_WINDOW that Meta refused is not a customer who went quiet.
+      ``last[REFUSED_KEY]`` is the fact that settles it, and it is checked
+      FIRST because it is true whatever the status word says.
+
+    When the card does not carry that key the wording in :data:`_DELIVERY_AR`
+    names both possible causes rather than assuming one, so this screen is
+    honest today and merely more PRECISE once the key arrives. Supplying it is
+    one predicate in `telegram.console.tenant_card` — «does any
+    delivery_messages row on this bundle sit at `failed`» — and that file
+    belongs to another owner; it is written up in this change's report.
+    """
     status = str(last.get("status"))
     delivered = last.get("delivered")
+    if last.get(REFUSED_KEY):
+        return "🔴 ميتا رفضت الإرسال — ما وصلت العميل، وما تجاهلها"
     if status == "PARTIAL" and delivered is not None and int(delivered) == 0:
         return "🔴 لم يصل منها شيء"
     return _DELIVERY_AR.get(status, status)

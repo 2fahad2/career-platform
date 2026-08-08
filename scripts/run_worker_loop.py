@@ -133,6 +133,14 @@ _RIYADH = ZoneInfo("Asia/Riyadh")
 #: is the entire mechanism — see :class:`HousekeepingGate`.
 HOUSEKEEPING_STAMP = "/run/career/worker-housekeeping"
 
+#: Line two of the stamp — «a pass reached the END of the block», as opposed to
+#: line one's «an hour was claimed». See :meth:`HousekeepingGate.completed`.
+_DONE = "done"
+
+
+def _stamp_iso(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, UTC).isoformat()
+
 
 class HousekeepingGate:
     """May the hourly block run now? — asked so a crash loop cannot answer yes.
@@ -182,6 +190,11 @@ class HousekeepingGate:
     the sweeps are idempotent and the nightly is a backstop for both paging
     ones, so the deferral costs at most the interval this file already prices
     as the worst-case lateness of every clock in the block.
+
+    Which is why the stamp carries TWO facts and not one. Line one is that
+    claim; line two — written by :meth:`completed` — is «a pass reached the
+    end». Keeping them apart is the difference between «an hour was taken» and
+    «the work happened», and only the second one is evidence.
 
     ── THE ALTERNATIVES, and why not them ───────────────────────────────────
     * **A row in the database**, the shape the weekly report already uses for
@@ -241,6 +254,9 @@ class HousekeepingGate:
         self._wall = wall
         self._mono = mono
         self._local_since = mono()
+        #: The wall clock of the interval this process most recently CLAIMED,
+        #: so `completed` can stamp both facts without re-reading the file.
+        self._claimed_at: float | None = None
         self._degraded = False
         # Proven, not assumed, and proven HERE: see the degradation note in
         # the class docstring for why finding this out at the first `mark`
@@ -285,24 +301,66 @@ class HousekeepingGate:
         """Claim this interval BEFORE the block runs — see the class docstring
         for why the ordering is that way round."""
         self._local_since = self._mono()
+        self._claimed_at = self._wall()
         if self._degraded:
             return
-        now = self._wall()
+        self._write(self._claimed_at, done=None)
+
+    def completed(self) -> None:
+        """Record that a pass reached the END of the block.
+
+        :meth:`mark` is a CLAIM and it is written before the block on purpose,
+        so it answers «an hour was taken» and has never answered «the work
+        happened». The two came apart the moment the block grew a stanza that
+        can raise: a pass killed inside the enrichment sweep advances the
+        stamp exactly like a pass that finished, so the only durable record of
+        housekeeping would read «fresh» for an hour in which not one promise
+        was swept. Recording the finish is what makes the stamp evidence
+        rather than an intention.
+
+        A second LINE and not a second file: :meth:`due` reads line one and is
+        untouched, `cat` still answers «when did housekeeping last run», and
+        the ABSENCE of line two is itself the fact — the last pass was claimed
+        and did not come back.
+        """
+        if self._degraded:
+            return
+        self._write(self._claimed_at or self._wall(), done=self._wall())
+
+    def _write(self, claimed: float, *, done: float | None) -> None:
         tmp = self._tmp_path()
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             # The epoch first so the gate can read it, the human form after it
             # so `cat` answers «when did housekeeping last run» on a bad night.
-            tmp.write_text(
-                f"{now:.0f} {datetime.fromtimestamp(now, UTC).isoformat()}\n",
-                encoding="utf-8",
-            )
+            text = f"{claimed:.0f} {_stamp_iso(claimed)}\n"
+            if done is not None:
+                text += f"{_DONE} {done:.0f} {_stamp_iso(done)}\n"
+            tmp.write_text(text, encoding="utf-8")
             # Atomic: a torn stamp would be an unreadable one, and an
             # unreadable one runs the block (see `_read`).
             os.replace(tmp, self._path)
         except OSError:
             tmp.unlink(missing_ok=True)
             self._degrade("cannot write")
+
+    def last_completed(self) -> float | None:
+        """When a pass last reached the end of the block, or None if the last
+        one was only claimed. THE reader for line two — a second parser of this
+        format somewhere else is how two ladders became one bug in
+        `whatsapp.worker`, and the same argument applies to a file."""
+        try:
+            lines = self._path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return None
+        for line in lines:
+            if not line.startswith(f"{_DONE} "):
+                continue
+            try:
+                return float(line.split(" ")[1])
+            except (IndexError, ValueError):
+                return None
+        return None
 
     def _read(self) -> float | None:
         try:
@@ -335,6 +393,57 @@ class HousekeepingGate:
             "the backstop for both promise sweeps until then",
             self._path, why, exc_info=True,
         )
+
+
+def publish_housekeeping(
+    counts: dict[str, int], *, when: datetime, first: bool,
+) -> str:
+    """Make «the block ran» answerable — without making it noisy.
+
+    ── THE HOLE THIS FILLS ──────────────────────────────────────────────────
+    Every stanza in the hourly block logs its line only when its count is
+    non-zero, and that is right on its own terms: «guarantee sweep: watching
+    1» every hour for every customer inside his first 72 hours is a channel
+    that stops being read. The consequence, which nobody priced, is that an
+    entirely idle hour and a block that NEVER EXECUTED produce byte-identical
+    journals — so «no `guarantee sweep` line, ever» is not evidence of
+    anything, and the only other record, the stamp under /run, is not read by
+    anybody.
+
+    That is not hypothetical. On 2026-08-07 this unit ran for seven hours,
+    ACTIVE, watchdog-fed, zero ERROR lines, on an image loaded before the
+    housekeeping block existed in this file at all — no gate, no guarantee
+    sweep, no SLA sweep — and every screen was green while six promises went
+    unswept. The first person to ask found an empty grep and could not tell
+    «nothing was due» from «nothing ran».
+
+    ── THE TWO PLACES IT GOES, and why neither is an hourly line ────────────
+    * ``STATUS=`` to systemd, so ``systemctl status career-worker`` prints it
+      under the unit. The first command anyone runs on this host then answers
+      «when did housekeeping last FINISH, and what did it find» directly. It
+      costs nothing on an idle system, because a status is REPLACED rather
+      than appended: an idle week is one line of state, not 168 of journal.
+    * exactly ONE ``INFO`` line, on the FIRST completed pass of a process.
+      Once per process LIFETIME, not once per hour — so it is not noise, and
+      it is precisely the fact the journal could not previously answer: this
+      binary has a housekeeping block, and it reached the end of it. A worker
+      running code six hours older than the repository says so by staying
+      silent here, on a line nothing else could have printed.
+
+    Deliberately NOT an alert, and that is the whole design rather than an
+    omission. An alarm nobody reads is worse than none, and «all quiet» once
+    an hour is the purest form of one; what was missing here was never a
+    notice, it was a QUESTION that could be answered on demand.
+
+    Returns the published status text (the tests read it; so does anyone
+    wondering what `systemctl` will show).
+    """
+    digest = " ".join(f"{k}={v}" for k, v in counts.items())
+    text = f"housekeeping ok {when.isoformat(timespec='seconds')} — {digest}"
+    sd_notify.notify(f"STATUS={text}")
+    if first:
+        logger.info("housekeeping: first pass complete — %s", text)
+    return text
 
 
 #: P0-8: both parsers moved to ``career.engine.cli`` so the boot check and
@@ -605,6 +714,14 @@ def main() -> None:  # pragma: no cover — the C7.8 live runner
     #: the direction is still toward freshness, the crash loop is no longer
     #: fresh twelve times a minute.
     housekeeping = HousekeepingGate()
+    #: Whether THIS process has already said out loud that its housekeeping
+    #: block completed. Process-local on purpose and not durable: the fact it
+    #: guards is «this image reached the end of the block», which is a claim
+    #: about the running binary and expires with it — a stamp that outlived
+    #: the process would let a worker started on code without a housekeeping
+    #: block inherit the previous one's proof, which is the exact confusion
+    #: `publish_housekeeping` exists to end.
+    housekeeping_announced = False
     #: The one per-evening dedupe in this block that is NOT durable and is a
     #: SEND rather than a sweep, so a restart inside the 19:00–22:00 band costs
     #: the operator a duplicate line. Left as a local knowingly: the path is
@@ -778,6 +895,30 @@ def main() -> None:  # pragma: no cover — the C7.8 live runner
                         session, admin_client=admin, now=now)
                 if released:
                     logger.info("forgotten tickets released: %d", released)
+                # ── the pass RAN, and that has to be answerable even when it
+                # found nothing to do. Only reachable from HERE: every stanza
+                # above is inside the cycle's try, so a raise leaves the stamp
+                # claimed and unfinished and this line unprinted — which is
+                # the honest record, not a gap in it. See
+                # `publish_housekeeping` for why it is a systemd STATUS and a
+                # once-per-process line rather than an hourly one.
+                first_pass = not housekeeping_announced
+                housekeeping_announced = True
+                housekeeping.completed()
+                publish_housekeeping(
+                    {
+                        "reminders": int(nudged),
+                        "enrich": sum(int(v) for v in enr_counts.values()),
+                        "outcome": sum(int(v) for v in oc_counts.values()),
+                        "guarantee": int(gu_counts.get("breached", 0))
+                        + int(gu_counts.get("met", 0))
+                        + int(gu_counts.get("alerted", 0)),
+                        "sla": sum(int(v) for v in sla_counts.values()),
+                        "tickets": int(released),
+                    },
+                    when=now,
+                    first=first_pass,
+                )
             # THE LAST STATEMENT OF THE CYCLE, and it has to stay that way.
             # Not in a `finally`, not in the `except` below: the two failures
             # this exists to catch — 100s of a restarting Postgres on

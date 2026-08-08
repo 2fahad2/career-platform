@@ -3334,3 +3334,210 @@ def test_the_direct_line_alert_and_its_ticket_line_are_direction_pure(
         for line in text.splitlines():
             if arabic.search(line):
                 assert not latin_or_digit.search(line), line
+
+
+# ── «انتهت مهلتها دون تسليم» — a sentence about the customer covering for a
+#    fact about Meta ───────────────────────────────────────────────────────
+#
+# A bundle expires when it was held for the 24h window and the next run day
+# arrived before that window opened. Two causes reach that state: the customer
+# never wrote back, or the template we sent to re-open the window was REFUSED
+# by Meta — 131049 (per-user marketing cap), 131050 (recipient switched
+# «Offers and announcements» off), 131047 (re-engagement required). The old
+# line named neither and the operator supplied the first one himself, every
+# time. Two of the six expiries in the live data were the second one.
+
+
+def test_an_expiry_no_longer_tells_the_operator_the_customer_ignored_us(
+) -> None:
+    """The default line, with no new data at all. It must stop implying one of
+    two causes it cannot distinguish — a screen that guesses is worse than one
+    that says it does not know, because he acts on it."""
+    line = views._delivery_ar({"run_date": "2026-08-02",
+                               "status": "EXPIRED_WINDOW"})
+
+    assert "ميتا" in line, (
+        "the expiry line still names only the customer's silence — the "
+        "operator goes on reading «he ignored us» about a refused send")
+    assert "العميل" in line, "and it must not swing to the other guess either"
+
+
+def test_a_refusal_the_card_knows_about_is_stated_outright() -> None:
+    """When the card carries the fact, the screen stops hedging. Checked
+    before the status word, because a refusal is true whatever the bundle's
+    own status happens to say."""
+    refused = views._delivery_ar({
+        "run_date": "2026-08-02", "status": "EXPIRED_WINDOW",
+        views.REFUSED_KEY: True,
+    })
+
+    assert "ميتا رفضت" in refused
+    assert "انتهت المهلة" not in refused, \
+        "the hedge outlived the fact that settles it"
+    # the PARTIAL correction is not lost to the new branch
+    assert views._delivery_ar(
+        {"status": "PARTIAL", "delivered": 0}) == "🔴 لم يصل منها شيء"
+    assert views._delivery_ar(
+        {"status": "COMPLETED"}) == "✅ وصلت كاملة"
+
+
+def test_the_expiry_and_refusal_lines_are_direction_pure() -> None:
+    """§16 — Fahad's client reverses any line mixing Arabic with Latin or
+    European digits, and these two lines are new."""
+    import re
+
+    arabic = re.compile(r"[؀-ۿ]")
+    latin_or_digit = re.compile(r"[A-Za-z0-9]")
+    for line in (views._DELIVERY_AR["EXPIRED_WINDOW"],
+                 views._delivery_ar({"status": "EXPIRED_WINDOW",
+                                     views.REFUSED_KEY: True})):
+        assert arabic.search(line)
+        assert not latin_or_digit.search(line), line
+
+
+# ── … and the card that has to SUPPLY that fact ─────────────────────────────
+#
+# The three tests above are about the RENDERER, which shipped hedging because
+# `_tenant_card` had nothing definite to give it: the card carried the
+# bundle's own status word and no way to reach the outbound messages under it.
+# The predicate is `delivery_messages.status == 'failed'` on this bundle —
+# every one of Meta's refusal codes lands on that single word on purpose (the
+# worker refused to mint a «refused» status because `close.whatsapp_spend`
+# bills everything that is not exactly `failed`), so it is the only fact there
+# is to join to, and joining to it is why `Delivery.id` is now selected.
+
+
+def _seed_bundle(
+    session: Session, tenant_id: str, *, status: str, run_date: str,
+    delivered: list[str], message_statuses: list[str],
+) -> str:
+    """One delivery with its outbound message log. Returns the delivery id.
+
+    ``delivered`` is what LANDED (the bundle's own results), ``message_statuses``
+    are the receipts Meta sent back for the sends — the two halves the card has
+    to read together."""
+    import json
+
+    channel_id = str(uuid.uuid4())
+    did = str(uuid.uuid4())
+    session.execute(sql_text(
+        "INSERT INTO customer_channels (id, tenant_id, provider, phone_e164)"
+        " VALUES (:i, :t, 'whatsapp', :p)"),
+        {"i": channel_id, "t": tenant_id,
+         "p": f"+96650{uuid.uuid4().int % 10**7:07d}"})
+    session.execute(sql_text(
+        "INSERT INTO deliveries (id, tenant_id, channel_id, run_date, status,"
+        " bundle) VALUES (:i, :t, :c, :d, :s, :b)"),
+        {"i": did, "t": tenant_id, "c": channel_id, "d": run_date, "s": status,
+         "b": json.dumps({"results": {"delivered": delivered, "failed": []}})})
+    for msg_status in message_statuses:
+        session.execute(sql_text(
+            "INSERT INTO delivery_messages (id, tenant_id, channel_id,"
+            " delivery_id, kind, template_name, status, wa_message_id)"
+            " VALUES (:i, :t, :c, :d, 'template', 'daily_jobs_ready', :s, :m)"),
+            {"i": str(uuid.uuid4()), "t": tenant_id, "c": channel_id, "d": did,
+             "s": msg_status, "m": f"wamid-{uuid.uuid4()}"})
+    session.commit()
+    return did
+
+
+def test_the_card_names_the_refusal_behind_an_expiry(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """The whole point: an expiry Meta caused stops being read as silence.
+
+    Two of the six live expiries were 131049 — the re-engagement template was
+    withheld, the customer never saw anything to answer, and the screen told
+    the operator he had gone quiet. With the fact on the card the sentence is
+    definite, and it is the RENDERED line that is asserted, because a key
+    nobody reads would be a fact that changed nothing.
+    """
+    t1, _ = two_tenants
+    _seed_bundle(owner_session, t1, status="EXPIRED_WINDOW",
+                 run_date="2026-07-14", delivered=[],
+                 message_statuses=["failed"])
+
+    card = console._tenant_card(owner_session, code=_code_of(owner_session, t1),
+                                now=NOW)
+
+    assert card is not None
+    last = card["last_delivery"]
+    assert last[views.REFUSED_KEY] is True
+    assert "ميتا رفضت" in views._delivery_ar(last)
+
+
+def test_an_expiry_with_no_refusal_keeps_the_honest_hedge(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """The customer who really did go quiet. Nothing failed, so the card must
+    not claim a refusal — the hedged line is the true one here, and inventing
+    the definite one would be the same lie pointing the other way."""
+    t1, _ = two_tenants
+    _seed_bundle(owner_session, t1, status="EXPIRED_WINDOW",
+                 run_date="2026-07-14", delivered=[],
+                 message_statuses=["sent", "delivered"])
+
+    card = console._tenant_card(owner_session, code=_code_of(owner_session, t1),
+                                now=NOW)
+
+    assert card is not None
+    assert card["last_delivery"][views.REFUSED_KEY] is False
+    assert "إما ما رد العميل" in views._delivery_ar(card["last_delivery"])
+
+
+def test_a_refusal_among_messages_that_landed_does_not_erase_them(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """Why the predicate is «failed AND nothing landed», not «failed».
+
+    A bundle can deliver three cards and have a fourth refused. «ميتا رفضت
+    الإرسال — ما وصلت العميل» about that bundle is a NEW falsehood on the one
+    screen written against falsehoods, so the refusal branch is withheld
+    wherever something did land and the card keeps saying what reached him.
+    On the expiries this change exists for the two readings agree exactly:
+    an expired bundle delivered nothing.
+    """
+    t1, _ = two_tenants
+    _seed_bundle(owner_session, t1, status="COMPLETED", run_date="2026-07-14",
+                 delivered=["job-1", "job-2", "job-3"],
+                 message_statuses=["delivered", "delivered", "delivered",
+                                   "failed"])
+
+    card = console._tenant_card(owner_session, code=_code_of(owner_session, t1),
+                                now=NOW)
+
+    assert card is not None
+    last = card["last_delivery"]
+    assert last["delivered"] == 3
+    assert last[views.REFUSED_KEY] is False
+    assert views._delivery_ar(last) == "✅ وصلت كاملة"
+
+
+def test_another_tenants_failed_message_cannot_speak_on_this_card(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """Constant 10, on a query that now reaches a second table.
+
+    The bundle id alone would already isolate this; the tenant predicate is
+    there so that a row which somehow carries the wrong bundle id cannot put a
+    sentence about Meta on an innocent customer's card. Seeded as exactly that
+    row, because a guard nobody attacked is a guard nobody has tested.
+    """
+    t1, t2 = two_tenants
+    did = _seed_bundle(owner_session, t1, status="EXPIRED_WINDOW",
+                       run_date="2026-07-14", delivered=[],
+                       message_statuses=["sent"])
+    _seed_bundle(owner_session, t2, status="EXPIRED_WINDOW",
+                 run_date="2026-07-14", delivered=[],
+                 message_statuses=["failed"])
+    # …and the neighbour's refusal, mis-pointed at t1's bundle
+    owner_session.execute(sql_text(
+        "UPDATE delivery_messages SET delivery_id = :d WHERE tenant_id = :t"),
+        {"d": did, "t": t2})
+    owner_session.commit()
+
+    card = console._tenant_card(owner_session, code=_code_of(owner_session, t1),
+                                now=NOW)
+
+    assert card is not None
+    assert card["last_delivery"][views.REFUSED_KEY] is False

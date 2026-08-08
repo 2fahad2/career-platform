@@ -316,6 +316,45 @@ def paid_subscriptions_by_plan(
     event — it never touches the money, which is the whole point of retiring
     rather than deleting. Dropping the retired row would under-report by a
     whole order, which is the same defect pointing the other way.
+
+    ── THE 1-RIYAL TEST PHASE, AND WHY NOTHING IS FILTERED (2026-08-08) ──
+
+    The coming test phase puts a 1.00 SAR row on a REAL plan for every tester
+    (the reviewer probe drives exactly that shape), so a plan's count climbs
+    while its riyals barely move and the ARPU a reader divides in his head
+    collapses. The tempting fix is a predicate here. It is refused, on four
+    grounds, and this paragraph exists so the next person does not have to
+    rediscover them:
+
+    1. **A 1 SAR order is revenue.** Money arrived and stayed. The one thing
+       :data:`NON_REVENUE_STATUSES` is careful about is that «revenue» has
+       exactly ONE definition in this file, derived from the state machine;
+       an amount predicate would be a second one, invented here, keyed on
+       nothing the state machine knows.
+    2. **Every available discriminator is a guess.** A threshold («under 5
+       riyals is not a sale») dies on the first real promotion or coupon and
+       on any partial refund. A product id is not visible here and must not
+       be — this function reads ``plan_code``, and that separation is what
+       keeps the store's catalogue out of the money reader.
+    3. **The live data says a threshold would remove the wrong row.** Staging
+       today carries two subscriptions: TEN-0002 at 1.00 SAR, which is
+       honest, and TEN-0001 at 34900.00 SAR, which is a seeding artefact
+       four orders of magnitude wrong and EXPIRED — i.e. revenue by this
+       function's own correct rule. A filter tuned to «ignore tiny amounts»
+       keeps the number that is actually lying and drops the one that is not.
+    4. **The distortion is not in either number — it is in the PAIR.** The
+       screen prints per-plan COUNTS beside one GLOBAL total, and nothing on
+       it asserts the division the reader performs anyway. The honest repair
+       is to give the operator per-plan riyals so «لمّاح: ١٠ · ٤٠٦ ريال» is
+       self-contradicting on its face; that is a change to
+       ``telegram/console``/``views`` (see the T2 report for the patch), not
+       to what counts as money.
+
+    And the cheapest cure is upstream of all of it: do not map the 1-riyal
+    test product onto a real ``plan_code``. Give it its own, and the breakdown
+    separates itself — for this screen, for founding seats, and for the price
+    lock the shared plan code already poisons
+    (``tests/test_reviewer_one_riyal_probe.py``).
     """
     query = select(
         Subscription.plan_code,
