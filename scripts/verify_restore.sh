@@ -191,8 +191,41 @@ classify_alert_hook() {
 # and in the same words. The running case does not become a pass-by-default
 # either: it must still be enabled and active, and the verdict says plainly
 # that the schedule was not read, so nobody mistakes it for proof.
+# CORRECTED 2026-08-10, HOURS AFTER IT WAS WRITTEN, and the correction is the
+# more useful half of this comment. The first version of this function excused
+# an empty next-elapse when the triggered job's `systemctl is-active` was one of
+# active/activating/reloading/deactivating — and it did not work, for two
+# reasons an adversarial reviewer caught on this host and I then reproduced:
+#
+#   * the CALLER built the state as `systemctl is-active … || echo inactive`,
+#     and is-active exits non-zero for every state except active/reloading
+#     while still PRINTING the real one. So the variable held two lines —
+#     $'failed\ninactive' — and `[[ $job_state == activating ]]` could never be
+#     true. The activating branch was dead code from the first commit;
+#   * and every unit in the loop below is Type=oneshot, which never reports
+#     `active` at all: sampled live, a oneshot goes inactive → activating →
+#     inactive. So the ONE branch that could match was a state this case cannot
+#     produce, and the branch that applied was unreachable.
+#
+# Its test passed because it called this function with hand-typed strings and
+# grepped the script for the other half. **It asserted the rule and never ran
+# the plumbing that feeds it** — the same defect this file exists to catch on
+# other people. tests/test_verify_restore_timer_selfcheck.py now drives the
+# substitution against the live host as well as the rule.
+#
+# WHY THE EXEMPTION IS BOUNDED BY TimeoutStartUSec, which the first version got
+# wrong in the other direction. career-backup, career-engine-nightly and
+# career-restore-test all carry `TimeoutStartSec=infinity` (verified). A hung
+# one stays `activating` for ever, its timer's next elapse stays empty for ever,
+# and an unbounded exemption would excuse it for ever — the old check was RIGHT
+# about those. Only a job systemd will eventually kill has a genuinely
+# temporary empty next-elapse, and career-verify-restore.service — the one that
+# reads its own timer — is the bounded one (10min). So: mid-run AND finite
+# timeout. If someone later sets that unit to infinity, this check starts
+# failing itself again, visibly, which is the correct way for that decision to
+# announce itself.
 classify_timer_liveness() {
-  local unit="$1" enabled="$2" active="$3" next="$4" job_state="$5"
+  local unit="$1" enabled="$2" active="$3" next="$4" job_state="$5" job_timeout="$6"
   if [[ "$enabled" != "enabled" || "$active" != "active" ]]; then
     bad "$unit: $enabled/$active next='${next:-none}' — it will never fire"
     return
@@ -201,10 +234,14 @@ classify_timer_liveness() {
     pass "$unit: enabled/active, next run scheduled"
     return
   fi
-  # Empty next-elapse. Two very different worlds.
-  if [[ "$job_state" == "active" || "$job_state" == "activating" \
+  # Empty next-elapse. Three worlds, and only one of them is fine.
+  if [[ "$job_state" == "activating" || "$job_state" == "active" \
         || "$job_state" == "reloading" || "$job_state" == "deactivating" ]]; then
-    pass "$unit: enabled/active; next run not scheduled YET because its own job is running ($job_state) — systemd sets the next elapse when the job ends"
+    if [[ -n "$job_timeout" && "$job_timeout" != "infinity" ]]; then
+      pass "$unit: enabled/active; next run not scheduled YET because its own job is running ($job_state) — systemd sets the next elapse when the job ends"
+      return
+    fi
+    bad "$unit: $enabled/$active next='${next:-none}' — its job has been $job_state with TimeoutStartUSec=${job_timeout:-unknown}, so systemd will never kill it and the timer will never be rescheduled"
     return
   fi
   bad "$unit: $enabled/$active next='${next:-none}' — it will never fire"
@@ -339,8 +376,24 @@ for unit in career-backup.timer career-engine-nightly.timer \
   # swapping the suffix: `Unit=` is the property that decides it, and a timer
   # may name a service that is not its own basename.
   triggers=$(systemctl show "$unit" -p Unit --value 2>/dev/null)
-  job_state=$(systemctl is-active "${triggers:-$unit}" 2>/dev/null || echo inactive)
-  classify_timer_liveness "$unit" "$enabled" "$active" "$next" "$job_state"
+  if [[ -z "$triggers" ]]; then
+    # `systemctl show` on a unit systemd cannot resolve prints an EMPTY Unit=
+    # and still exits 0. Falling back to the timer's own name would then ask
+    # «is the timer active», which it is — an unconditional pass. Unreachable
+    # today only because is-enabled catches a missing timer first, which is a
+    # fact about the order of two checks and not a property of this one.
+    bad "$unit: systemd reports no Unit= for this timer — it triggers nothing, or the name does not resolve"
+    continue
+  fi
+  # NOT `|| echo inactive`. is-active exits non-zero for every state except
+  # active/reloading while still PRINTING the real state, so the `||` appended
+  # a SECOND line and every comparison below silently failed. Take the last
+  # line; an empty result falls through to `inactive`, which fails, which is
+  # right.
+  job_state=$(systemctl is-active "$triggers" 2>/dev/null | tail -n1)
+  job_state="${job_state:-inactive}"
+  job_timeout=$(systemctl show "$triggers" -p TimeoutStartUSec --value 2>/dev/null)
+  classify_timer_liveness "$unit" "$enabled" "$active" "$next" "$job_state" "$job_timeout"
 done
 # A timer that fires a unit which has been failing since the last rebuild is
 # the quietest failure of all; check the actual results too.
