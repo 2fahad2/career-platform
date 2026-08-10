@@ -42,6 +42,12 @@ from career.config import (
     price_test_window,
 )
 from career.db.models import DiscoveryRun, PlanEntitlement, Subscription, Tenant
+from career.db.schema_guard import (
+    DB_AHEAD,
+    UNMEASURABLE,
+    SchemaVerdict,
+    measure_schema,
+)
 from career.engine.enrichment import UrllibPageFetcher
 from career.engine.run import RunReport, run_nightly
 from career.engine.sources import HttpSearchApiClient, PythonJobSpyClient
@@ -280,27 +286,66 @@ EXIT_NO_WHATSAPP_TOKEN = 4
 #: watched. Until 2026-08-07 this failure had no number at all — the sweep was
 #: wrapped in a broad `except` that logged and let the night exit 0.
 EXIT_LIFECYCLE_FAILED = 5
+#: 6 is «the database cannot record what this code sends» (§15.3, §15.12), and
+#: it is its own number because its runbook entry is one line long and shared
+#: with nothing: run the migration, then re-run the night. It is NOT 3 — on 3
+#: the operator hunts for which customer's delivery broke, and here nothing was
+#: attempted and nobody's day was closed. It is NOT 4 either, even though both
+#: mean «total outage tonight»: 4 is fixed in the credential file and 6 is fixed
+#: with `alembic upgrade head`, and sending a woken operator to the wrong file
+#: at 05:00 is the whole reason these numbers are a vocabulary.
+#:
+#: THE NIGHT THAT BOUGHT IT (2026-08-10): the run sent four real WhatsApp
+#: messages to a real customer, then could not write `delivery_messages`
+#: because the host database was at 0028 and the code writes columns 0030 adds.
+#: The transaction rolled back, the customer's day was recorded
+#: CV_GENERATION_FAILED — false in every particular — and the exit code was 3,
+#: which sent the operator looking for a broken CV pipeline that was working.
+EXIT_SCHEMA_DRIFT = 6
 
-#: The four things ``delivery_phase`` can say, named rather than spelled out at
+#: The five things ``delivery_phase`` can say, named rather than spelled out at
 #: every call site: the exit code now keys off one of them, and a verdict that
 #: turns on a string literal typed twice is a verdict one typo from silence.
 PHASE_RAN = "ran"
 PHASE_NO_DELIVER = "skipped:no-deliver"
 PHASE_NO_CREDENTIALS = "skipped:no-whatsapp-credentials"
 PHASE_NO_TENANTS = "skipped:no-tenants"
+#: «Refused», not «skipped», and the word is load-bearing: the other three
+#: skips are conditions the night arrived in, while this one is a decision the
+#: night MADE. The operator reading his journal must be able to tell «there was
+#: nothing to do» from «there was everything to do and we declined».
+PHASE_SCHEMA_REFUSED = "refused:schema-drift"
 
 
 def delivery_phase_for(
-    *, deliver: bool, has_whatsapp_token: bool, has_tenants: bool
+    *, deliver: bool, has_whatsapp_token: bool, has_tenants: bool,
+    schema: SchemaVerdict | None = None,
 ) -> str:
     """Why the delivery phase did or did not run — the reason, not the ashes.
 
     Lifted out of ``main`` because the verdict now turns on it: one of these
-    four answers means «total outage» and the other three do not, and a
-    decision with a customer-facing consequence does not belong in the one
-    function in this module that no test can reach. The order matters and is
-    the operator's own reading order: what he asked for, then what he is
-    missing, then who there was to serve.
+    answers means «total outage» and the others do not, and a decision with a
+    customer-facing consequence does not belong in the one function in this
+    module that no test can reach. The order matters and is the operator's own
+    reading order: what he asked for, then what he is missing, then who there
+    was to serve — and last, the one thing that is true of the machine rather
+    than of the night.
+
+    ``schema`` is the measured migration state (:func:`measure_schema`), and it
+    is checked LAST on purpose. If the operator asked for no delivery, or the
+    token is gone, or there is nobody to serve, then nothing was ever going to
+    be sent and a drift harms no one tonight; the more actionable answer is the
+    one that should reach the exit code. The drift is still ANNOUNCED in every
+    one of those cases — ``main`` alerts on the measurement itself, not on this
+    decision — so «quiet exit code» never means «quiet night».
+
+    ``None`` means «not measured», which this function reports as RAN rather
+    than refusing. That is not a hole: the hard gate is
+    :func:`run_delivery_phase`, which re-measures through the session that is
+    about to write and cannot be bypassed by a caller who forgot an argument.
+    A default that refused would make every existing caller of this function
+    silently stop delivering, which is a worse failure than the one being
+    fixed.
     """
     if not deliver:
         return PHASE_NO_DELIVER
@@ -308,6 +353,8 @@ def delivery_phase_for(
         return PHASE_NO_CREDENTIALS
     if not has_tenants:
         return PHASE_NO_TENANTS
+    if schema is not None and not schema.deliverable:
+        return PHASE_SCHEMA_REFUSED
     return PHASE_RAN
 
 #: The four day states that mean a human has to look at tonight (§15.12).
@@ -389,6 +436,14 @@ def exit_code_for(
     and the sweep is idempotent, so tomorrow's run redoes exactly the work that
     rolled back.
 
+    ``PHASE_SCHEMA_REFUSED`` is the 2026-08-10 incident's number and it ranks
+    ABOVE the day states deliberately. On a refused night there are no day
+    states to read — nothing was closed, because nothing was attempted — so the
+    states rule would answer 0 for a total outage, exactly as the emptiness
+    rule did for the missing token. It ranks BELOW ``discovery_failed`` for the
+    same reason 4 does: if every source is down as well, that is the bigger
+    fire and the operator should see it first.
+
     An unrecognised state counts as a failure: a ninth day state added
     without deciding its side of this line should shout, not go quiet.
     """
@@ -396,6 +451,8 @@ def exit_code_for(
         # kept first: every tenant closed DISCOVERY_FAILED on that path, so
         # both rules agree on «not zero», and 1 names the bigger fire.
         return EXIT_DISCOVERY_FAILED
+    if delivery_phase == PHASE_SCHEMA_REFUSED:
+        return EXIT_SCHEMA_DRIFT
     if delivery_phase == PHASE_NO_CREDENTIALS:
         return EXIT_NO_WHATSAPP_TOKEN
     if any(state not in HONEST_DAY_STATES for state in (delivery_states or ())):
@@ -1552,6 +1609,143 @@ def sweep_lifecycle_per_customer(
     )
 
 
+# ── «لا تسلّم ما لا تستطيع تسجيله» — the last gate before the first send ────
+
+
+def format_schema_alert(schema: SchemaVerdict) -> str:
+    """The operator's page for a migration drift. Direction-pure, one fact
+    per line.
+
+    Fahad's client REVERSES any line that mixes Arabic with Latin letters or
+    digits, and every fact this alert has to carry — two revision ids, a
+    verdict token and a shell command — is Latin. So each of them gets a line
+    of its own and the Arabic lines carry no identifiers at all
+    (tests/test_alert_direction_purity.py).
+
+    The command is not a phrase, it is the thing he pastes. It comes from
+    :attr:`SchemaVerdict.fix`, which builds it from the checkout the running
+    code was imported from — a hardcoded `/root/career` in this string would be
+    wrong on the production host the moment §13 moves it to Riyadh.
+    """
+    if schema.verdict == UNMEASURABLE:
+        headline = "⚠️ تعذّر قياس حالة قاعدة البيانات — لن يُسلَّم شيء الليلة"
+        advice = "لا نرسل ما لا نضمن تسجيله؛ راجع الخادم ثم أعد تشغيل الليلة"
+    elif schema.verdict == DB_AHEAD:
+        headline = "⚠️ الكود أقدم من قاعدة البيانات — لن يُسلَّم شيء الليلة"
+        advice = "انشر الكود المطابق، ولا تُرجِع القاعدة للخلف أبدًا"
+    else:
+        headline = "⚠️ قاعدة البيانات خلف الكود — لن يُسلَّم شيء الليلة"
+        advice = "شغّل الترقية ثم أعد تشغيل الليلة"
+    return "\n".join([
+        headline,
+        "لا رسالة واحدة أُرسلت لأي عميل",
+        "الحالة",
+        schema.verdict,
+        "النسخة في القاعدة",
+        ", ".join(schema.db_revisions) or "—",
+        "رأس الهجرات في الكود",
+        ", ".join(schema.code_heads) or "—",
+        advice,
+        schema.fix,
+    ])
+
+
+@dataclass(frozen=True)
+class DeliveryPhaseResult:
+    """What the delivery phase did, and the measurement that let it.
+
+    ``schema`` is present on EVERY result, refused or not. A guard that only
+    reports itself when it fires leaves no evidence that it ran on the nights
+    it passed, and «the check was green» and «the check was never installed in
+    this process» then print identically — which is the exact confusion the
+    July systemd-unit guard died of.
+    """
+
+    schema: SchemaVerdict
+    states: dict[uuid.UUID, Any] = field(default_factory=dict)
+
+    @property
+    def refused(self) -> bool:
+        return not self.schema.deliverable
+
+
+def run_delivery_phase(
+    session: Session,
+    *,
+    report: RunReport,
+    deps: Any,
+    now: datetime,
+    include_weekend: bool = False,
+    canary_tenant_id: uuid.UUID | None = None,
+    expired_out: list[Any] | None = None,
+    canary_delay_seconds: float = 0.0,
+) -> DeliveryPhaseResult:
+    """Measure the schema, then deliver — or refuse, having sent nothing.
+
+    THE GATE, and the reason it is here rather than three lines further in.
+    ``run_daily_delivery`` sends on its very first statement: ``sweep_promises``
+    runs before the stale-bundle sweep, which runs before any tenant loop. By
+    the time any code inside that function could ask a question, messages have
+    left the building. So the question is asked HERE, in the caller, through
+    the session that function will write with, and the only way past it is a
+    match.
+
+    WHY THE PHASE AND NOT THE RUN. Refusing the whole nightly was considered
+    and rejected. Discovery and ranking send nothing to anybody; their writes
+    are local and roll back cleanly, and losing them costs the operator a
+    warmed pool he will want when he re-runs after migrating. Worse, an early
+    hard exit would take out the two things that make a drifted night
+    survivable: ``report_environment``, which is how the operator learns the
+    state of his own machine, and the §05 lifecycle sweep, whose absence turns
+    a delivery outage into a billing one (renewal clocks stop ticking). The
+    harm this guard exists to prevent is the IRREVERSIBLE EXTERNAL SIDE EFFECT
+    — a message on a real customer's phone — and that harm lives entirely in
+    this phase.
+
+    WHY IT MEASURES AGAIN. ``main`` already measured at boot, ~90 minutes
+    earlier, to page the operator before the night wastes an hour. That
+    measurement is a WARNING and this one is the DECISION, because between them
+    lies a whole discovery run and, on this host, a deploy is a `git pull` a
+    human can do at any moment. A guard whose answer is 90 minutes old is a
+    guard that answers a question about a machine that no longer exists.
+
+    WHAT THE CUSTOMER'S DAY IS RECORDED AS — nothing, and that is the honest
+    answer rather than a convenient one. §15.12 gives eight states and the
+    truthful one for tonight is LEDGER_FAILED: the ledger is precisely what
+    cannot accept the day. But writing it would mean writing a row through the
+    schema this function has just measured as untrustworthy, which is the same
+    mistake as sending through it, one table over. So the state is REPORTED —
+    ``delivery_phase`` says refused, ``schema`` carries both revisions, every
+    intended tenant appears in ``delivery_unclosed``, and the exit code is 6 —
+    and it is not PERSISTED. A ninth state («REFUSED_SCHEMA_DRIFT») would say
+    it more exactly, and it is a whitepaper edit before it is a code edit
+    (§15.12 fixes the vocabulary at eight, and CLAUDE.md says the document
+    comes first); it is not invented here.
+    """
+    schema = measure_schema(session)
+    if not schema.deliverable:
+        logger.error(
+            "delivery REFUSED — %s (db=%s, code heads=%s). Nothing was sent. "
+            "Fix: %s",
+            schema.detail,
+            ", ".join(schema.db_revisions) or "-",
+            ", ".join(schema.code_heads) or "-",
+            schema.fix or "-",
+        )
+        return DeliveryPhaseResult(schema=schema)
+
+    from career.cv.daily_run import run_daily_delivery
+
+    states = run_daily_delivery(
+        session, report=report, deps=deps, now=now,
+        include_weekend=include_weekend,
+        canary_tenant_id=canary_tenant_id,
+        expired_out=expired_out,
+        canary_delay_seconds=canary_delay_seconds,
+    )
+    return DeliveryPhaseResult(schema=schema, states=dict(states))
+
+
 def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
     # composition over tested parts; exercised live by the C6 exit gate.
     logging.basicConfig(level=logging.INFO)
@@ -1576,10 +1770,27 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
     # boot checks: this is a daily oneshot, so it is one Graph call a day, and
     # it is the second independent witness — after the 08:30 timer — on the
     # morning of the run whose customers the credential would fail.
+    #
+    # The schema measurement rides in the same session for the same reason and
+    # at the same moment: it is the EARLY WARNING half of the 2026-08-10 guard.
+    # It decides nothing on its own — `run_delivery_phase` re-measures through
+    # the session that writes, and that is the decision — but it pages the
+    # operator at 04:30 instead of at 06:00, an hour and a half before the
+    # phase it will refuse. A drift is fixed by one command; the expensive part
+    # is finding out.
     with Session(engine) as session:
         report_environment(settings=settings, session=session,
                            admin_client=admin,
                            token_health=read_token_health(settings))
+        schema = measure_schema(session)
+    if not schema.deliverable:
+        logger.error("migration drift — db=%s, code heads=%s: %s",
+                     ", ".join(schema.db_revisions) or "-",
+                     ", ".join(schema.code_heads) or "-", schema.detail)
+        try:
+            admin.send_admin(format_schema_alert(schema))
+        except Exception:  # noqa: BLE001 — alerting never breaks the run
+            logger.warning("schema drift alert failed", exc_info=True)
 
     # §05 lifecycle sweep BEFORE the engine: a just-expired subscription
     # must not seed tonight's query families.
@@ -1676,6 +1887,11 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
     # sweep that half-completed and a sweep that did everything used to print
     # identically, which is nothing.
     summary["lifecycle"] = lifecycle.summary()
+    # On EVERY night, green or not. The measured pair (what the database holds,
+    # what the code on disk resolves to) is the evidence that the guard ran in
+    # this process at all; printing it only when it fires is how a guard's
+    # absence and a guard's silence become the same line in the journal.
+    summary["schema"] = schema.summary()
 
     if report.status in ("discovery_failed", "partial"):
         try:
@@ -1725,12 +1941,13 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
         deliver=bool(args.deliver),
         has_whatsapp_token=bool(settings.whatsapp_access_token),
         has_tenants=bool(report.per_tenant),
+        schema=schema,
     )
     delivery_phase_ran = summary["delivery_phase"] == PHASE_RAN
     if args.digest_only is None and not delivery_phase_ran:
-        # ح-3: intended to deliver but the phase never ran (no creds / no
-        # tenants) — flip the record so it never claims sends that didn't
-        # happen NOR a digest that actually delivered.
+        # ح-3: intended to deliver but the phase never ran (no creds, no
+        # tenants, or a refused schema) — flip the record so it never claims
+        # sends that didn't happen NOR a digest that actually delivered.
         try:
             with Session(engine) as session:
                 run_row = session.get(DiscoveryRun, report.run_id)
@@ -1740,7 +1957,7 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
         except Exception:  # noqa: BLE001 — honesty patch must not kill the run
             logger.warning("digest-only backfill failed", exc_info=True)
     if delivery_phase_ran:
-        from career.cv.daily_run import DailyDeps, run_daily_delivery
+        from career.cv.daily_run import DailyDeps
         from career.cv.generate import AnthropicLlmClient
         from career.onboarding.achievement_render import AnthropicExamplesWriter
         from career.storage import FilesystemStorageAdapter
@@ -1790,7 +2007,11 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
                 # real customer from that sweep and exited 0 because those
                 # closures had no way back to this function.
                 expired_states: list[Any] = []
-                states = run_daily_delivery(
+                # THE GATE. `run_delivery_phase` re-measures the migration
+                # state through THIS session — the one that will write the
+                # ledger — and sends nothing at all if it does not match. The
+                # boot measurement above only warned; this one decides.
+                outcome = run_delivery_phase(
                     session, report=report, deps=deps,
                     now=datetime.now(UTC),
                     include_weekend=args.include_weekend,
@@ -1803,6 +2024,22 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
                     # wait is gone: everyone is served at eleven.
                     canary_delay_seconds=0.0,
                 )
+                states = outcome.states
+                # The late verdict REPLACES the boot one in the journal: they
+                # are two readings of the same thing and the later one is the
+                # one that governed. They differ only when the machine changed
+                # under the run — which is precisely the fact worth printing.
+                summary["schema"] = outcome.schema.summary()
+                if outcome.refused:
+                    summary["delivery_phase"] = PHASE_SCHEMA_REFUSED
+                    # The boot alert did not fire (boot said «match»), so this
+                    # is the operator's only page for a drift that appeared
+                    # mid-run — a deploy while the engine was discovering.
+                    try:
+                        admin.send_admin(format_schema_alert(outcome.schema))
+                    except Exception:  # noqa: BLE001 — never breaks the run
+                        logger.warning("schema drift alert failed",
+                                       exc_info=True)
                 # read INSIDE the session — the rows expire on close
                 # AUDIT ك-17: TEN codes in the journal, never raw uuids
                 closed_ids = set(states) | {s.tenant_id for s in expired_states}
