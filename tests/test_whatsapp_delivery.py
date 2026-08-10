@@ -552,6 +552,17 @@ def test_a_ledger_failure_the_guard_cannot_prevent_still_fails_the_delivery(
     show; failing the transaction refuses to claim it. `salla/lifecycle` needs
     the savepoint for the opposite reason — there one row's failure would
     discard a whole night of OTHER customers' marks.
+
+    WHAT CHANGED ON 2026-08-10, and it is the other half of the same constant
+    (CHANGELOG 39). The refused row still fails its transaction — that part is
+    unchanged and is what the first assertion below pins. What it may no
+    longer do is take the EVIDENCE OF REAL SENDS with it: `deliver_adaptive`
+    commits at its durability point after the last send, so the two messages
+    this customer actually received keep their rows and their `deliveries`
+    parent, and the rollback discards exactly the one row that could not be
+    written. The old assertions here — no messages at all, no delivery row —
+    described the live incident of that morning rather than the behaviour we
+    want: four messages on a real phone, and a ledger that said zero.
     """
     from career.whatsapp.delivery import record_out
 
@@ -567,8 +578,12 @@ def test_a_ledger_failure_the_guard_cannot_prevent_still_fails_the_delivery(
         owner_session.commit()
     owner_session.rollback()
 
-    assert _messages_of(owner_engine, delivery_id) == []
+    # the orphan row is gone — it is the only thing the rollback may cost
+    ids = sorted(r.wa_message_id or "" for r
+                 in _messages_of(owner_engine, delivery_id))
+    assert ids == ["wamid.fake.1", "wamid.fake.2"]   # both real sends kept
+    # and the delivery the customer really received is still on the books
     with Session(owner_engine) as s:
         assert s.execute(
             select(Delivery.id).where(Delivery.id == delivery_id)
-        ).scalars().first() is None
+        ).scalars().first() is not None

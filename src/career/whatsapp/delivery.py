@@ -319,6 +319,48 @@ def record_out(
     receipt (`worker._handle_status`) fills the column only while it is still
     NULL — so a belief stamped on the row at this moment would be the value
     that arrives first and would shut the measurement out for good.
+
+    ── WHAT IS DELIBERATELY NOT LEDGERED, AND WHY ──────────────────────────
+    CHANGELOG 39: «ما لا يُقيَّد أصلًا يُكتب أنه لا يُقيَّد». This paragraph is
+    the DENOMINATOR — the list a gap-detector has to subtract before it can
+    call a missing row a hole. Verified against the tree on 2026-08-10: fifty
+    calls reach a WhatsApp client, twenty-three of them record a row here, and
+    the twenty-seven that do not expand to THIRTY-EIGHT distinct messages a
+    customer can receive. Counted where the MESSAGE is chosen rather than
+    where the client is called — `worker._reply` is one call to the client and
+    twelve different messages, and a detector comparing receipts to rows sees
+    the twelve.
+
+    * `worker._reply`, TWELVE call sites — the conversational acks (stop and
+      resume confirmations, the support ack, the way-back note for an
+      opted-out customer, the media and document acks, the thanks). Free-form
+      service replies inside an open 24h window: Meta bills nothing for them,
+      so a row would carry no money and no receipt anyone reads.
+    * `worker`'s `_UNRECOGNIZED` reply to an unknown number — ONE. There is no
+      tenant yet, and `delivery_messages.tenant_id` is NOT NULL, so this row
+      is not merely unwritten but impossible.
+    * the whole of `funnel/flow.py`, FIFTEEN sends. `record_out` has never
+      appeared in that file: the free analysis funnel is a conversation, not a
+      delivery, and none of it is billed.
+    * `whatsapp/samples.py`, THREE — sent to a prospect before any order
+      exists. Same NOT NULL wall as the unrecognised reply.
+    * the activation refusals in `whatsapp/activation_flow`, FOUR (`_INVALID`,
+      `_CONFLICT`, `_EXPIRED`, `_USED`). The successful activation right below
+      them IS ledgered; a refusal has no tenant to attribute.
+    * `onboarding/orchestrator`'s `_DELETE_DONE`, ONE — its channel row was
+      just deleted, so the FK it would need is gone by construction (that one
+      already says so at its call site).
+    * `salla/lifecycle._send_renew_link`, ONE, and `salla/provisioning`'s
+      renewal confirmation, ONE. Both are free-form texts that ride an already
+      open window beside a template that IS ledgered.
+
+    THE THIRD CATEGORY, which is not a hole either: a send that RAISED writes
+    no row, because every caller here records only after the client returns.
+    That is correct and must stay — a ledger row for a refused send is a bill
+    Meta never charged us, and `close.whatsapp_spend` would price it.
+
+    So the only real hole is the FIRST kind: a row lost AFTER a successful
+    send. That is what :func:`durability_point` exists for.
     """
     dm = DeliveryMessage(
         id=uuid.uuid4(), tenant_id=tenant_id, channel_id=channel_id,
@@ -329,6 +371,118 @@ def record_out(
     )
     session.add(dm)
     return dm
+
+
+class LedgerLost(RuntimeError):
+    """A durability point could not commit what the customer already received.
+
+    Raised INSTEAD of returning, because the object the caller holds is a lie
+    after the rollback: `deliveries` reverts to the status it carried before
+    the send (NO_SEND on the direct path), so a caller that read it would
+    conclude nothing was sent and close the day SKIPPED_OPTED_OUT — the exact
+    manufactured number CHANGELOG 39 is about. It carries the groups that
+    LANDED so the day can still close `LEDGER_FAILED` with real counts.
+    """
+
+    def __init__(self, *, delivered: list[str], failed: list[str],
+                 landed: bool = True) -> None:
+        super().__init__("delivery ledger lost after a successful send")
+        self.delivered = delivered
+        self.failed = failed
+        #: :func:`anything_landed`, read BEFORE the rollback could destroy it.
+        #: Defaulted rather than required, and defaulted to the conservative
+        #: side: a raiser that does not answer is taken to mean the customer
+        #: received something, so the day says LEDGER_FAILED. The opposite
+        #: default would let a real delivery be closed as a send failure, and
+        #: under-claiming a delivery the customer has read is the error this
+        #: whole class exists to stop. Pass :func:`anything_landed` explicitly
+        #: where the delivery object is to hand.
+        self.landed = landed
+
+
+def anything_landed(delivery: Delivery) -> bool:
+    """Did ANY message of this delivery actually reach the customer?
+
+    The one question the honest day state hinges on after a crash, and it is
+    not «is the delivered list non-empty» — that list only exists for grouped
+    C7 bundles. A generic parts bundle sends text and document with no groups
+    at all, and a held bundle sends a real morning template while delivering
+    no job; both landed. A grouped bundle that failed EVERY job is the
+    opposite case: terminal, and nothing reached anybody.
+
+    So: a delivered group is proof, and otherwise the status is — COMPLETED
+    and PENDING both mean a message left the building, PARTIAL with nothing
+    delivered means none did, and NO_SEND never sent.
+    """
+    results = delivery.bundle.get("results") or {}
+    if results.get("delivered"):
+        return True
+    return str(delivery.status) in (DELIVERY_COMPLETED, DELIVERY_PENDING)
+
+
+def durability_point(session: Session, *, what: str) -> bool:
+    """Commit what the customer has ALREADY received, before the first thing
+    that can raise. ``True`` when the ledger is safe; ``False`` when it was
+    lost anyway (the session is rolled back and usable either way).
+
+    ── THE DIRECTION CONSTANT 3 DOES NOT NAME ──────────────────────────────
+    «لا كتابة في السجلّ إلا بعد اكتمال التسليم، والكتابة ذرية» names one
+    direction — never write EARLY — and is silent about the other: never LOSE
+    the write afterwards. On 2026-08-10 a live nightly sent four messages to a
+    real customer (two texts, a document, an interactive card, all four
+    acknowledged by Meta), then the `delivery_messages` INSERT hit a column
+    the host database did not have; the per-tenant `except` rolled back, and
+    all four ledger rows and the `deliveries` row went with it. A rollback is
+    whole — but a send is not undoable, so «roll back the tenant» silently
+    means «keep the half the customer received, discard the half that records
+    it».
+
+    Every send happens OUTSIDE any transaction we control. So the transaction
+    boundary has to be placed where it matches that fact: after the last send,
+    before the first work that can raise.
+
+    ── TWO ALTERNATIVES, BOTH MEASURED AND BOTH REJECTED ───────────────────
+    * **A savepoint around the ledger rows.** It does nothing here, and this
+      was proved on `career_test` rather than argued: ``RELEASE SAVEPOINT`` is
+      not a commit — it merges the nested work into the enclosing transaction,
+      which the outer ``rollback()`` then discards exactly as before. A
+      savepoint protects the OUTER work from an inner failure (which is why
+      `salla/lifecycle._record_send` uses one, and why `close.close_tenant_day`
+      wraps the suppression loop); it cannot protect inner work from an outer
+      rollback. Nothing short of a commit makes a row survive one.
+    * **A second, autonomous session for the ledger rows.** Rejected on the
+      schema: `delivery_messages.delivery_id` is an FK to `deliveries(id)`,
+      and on the send path that parent row lives in the CALLER's still-open
+      transaction. A second connection would block on it until the caller
+      ends, then fail its INSERT the moment the caller rolls back — a
+      guaranteed lock wait followed by the same lost row.
+
+    ── THE PRICE, SAID OUT LOUD ────────────────────────────────────────────
+    After this commits, the caller's per-tenant ``except`` CAN NO LONGER UNDO
+    the tenant. That is not a side effect to be minimised; it is the point.
+    The half it would undo is the half the customer already received, and an
+    orchestrator that can erase it is an orchestrator that reports zero for a
+    CV a human has read. What the ``except`` keeps is the ability to roll back
+    everything written AFTER this line, which is the only part nobody has seen.
+
+    On failure the shape is `telegram/console._run_reply`'s, deliberately: the
+    message IS with the customer and only our record failed, so the log says
+    exactly which half succeeded rather than «failed», and it is ERROR because
+    the operator's harvester forwards ERROR lines only. ``what`` is a phrase,
+    never an id — §15.13 keeps PII and raw identifiers out of the logs.
+    """
+    try:
+        session.commit()
+        return True
+    except Exception:  # noqa: BLE001 — the send already happened
+        logger.error(
+            "%s landed but was not recorded — the customer has the messages "
+            "and the ledger does not; the day closes LEDGER_FAILED with the "
+            "counts that actually reached them",
+            what, exc_info=True,
+        )
+        session.rollback()
+        return False
 
 
 def _send_bundle_parts(
@@ -503,7 +657,7 @@ def close_day_from_terminal_delivery(
             session, tenant_id=delivery.tenant_id, day=closed.run_date
         )
     except Exception:  # noqa: BLE001 — accounting never blocks the close
-        logger.warning("resend cost rollup failed", exc_info=True)
+        logger.error("resend cost rollup failed", exc_info=True)
 
 
 def resend_pending_delivery(
@@ -570,11 +724,29 @@ def deliver_adaptive(
         window_state_at_start=window.value, bundle=bundle,
     )
     session.add(delivery)
-    session.flush()
+    # THE FK PRECONDITION, and the reason this is a commit and not the flush
+    # it was until 2026-08-10. `delivery_messages.delivery_id` points HERE, so
+    # a ledger row can only outlive a rollback if its parent already has. A
+    # flush makes the row visible to this transaction and to nothing else; the
+    # durability point below would then be committing the parent and the
+    # children together, which is fine — until the parent's INSERT is the
+    # statement that fails, at which point the send has happened and there is
+    # no row to attach it to. Committing before the first send costs one round
+    # trip and removes that ordering entirely.
+    #
+    # It is safe to commit early precisely because the row is honest at this
+    # moment: NO_SEND, nothing claimed. If this commit RAISES, nothing has
+    # been sent yet and the caller's ordinary failure path closes the day
+    # correctly — that is the one moment where losing the row is the right
+    # outcome, so it is deliberately not a durability point.
+    session.commit()
 
     if action is DeliveryAction.SKIP_OPTED_OUT:
+        # Nothing leaves the building, so there is nothing to make durable —
+        # the caller's own commit carries this row.
         delivery.status = DELIVERY_NO_SEND
-    elif action is DeliveryAction.SEND_DIRECT:
+        return delivery
+    if action is DeliveryAction.SEND_DIRECT:
         _dispatch_bundle(session, channel, delivery,
                          whatsapp_client=whatsapp_client, now=now)
     else:  # SEND_TEMPLATE_THEN_WAIT
@@ -598,6 +770,16 @@ def deliver_adaptive(
                    kind="template", wa_message_id=mid,
                    template_name=daily_template.name, delivery_id=delivery.id, now=now)
         delivery.status = DELIVERY_PENDING
+
+    # THE DURABILITY POINT. Read while the objects still hold the truth: after
+    # a failed commit the rollback reverts them, so the answer to «what landed»
+    # has to be taken before the question can be destroyed.
+    results = delivery.bundle.get("results") or {}
+    delivered = [str(g) for g in (results.get("delivered") or [])]
+    unlanded = [str(g) for g in (results.get("failed") or [])]
+    landed = anything_landed(delivery)
+    if not durability_point(session, what="today's delivery"):
+        raise LedgerLost(delivered=delivered, failed=unlanded, landed=landed)
     return delivery
 
 

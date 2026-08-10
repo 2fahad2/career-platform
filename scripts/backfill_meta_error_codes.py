@@ -47,6 +47,58 @@ won. History fills gaps; it does not correct the present.
 
 So the second run of this script writes nothing, and says so.
 
+THE LEDGER HOLE, AND WHY IT IS COUNTED HERE
+-------------------------------------------
+This script already reads every stored receipt, so counting the receipts that
+have NO `delivery_messages` row at all costs one more `IN (...)` and answers a
+question nobody was asking: «did a message we sent leave no trace in the
+ledger?» It went unasked for 24 days because the only line resembling it —
+«codes with no ledger row» — counts ERROR-carrying receipts, and the missing
+rows were `delivered`.
+
+The count is SPLIT, because a hole has three causes and only one of them is a
+defect (CHANGELOG §39):
+
+  * *a lost write* — the send succeeded, the ledger INSERT died in a rolled
+    back transaction. Meta billed us, the customer holds his CV, and our row
+    says nothing. This is the defect.
+  * *a send no code ever records* — the worker's conversational acks,
+    `funnel/flow.py`, `whatsapp/samples.py`, the activation refusals. Free
+    `service` receipts by the dozen. An old decision, not a defect.
+  * *a refused send* — the send raised, so no row was written, which is
+    correct: a row for a send that was never accepted is a bill we were never
+    charged.
+
+A detector that adds those together fires daily on the free acks and teaches
+the operator to skip the report — the exact failure mode §37 paid for, where
+one false line at the top buried seven true ones underneath. So the line worth
+a page is the NARROW one: `pricing.billable`, or a band that is not `service`,
+with no row. On 24 days of live staging data that set has exactly one member
+(a `utility` template from 2026-07-17) and would have raised zero false alarms;
+the twelve free `service` acks and the one refusal are counted on their own
+lines, where they explain themselves instead of crying.
+
+NO SCRIPT IN THIS TREE BECOMES A LEDGER AUTHOR
+----------------------------------------------
+The obvious next move — write the missing rows from the receipts — is REFUSED,
+and the refusal is the finding, not an omission.
+
+A receipt carries the wamid, the status and the price band. It names NEITHER
+the message kind NOR the template. Those two are exactly the columns spend is
+billed on (`cv/close.whatsapp_spend` narrows to `kind == 'template'` and prices what is
+left by `template_name`, and its docstring calls that line load-bearing for
+correctness) — the same two `_wa_kind_of` reads. So a repair row would carry a real wamid,
+a GUESSED `kind` and an invented-or-NULL `template_name` — and nothing
+downstream could tell it from a row the delivery path wrote: not the spend
+arithmetic, not the console's message-status panel, not the detector above,
+which would go quiet having been fed its own guess.
+
+A ROW WE INVENT IS WORSE THAN A HOLE WE CAN SEE. The hole is visible, bounded,
+and dated; the invention is permanent and indistinguishable. The fix for a lost
+write belongs where the write is lost — the durability point moving ahead of
+the first send, and `LEDGER_FAILED` with its true counts when it is lost
+anyway — not in a repair script reading yesterday's receipts.
+
 THE CATEGORY COLUMN IS READ AND NEVER WRITTEN
 ---------------------------------------------
 0030 also added `delivery_messages.category`, filled from `pricing.category`
@@ -130,17 +182,58 @@ def status_objects(payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
                     yield st
 
 
+#: The band Meta puts on the free-form replies it delivers inside the open 24h
+#: window and charges nothing for. Named because the whole point of the hole
+#: report is that a `service` hole is not news and anything else is.
+FREE_BAND = "service"
+
+
+def status_is_billable(st: dict[str, Any]) -> bool | None:
+    """Meta's own `pricing.billable` flag, or None when it did not say.
+
+    Written HERE and not imported, unlike every other parser in this file, for
+    a stated reason: `worker.status_billed_category` refuses to read
+    `billable` on purpose — netting Meta's zero-rated sends out of
+    `whatsapp_spend` would change the DEFINITION of spend, and that is a
+    separate decision with its own evidence. This function is not part of that
+    decision and does not touch the bill: it only decides which line of a
+    REPORT a missing ledger row is counted on. Nothing it returns is ever
+    written to a column.
+
+    Total, like the two it sits beside: this is somebody else's HTTP body.
+    A missing, malformed or non-boolean flag answers None, which lands the
+    receipt on the quiet line unless its band already speaks for it.
+    """
+    pricing = st.get("pricing")
+    if not isinstance(pricing, dict):
+        return None
+    raw = pricing.get("billable")
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str) and raw.strip().lower() in {"true", "false"}:
+        return raw.strip().lower() == "true"
+    return None
+
+
 @dataclass(frozen=True)
 class Scan:
     """What history still knows. Nothing here is per-tenant: a stored payload
     is not scoped to anyone, which is exactly why the writing half is."""
 
     #: wa_message_id → the leading Meta code, the same choice the live handler
-    #: makes (`worker._handle_status`).
+    #: makes (`worker._handle_status`). Membership here is also this file's
+    #: definition of «the send was refused»: a code is Meta declining it.
     codes: dict[str, int] = field(default_factory=dict)
     #: wa_message_id → the billed category Meta reported. MEASURED ONLY —
     #: nothing in this file writes it.
     categories: dict[str, str] = field(default_factory=dict)
+    #: EVERY wa_message_id that appeared in a status object, whether or not it
+    #: carried a code or a band. The denominator of the ledger-hole report,
+    #: and the reason that report was free to add: these ids are read already.
+    receipt_ids: set[str] = field(default_factory=set)
+    #: the subset Meta flagged `pricing.billable` — true on ANY receipt for
+    #: that id. Monotone on purpose: being billed once is being billed.
+    billable_ids: set[str] = field(default_factory=set)
     events: int = 0
     redacted: int = 0
     status_objects: int = 0
@@ -173,6 +266,8 @@ def scan_payloads(session: Session) -> Scan:
     """
     codes: dict[str, int] = {}
     categories: dict[str, str] = {}
+    receipt_ids: set[str] = set()
+    billable_ids: set[str] = set()
     events = redacted = seen = 0
 
     rows = session.execute(
@@ -194,14 +289,23 @@ def scan_payloads(session: Session) -> Scan:
             wamid = st.get("id")
             if not isinstance(wamid, str) or not wamid:
                 continue
+            receipt_ids.add(wamid)
             found = status_error_codes(st)
             if found:
                 codes[wamid] = found[0]
             category = status_billed_category(st)
             if category is not None:
                 categories[wamid] = category
+            if status_is_billable(st):
+                # OR-ed across receipts rather than last-wins: `delivered`
+                # carries the pricing and `read` often carries none, so the
+                # later body would otherwise un-bill a message Meta charged
+                # for. The band above keeps last-wins because there Meta is
+                # RE-stating the band; here it is simply silent.
+                billable_ids.add(wamid)
 
-    return Scan(codes=codes, categories=categories, events=events,
+    return Scan(codes=codes, categories=categories, receipt_ids=receipt_ids,
+                billable_ids=billable_ids, events=events,
                 redacted=redacted, status_objects=seen)
 
 
@@ -224,6 +328,11 @@ class Applied:
     #: measurement this script makes and does not act on
     category_recoverable: int = 0
     by_code: Counter[int] = field(default_factory=Counter)
+    #: every scanned wa_message_id this session actually found on a row, code
+    #: or no code. A SET and not a count because the sessions are per-tenant
+    #: and the question is asked of all of them at once: an id present in one
+    #: tenant is not a hole just because the next tenant cannot see it.
+    present: set[str] = field(default_factory=set)
 
     def absorb(self, other: Applied) -> None:
         self.matched += other.matched
@@ -233,6 +342,7 @@ class Applied:
         self.category_present += other.category_present
         self.category_recoverable += other.category_recoverable
         self.by_code.update(other.by_code)
+        self.present |= other.present
 
 
 def apply_codes(session: Session, scan: Scan, *, apply: bool = False) -> Applied:
@@ -248,18 +358,30 @@ def apply_codes(session: Session, scan: Scan, *, apply: bool = False) -> Applied
     than at some later moment the caller did not choose.
     """
     out = Applied()
-    ids = list(scan.codes)
+    # EVERY scanned id, not only the ones carrying a code. The rows come back
+    # in the same query either way, and the difference is the whole of the
+    # ledger-hole report: the 24-day-old holes were `delivered` receipts, so a
+    # sweep restricted to codes could never have seen one. Sorted so the
+    # chunking is deterministic and a re-run reads the same batches.
+    ids = sorted(scan.receipt_ids | set(scan.codes))
     for start in range(0, len(ids), _CHUNK):
         chunk = ids[start:start + _CHUNK]
         rows = session.execute(
             select(DeliveryMessage).where(DeliveryMessage.wa_message_id.in_(chunk))
         ).scalars().all()
         for dm in rows:
+            wamid = str(dm.wa_message_id)
+            out.present.add(wamid)
+            if wamid not in scan.codes:
+                # Nothing to fill and nothing to count: every counter below is
+                # about the code backfill, and widening them would silently
+                # change numbers an operator has been reading for weeks.
+                continue
             out.matched += 1
-            code = scan.codes[str(dm.wa_message_id)]
+            code = scan.codes[wamid]
             if dm.category is not None:
                 out.category_present += 1
-            elif str(dm.wa_message_id) in scan.categories:
+            elif wamid in scan.categories:
                 out.category_recoverable += 1
             if dm.meta_error_code is None:
                 out.filled += 1
@@ -277,6 +399,67 @@ def apply_codes(session: Session, scan: Scan, *, apply: bool = False) -> Applied
     if apply:
         session.flush()
     return out
+
+
+@dataclass
+class Holes:
+    """Receipts with no `delivery_messages` row, triaged into §39's three
+    causes. Counts only — the ids are not kept and never printed.
+
+    The buckets are mutually exclusive and ordered, because an operator acts
+    on the first line that names him and a total is not actionable:
+
+    ``billed`` — Meta said `billable`, or named a band that is not
+    :data:`FREE_BAND`. We were charged for a message our ledger does not
+    contain. THIS is the paging line, and the only one.
+
+    ``refused`` — no money on it and Meta gave a reason code: the send was
+    declined, so no row was written, which is correct. A row for a send that
+    never happened is a bill we were never charged.
+
+    ``unledgered`` — the remainder: free `service` receipts and receipts with
+    no pricing at all. Conversational acks, `funnel/flow.py`,
+    `whatsapp/samples.py`, the activation refusals — sends no code in this
+    tree has ever recorded. A decision, not a defect, and the reason this
+    report is split at all: twelve of these fire every day, and a detector
+    that pages on them is a detector the operator learns to skip.
+    """
+
+    billed: int = 0
+    refused: int = 0
+    unledgered: int = 0
+    by_band: Counter[str] = field(default_factory=Counter)
+
+    @property
+    def total(self) -> int:
+        return self.billed + self.refused + self.unledgered
+
+
+#: The label a hole with no `pricing` object at all is counted under. Not
+#: `service`: «Meta said free» and «Meta said nothing» are different facts and
+#: only one of them is a decision we made.
+NO_BAND = "(no pricing)"
+
+
+def ledger_holes(scan: Scan, applied: Applied) -> Holes:
+    """Which scanned receipts have no ledger row, and why that is or is not news.
+
+    Pure: it reads the scan and the presence set the sessions built, and
+    touches neither. This is deliberately not a query — the presence set is
+    the union across every tenant session, and a hole is only a hole when NO
+    tenant could see the row.
+    """
+    holes = Holes()
+    for wamid in sorted(scan.receipt_ids - applied.present):
+        band = scan.categories.get(wamid)
+        holes.by_band[band or NO_BAND] += 1
+        if wamid in scan.billable_ids or (band is not None and band != FREE_BAND):
+            holes.billed += 1
+        elif wamid in scan.codes:
+            holes.refused += 1
+        else:
+            holes.unledgered += 1
+    return holes
 
 
 def _tenant_ids(session: Session) -> list[str]:
@@ -312,6 +495,29 @@ def _report(scan: Scan, applied: Applied, *, apply: bool) -> None:
     if unmatched:
         print("  NOTE: an unmatched code is a refusal with no ledger row, or a "
               "tenant this role could not enumerate — see --tenant.")
+
+    holes = ledger_holes(scan, applied)
+    print("  ledger holes — receipts Meta sent us with no delivery_messages row")
+    _line("    status ids in the receipts", len(scan.receipt_ids))
+    _line("    …found on a ledger row", len(applied.present))
+    _line("    …with no row at all", holes.total)
+    _line("    BILLED, no row — PAGE THIS", holes.billed)
+    _line("    refused send, no row — correct", holes.refused)
+    _line("    free ack — no code records it", holes.unledgered)
+    for band, count in sorted(holes.by_band.items()):
+        _line(f"      hole band {band}", count)
+    if holes.billed:
+        # The only line in this report that is an incident. Phrased as what to
+        # do rather than as what was counted, because a count is not an
+        # instruction and this one has a customer behind it — and it says in
+        # the same breath what NOT to do, since «fill in the missing row» is
+        # the first thing the reader will reach for.
+        print("  ACT: a message Meta charged us for has no ledger row. That "
+              "customer's day is not trustworthy.")
+        print("       The row is NOT to be reconstructed here: the receipt "
+              "carries no kind and no template_name,")
+        print("       so a repair row is a guess nothing downstream could tell "
+              "from a fact.")
 
 
 def main(argv: list[str] | None = None) -> int:

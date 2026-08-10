@@ -477,10 +477,37 @@ def test_the_operator_page_is_direction_pure_and_carries_the_command(
     finally:
         _restore(owner_session, real)
 
-    # the unmeasurable shape has no revisions to name at all
-    blank = schema_guard.SchemaVerdict(UNMEASURABLE, (), (), "x", "y")
-    lines = cli.format_schema_alert(blank).split("\n")
-    assert [ln for ln in lines if line_is_mixed(ln)] == []
+
+def test_every_verdict_has_its_own_arabic_sentence() -> None:
+    """Derived from the module's constants, never from a list kept here.
+
+    A sixth verdict added next month must not silently fall through to «the
+    database is behind the code», which would be a confident lie in whichever
+    new case it describes. The set is read off ``schema_guard`` so adding a
+    constant without a sentence fails HERE, in the file that knows why the
+    sentence matters, rather than on Fahad's phone.
+    """
+    verdicts = {
+        value for name, value in vars(schema_guard).items()
+        if name.isupper() and isinstance(value, str) and not name.startswith("_")
+    }
+    assert len(verdicts) >= 6, "the verdict vocabulary was not found"
+    for verdict in sorted(verdicts):
+        alert = cli.format_schema_alert(
+            schema_guard.SchemaVerdict(verdict, (), (), "detail", "fix")
+        )
+        assert [ln for ln in alert.split("\n") if line_is_mixed(ln)] == []
+    # MATCH never reaches this function — a matching night sends no alert — so
+    # every OTHER verdict must arrive under a headline of its own. Two drifts
+    # that page identically are one runbook entry the operator has to guess.
+    refusals = sorted(verdicts - {MATCH})
+    headlines = {
+        cli.format_schema_alert(
+            schema_guard.SchemaVerdict(verdict, (), (), "detail", "fix")
+        ).split("\n")[0]
+        for verdict in refusals
+    }
+    assert len(headlines) == len(refusals)
 
 
 # ═════════════ the scope this deliberately does NOT cover ════════════════════

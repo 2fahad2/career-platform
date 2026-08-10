@@ -184,8 +184,9 @@ def test_the_units_this_check_guards_are_still_shaped_the_way_it_assumes() -> No
     """
     if not shutil.which("systemctl"):
         return
-    timeout = subprocess.run(  # noqa: S603 — fixed argv
-        ["systemctl", "show", "career-verify-restore.service",
+    systemctl = shutil.which("systemctl") or "/usr/bin/systemctl"
+    timeout = subprocess.run(  # noqa: S603 — fixed argv, resolved interpreter
+        [systemctl, "show", "career-verify-restore.service",
          "-p", "TimeoutStartUSec", "--value"],
         capture_output=True, text=True, check=False,
     ).stdout.strip()
@@ -226,8 +227,9 @@ def test_a_timer_systemd_cannot_resolve_does_not_pass_by_falling_back() -> None:
     """
     if not shutil.which("systemctl"):
         return
-    proc = subprocess.run(  # noqa: S603 — fixed argv
-        ["systemctl", "show", "career-nonexistent-probe.timer", "-p", "Unit",
+    systemctl = shutil.which("systemctl") or "/usr/bin/systemctl"
+    proc = subprocess.run(  # noqa: S603 — fixed argv, resolved path
+        [systemctl, "show", "career-nonexistent-probe.timer", "-p", "Unit",
          "--value"],
         capture_output=True, text=True, check=False,
     )

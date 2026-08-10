@@ -90,23 +90,68 @@ def close_tenant_day(
     delivered_groups: list[str],
     failed_groups: list[str],
     suppressor: Suppressor = record_suppression_by_url,
+    ledger_ok: bool = True,
 ) -> TenantDayState:
     """Suppress ONLY the delivered, then record the one honest state.
-    A suppression failure becomes LEDGER_FAILED — recorded, never raised."""
-    ledger_ok = True
-    try:
-        # audit fix: the whole day's ledger write is ONE savepoint — a
-        # mid-loop failure must not leave earlier groups half-committed
-        # next to a LEDGER_FAILED state (§15.3 atomicity).
-        with session.begin_nested():
-            for group in delivered_groups:
-                suppressor(session, tenant_id=tenant_id, url=group, now=now)
-    except Exception:  # noqa: BLE001 — the failure IS the state (§15.12)
-        logger.error("suppression ledger write failed", exc_info=True)
-        ledger_ok = False
+    A suppression failure becomes LEDGER_FAILED — recorded, never raised.
+
+    ``ledger_ok=False`` IS THE CALLER SAYING «THIS DAY'S LEDGER IS ALREADY
+    LOST» (CHANGELOG 39, 2026-08-10). The sends are not undoable and the rows
+    that record them are; `cv/daily_run`'s crash close knows the delivery
+    landed and its ledger write did not, and until now had no way to say so
+    through this door — this function derived ``ledger_ok`` from ONE source,
+    its own suppression loop, so it could only ever answer a state claiming the
+    delivery was recorded. It composed :func:`daily_state` and
+    :func:`_record_day_state` by hand instead, which works and goes around the
+    one function that knows what closing a day means.
+
+    THE TWO SOURCES ARE **AND**-ed, never replaced. A caller's answer can only
+    make the state worse: `True` is «I know of no upstream loss», which is the
+    default and says nothing about the suppression write this function is about
+    to attempt, and no argument may certify a ledger this function itself
+    watched fail.
+
+    AND IT WRITES NO SUPPRESSION WHEN THE CALLER SAYS FALSE — the coupling
+    decided here rather than left to each caller's memory, because forgetting
+    it is silent and permanent. Suppression is the claim «this posting was
+    delivered, do not offer it again»; on a day whose delivery rows were lost
+    it is a claim with nothing behind it, and its cost runs the wrong way: a
+    suppressed LEDGER_FAILED day makes the operator's re-run find NOTHING,
+    close `NO_MATCHES` — which :func:`_outranks` does not stop, since only
+    DELIVERED and PARTIAL_DELIVERY are protected — and overwrite the alarm.
+    A duplicate send is visible to one customer and he can say so; a silently
+    cleared alarm is invisible to everybody. The re-run is the recovery, so it
+    is kept possible, and ``delivered_groups`` still passes through in full so
+    the COUNTS stay true: `LEDGER_FAILED` beside `delivered: 1` is what the
+    operator can act on, and manufacturing a zero there was half of what
+    CHANGELOG 39 was about.
+    """
+    caller_ledger_ok = ledger_ok
+    suppression_ok = True
+    if caller_ledger_ok:
+        try:
+            # audit fix: the whole day's ledger write is ONE savepoint — a
+            # mid-loop failure must not leave earlier groups half-committed
+            # next to a LEDGER_FAILED state (§15.3 atomicity).
+            with session.begin_nested():
+                for group in delivered_groups:
+                    suppressor(session, tenant_id=tenant_id, url=group, now=now)
+        except Exception:  # noqa: BLE001 — the failure IS the state (§15.12)
+            logger.error("suppression ledger write failed", exc_info=True)
+            suppression_ok = False
+    elif delivered_groups:
+        # ERROR, not warning: this is the one line that tells the operator the
+        # re-run is both possible and necessary, and warnings do not leave the
+        # box (`whatsapp/worker`: the harvester forwards «ERROR:» lines only).
+        logger.error(
+            "day closed with its ledger already lost — %d delivered group(s) "
+            "left UNSUPPRESSED on purpose so a re-run can still find them; "
+            "the day is LEDGER_FAILED with its real counts",
+            len(delivered_groups),
+        )
 
     state_value = daily_state(
-        ledger_ok=ledger_ok,
+        ledger_ok=caller_ledger_ok and suppression_ok,
         discovery_ok=discovery_ok,
         gate_passes=gate_passes,
         cv_resolved=cv_resolved,
@@ -790,6 +835,42 @@ def _upsert_allocation(
         row.cost_usd = cost_usd
 
 
+def _priceable_rows(
+    session: Session, *, tenant_id: uuid.UUID, day: date
+) -> tuple[int, int]:
+    """``(usage rows, billed template rows)`` this tenant-day still HAS.
+
+    Deliberately coarser than :func:`spend_by_kind`: the same two predicates
+    that decide whether a row is priceable at all — :data:`SPEND_KINDS`, and
+    «a template Meta did not refuse» — with none of the mapping, the grouping
+    or the pricing that turns them into a kind. It answers ONE question, and
+    only :func:`_retire_allocations` asks it: is there evidence here that a
+    derivation returning «nothing» must be wrong about?
+
+    It is not a second definition of spend — it computes no money and no kind,
+    and it is never compared to one. It reads no column past the two filters,
+    which is why it still answers on a host where the derivation itself cannot
+    (a `delivery_messages.category` that does not exist is what broke this
+    whole path on staging; see :func:`_retire_allocations`).
+    """
+    usage = session.execute(
+        select(func.count(UsageEvent.id)).where(
+            UsageEvent.tenant_id == tenant_id,
+            UsageEvent.kind.in_(SPEND_KINDS),
+            func.date(UsageEvent.occurred_at) == day,
+        )
+    ).scalar_one()
+    billed = session.execute(
+        select(func.count(DeliveryMessage.id)).where(
+            DeliveryMessage.tenant_id == tenant_id,
+            DeliveryMessage.kind == "template",
+            DeliveryMessage.status != "failed",
+            func.date(DeliveryMessage.created_at) == day,
+        )
+    ).scalar_one()
+    return int(usage), int(billed)
+
+
 def _retire_allocations(
     session: Session, *, tenant_id: uuid.UUID, day: date, keep: set[str],
 ) -> None:
@@ -830,11 +911,65 @@ def _retire_allocations(
 
     SCOPED to one ``(tenant, day)``, which is the unit :func:`rollup_costs`
     recomputes in full. Nothing outside that pair may be touched by a re-run of
-    it, and ``keep`` empty deletes the pair's rows honestly: `spend_by_kind`
-    returning nothing means the day cost nothing (or its ledger rows were
-    erased under §12, in which case the archive should follow the evidence it is
-    derived from, not outlive it).
+    it.
+
+    ── AN EMPTY ANSWER HAS THREE CAUSES, AND THIS PARAGRAPH KNEW TWO ─────────
+
+    ``keep`` empty is the one branch that destroys the whole pair, and it was
+    blessed as «the day cost nothing, or its ledger rows were erased under §12
+    — the archive should follow the evidence it is derived from rather than
+    outlive it». Both remain true. The third was not hypothetical even on the
+    day this was written: **the derivation is broken.**
+
+    On staging, `whatsapp_spend` was RAISING on every call — the host was two
+    migrations behind and `delivery_messages.category` did not exist there — so
+    :func:`spend_by_kind` raised, so :func:`rollup_costs` raised, at all five
+    call sites, and every one of them swallows it with `logger.warning`. By
+    this repository's own rule (`whatsapp/worker.py`: warnings do not leave the
+    box, the operator's harvester forwards «ERROR:» lines only) it had been
+    failing silently. That variant never reaches this line — it raises above
+    it — but it is the proof that «the derivation cannot answer» is a live
+    state of this system, and the next one need only answer WRONGLY (a
+    predicate that stops matching, a kind list that loses a name, a day
+    boundary that moves) to arrive here as an empty ``keep`` with a full day
+    behind it. An empty answer is indistinguishable from a broken derivation,
+    and this is the branch that deletes.
+
+    So the two are separated by MEASUREMENT, not by assumption. If the day has
+    archived kinds and :func:`_priceable_rows` still finds rows the derivation
+    would have priced, the derivation — not the day — is what changed, and the
+    pair is left exactly as it is, at ERROR, which is the level that leaves the
+    box. If the evidence is genuinely gone (§12 erasure, or a day that only
+    ever had `MANUAL_KINDS`, or a day whose one template send ended `failed`
+    and was never billed) the counts are zero and the delete proceeds, because
+    that is the same «follow the evidence» rule pointing the other way.
+
+    The refusal costs an over-stated day, which is the direction everything
+    around here already leans, and it costs it only until a derivation that
+    works runs again. The alternative cost is the archive of a real day erased
+    on the word of a reader that had stopped reading.
     """
+    if not keep:
+        archived = session.execute(
+            select(func.count()).select_from(CostAllocation).where(
+                CostAllocation.tenant_id == tenant_id,
+                CostAllocation.day == day,
+            )
+        ).scalar_one()
+        usage_rows, billed_rows = (
+            _priceable_rows(session, tenant_id=tenant_id, day=day)
+            if archived else (0, 0)
+        )
+        if archived and (usage_rows or billed_rows):
+            logger.error(
+                "cost rollup derived NO spend for %s while the day still has "
+                "%d archived kinds over %d usage rows and %d billed template "
+                "rows — the derivation is broken, not the day; archive left "
+                "as-is, nothing retired",
+                day.isoformat(), int(archived), usage_rows, billed_rows,
+            )
+            return
+
     query = delete(CostAllocation).where(
         CostAllocation.tenant_id == tenant_id,
         CostAllocation.day == day,
@@ -898,6 +1033,34 @@ def spend_by_kind(
     return out
 
 
+#: One rollup at a time per ``(tenant, day)`` — the pair :func:`rollup_costs`
+#: recomputes in full, and therefore the only pair two rollups can fight over.
+#: DERIVED from the pair rather than a fixed number like
+#: `promises.guarantee._SWEEP_LOCK_KEY`, because two different pairs share no
+#: row and must never stand each other down. `hashtextextended` can of course
+#: collide — with another pair, or with one of those two fixed keys — and the
+#: cost of a collision is one rollup that stands down and runs again later,
+#: never a wrong row: that is why the losing side does NOTHING rather than
+#: something reduced.
+_ROLLUP_LOCK_NAMESPACE = "career.cv.close.rollup_costs"
+
+
+def _rollup_lock(session: Session, *, tenant_id: uuid.UUID, day: date) -> bool:
+    """Try to become the only rollup of this tenant-day. Never waits."""
+    return bool(
+        session.execute(
+            select(
+                func.pg_try_advisory_xact_lock(
+                    func.hashtextextended(
+                        f"{_ROLLUP_LOCK_NAMESPACE}:{tenant_id}:{day.isoformat()}",
+                        0,
+                    )
+                )
+            )
+        ).scalar_one()
+    )
+
+
 def rollup_costs(session: Session, *, tenant_id: uuid.UUID, day: date) -> None:
     """Persist :func:`spend_by_kind` for one tenant-day — idempotent by
     construction (SET, not increment), so the whole day's bill lands in one
@@ -925,15 +1088,88 @@ def rollup_costs(session: Session, *, tenant_id: uuid.UUID, day: date) -> None:
     rows for a tenant-day are exactly :func:`spend_by_kind`'s answer for that
     tenant-day, which is what «the whole day's bill lands in one table» has to
     mean if the sentence is to be true.
+
+    ── ONE ROLLUP AT A TIME PER (TENANT, DAY), 2026-08-10 ────────────────────
+
+    That other half arrived with a race under it. ``fresh`` is read in ONE
+    statement and the DELETE runs in a later one, and under READ COMMITTED the
+    DELETE takes a NEW snapshot — so it removes rows another rollup committed
+    after ``fresh`` was read, using a keep-set that predates them. Two rollups
+    do reach the same pair: the send-time one (`whatsapp/delivery.py`,
+    `whatsapp/worker.py`) and the nightly (`cv/daily_run.py`). The exposed
+    window is the upsert loop above — milliseconds — and inside it the
+    send-time rollup deletes the `llm_generation` the nightly has just
+    committed, leaving a day that generated a CV with an archive reading
+    `['wa_marketing']`.
+
+    THE LOCK IS THE **TRY** FORM, and the blocking `pg_advisory_xact_lock` is
+    rejected on two grounds that are about THIS repository, not about locks:
+
+    * **Hold time is not the rollup, it is the caller's transaction.** An xact
+      lock is released at COMMIT, and `whatsapp/worker` rolls up ~130 lines
+      before its commit with four customer replies and an admin send in
+      between (CHANGELOG 39 put the durability point exactly there, on
+      purpose). A blocking lock would be held across those HTTP calls — and
+      the transaction queued behind it is sometimes the customer-facing
+      worker turn, which would then wait on a batch job's network.
+    * **It would deadlock, silently.** `daily_run` rolls up MANY pairs inside
+      ONE transaction, in whatever order the stale deliveries come back; two
+      such waiters in different orders is a textbook deadlock, Postgres aborts
+      one, and all five call sites swallow the abort with `logger.warning` —
+      i.e. invisibly (see :func:`_retire_allocations` for what that costs).
+      `pg_try_advisory_xact_lock` never waits, so it cannot deadlock, and it
+      is already this repository's pattern for «another pass is doing exactly
+      this work» (`promises/guarantee`, `promises/career_session`).
+
+    **THE LOSER SKIPS THE WHOLE ROLLUP, UPSERTS INCLUDED**, and that is what
+    makes the try form correct rather than half of it. A loser that still
+    upserted would write rows the winner's keep-set — read before them —
+    does not contain, and the winner's DELETE would erase those: the same
+    defect with the roles swapped. Doing nothing is the only thing a rollup
+    that cannot see the whole pair may safely do.
+
+    WHAT STANDING DOWN COSTS: this pair keeps the answer the other rollup
+    wrote until some later rollup reaches it, so it can be seconds stale. Both
+    rollups recompute the SAME pair in full, so the loss is bounded by the gap
+    between the two snapshots, and this table is a best-effort archive nothing
+    reads. Staleness in a table nothing reads is not comparable to erasing a
+    real kind out of it.
+
+    REJECTED, both cheaper on their face: ``SELECT … FOR UPDATE`` over the
+    pair's rows locks only rows that EXIST, and the erased kind is an INSERT by
+    the other rollup — no row lock in READ COMMITTED covers a row that is not
+    there yet. Re-deriving the keep-set inside the DELETE
+    (``category NOT IN (SELECT …)``, one statement, one snapshot) does close it
+    for the ``usage_events`` half and cannot express the WhatsApp half at all:
+    that kind comes from :func:`_wa_kind_of`, whose entire purpose is to be the
+    ONE place a send's band is decided, and a SQL transcription of it beside
+    the Python one is the second definition this file was written to delete.
     """
+    if not _rollup_lock(session, tenant_id=tenant_id, day=day):
+        # Another rollup holds this exact pair. It recomputes the same day from
+        # the same tables, so standing down loses at most the seconds between
+        # its snapshot and ours — and doing HALF of a rollup beside it is the
+        # interleaving this lock exists to end.
+        logger.info("cost rollup for %s already in flight — standing down",
+                    day.isoformat())
+        return
+
     fresh = spend_by_kind(session, tenant_id=tenant_id, day=day)
     for kind, (events, cost) in fresh.items():
         _upsert_allocation(
             session, tenant_id=tenant_id, day=day, category=kind,
             events=events, cost_usd=cost,
         )
-    # After the upserts, never before: a failure between the two must leave the
-    # day OVER-stated rather than missing a kind it really had.
+    # After the upserts, never before — and the reason first written here was
+    # WRONG. CORRECTED IN PLACE 2026-08-10, not dropped: it said «a failure
+    # between the two must leave the day OVER-stated rather than missing a kind
+    # it really had», and there is no «between». Both run in the CALLER's one
+    # transaction (this function only flushes), so a failure after the upserts
+    # rolls them back with the delete and the state that sentence protects is
+    # unreachable. The order stands on a smaller claim: the upsert keeps a
+    # surviving row's identity instead of deleting and recreating it, and the
+    # keep-set the DELETE is given is the upserts' own answer, which is easier
+    # to read in that order than the reverse.
     _retire_allocations(session, tenant_id=tenant_id, day=day, keep=set(fresh))
     session.flush()
 

@@ -54,7 +54,12 @@ from career.whatsapp.activation_flow import (
     activate_by_order_phone,
 )
 from career.whatsapp.client import WhatsAppClient, WhatsAppSendError
-from career.whatsapp.delivery import descend_pending_delivery
+from career.whatsapp.delivery import (
+    LedgerLost,
+    anything_landed,
+    descend_pending_delivery,
+    durability_point,
+)
 from career.whatsapp.inbound import (
     InboundKind,
     classify_inbound,
@@ -62,6 +67,7 @@ from career.whatsapp.inbound import (
     media_ack,
 )
 from career.whatsapp.phones import phone_variants
+from career.whatsapp.templates import REGISTRY, billed_category
 
 logger = logging.getLogger("career.whatsapp")
 
@@ -882,6 +888,63 @@ def _handle_message(
             session, channel, whatsapp_client=whatsapp_client, now=now
         )
         if landed is not None:
+            # ── THE DURABILITY POINT (CHANGELOG 39) ─────────────────────────
+            # `descend_pending_delivery` sends the SAME four-message bundle the
+            # nightly sends — two texts, a document, an interactive card — and
+            # returns with every one of them at Meta and every ledger row still
+            # uncommitted. What follows in this function before its commit ~130
+            # lines down is `close_from_delivery`, `rollup_costs`,
+            # `handle_enrichment`, `escalate_direct_message`, four `_reply`s and
+            # an admin send; and BOTH failure paths in the event loop above —
+            # `_dead_letter` and the transient defer — call `session.rollback()`
+            # unconditionally. So this path has exactly the shape of the 10
+            # August incident (a nightly that sent four real messages and lost
+            # every row when later work raised), and a wider back half.
+            #
+            # No live instance of the loss has been found on this path; the
+            # shape is enough. A send is not undoable, so the transaction
+            # boundary belongs where that fact is: after the last send, before
+            # the first work that can raise.
+            #
+            # Neither cheaper alternative works, and both were measured rather
+            # than argued (see `delivery.durability_point`): RELEASE SAVEPOINT
+            # is not a commit, so a savepoint around the ledger rows dies with
+            # the outer rollback like everything else; and a second, autonomous
+            # session cannot insert `delivery_messages` at all, because
+            # `delivery_id` points at a `deliveries` row still uncommitted in
+            # THIS transaction.
+            #
+            # Read the results BEFORE the commit can destroy them: after a
+            # failed commit the rollback reverts `landed` to the state it
+            # carried before the send, so a caller reading it afterwards would
+            # conclude nothing went out.
+            results = landed.bundle.get("results") or {}
+            _delivered = [str(g) for g in (results.get("delivered") or [])]
+            _unlanded = [str(g) for g in (results.get("failed") or [])]
+            # …and the same for «did ANYTHING reach him», which is a different
+            # question from «is the delivered list non-empty»: a held bundle
+            # that sent a real morning template delivers no GROUP and has
+            # certainly landed, while a grouped bundle whose every job failed
+            # has not. `anything_landed` owns that distinction, and reading it
+            # here — before the rollback rewrites the delivery's status — is
+            # what keeps the day's state honest instead of merely defaulted.
+            _landed = anything_landed(landed)
+            if not durability_point(session, what="the held delivery"):
+                # The customer has the bundle and we could not record it.
+                # Raising rather than continuing, for two reasons: the objects
+                # this branch is about are a lie after the rollback (the
+                # delivery is PENDING again, so `close_from_delivery` would
+                # close the day on a bundle it thinks never went out), and
+                # `LedgerLost` is not in `_is_transient`'s retried set — so the
+                # event dead-letters as poison, the operator is paged with the
+                # TEN code, and nothing re-drives a turn that has already sent
+                # four messages to a paying customer.
+                #
+                # `landed=` is passed and not left to its conservative default:
+                # a descend that delivered NOTHING would otherwise be reported
+                # LEDGER_FAILED, where the truthful state is WHATSAPP_FAILED.
+                raise LedgerLost(delivered=_delivered, failed=_unlanded,
+                                 landed=_landed)
             # the held day closes when its bundle actually lands; the same
             # inbound may ALSO be an enrichment answer — fall through.
             closed = close_from_delivery(session, delivery=landed, now=now)
@@ -895,7 +958,7 @@ def _handle_message(
                         day=closed.run_date,
                     )
                 except Exception:  # noqa: BLE001 — accounting never blocks
-                    logger.warning("descend cost rollup failed", exc_info=True)
+                    logger.error("descend cost rollup failed", exc_info=True)
 
         # F-ENRICH (§13): an open enrichment session consumes this reply —
         # button taps route by machine id (also when the tap carries no
@@ -1164,6 +1227,101 @@ def status_billed_category(st: dict[str, Any]) -> str | None:
     return category
 
 
+def status_is_billable(st: dict[str, Any]) -> bool | None:
+    """Meta's own ``pricing.billable`` flag, or None when the callback has no
+    readable one.
+
+    :func:`status_billed_category` refuses to read this field ON PURPOSE — it
+    answers «which band», never «how much», and netting Meta's zero-rated
+    sends out of `close.whatsapp_spend` would change the definition of spend.
+    This function asks a different question, and it is not about money at all:
+    **is this receipt one whose missing ledger row would matter.** Nothing it
+    returns is written to any row or counted in any total.
+
+    Total, like its neighbours: a shape we cannot read answers None, and None
+    is «we do not know», never «not billable».
+    """
+    pricing = st.get("pricing")
+    if not isinstance(pricing, dict):
+        return None
+    billable = pricing.get("billable")
+    # `bool` and not truthiness: Meta sends a JSON boolean here (measured on
+    # 232 of 235 staging receipts), and a string "false" is truthy in Python.
+    return billable if isinstance(billable, bool) else None
+
+
+def _unledgered_receipt_matters(st: dict[str, Any], category: str | None) -> bool:
+    """Would a MISSING ledger row for this receipt be worth waking someone.
+
+    Billable is the first half and Meta's own word for it. The band is the
+    second: a receipt with `billable=false` and a band that is not `service`
+    is still a template send we cannot see, and a receipt with no readable
+    `pricing` at all says nothing either way — so it is silent, which is what
+    keeps the 12 measured `service` acks off the operator's screen.
+    """
+    return bool(status_is_billable(st)) or (
+        category is not None and category != "service"
+    )
+
+
+def _is_frozen_belief(dm: DeliveryMessage) -> bool:
+    """Is the band on this row EXACTLY what the nightly freeze would have
+    written — i.e. a belief, not a measurement?
+
+    ── THE STOPGAP, AND THE COLUMN THAT SHOULD REPLACE IT ───────────────────
+    `delivery_messages.category` holds two different kinds of fact and has no
+    column that says which (`delivery.freeze_unmeasured_categories` names them
+    in full): a MEASUREMENT, `pricing.category` off Meta's receipt, written
+    here; and a BELIEF, `templates.billed_category`, written by the nightly
+    freeze onto rows the receipt has not filled after 48h. The write below is
+    FILL-ONCE, so whichever arrives first is permanent — and a row frozen at
+    hour 48 whose receipt lands at hour 49 keeps the belief for ever, at
+    $0.0501 where Meta charged $0.0107. The freeze's own note calls its window
+    «long after any receipt could still arrive», which is an assumption and
+    not a property: a webhook outage, a `webhook_events` row working through
+    its retry backoff, or a night this worker spent down all break it, and the
+    nightly and this worker are separate units that can fail separately.
+
+    THE REAL FIX IS A COLUMN — `category_source` in ('meta','registry') — so
+    the rule becomes «overwrite a belief, never a receipt» and is decided by
+    what the row SAYS rather than by what it looks like. That is a migration,
+    which this change does not own; the patch is reported alongside it.
+
+    THE STOPGAP IS SOUND, and on one measured fact rather than on hope: across
+    every WhatsApp status callback on staging, **no wa_message_id ever carries
+    two different `pricing.category` values** (235 receipts, 119 ids, zero
+    conflicts; `sent` and `delivered` always agree). A receipt therefore never
+    contradicts a receipt — so a disagreement can only be belief-versus-receipt
+    or a row matched by the wrong id, and recognising the belief by its
+    fingerprint recovers the measurement without a schema change.
+
+    The fingerprint has to be EXACT: `kind='template'` and a name in
+    :data:`REGISTRY` are the freeze's own WHERE clause, and the value has to be
+    the one it writes today. Anything else keeps the first value and the ERROR
+    line.
+
+    TWO WAYS THIS IS WRONG, both in the safe direction and both stated here
+    rather than discovered later:
+
+    * `billed_category` is read NOW, and Meta re-categorises templates (five on
+      2026-07-17, five on 2026-08-02). A belief frozen before a
+      re-categorisation no longer matches the fingerprint, so it is kept and
+      the ERROR is logged — the old behaviour, on a row we can no longer
+      classify.
+    * a MEASUREMENT that happens to equal the belief looks like one. Losing it
+      to a later, different measurement would need one wa_message_id to carry
+      two bands, which is the thing measured never to happen — and if it ever
+      did, the later receipt is still a receipt.
+    """
+    name = dm.template_name
+    return (
+        dm.kind == "template"
+        and name is not None
+        and name in REGISTRY
+        and dm.category == str(billed_category(name))
+    )
+
+
 def _report_refusal(
     session: Session, *, codes: list[int], status: str,
     tenant_id: uuid.UUID | None, template_name: str | None,
@@ -1326,12 +1484,43 @@ def _handle_status(session: Session, st: dict[str, Any], *, now: datetime) -> No
             if dm.category is None:
                 dm.category = category
             elif dm.category != category:
-                logger.error(
-                    "whatsapp receipt reports billed category %r for a send "
-                    "already recorded as %r — the FIRST is kept; the bill for "
-                    "this send may be wrong either way",
-                    category, dm.category,
-                )
+                # FILL-ONCE IS RIGHT AGAINST A SECOND RECEIPT AND WRONG AGAINST
+                # A GUESS. Since the nightly freeze (`freeze_unmeasured_
+                # categories`) also writes this column, «the first is kept» can
+                # mean «the belief shuts the measurement out for ever, at 4.7×»
+                # — so the row is asked which kind of value it holds before the
+                # rule is applied. :func:`_is_frozen_belief` carries the whole
+                # argument, including the measurement that makes it safe and
+                # the column that should replace it.
+                if _is_frozen_belief(dm):
+                    believed = dm.category   # read before it is replaced
+                    dm.category = category
+                    # INFO and not ERROR: this is the system working. Nothing
+                    # is wrong, nobody has to look, and an ERROR here would
+                    # teach the operator to skip the very screen entry 37 is
+                    # about.
+                    logger.info(
+                        "whatsapp billed category %r replaces the frozen "
+                        "registry belief %r for template %s — the measurement "
+                        "wins over the guess",
+                        category, believed, dm.template_name or "-",
+                    )
+                else:
+                    # The wording no longer ATTRIBUTES the kept value. It used
+                    # to — «whatsapp receipt reports X for a send already
+                    # recorded as Y» — which reads as Meta having re-priced the
+                    # send, and sent the operator to look at Meta for a number
+                    # this repository had written itself. Both writers are
+                    # named now and neither is accused, because from the row
+                    # alone we genuinely cannot tell which one wrote it.
+                    logger.error(
+                        "whatsapp billed category %r disagrees with %r already "
+                        "recorded on the row (template %s) — the FIRST is kept. "
+                        "Two writers fill this column, Meta's receipt and the "
+                        "nightly registry freeze, and no column says which; "
+                        "the bill for this send may be wrong either way",
+                        category, dm.category, dm.template_name or "-",
+                    )
         if rank <= receipt_rank(dm.status):
             continue  # out of order, or the same receipt twice — a no-op
         dm.status = str(status)
@@ -1379,6 +1568,36 @@ def _handle_status(session: Session, st: dict[str, Any], *, now: datetime) -> No
         _report_refusal(
             session, codes=codes, status=str(status),
             tenant_id=None, template_name=None,
+        )
+    elif not matched and _unledgered_receipt_matters(st, category):
+        # ── A RECEIPT FOR A SEND NOTHING RECORDED ────────────────────────────
+        # The refusal above has said this for years about a REFUSED send. This
+        # line says it about an accepted one, and it is deliberately NOT said
+        # about every unmatched receipt.
+        #
+        # CHANGELOG 39 measured the hole and found three kinds, not one: a row
+        # LOST after a successful send (what `durability_point` exists for), a
+        # send NOTHING ledgers by an old and deliberate decision — the
+        # conversational acks, the funnel, the samples: free `service` messages
+        # Meta bills at nothing — and a send that was REFUSED, which correctly
+        # has no row at all. Only the first is a hole.
+        #
+        # So the scope is the measurement, not the shape: on 24 days of live
+        # data, 14 wa_message_ids carry a receipt and no ledger row, TWELVE of
+        # them free `service` acks from paths that deliberately record nothing.
+        # Alarming on those is how entry 37's operator learns to skip the
+        # report. Billable, or banded as anything but `service` — one member,
+        # zero false alarms.
+        #
+        # It can repeat: `sent` and `delivered` both carry pricing, so one hole
+        # is worth up to a couple of lines. That is the right side to be wrong
+        # on for a send we cannot see, and there is no state here to dedupe on.
+        logger.error(
+            "whatsapp receipt for a send this ledger never recorded (band %s) "
+            "— a billable send with no row is money and delivery we cannot "
+            "see; free service acks are unledgered by design and are NOT "
+            "reported here",
+            category or "-",
         )
 
 

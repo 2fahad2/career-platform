@@ -43,7 +43,9 @@ from career.config import (
 )
 from career.db.models import DiscoveryRun, PlanEntitlement, Subscription, Tenant
 from career.db.schema_guard import (
+    CODE_BRANCHED,
     DB_AHEAD,
+    DB_UNSTAMPED,
     UNMEASURABLE,
     SchemaVerdict,
     measure_schema,
@@ -1633,6 +1635,12 @@ def format_schema_alert(schema: SchemaVerdict) -> str:
     elif schema.verdict == DB_AHEAD:
         headline = "⚠️ الكود أقدم من قاعدة البيانات — لن يُسلَّم شيء الليلة"
         advice = "انشر الكود المطابق، ولا تُرجِع القاعدة للخلف أبدًا"
+    elif schema.verdict == CODE_BRANCHED:
+        headline = "⚠️ للهجرات في الكود رأسان غير مدموجين — لن يُسلَّم شيء الليلة"
+        advice = "ادمج الرأسين أولًا، فالترقية لا تعمل قبل ذلك"
+    elif schema.verdict == DB_UNSTAMPED:
+        headline = "⚠️ قاعدة البيانات غير مختومة بأي هجرة — لن يُسلَّم شيء الليلة"
+        advice = "شغّل الترقية ثم أعد تشغيل الليلة"
     else:
         headline = "⚠️ قاعدة البيانات خلف الكود — لن يُسلَّم شيء الليلة"
         advice = "شغّل الترقية ثم أعد تشغيل الليلة"
@@ -1784,9 +1792,10 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
                            token_health=read_token_health(settings))
         schema = measure_schema(session)
     if not schema.deliverable:
-        logger.error("migration drift — db=%s, code heads=%s: %s",
+        logger.error("migration drift — db=%s, code heads=%s: %s. Fix: %s",
                      ", ".join(schema.db_revisions) or "-",
-                     ", ".join(schema.code_heads) or "-", schema.detail)
+                     ", ".join(schema.code_heads) or "-", schema.detail,
+                     schema.fix or "-")
         try:
             admin.send_admin(format_schema_alert(schema))
         except Exception:  # noqa: BLE001 — alerting never breaks the run
@@ -2025,11 +2034,14 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
                     canary_delay_seconds=0.0,
                 )
                 states = outcome.states
-                # The late verdict REPLACES the boot one in the journal: they
+                # The late verdict REPLACES the boot one everywhere below: they
                 # are two readings of the same thing and the later one is the
-                # one that governed. They differ only when the machine changed
-                # under the run — which is precisely the fact worth printing.
-                summary["schema"] = outcome.schema.summary()
+                # one that GOVERNED. They differ only when the machine changed
+                # under the run — which is precisely the fact worth printing,
+                # and the fix the last journal line names must be the fix for
+                # the reading that actually decided.
+                schema = outcome.schema
+                summary["schema"] = schema.summary()
                 if outcome.refused:
                     summary["delivery_phase"] = PHASE_SCHEMA_REFUSED
                     # The boot alert did not fire (boot said «match»), so this
@@ -2089,6 +2101,17 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
         logger.error(
             "WHATSAPP_ACCESS_TOKEN is empty — the delivery phase never ran "
             "and no customer was served tonight"
+        )
+    if summary["delivery_phase"] == PHASE_SCHEMA_REFUSED:
+        # The same shape of line as the missing token, deliberately: both are
+        # total outages, both are one operator action away, and both must land
+        # in the journal at ERROR because that is the only level his harvester
+        # forwards. The fix is repeated here because a man reading `systemctl
+        # status` at 05:00 should not have to go and find it.
+        logger.error(
+            "the database cannot record what tonight would have sent — the "
+            "delivery phase was REFUSED and no customer was served. Fix: %s",
+            schema.fix or "-",
         )
     return exit_code_for(report.status, closed_states,
                          delivery_phase=summary["delivery_phase"],

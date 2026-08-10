@@ -2113,7 +2113,7 @@ def _run_action(
                         session, tenant_id=tenant.id, day=closed.run_date,
                     )
                 except Exception:  # noqa: BLE001 — accounting never blocks
-                    logger.warning("resend cost rollup failed", exc_info=True)
+                    logger.error("resend cost rollup failed", exc_info=True)
         session.commit()
         if result.outcome == RESEND_WINDOW_CLOSED:
             message = RESEND_CLOSED_AR

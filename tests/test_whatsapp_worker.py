@@ -2656,8 +2656,21 @@ def test_a_second_receipt_never_repaints_the_band_and_says_so(
                  extra={"pricing": {"category": "marketing"}})
 
     assert _receipt_facts(owner_session, wamid).category == "utility"
-    assert [r for r in caplog.records if "already recorded" in r.getMessage()], \
-        "one message billed two ways, and nobody was told"
+    # Pinned on MEANING, not on a phrase. This assertion used to be the
+    # substring «already recorded», lifted out of the old sentence «whatsapp
+    # receipt reports X for a send already recorded as Y» — which is the very
+    # wording that had to change: it reads as Meta having re-priced the send,
+    # and since the nightly registry freeze also writes this column it sent the
+    # operator to look at Meta for a value this repository may have written
+    # itself. So what is pinned is what the operator has to be able to do with
+    # the line: see BOTH bands, and know that either writer could be the source.
+    said = [r.getMessage() for r in caplog.records if "billed category" in r.getMessage()]
+    assert said, "one message billed two ways, and nobody was told"
+    line = said[0]
+    assert "'utility'" in line and "'marketing'" in line, \
+        f"the line does not say which two bands disagreed: {line}"
+    assert "freeze" in line, \
+        f"the line names only one of the column's two writers: {line}"
 
 
 def test_a_band_too_wide_for_the_column_costs_only_itself(

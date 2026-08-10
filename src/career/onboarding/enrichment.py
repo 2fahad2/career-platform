@@ -710,7 +710,7 @@ def run_hourly_sweep(
     only when their 24h window is OPEN. once-ever still holds (enqueue
     refuses a role with any ledger row). Never raises into the loop."""
     from career.db.models import CustomerChannel, OnboardingSession
-    from career.whatsapp.delivery import record_out
+    from career.whatsapp.delivery import durability_point, record_out
     from career.whatsapp.window import WindowState, window_state
 
     counts = {"auto_closed": 0, "swept": 0}
@@ -769,47 +769,93 @@ def run_hourly_sweep(
             opt_out_at=channel.opt_out_at, now=now,
         ) is not WindowState.OPEN:
             continue
-        # AUDIT ك-8: one journey's failure must not poison the others — a
-        # savepoint isolates this journey's rows, so a send exception rolls
-        # back ONLY its ASKED row (no duplicate nudge next hour for customers
-        # who already received theirs) and the sweep continues.
+        # ── THE SAVEPOINT IS FOR THE PREPARATION, NEVER FOR THE WIRE ────────
+        # AUDIT ك-8 is unchanged and still the reason a savepoint is here at
+        # all: one journey's failure must not poison the others, and a nudge
+        # that could not be armed must leave NO ASKED row, or the once-ever
+        # rule spends the customer's only nudge on a question he never saw.
+        #
+        # What moved is where the sends sit. Both of them used to be INSIDE
+        # this savepoint, which put it on the wrong side of the wire: the
+        # examples message is sent SECOND, and its failure rolled the savepoint
+        # back — deleting the ledger row for the opening question that had
+        # ALREADY reached the customer. A send is not undoable, so a rollback
+        # that spans one silently means «keep the half he received, discard the
+        # half that records it» (CHANGELOG 39, the direction constant 3 does
+        # not name).
+        #
+        # So: the savepoint covers the DB preparation and is still open across
+        # the FIRST send, which is what lets a refused send take the ASKED row
+        # back with it — nothing has been delivered at that moment, so nothing
+        # is lost by undoing. The instant that send succeeds the savepoint is
+        # released and never rolled back again: the ledger row is written
+        # outside it and committed at once, so the second send's failure can
+        # only cost the second send's own row.
+        prep = session.begin_nested()
         try:
-            with session.begin_nested():
-                if not enqueue_enrichment(
-                    session, tenant_id=journey.tenant_id, role_fact_id=role.id,
-                    journey_context=context,
-                    trigger="post_activation_sweep", now=now,
-                ):
-                    continue
-                examples = prepare_examples(
-                    session, role_fact_id=role.id, writer=examples_writer
-                )
-                if examples:
-                    context["enrichment"]["examples"] = examples
-                journey.context = context
-                mid = whatsapp_client.send_interactive(
-                    channel.phone_e164,
-                    opening_message(session, role_fact_id=role.id),
-                    OPENING_BUTTONS,
-                )
-                record_out(session, tenant_id=journey.tenant_id,
-                           channel_id=channel.id, kind="interactive",
-                           wa_message_id=mid, now=now)
-                if examples:
-                    from career.onboarding.achievement_render import (
-                        format_examples_message,
-                    )
-
-                    mid2 = whatsapp_client.send_text(
-                        channel.phone_e164, format_examples_message(examples)
-                    )
-                    record_out(session, tenant_id=journey.tenant_id,
-                               channel_id=channel.id, kind="text",
-                               wa_message_id=mid2, now=now)
+            if not enqueue_enrichment(
+                session, tenant_id=journey.tenant_id, role_fact_id=role.id,
+                journey_context=context,
+                trigger="post_activation_sweep", now=now,
+            ):
+                prep.rollback()
+                continue
+            examples = prepare_examples(
+                session, role_fact_id=role.id, writer=examples_writer
+            )
+            if examples:
+                context["enrichment"]["examples"] = examples
+            journey.context = context
+            # Composed here, inside the guard: it READS the role row, so a
+            # database failure while building the question is a preparation
+            # failure and must not be mistaken for a failed send.
+            opening = opening_message(session, role_fact_id=role.id)
+            session.flush()
         except Exception:  # noqa: BLE001 — isolate, log, move on
+            prep.rollback()
             _logger.warning("enrichment sweep failed for one journey",
                             exc_info=True)
             continue
+
+        try:
+            mid = whatsapp_client.send_interactive(
+                channel.phone_e164, opening, OPENING_BUTTONS,
+            )
+        except Exception:  # noqa: BLE001 — nothing reached the customer
+            # Give the nudge back. The savepoint is still open, so this undoes
+            # this journey's ASKED row and its cursor and NOTHING else — no
+            # outer rollback, so the auto-closes and the journeys already swept
+            # in this pass are untouched.
+            prep.rollback()
+            _logger.warning("enrichment nudge send failed for one journey",
+                            exc_info=True)
+            continue
+        # RELEASE. From here the customer HAS the question, so nothing may
+        # discard the fact that we asked it.
+        prep.commit()
+        record_out(session, tenant_id=journey.tenant_id,
+                   channel_id=channel.id, kind="interactive",
+                   wa_message_id=mid, now=now)
+        # THE DURABILITY POINT: the question is with the customer, so the row
+        # that records it is committed before the examples send can raise.
+        durability_point(session, what="the enrichment nudge")
         counts["swept"] += 1
+
+        if not examples:
+            continue
+        from career.onboarding.achievement_render import format_examples_message
+
+        try:
+            mid2 = whatsapp_client.send_text(
+                channel.phone_e164, format_examples_message(examples)
+            )
+        except Exception:  # noqa: BLE001 — the question stands without them
+            _logger.warning("enrichment examples send failed for one journey",
+                            exc_info=True)
+            continue
+        record_out(session, tenant_id=journey.tenant_id,
+                   channel_id=channel.id, kind="text",
+                   wa_message_id=mid2, now=now)
+        durability_point(session, what="the enrichment examples")
     session.flush()
     return counts

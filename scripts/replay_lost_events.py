@@ -45,6 +45,30 @@ The worker itself also refuses a backwards receipt, so a mis-ranked replay
 costs an operator a false report rather than a corrupted row — but a false
 report on a recovery tool is what the ledger then makes permanent.
 
+A RECEIPT WITH NO LEDGER ROW IS COUNTED, NOT REPAIRED
+-----------------------------------------------------
+Some receipts have no ``delivery_messages`` row to move at all: Meta accepted
+and delivered a message that our ledger never recorded. This tool has always
+skipped them — ``_handle_status`` iterates the rows matching the wamid, so
+replaying such an event does precisely nothing — and the skip is now a NAMED,
+COUNTED line in the report (:data:`NO_LEDGER_ROW`), because this is the only
+place in the tree that already knows the number and it was being spent on a
+truncated tally key.
+
+Counted, and deliberately not repaired. Teaching this script to CREATE the
+missing row would destroy the one argument that makes it safe to run: it only
+ever moves an existing row FORWARD, so its worst case is a no-op the worker
+refuses. And the row it would create could not be honest — a receipt carries
+the wamid, the status and the price band, and names NEITHER the message kind
+NOR the template name, which are exactly the two columns
+``cv/close.whatsapp_spend`` bills on and ``_wa_kind_of`` reads. The row would
+carry a real wamid, a guessed ``kind`` and an invented ``template_name``, and
+nothing downstream — the spend arithmetic, the console's message-status panel,
+the detector in ``scripts/backfill_meta_error_codes.py`` that finds these holes
+— could tell it from a row the delivery path wrote. A ROW WE INVENT IS WORSE
+THAN A HOLE WE CAN SEE (CHANGELOG §39). The hole belongs to the write path;
+this script reports it and keeps its hands off.
+
 IDEMPOTENCY
 -----------
 Two independent guards, because the first one is only true while the criteria
@@ -98,6 +122,13 @@ SAFE_EVENT_TYPES = frozenset({"statuses"})
 #: :func:`_verdict_for_messages` — the worker had already spoken to the
 #: customer before it rolled back.
 ROLLED_BACK_STATUS = "failed"
+
+#: The verdict for a receipt whose message was never written to the ledger.
+#: A CONSTANT because the report counts it by identity: matching on a prefix
+#: of a sentence is how a rename turns a named incident back into an anonymous
+#: skip line. See the module docstring — this is a hole in the ledger, not a
+#: replayable event, and this tool reports it rather than filling it.
+NO_LEDGER_ROW = "no delivery_messages row to apply it to"
 
 
 @dataclass(frozen=True)
@@ -195,8 +226,12 @@ def _verdict_for_statuses(
             forward += 1
 
     if targets == 0:
-        return _outcome(event, len(items), action="skip",
-                        reason="no delivery_messages row to apply it to")
+        # Not «nothing to do»: Meta priced a send our ledger never recorded.
+        # Skipping is still right — `_handle_status` iterates matching rows
+        # and would touch none — but the number is reported by name rather
+        # than folded into a truncated tally key. See the module docstring for
+        # why the row is not created here.
+        return _outcome(event, len(items), action="skip", reason=NO_LEDGER_ROW)
     if forward == 0:
         return _outcome(event, len(items), action="skip",
                         reason="delivery status already at or past this receipt")
@@ -446,10 +481,22 @@ def main() -> int:
               f"{'y' if outcome.entries == 1 else 'ies'})  {outcome.reason}")
 
     replayed = sum(1 for o in outcomes if o.action == "replay")
+    holes = [o for o in outcomes if o.reason == NO_LEDGER_ROW]
     print(f"\n  to replay : {replayed}")
     print(f"  skipped   : {len(outcomes) - replayed}")
+    print(f"  no ledger row : {len(holes)}")
     for key, count in sorted(tally.items()):
         print(f"    {count:>3}  {key}")
+    if holes:
+        # A named line and not a tally row, because this one is not about the
+        # replay at all: it says a message Meta accepted has nothing in
+        # `delivery_messages`. Nothing here can fix that — the receipt does not
+        # carry the kind or the template name — so it points at the tool that
+        # counts them all, billable ones first.
+        print("  NOTE: those events carry receipts for messages with NO ledger "
+              "row. A replay cannot fix that and this tool will not invent the "
+              "row (see the module docstring). Count them, billable first, with "
+              "scripts/backfill_meta_error_codes.py")
 
     _append_ledger(audit_path, [
         {

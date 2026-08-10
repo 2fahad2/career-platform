@@ -375,7 +375,7 @@ def measure_schema(session: Session) -> SchemaVerdict:
             # downgrading destroys them to make a mismatch report look tidy.
             "deploy the code whose migrations the database already has — do "
             "NOT downgrade the database",
-            )
+        )
     if len(heads) > 1:
         return SchemaVerdict(
             CODE_BRANCHED, current, heads,

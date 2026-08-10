@@ -52,7 +52,10 @@ from career.whatsapp.delivery import (
     DELIVERY_COMPLETED,
     DELIVERY_PARTIAL,
     DELIVERY_PENDING,
+    LedgerLost,
+    anything_landed,
     deliver_adaptive,
+    durability_point,
     record_out,
 )
 from career.whatsapp.templates import DAILY_UTILITY, TemplateSpec
@@ -252,6 +255,114 @@ def close_from_delivery(
     )
 
 
+@dataclass
+class TenantProgress:
+    """What one tenant's run knows so far — readable AFTER it crashes.
+
+    CHANGELOG 39: the failure path used to close the day with
+    ``cv_resolved=0`` and ``cv_failed=max(passes, 1)`` because the ``except``
+    lives one frame above :func:`_run_tenant` and every local it knew died
+    with the frame. Those were not stale numbers, they were MANUFACTURED ones:
+    a zero hard-coded next to a `max()` that cannot return zero. On 10 August
+    they wrote ``cv_resolved=0, cv_failed=6, delivered=0`` for a night that
+    generated one CV, delivered it, and had it read — and six was the number
+    of jobs that PASSED the gate, not the number that failed.
+
+    So the facts leave the frame as they become true, in an object the CALLER
+    owns. Nothing here is a prediction: each field is written at the moment it
+    stops being one, which is why the crash path can use them without knowing
+    where the crash happened.
+
+    ``failed`` holds «resolved CVs that have NOT reached the customer», and it
+    starts full for that reason — before the send, every resolved CV is an
+    unsent one. Delivery moves entries out of it. Without that the state
+    authority would read ``cv_resolved=N, delivered=0, failed_sends=0`` for a
+    crash between resolution and the send and answer DELIVERED, which is the
+    same class of lie in the opposite direction.
+
+    ``landed`` is the ONE thing the day state hinges on: whether any message
+    reached the customer in this run. It is what separates «the ledger failed»
+    from «the pipeline failed before there was anything to record».
+    """
+
+    gate_passes: int = 0
+    cv_resolved: int = 0
+    cv_failed: int = 0
+    delivered: list[str] = field(default_factory=list)
+    failed: list[str] = field(default_factory=list)
+    landed: bool = False
+
+
+def _close_after_crash(
+    session: Session,
+    *,
+    tenant_id: uuid.UUID,
+    run_date: date,
+    now: datetime,
+    progress: TenantProgress,
+) -> TenantDayState:
+    """Close a tenant's day after :func:`_run_tenant` raised — with the counts
+    that were true when it did, and never with invented ones.
+
+    THE STATE. ``ledger_ok = not progress.landed``, and that one line is the
+    whole decision. If nothing reached the customer, the crash is upstream of
+    delivery and the state authority reads the real counts and answers
+    honestly (no gate passes → NO_MATCHES, no resolved CV → CV_GENERATION_
+    FAILED, resolved but unsent → WHATSAPP_FAILED). If something DID reach
+    them, then the sends succeeded and the only thing that can still have gone
+    wrong is the recording of the day — so `LEDGER_FAILED`, which
+    :func:`close.daily_state` asks before every other question and whose
+    module docstring already says a ledger-write failure IS the honest state
+    rather than an exception. CHANGELOG 39: no ninth state; the missing thing
+    was the ROUTE to the seventh, not the seventh.
+
+    A row saying ``LEDGER_FAILED`` beside ``delivered: 1`` is something the
+    operator can act on. ``CV_GENERATION_FAILED`` beside ``delivered: 0`` sent
+    him searching a generation pipeline that had worked perfectly.
+
+    WHY THIS DOES NOT CALL `close.close_tenant_day`. That function derives
+    ``ledger_ok`` from ONE source — whether its own suppression loop raised —
+    and has no parameter for «the ledger already failed upstream», so it can
+    only ever answer a state that claims the delivery was recorded. The tidier
+    home for this is a ``ledger_ok: bool = True`` argument on it, folded into
+    its own result with ``and``; that is an edit to `cv/close.py` and belongs
+    to its owner. Until then the composition is explicit and goes through the
+    same single door every other writer uses — :func:`close._record_day_state`
+    is the ONE writer of the table, so the monotonic rule that protects a real
+    DELIVERED day from being overwritten still applies here for free.
+
+    NO SUPPRESSION IS WRITTEN, deliberately, and it is a real cost rather than
+    an omission: the delivered jobs stay unsuppressed, so tomorrow's gate can
+    offer them again. Writing them here was rejected because the alternative is
+    worse in a way that is hard to see — a suppressed LEDGER_FAILED day makes
+    the operator's re-run find nothing, close NO_MATCHES, and OVERWRITE the
+    alarm (NO_MATCHES is not protected by :func:`close._outranks`). A duplicate
+    send is visible to one customer; a silently cleared alarm is invisible to
+    everybody. The re-run is the recovery, so it is kept possible.
+    """
+    ledger_ok = not progress.landed
+    state_value = close_mod.daily_state(
+        ledger_ok=ledger_ok,
+        discovery_ok=True,
+        gate_passes=progress.gate_passes,
+        cv_resolved=progress.cv_resolved,
+        cv_failed=progress.cv_failed,
+        delivered=len(progress.delivered),
+        failed_sends=len(progress.failed),
+    )
+    counts = {
+        "gate_passes": progress.gate_passes,
+        "cv_resolved": progress.cv_resolved,
+        "cv_failed": progress.cv_failed,
+        "delivered": len(progress.delivered),
+        "failed_sends": len(progress.failed),
+    }
+    return close_mod._record_day_state(
+        session, tenant_id=tenant_id, run_date=run_date,
+        state=state_value, counts=counts, now=now,
+    )
+
+
 def _run_tenant(
     session: Session,
     *,
@@ -263,7 +374,12 @@ def _run_tenant(
     generation_budget: int,
     renderer: Callable[..., Any],
     suppressor: close_mod.Suppressor,
+    progress: TenantProgress | None = None,
 ) -> TenantDayState | None:
+    # Optional so the signature stays callable from a test or a future caller
+    # that does not care; the orchestrator always passes one, because the
+    # crash path is exactly the caller that cannot ask this frame anything.
+    progress = progress if progress is not None else TenantProgress()
     run_date = now.astimezone(_RIYADH).date()
     discovery_ok = report.status != "discovery_failed"
     final = list(payload.get("final") or [])
@@ -274,6 +390,7 @@ def _run_tenant(
     # already delivered (suppressed) is honestly NO_MATCHES — nothing failed,
     # the jobs are simply repeats within the TTL (§15.12).
     gate_passes = max(raw_passed - suppressed, len(final))
+    progress.gate_passes = gate_passes
 
     def _close(
         *, cv_resolved: int = 0, cv_failed: int = 0,
@@ -412,6 +529,11 @@ def _run_tenant(
     )
     resolved = [j for j in processed if j.get("cv_key")]
     cv_failed = len(processed) - len(resolved)
+    progress.cv_resolved = len(resolved)
+    progress.cv_failed = cv_failed
+    # Every resolved CV is an UNSENT one until a send says otherwise — see
+    # TenantProgress.failed for why the pessimistic start is the honest one.
+    progress.failed = [str(j.get("url")) for j in resolved]
     if not resolved:
         return _close(cv_resolved=0, cv_failed=cv_failed)
 
@@ -423,12 +545,24 @@ def _run_tenant(
         "cv_resolved": len(resolved),
         "cv_failed": cv_failed + len(bundle_failures),
     }
+    progress.cv_failed = cv_failed + len(bundle_failures)
+    progress.failed = [str(e.get("group")) for e in bundle.get("jobs", [])]
     try:
         delivery = deliver_adaptive(
             session, channel, bundle, run_date=run_date,
             whatsapp_client=deps.whatsapp_client,
             daily_template=deps.daily_template, now=now,
         )
+    except LedgerLost as lost:
+        # Caught BEFORE the generic handler below, and re-raised rather than
+        # closed here. The messages landed, so «WHATSAPP_FAILED» would be
+        # false about the one thing that worked; the honest close for a lost
+        # ledger is the orchestrator's crash path, which has the tenant's
+        # session and writes LEDGER_FAILED with exactly these counts.
+        progress.landed = lost.landed
+        progress.delivered = lost.delivered
+        progress.failed = lost.failed
+        raise
     except Exception as exc:  # noqa: BLE001 — a send-path crash (e.g. the
         # morning template still PENDING at Meta) must close the day
         # honestly, not vanish into a crash-skip (§15.12: no silent states).
@@ -449,6 +583,28 @@ def _run_tenant(
             session, tenant_id=tenant_id, run_date=run_date, now=now,
             gate_passes=gate_passes,
         )
+    # What actually reached the customer, read off the delivery before any
+    # further work can raise and take the answer with it.
+    results = delivery.bundle.get("results") or {}
+    progress.delivered = [str(g) for g in (results.get("delivered") or [])]
+    progress.failed = [str(g) for g in (results.get("failed") or [])]
+    # NOT «the delivered list is non-empty» — a held template and a generic
+    # parts bundle both land without delivering a group. One rule, next to
+    # the statuses it reads (:func:`delivery.anything_landed`).
+    progress.landed = anything_landed(delivery)
+    # THE DURABILITY POINT (CHANGELOG 39). `close_from_delivery` writes the
+    # suppression ledger and flushes the day state — the first work after the
+    # last send that can raise, and on 10 August it did, on a column the host
+    # database did not have. Everything the customer has already received is
+    # committed here so that raise can only cost the day's bookkeeping.
+    #
+    # It is redundant TODAY — `deliver_adaptive` commits at its own durability
+    # point and nothing between the two writes — and it is kept anyway,
+    # because the redundancy ends the moment anybody inserts a line above it,
+    # and that line is exactly how the first hole was dug.
+    if not durability_point(session, what="the day's delivery"):
+        raise LedgerLost(delivered=progress.delivered, failed=progress.failed,
+                         landed=progress.landed)
     day_state = close_from_delivery(
         session, delivery=delivery, now=now, suppressor=suppressor
     )
@@ -586,7 +742,7 @@ def expire_stale_held_deliveries(
                 session, tenant_id=delivery.tenant_id, day=delivery.run_date
             )
         except Exception:  # noqa: BLE001 — accounting never blocks expiry
-            logger.warning("expiry cost rollup failed", exc_info=True)
+            logger.error("expiry cost rollup failed", exc_info=True)
     return closed
 
 
@@ -737,30 +893,44 @@ def run_daily_delivery(
             # skip them, do not re-serve and do not overwrite.
             logger.info("tenant already delivered today — skipping re-run")
             continue
+        # The crash path's only witness. Seeded from the payload so a tenant
+        # that raises before `_run_tenant` computes anything still closes with
+        # the night's real gate count rather than a zero.
+        counts_in = payload.get("counts") or {}
+        progress = TenantProgress(
+            gate_passes=int(counts_in.get("passed",
+                                          len(payload.get("final") or [])))
+        )
         try:
             state = _run_tenant(
                 session, tenant_id=tenant_id, payload=payload, report=report,
                 deps=deps, now=now, generation_budget=generation_budget,
-                renderer=renderer, suppressor=suppressor,
+                renderer=renderer, suppressor=suppressor, progress=progress,
             )
         except Exception:  # noqa: BLE001 — tenant isolation is the contract
             logger.error("tenant delivery crashed", exc_info=True)
             # AUDIT ح-1/ك-10: roll back ONLY this tenant's uncommitted work
             # (earlier tenants are already committed), then close the day
-            # honestly — a crashed pipeline is CV_GENERATION_FAILED, never a
-            # silent no-state day (§15.12).
+            # honestly — never a silent no-state day (§15.12).
+            #
+            # AND WHAT THIS ROLLBACK CAN NO LONGER DO, deliberately
+            # (CHANGELOG 39): it cannot undo a HALF-finished tenant any more.
+            # Everything up to the last durability point is already committed,
+            # because the half it would undo is the half the customer already
+            # received — four messages on a real phone on 10 August, erased
+            # from the ledger by this very line. What it still undoes is
+            # everything written after that point, which is the only part
+            # nobody outside this process has seen.
             session.rollback()
             try:
-                counts_in = payload.get("counts") or {}
-                passes = int(counts_in.get("passed",
-                                           len(payload.get("final") or [])))
-                fallback = close_mod.close_tenant_day(
+                # The counts come from `progress`, which survived the frame.
+                # They used to be manufactured here — a hard-coded
+                # `cv_resolved=0` beside `cv_failed=max(passes, 1)` — because
+                # this handler had nothing else to say.
+                fallback = _close_after_crash(
                     session, tenant_id=tenant_id,
                     run_date=now.astimezone(_RIYADH).date(), now=now,
-                    discovery_ok=True, gate_passes=passes,
-                    cv_resolved=0, cv_failed=max(passes, 1),
-                    delivered_groups=[], failed_groups=[],
-                    suppressor=suppressor,
+                    progress=progress,
                 )
                 states[tenant_id] = fallback
                 session.commit()
@@ -776,7 +946,7 @@ def run_daily_delivery(
                     session, tenant_id=tenant_id, day=state.run_date
                 )
             except Exception:  # noqa: BLE001 — accounting never breaks the day
-                logger.warning("cost rollup failed", exc_info=True)
+                logger.error("cost rollup failed", exc_info=True)
         # ح-1: DURABILITY POINT — WhatsApp messages for this tenant are
         # already on the wire; their delivery rows, ledger and day state
         # must survive any later crash (and the canary hour-long sleep no

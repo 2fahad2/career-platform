@@ -60,7 +60,7 @@ from career.onboarding.extraction import (
 from career.onboarding.upload import Limits, MalwareScanner, process_cv_upload
 from career.storage import StorageAdapter
 from career.whatsapp.client import WhatsAppClient
-from career.whatsapp.delivery import record_out
+from career.whatsapp.delivery import durability_point, record_out
 from career.whatsapp.templates import ONBOARDING_REMINDER
 
 logger = logging.getLogger("career.onboarding")
@@ -1647,7 +1647,38 @@ def _handle_privacy_command(
 
 
 def send_due_reminders(owner_session: Session, *, deps: Deps, now: datetime) -> int:
-    """Nudge every stalled journey once per stall (§05). Returns count sent."""
+    """Nudge every stalled journey once per stall (§05). Returns count sent.
+
+    ── ONE COMMIT PER TENANT, NOT ONE PER PASS (CHANGELOG 39) ───────────────
+    This function used to end at a single ``flush()`` and own no commit at
+    all, so every tenant's work sat in the caller's one transaction until the
+    sweep was over. `send_template` is BILLED — `onboarding_reminder` is an
+    approved template going to a customer whose 24h window is shut by
+    definition — and one Graph error on tenant N threw out of here with
+    tenants 1..N-1's ledger rows AND their `last_reminder_at` stamps still
+    uncommitted. The caller's session is closed by its context manager without
+    a commit, so all of it is discarded: Meta charged us for N-1 templates we
+    recorded nowhere, and because `last_reminder_at` went back with them,
+    `is_reminder_due` said yes again the next hour and we sent and paid for
+    all of them a second time — for as long as tenant N kept failing.
+
+    The pattern is already in this tree twice, and both say the same thing:
+    `salla/lifecycle._record_send` («a single ledger row the database refused
+    discarded the marks of EVERY customer already processed that night») and
+    `cv/outcome_followup` («commit per question, not per pass»). The send is
+    the fact, and it happens outside any transaction we control; the commit
+    belongs immediately after it, before anything that can raise.
+
+    NOT a savepoint: `RELEASE SAVEPOINT` is not a commit, and a released
+    savepoint dies with the outer rollback exactly like everything else
+    (measured on `career_test`; the argument is written out in
+    `delivery.durability_point`).
+
+    The failing send itself still propagates — this function's contract with
+    the worker loop is unchanged, and a Graph error there is the loop's to
+    classify. What changes is that it can no longer take anybody else's
+    billed row with it.
+    """
     sent = 0
     journeys = owner_session.execute(select(OnboardingSession)).scalars().all()
     for journey in journeys:
@@ -1675,6 +1706,20 @@ def send_due_reminders(owner_session: Session, *, deps: Deps, now: datetime) -> 
             template_name=ONBOARDING_REMINDER.name, now=now,
         )
         journey.last_reminder_at = now
+        # THE DURABILITY POINT for this tenant: the row that says we were
+        # charged and the stamp that stops us being charged again, committed
+        # together, before the next tenant's send can fail. `durability_point`
+        # is the shared helper — it commits, and if the commit itself fails it
+        # says which half survived (the customer has the nudge, we have no
+        # record) and leaves the session usable for the tenants after this one.
+        #
+        # Committing here EXPIRES the ORM objects loaded above, so the next
+        # journey's attribute reads re-SELECT one row each. That cost is real
+        # and it is the price of the guarantee; the sweep is hourly and its
+        # candidate set is «journeys stalled over 24h», not the whole estate.
+        durability_point(owner_session, what="the stall reminder")
+        # Counted whatever the commit said. The template LEFT — Meta has
+        # billed it and the customer's phone has it — and a return value that
+        # under-reports sends is the manufactured number CHANGELOG 39 is about.
         sent += 1
-    owner_session.flush()
     return sent

@@ -2510,6 +2510,60 @@ _LITERAL_COLLECTIONS = (ast.Tuple, ast.List, ast.Set)
 _TRANSPARENT_CALLS = frozenset({"frozenset", "set", "tuple", "list", "sorted"})
 
 
+def _support_vocabulary() -> dict[str, list[str]]:
+    """`career.support`'s public names → the words behind them, READ from the
+    module and never retyped (the `_STOP` / `_TICKET_STATUSES` rule).
+
+    Both shapes it exports: the three words, and the sets derived from them —
+    so an author who rebuilds a set out of ``MUTING_STATUSES`` is resolved the
+    same way as one who rebuilds it out of ``OPEN``.
+    """
+    words: dict[str, list[str]] = {}
+    for name in dir(support):
+        if name.startswith("_"):
+            continue
+        value = getattr(support, name)
+        if isinstance(value, str):
+            words[name] = [value]
+        elif isinstance(value, frozenset | set | tuple | list) and all(
+            isinstance(member, str) for member in value
+        ):
+            words[name] = sorted(value)
+    return words
+
+
+def _vocabulary_in_scope(
+    tree: ast.Module,
+) -> tuple[dict[str, list[str]], frozenset[str], dict[str, list[str]]]:
+    """What this module can spell the words with WITHOUT retyping them:
+    ``(name -> words, module aliases, the whole vocabulary)``.
+
+    Both import shapes, because both are in the tree already:
+    ``from career.support import OPEN`` (every production caller) and
+    ``from career import support`` (this file's own).
+    """
+    vocabulary = _support_vocabulary()
+    names: dict[str, list[str]] = {}
+    modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if node.module == "career.support":
+                for alias in node.names:
+                    if alias.name in vocabulary:
+                        names[alias.asname or alias.name] = vocabulary[alias.name]
+            elif node.module == "career":
+                modules |= {
+                    alias.asname or alias.name
+                    for alias in node.names if alias.name == "support"
+                }
+        elif isinstance(node, ast.Import):
+            modules |= {
+                alias.asname for alias in node.names
+                if alias.name == "career.support" and alias.asname
+            }
+    return names, frozenset(modules), vocabulary
+
+
 def _literal_bindings(tree: ast.Module) -> dict[str, list[str]]:
     """``name -> the string literals it is bound to``, anywhere in the module.
 
@@ -2531,7 +2585,53 @@ def _literal_bindings(tree: ast.Module) -> dict[str, list[str]]:
     OVER-report, and over-reporting here costs an author one import; the other
     error costs a customer his line. Re-binding (a name assigned twice) keeps
     both values for the same reason.
+
+    ── AND THE SHAPE AN AUTHOR REACHES FOR THE MOMENT THIS REJECTS HIM ───────
+    Added 2026-08-10, after a second adversarial pass walked the D4 defect back
+    in with the suite green:
+
+        from career.support import OPEN, RELEASED
+        _STILL_OWED = frozenset({OPEN, RELEASED})
+        ...
+        SupportEvent.status.in_(sorted(_STILL_OWED))
+
+    Nothing above is a literal — the words are imported from their home, which
+    is what the failing guard told him to do — so the binding came out EMPTY
+    and shape 3 never fired. The derived-set ratchet is equally silent: no
+    name in it is `QUEUED_STATUSES`. The whole defect is restored, and the
+    thing it restores is the worst one: a private positive list of queue words
+    that a fourth status does not join, filtering a waiting customer's ticket
+    off every screen.
+
+    So the words `career.support` gives this module are resolved too — but ONLY
+    as ELEMENTS OF A COLLECTION, and that boundary is the whole design:
+
+    * ``_STILL_OWED = frozenset({OPEN, RELEASED})`` is a SET assembled here,
+      and a set assembled here does not grow when the vocabulary does. That is
+      the defect, whatever the elements were spelled with.
+    * ``SupportEvent(status=OPEN)`` and ``ticket.status = RESOLVED`` are the
+      shapes this guard's own failure message prescribes. Seeding the map
+      wholesale — the obvious reading of «resolve the imports» — binds `OPEN`
+      to «open» everywhere and flags exactly those two, i.e. the guard fires on
+      the fix it recommends and gets deleted by the next author it corners
+      (`test_the_status_guard_accepts_the_vocabulary_used_correctly` is that
+      claim, checked). REJECTED for that reason, not on taste.
+    * ``ALIAS = OPEN`` stays unresolved for the same reason: one word under
+      another name still IS the word, and still moves with its home.
     """
+    names, modules, vocabulary = _vocabulary_in_scope(tree)
+
+    def words_of(element: ast.expr) -> list[str]:
+        if isinstance(element, ast.Constant) and isinstance(element.value, str):
+            return [element.value]
+        if isinstance(element, ast.Name) and element.id in names:
+            return names[element.id]
+        if (isinstance(element, ast.Attribute)
+                and isinstance(element.value, ast.Name)
+                and element.value.id in modules and element.attr in vocabulary):
+            return vocabulary[element.attr]
+        return []
+
     bound: dict[str, list[str]] = {}
     for node in ast.walk(tree):
         if not isinstance(node, ast.Assign | ast.AnnAssign):
@@ -2545,9 +2645,7 @@ def _literal_bindings(tree: ast.Module) -> dict[str, list[str]]:
             literals = [value.value]
         elif isinstance(value, _LITERAL_COLLECTIONS):
             literals = [
-                element.value for element in value.elts
-                if isinstance(element, ast.Constant)
-                and isinstance(element.value, str)
+                word for element in value.elts for word in words_of(element)
             ]
         if not literals:
             continue
@@ -2634,6 +2732,14 @@ def _status_literal_sites(
     invisible. :func:`_literal_bindings` and :func:`_class_names` resolve those
     before the shapes run — the first of them being precisely the shape this
     codebase itself models, constants then derived sets then the query.
+
+    AND THE ONE AFTER THAT, the same day: a set rebuilt HERE out of words
+    imported correctly from `career.support` (``frozenset({OPEN, RELEASED})``)
+    was invisible to both new guards at once — no literal for this scan, no
+    derived-set name for the other — which restored D4 whole with the suite
+    green. :func:`_literal_bindings` now resolves the vocabulary's own names
+    when they are elements of a collection, and only then; its docstring
+    argues that boundary and what seeding the map wholesale would break.
 
     ── WHAT IT STILL CANNOT SEE ──────────────────────────────────────────────
     An AST guard is not a proof, and this one closes no door completely. It
@@ -2843,6 +2949,21 @@ def test_no_reader_asks_the_queue_question_with_a_derived_set() -> None:
     still owed» is the negation of it, «does it mute» is `MUTING_STATUSES`.
     The derived sets stay in `career.support` for display and for the invariant
     above, which is what this file asserts them against.
+
+    ONE HONEST USE IS BANNED WITH THEM, and it is named rather than carved out
+    (2026-08-10). «Is this word one we know» — validating a status arriving
+    from outside before it is written — is a legitimate question, and reading
+    `ALL_STATUSES` is the obvious way to ask it. The exemption it would need is
+    a rule about SYNTAX (allow the set inside a membership test, forbid it
+    inside a `where`), which is exactly the subtler rule the paragraph above
+    refuses: the two shapes are one `.in_()` apart, and a guard whose scope
+    depends on where an expression sits is a guard the next author reads
+    wrongly in good faith. No production file asks that question today, so the
+    ban costs nothing today; the day one does, the answer is a PREDICATE in
+    `career.support` (which can also refuse to answer about a word nobody
+    added) and not a set exported into a caller. That is one edit to the
+    vocabulary's own file, which is where every other answer about these words
+    already lives.
     """
     offenders: list[str] = []
     for root in _SCAN_ROOTS:
@@ -2874,7 +2995,18 @@ def test_no_reader_asks_the_queue_question_with_a_derived_set() -> None:
         "career/support.py is in neither ALL_STATUSES nor anything derived "
         "from it. Asked positively, his ticket disappears from every screen "
         "while a paying customer waits behind it; asked negatively it is one "
-        "row of noise the operator can see and close."
+        "row of noise the operator can see and close.\n"
+        "\n"
+        "AND IF YOUR QUESTION IS «is this a word we know» — validating a "
+        "status that arrived from outside — that is a real question and this "
+        "is still not the way to ask it. Add the predicate to "
+        "career/support.py and call it; a set exported into a caller cannot "
+        "stop the caller from putting it in a where clause tomorrow.\n"
+        "\n"
+        "REBUILDING THE SET LOCALLY IS NOT THE WAY ROUND THIS: "
+        "`_STILL_OWED = frozenset({OPEN, RELEASED})` is the same defect with "
+        "the words imported, and test_no_module_spells_a_support_ticket_"
+        "status_for_itself sees it."
     )
 
 
@@ -2986,6 +3118,39 @@ _STATUS_LITERAL_SHAPES: tuple[tuple[str, str], ...] = (
         "def escalate(session, tenant_id, channel_id):\n"
         "    session.add(SE(tenant_id=tenant_id, channel_id=channel_id,\n"
         "                   status='open'))\n",
+    ),
+    # ── the two a SECOND adversarial pass walked through, 2026-08-10 ─────────
+    # The shape an author reaches for the moment the ratchet above rejects him:
+    # he imports the words from their home — exactly as the failure message
+    # tells him to — and then assembles his own set out of them. Neither guard
+    # saw it. There is no literal in it for this scan, and no `QUEUED_STATUSES`
+    # in it for `test_no_reader_asks_the_queue_question_with_a_derived_set`, so
+    # D4 came back whole with the suite green: a positive list of queue words
+    # that a fourth status does not join, filtering a waiting customer's ticket
+    # off the screen. Both probes belong HERE, because the literal ratchet is
+    # the one that can see a word — the derived-set ratchet only knows names,
+    # and a rule that banned assembling a set out of imported constants would
+    # ban `career/support.py`'s own shape.
+    (
+        "a second screen rebuilding the queue out of the words it imported",
+        "from sqlalchemy import select\n"
+        "from career.db.models import SupportEvent\n"
+        "from career.support import OPEN, RELEASED\n"
+        "_STILL_OWED = frozenset({OPEN, RELEASED})\n"
+        "def screen(session):\n"
+        "    return session.execute(select(SupportEvent).where(\n"
+        "        SupportEvent.status.in_(sorted(_STILL_OWED)))).all()\n",
+    ),
+    (
+        "a fifth dedupe rebuilding the muting set through the module",
+        "from sqlalchemy import select\n"
+        "from career import support\n"
+        "from career.db.models import SupportEvent\n"
+        "_MUTES = (support.OPEN, support.RELEASED)\n"
+        "def muted(session, tenant_id):\n"
+        "    return session.execute(select(SupportEvent.id).where(\n"
+        "        SupportEvent.tenant_id == tenant_id,\n"
+        "        SupportEvent.status.in_(_MUTES))).first()\n",
     ),
 )
 
