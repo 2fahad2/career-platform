@@ -196,12 +196,24 @@ def _raise_opted_out_ticket(
       it as a customer asking for help and answer with a reply the customer
       cannot receive.
 
-    DEDUPLICATED on an OPEN ticket for this CHANNEL, so a retried activation
+    DEDUPLICATED on a MUTING ticket for this CHANNEL, so a retried activation
     and the upgrade re-run do not grow the queue. Keyed on the channel and not
     the tenant because the §04 upgrade MOVES the subscription to another
     tenant — the channel is the one identity that survives it. Not keyed on
-    «any ticket ever»: once the operator has closed this one, a customer who
-    is still silent and pays AGAIN is a fact he has to hear a second time.
+    «any ticket ever»: a customer who is still silent and pays AGAIN is a fact
+    the operator has to hear a second time.
+
+    HOW LONG THE DEDUPE HOLDS — corrected, because it drifted by one word.
+    This used to say «once the operator has closed this one», and closing is
+    no longer the only way out: since `telegram.console.
+    release_forgotten_tickets` the sweep moves an unclosed ticket OPEN →
+    RELEASED after 48 hours, and RELEASED is not in ``MUTING_STATUSES``. So
+    the true bound is «until it is closed OR released», i.e. at most 48 hours
+    — which is the invariant that sweep exists to state (NO TICKET MUTES
+    ANYTHING FOR LONGER THAN THIS) and it applies to this dedupe exactly as it
+    applies to the other three. The code already read the set rather than the
+    word, so nothing here changes; the sentence was the only thing that was
+    still describing the old world.
 
     ``created_at`` is written explicitly (the column has a server default) so
     the age the tickets screen prints comes from the same clock the rest of

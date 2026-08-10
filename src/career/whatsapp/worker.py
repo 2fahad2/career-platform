@@ -1235,7 +1235,11 @@ def _handle_status(session: Session, st: dict[str, Any], *, now: datetime) -> No
         # `failed`, and the watchtower's message-status panel is read as the
         # truth about what reached customers — so a status nobody has placed
         # on the ladder would be billed and displayed by accident, on the
-        # strength of a name we have never seen. Refusing to guess is right.
+        # strength of a name we have never seen. Refusing to guess is right —
+        # and the refusal now covers the whole callback, `pricing` included:
+        # for a while this line refused the status word and the loop below
+        # still took the price band off the same unreadable receipt, which is
+        # the one place the refusal cost real money. See the band's own note.
         #
         # Whispering about it is not. This was a `logger.warning`, and warnings
         # do not leave this box: the operator's harvester forwards «ERROR:»
@@ -1255,8 +1259,8 @@ def _handle_status(session: Session, st: dict[str, Any], *, now: datetime) -> No
     # never recorded. That is a hole in the ledger and the only way anyone
     # learns of it is the line below.
     codes = status_error_codes(st)
-    # The other half of the same callback, and it is NOT on the ladder — see
-    # the loop below.
+    # The other half of the same callback. It is not a POSITION on the ladder —
+    # but it is only read off a receipt that is ON it. See the loop below.
     category = status_billed_category(st)
     reported = False
     matched = False
@@ -1264,19 +1268,61 @@ def _handle_status(session: Session, st: dict[str, Any], *, now: datetime) -> No
         select(DeliveryMessage).where(DeliveryMessage.wa_message_id == wamid)
     ).scalars():
         matched = True
-        # WRITTEN BEFORE THE RANK GATE, and that is the decision. The price
-        # band is a fact about the MESSAGE, not a position on the receipt
-        # ladder: Meta attaches `pricing` to the `sent`/`delivered` receipt,
-        # and those are exactly the receipts that LOSE the rank comparison
-        # when they arrive after a `read` — which Meta's own retry behaviour
-        # makes routine. Gating this on rank would have discarded the billed
-        # category precisely on the messages that were read fastest.
+        # WRITTEN BEFORE THE RANK GATE, AND ONLY FOR A RECEIPT THAT IS ON THE
+        # LADDER AT ALL. Those are two different questions, and one `if` used
+        # to answer them as one.
+        #
+        # Before the gate, because the price band is a fact about the MESSAGE
+        # and not a position in the order of receipts: Meta attaches `pricing`
+        # to the `sent`/`delivered` receipt, and those are exactly the receipts
+        # that LOSE the rank comparison when they arrive after a `read` — which
+        # Meta's own retry behaviour makes routine. Gating this on WINNING
+        # would have discarded the billed category precisely on the messages
+        # that were read fastest, which is what
+        # `test_the_price_band_is_not_on_the_receipt_ladder` pins.
+        #
+        # UNRANKED IS NOT OUT-OF-ORDER — that is the `rank and`, and its
+        # absence was a money defect measured against staging. The rank-0
+        # branch at the top of this handler REFUSES to record `status` for a
+        # word nobody has put on the ladder, on the argument that a rung we
+        # have never seen must not be billed or displayed on the strength of a
+        # name we cannot read; and then the
+        # same callback's `pricing` was trusted to set the price band for the
+        # life of the row, because FILL-ONCE makes the FIRST writer permanent.
+        # A `deleted` receipt carrying `marketing` ahead of the real
+        # `delivered` carrying `utility` pinned the row at `marketing`: a
+        # `subscription_daily_report` billed at $0.0501 where Meta charged
+        # $0.0107, 4.7× and forever, since the recognised receipt that follows
+        # loses fill-once and is logged as if META had re-priced the send, and
+        # `scripts/backfill_meta_error_codes.py` writes `meta_error_code` and
+        # never `category`, so nothing can repair the row afterwards.
+        #
+        # A late receipt is one we UNDERSTAND that arrived out of order: it is
+        # authoritative about money and merely stale about order. An unranked
+        # receipt is one we do not understand at all — its `pricing` is no more
+        # readable than its status word, and trusting half of a callback we
+        # refused to trust was the whole bug.
+        #
+        # NOT «drop the rank-0 refusal instead»: the two questions this handler
+        # is asked about an unknown rung have opposite safe answers. Recording
+        # its status guesses at DELIVERY (it might be a rung above `read` or a
+        # rung below `sent`; we cannot know which) — recording nothing loses
+        # nothing that was ever there. Recording its band guesses at MONEY, and
+        # money has a bill behind it. Both refusals point the same way: say
+        # only what a receipt we can read has told us.
         #
         # Fill-once, never overwrite. A second receipt reporting a DIFFERENT
         # band for one message is either Meta re-pricing a single send or us
         # reading the wrong row, and both are worth a line rather than a
         # silent last-writer-wins.
-        if category is not None:
+        #
+        # STAMPED ON EVERY MATCHING ROW, whatever its `kind` — and that makes
+        # `cv/close.whatsapp_spend`'s `kind == 'template'` filter load-bearing
+        # for CORRECTNESS, not tidiness. Meta labels the free-form service
+        # replies it prices at zero `pricing.category = 'service'`: 212 of the
+        # 230 banded receipts on staging, ~91% of this column. See that
+        # function's docstring before writing any new spend query.
+        if rank and category is not None:
             if dm.category is None:
                 dm.category = category
             elif dm.category != category:

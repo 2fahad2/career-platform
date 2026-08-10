@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -608,8 +608,8 @@ def test_whatsapp_templates_are_priced_per_category(
         owner_session.commit()
 
         spend = close.whatsapp_spend(owner_session, tenant_id=tid, day=DAY)
-        assert spend["wa_utility"] == (2, Decimal("0.0314"))
-        assert spend["wa_marketing"] == (1, Decimal("0.0384"))
+        assert spend["wa_utility"] == (2, Decimal("0.0214"))
+        assert spend["wa_marketing"] == (1, Decimal("0.0501"))
     finally:
         _cleanup(owner_session, tid)
 
@@ -628,9 +628,11 @@ def test_the_bill_follows_metas_category_not_the_templates_name(
     Saudi Arabia card (utility $0.0107, marketing $0.0501, verified the same
     day) that recorded 21% of what Meta charges. A name is not evidence.
 
-    The Decimals below are the CONFIGURED rates, not Meta's — the settings are
-    themselves stale (see `close._wa_price`), and this test is about which
-    bucket a send lands in, not about what the operator has typed into `.env`.
+    The Decimals below are the CONFIGURED rates. Since 2026-08-10 those ARE
+    Meta's card — the defaults were corrected in `career/config.py` and
+    `test_the_configured_whatsapp_prices_are_metas_measured_card` pins them —
+    but this test is still about which bucket a send lands in, not about what
+    the operator has typed into `.env`.
     """
     tid = _seed_tenant(owner_session)
     try:
@@ -644,7 +646,7 @@ def test_the_bill_follows_metas_category_not_the_templates_name(
 
         spend = close.whatsapp_spend(owner_session, tenant_id=tid, day=DAY)
         assert "wa_utility" not in spend, spend
-        assert spend["wa_marketing"] == (5, Decimal("0.1920"))
+        assert spend["wa_marketing"] == (5, Decimal("0.2505"))
     finally:
         _cleanup(owner_session, tid)
 
@@ -673,8 +675,8 @@ def test_the_band_on_the_row_outranks_todays_reading_of_the_registry(
         owner_session.commit()
 
         spend = close.whatsapp_spend(owner_session, tenant_id=tid, day=DAY)
-        assert spend["wa_marketing"] == (1, Decimal("0.0384"))
-        assert spend["wa_utility"] == (1, Decimal("0.0157"))
+        assert spend["wa_marketing"] == (1, Decimal("0.0501"))
+        assert spend["wa_utility"] == (1, Decimal("0.0107"))
     finally:
         _cleanup(owner_session, tid)
 
@@ -708,7 +710,7 @@ def test_a_day_already_billed_stops_moving_when_meta_changes_its_mind(
         owner_session.commit()
 
         before = close.whatsapp_spend(owner_session, tenant_id=tid, day=DAY)
-        assert before["wa_utility"] == (2, Decimal("0.0314"))
+        assert before["wa_utility"] == (2, Decimal("0.0214"))
 
         # …and now Meta moves it, exactly as it moved the other five.
         tmpl.record_observed_category(
@@ -717,9 +719,9 @@ def test_a_day_already_billed_stops_moving_when_meta_changes_its_mind(
         )
         after = close.whatsapp_spend(owner_session, tenant_id=tid, day=DAY)
 
-        assert after["wa_utility"] == (1, Decimal("0.0157")), \
+        assert after["wa_utility"] == (1, Decimal("0.0107")), \
             "a send Meta had already priced was re-priced by a later decision"
-        assert after["wa_marketing"] == (1, Decimal("0.0384"))
+        assert after["wa_marketing"] == (1, Decimal("0.0501"))
     finally:
         tmpl.forget_live_observations()
         _cleanup(owner_session, tid)
@@ -741,7 +743,7 @@ def test_a_band_we_have_no_price_for_is_still_priced_the_expensive_way(
         owner_session.commit()
 
         spend = close.whatsapp_spend(owner_session, tenant_id=tid, day=DAY)
-        assert spend["wa_unknown"] == (1, Decimal("0.0384"))
+        assert spend["wa_unknown"] == (1, Decimal("0.0501"))
     finally:
         _cleanup(owner_session, tid)
 
@@ -777,7 +779,7 @@ def test_an_unknown_template_is_priced_conservatively(
                       template_name="some_template_added_in_meta_console")
         owner_session.commit()
         spend = close.whatsapp_spend(owner_session, tenant_id=tid, day=DAY)
-        assert spend["wa_unknown"] == (1, Decimal("0.0384"))
+        assert spend["wa_unknown"] == (1, Decimal("0.0501"))
     finally:
         _cleanup(owner_session, tid)
 
@@ -812,9 +814,168 @@ def test_rollup_folds_whatsapp_in_and_stays_idempotent(
         assert [(r.category, r.events) for r in rows] == [
             ("llm_render", 1), ("search_api", 1), ("wa_utility", 1),
         ]
-        assert sum(r.cost_usd for r in rows) == Decimal("0.039200")
+        assert sum(r.cost_usd for r in rows) == Decimal("0.034200")
     finally:
         _cleanup(owner_session, tid)
+
+
+# ── the belief, frozen once no measurement can still arrive ──────────────────
+
+
+def _bands(owner_session: Session, tid: uuid.UUID) -> dict[str, str | None]:
+    """``template_name (or kind) → the band on the row``."""
+    rows = owner_session.execute(
+        sql_text("SELECT kind, template_name, category FROM delivery_messages"
+                 " WHERE tenant_id = :t"),
+        {"t": str(tid)},
+    ).all()
+    return {str(r.template_name or r.kind): r.category for r in rows}
+
+
+def test_the_freeze_stamps_only_the_sends_meta_never_priced(
+    owner_session: Session,
+) -> None:
+    """`delivery_messages.category` carries two different kinds of fact and the
+    column cannot tell them apart, so the WHERE clause has to.
+
+    Four rows, one of each shape this has to get right:
+
+    * an unmeasured template — the belief is written, and it is what makes a
+      re-run of an old day reproducible;
+    * a template Meta's receipt already priced, at a band that DISAGREES with
+      today's registry (`daily_service_update` is MARKETING at Meta today and
+      this send's receipt said utility) — the measurement is the authority and
+      is left exactly as it is. A fixture that agreed with the registry would
+      pass whether or not the guard existed;
+    * a template name nobody recognises — left NULL on purpose, because
+      `wa_unknown` is the bucket for «never measured» and stamping MARKETING
+      would move it to `wa_marketing` at the identical price while destroying
+      the only signal that an unknown template is being sent;
+    * a free-form service message — never billed, so a band on it would be a
+      number about nothing.
+    """
+    from career.whatsapp.delivery import freeze_unmeasured_categories
+
+    tid = _seed_tenant(owner_session)
+    try:
+        cid = _seed_channel(owner_session, tid)
+        _seed_message(owner_session, tid, cid, kind="template",
+                      template_name="subscription_daily_report")
+        _seed_message(owner_session, tid, cid, kind="template",
+                      template_name="daily_service_update", category="utility")
+        _seed_message(owner_session, tid, cid, kind="template",
+                      template_name="some_template_added_in_meta_console")
+        _seed_message(owner_session, tid, cid, kind="text", template_name=None)
+        owner_session.commit()
+
+        frozen = freeze_unmeasured_categories(
+            owner_session, now=NOW + timedelta(days=3)
+        )
+        owner_session.commit()
+
+        assert frozen == 1
+        assert _bands(owner_session, tid) == {
+            "subscription_daily_report": "utility",
+            "daily_service_update": "utility",
+            "some_template_added_in_meta_console": None,
+            "text": None,
+        }
+    finally:
+        _cleanup(owner_session, tid)
+
+
+def test_the_freeze_waits_for_the_receipt_before_writing_a_belief(
+    owner_session: Session,
+) -> None:
+    """A send an hour old may still be priced by Meta, and a belief written
+    over a measurement that was on its way is the one failure this ordering
+    exists to prevent — `worker._handle_status` fills the column only while it
+    is NULL, so whatever is written first is written for good."""
+    from career.whatsapp.delivery import freeze_unmeasured_categories
+
+    tid = _seed_tenant(owner_session)
+    try:
+        cid = _seed_channel(owner_session, tid)
+        _seed_message(owner_session, tid, cid, kind="template",
+                      template_name="subscription_daily_report")
+        owner_session.commit()
+
+        assert freeze_unmeasured_categories(
+            owner_session, now=NOW + timedelta(hours=1)
+        ) == 0
+        owner_session.commit()
+        assert _bands(owner_session, tid) == {
+            "subscription_daily_report": None
+        }
+    finally:
+        _cleanup(owner_session, tid)
+
+
+def test_a_frozen_day_stops_moving_when_meta_re_categorises(
+    owner_session: Session,
+) -> None:
+    """The stability property, over a send Meta never priced for us.
+
+    `test_a_day_already_billed_stops_moving_when_meta_changes_its_mind` proves
+    it for a row carrying META's band. This is the other half of the same
+    ledger — the rows whose receipt never carried a price band, which was every
+    such row forever. Before the freeze existed, `whatsapp_spend` re-asked the
+    registry every time it was called, so re-running an old day AFTER a
+    re-categorisation priced it at a band that day was not billed at.
+    """
+    from career.whatsapp import templates as tmpl
+    from career.whatsapp.delivery import freeze_unmeasured_categories
+
+    tid = _seed_tenant(owner_session)
+    try:
+        cid = _seed_channel(owner_session, tid)
+        _seed_message(owner_session, tid, cid, kind="template",
+                      template_name="subscription_daily_report")
+        owner_session.commit()
+
+        freeze_unmeasured_categories(owner_session, now=NOW + timedelta(days=3))
+        owner_session.commit()
+        before = close.whatsapp_spend(owner_session, tenant_id=tid, day=DAY)
+        assert before["wa_utility"] == (1, Decimal("0.0107"))
+
+        # …and now Meta moves it, exactly as it moved five of the eight.
+        tmpl.record_observed_category(
+            "subscription_daily_report", "marketing",
+            observed_on=date(2026, 8, 9), source="test",
+        )
+        after = close.whatsapp_spend(owner_session, tenant_id=tid, day=DAY)
+        assert after == before, \
+            "a day that was already billed was re-priced by a later decision"
+    finally:
+        tmpl.forget_live_observations()
+        _cleanup(owner_session, tid)
+
+
+def test_the_configured_whatsapp_prices_are_metas_measured_card() -> None:
+    """§06 keeps provider list prices in the settings so the operator can
+    correct them without a deploy — which is exactly why the DEFAULT has to be
+    right too: it is the price on every host nobody has corrected.
+
+    Meta's live Saudi Arabia card, read 2026-08-08 alongside the template
+    categories: utility $0.0107, marketing $0.0501. The defaults were $0.0157
+    and $0.0384 — utility 47% high and marketing 23% LOW, on the majority of
+    this account's billed traffic, and understating a bill is the direction
+    that becomes a surprise.
+
+    Asserted on the FIELD DEFAULT and not on `get_settings()`, so a developer
+    who has corrected the numbers in his own environment still runs the check
+    that matters here.
+    """
+    from career.config import Settings
+
+    fields = Settings.model_fields
+    assert fields["whatsapp_usd_per_utility_message"].default == 0.0107
+    assert fields["whatsapp_usd_per_marketing_message"].default == 0.0501
+    # …and marketing is the expensive one, which is the whole reason the two
+    # are separate settings and the reason an unmeasured category errs
+    # MARKETING (`templates.billed_category`).
+    assert (fields["whatsapp_usd_per_marketing_message"].default
+            > fields["whatsapp_usd_per_utility_message"].default)
 
 
 # ── the operator's screens ───────────────────────────────────────────────────
@@ -847,7 +1008,7 @@ def test_business_data_covers_every_category_and_names_the_top_spender(
                      "wa_utility"):
             assert kind in categories, categories
         assert data["llm_generations"] >= 3          # not just generation+extraction
-        assert data["total_cost_usd"] >= Decimal("0.0727")
+        assert data["total_cost_usd"] >= Decimal("0.0677")
         assert (code, Decimal("0.057000")) in data["top_cost_tenants"]
     finally:
         _cleanup(owner_session, tid)

@@ -173,11 +173,49 @@ class Settings(BaseSettings):
     )
     # Meta prices a template message per CATEGORY and per market (Saudi
     # Arabia); marketing costs multiples of utility, so they are separate.
+    #
+    # ── MEASURED 2026-08-08, off Meta's live Saudi Arabia rate card ──────────
+    # utility $0.0107 · marketing $0.0501 — the same reading, on the same day,
+    # that `whatsapp/templates.META_CATEGORY_OBSERVED` was taken from. The old
+    # defaults were 0.0157 and 0.0384: utility 47% HIGH and marketing 23% LOW,
+    # on what `salla/lifecycle._live_channel` documents as the majority of this
+    # account's billed traffic. KSA's marketing rate rose on 2026-04-01 and the
+    # defaults predated it, so the true multiple is ~4.7×, not the ~2.4× the
+    # comments around the biller used to assume. `cv/close._wa_price` has been
+    # DOCUMENTING that drift instead of carrying it; its note is now history
+    # and this pair is the number.
+    #
+    # NOT MODELLED, deliberately, and both err the safe way (over-reporting):
+    # KSA utility has VOLUME TIERS stepping to $0.0080, and since 2025-07-01
+    # Meta delivers utility templates free inside an open 24h service window.
+    # A bill that is too big is a question; a bill that is too small is a
+    # surprise.
+    #
+    # WHY THERE IS NO `WHATSAPP_PRICE_OBSERVED_AT` CONSTANT beside these, when
+    # the categories one file over has exactly that. `META_CATEGORY_OBSERVED_AT`
+    # earns its keep because something READS it: `templates.record_observed_
+    # category` compares it against a date Meta itself supplies (the nightly
+    # GET on the WABA and the `template_category_update` push), so the date is
+    # the input to a machine check that fires the morning the file goes stale.
+    # Meta's rate card has no such endpoint — it is a page in Business Manager
+    # and a PDF, readable by a human and by nothing else in this process — so a
+    # date here could never be compared with anything, and a constant no code
+    # reads is a second place to forget to edit. What the date is genuinely
+    # good for is telling the next reader the AGE of the measurement, and the
+    # comment above carries that at zero cost. If Meta ever exposes the card to
+    # an API, the dated constant and its divergence check belong here that day.
+    #
+    # And the deeper point stands however these two are stored: they are a
+    # third party's numbers and they change without telling us, so §06 keeps
+    # them in the environment. The default is the FLOOR for a host nobody has
+    # corrected; `WHATSAPP_USD_PER_{UTILITY,MARKETING}_MESSAGE` in `.env` moves
+    # the price with no deploy at all, which is the path an operator who reads
+    # a new rate card should take.
     whatsapp_usd_per_utility_message: float = Field(
-        default=0.0157, alias="WHATSAPP_USD_PER_UTILITY_MESSAGE"
+        default=0.0107, alias="WHATSAPP_USD_PER_UTILITY_MESSAGE"
     )
     whatsapp_usd_per_marketing_message: float = Field(
-        default=0.0384, alias="WHATSAPP_USD_PER_MARKETING_MESSAGE"
+        default=0.0501, alias="WHATSAPP_USD_PER_MARKETING_MESSAGE"
     )
 
     # Engine caps (§06: «قابلة للضبط في الإعدادات لا في الكود»).

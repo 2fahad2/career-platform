@@ -1261,13 +1261,35 @@ def report_environment(
 def _report_seat_supply(
     *, settings: Any, session: Session, admin_client: Any
 ) -> None:
-    """«ما نبيع الكرسي رقم ٣١» — the one published promise nothing compared.
+    """«taken + still sellable == cap» — the one published promise nothing
+    compared.
 
     Two counters describe one wave: Salla holds a quantity per seat product and
     decrements it on every sale, we hold `FOUNDING_SEATS_CAP` and count rows,
-    and nothing in the repository ever read the first. Read live on 2026-08-08
-    the store was configured to sell forty seats against a page that says
-    thirty.
+    and nothing in the repository ever read the first.
+
+    WHAT THIS DOCSTRING SAID UNTIL 2026-08-10, kept rather than deleted because
+    a comment that quietly becomes right is how the next one quietly becomes
+    wrong: it led with «ما نبيع الكرسي رقم ٣١» and reported that «the store was
+    configured to sell forty seats against a page that says thirty». Both were
+    true when they were written and neither is the check. ٣١ was never the
+    constraint — the CAP was, and on 2026-08-08 the owner moved the wave from
+    thirty to forty, so the store's forty and `FOUNDING_SEATS_CAP` now AGREE
+    and the number-versus-number sentence has nothing left to report. The
+    invariant did not move with the cap, which is the whole reason
+    `salla.seats.supply_verdict` was written as an invariant and not as a
+    comparison of two numbers.
+
+    WHAT IS TRUE TODAY, and it is not zero: the residual is **+1**. One seat is
+    held on plan ``basic`` — the retired 1.00 SAR pass from the reviewer probe.
+    A paid pass is a paid pass, so it holds a seat and always should, but NO
+    product in the catalog maps to ``basic`` any more, so Salla never
+    decremented anything for it and never can. Forty still sellable on top of
+    one already held is forty-one founders on a forty-seat wave. That +1 is a
+    permanent, correct, accepted offset rather than a fault
+    (`SupplyVerdict.seats_on_unsold_plans` names it, and `.ok` ignores it), so
+    what reaches the operator here is the drift WITH its reason — never a bare
+    number he cannot derive.
 
     OUTSIDE :func:`verify_environment`, on purpose. That function is pure and
     must stay pure — it is the matrix a hundred tests drive without a network,
@@ -1604,6 +1626,23 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover — thin
             logger.info("retention sweep: %s", counts)
     except Exception:  # noqa: BLE001 — never blocks the run
         logger.error("retention sweep failed", exc_info=True)
+
+    # §14: freeze the billing category of every template send Meta never priced
+    # for us. The receipt half (`worker._handle_status`) records what Meta
+    # CHARGED, within seconds and only when the callback carries a price band;
+    # this is the other half, and it runs here because it must run LATE — see
+    # `delivery.freeze_unmeasured_categories` for why a belief stamped at send
+    # time would shut the measurement out for good. Once a row is stamped,
+    # re-running `rollup_costs` over that day reproduces the number it was
+    # billed at instead of re-deriving it from a registry Meta keeps rewriting.
+    try:
+        from career.whatsapp.delivery import freeze_unmeasured_categories
+
+        with Session(engine) as session:
+            freeze_unmeasured_categories(session, now=datetime.now(UTC))
+            session.commit()
+    except Exception:  # noqa: BLE001 — accounting never blocks the run
+        logger.error("billed-category freeze failed", exc_info=True)
 
     try:
         with Session(engine) as session:

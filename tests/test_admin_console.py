@@ -387,6 +387,8 @@ def test_every_screen_and_button_is_direction_pure_when_rendered() -> None:
         "last_delivery": {"run_date": "2026-08-01", "status": "COMPLETED"},
         "outcomes": {"applied": 9, "ignored": 3}, "suppressions": 4,
         "support_minutes": 15, "review_count": 2,
+        # the closed-ticket line, on its months branch (214 days ≈ ٧ أشهر)
+        "support_tickets": {"closed": 3, "last_closed_days": 214},
     }))
     check("business", *views.render_business("30", {
         "subs_by_plan": {"professional": 3, "a_plan_nobody_mapped": 1},
@@ -3819,3 +3821,101 @@ def test_another_tenants_failed_message_cannot_speak_on_this_card(
 
     assert card is not None
     assert card["last_delivery"][views.REFUSED_KEY] is False
+
+
+# ── «هل تعامل معه أحد من قبل؟» — the closed ticket, on the card ──────────────
+#
+# `support_events.resolved_at` is written by `console._run_ticket_close` and
+# was read by nothing. A closed ticket leaves the queue by design — the tickets
+# screen is what is still OWED — so the console could not answer «did anybody
+# ever deal with this customer», which is the question a «راسلتكم وما رد أحد»
+# forces. The answer is one line on the card and NOT a closed-tickets screen:
+# a second inbox is a second thing to forget (`activation_flow` settled that
+# about this same table), and it is a question asked about one customer while
+# looking at him.
+
+
+def test_a_card_with_no_closed_ticket_says_nothing_at_all() -> None:
+    """The silence is the design. Most customers never raise a ticket, so a
+    line printed on every card is a line the eye learns to skip — and this one
+    only earns its place on the cards where it has something to say."""
+    assert views._support_history_lines({}) == []
+    assert views._support_history_lines({"support_tickets": {"closed": 0}}) == []
+
+
+def test_the_card_names_how_many_were_closed_and_when_the_last_one_was() -> None:
+    """Several closures collapse to a count plus the age of the LATEST — the
+    two facts that change the operator's next sentence. A list of ticket ids
+    would be the screen this line exists instead of."""
+    line, = views._support_history_lines(
+        {"support_tickets": {"closed": 3, "last_closed_days": 4}}
+    )
+
+    assert "٣" in line, line          # three closures, in Arabic-Indic digits
+    assert "٤" in line, line          # …the last of them four days ago
+    assert "يوم" in line
+
+
+def test_a_closure_long_ago_reads_as_history_and_not_as_coverage() -> None:
+    """«منذ ٢١٤ يوم» is a number the eye has to convert, and the operator is
+    reading this mid-conversation. Past a month it is said in months, so an
+    ancient closure cannot be mistaken for an answer about today."""
+    old, = views._support_history_lines(
+        {"support_tickets": {"closed": 1, "last_closed_days": 214}}
+    )
+    recent, = views._support_history_lines(
+        {"support_tickets": {"closed": 1, "last_closed_days": 29}}
+    )
+    today, = views._support_history_lines(
+        {"support_tickets": {"closed": 1, "last_closed_days": 0}}
+    )
+
+    assert "شهر" in old and "يوم" not in old, old
+    assert "٧" in old, old                       # 214 days ≈ seven months
+    assert "يوم" in recent, recent
+    assert "اليوم" in today and "منذ" not in today, today
+
+
+def test_a_ticket_closed_before_the_column_was_written_admits_it() -> None:
+    """`resolved_at` was NULL on every ticket closed before it started being
+    written. «منذ ٠ يوم» about one of those is an invented answer on the screen
+    whose whole purpose is not inventing them."""
+    line, = views._support_history_lines(
+        {"support_tickets": {"closed": 2, "last_closed_days": None}}
+    )
+
+    assert "غير مسجل" in line, line
+    assert "٢" in line, line
+
+
+def test_the_support_history_line_reaches_the_customer_card() -> None:
+    """It renders beside the promise lines, on the screen the operator already
+    has open — which is the entire argument for it being a line and not a
+    screen."""
+    text, _keyboard = views.render_tenant_card({
+        "code": "TEN-0002", "plan_code": "executive", "sub_status": "ACTIVE",
+        "outcomes": {}, "suppressions": 0,
+        "support_tickets": {"closed": 2, "last_closed_days": 4},
+    })
+
+    assert "تذاكر دعم أغلقناها" in text
+    # …and it is one line, not a block: the card is long already
+    assert sum("تذاكر دعم" in line for line in text.split("\n")) == 1
+
+
+def test_the_support_history_line_is_direction_pure() -> None:
+    """Fahad's client reverses any line mixing Arabic with Latin letters or
+    European digits, and every branch of this line carries a count."""
+    import re
+
+    arabic = re.compile(r"[؀-ۿ]")
+    latin_or_digit = re.compile(r"[A-Za-z0-9]")
+    for tickets in (
+        {"closed": 3, "last_closed_days": 4},
+        {"closed": 1, "last_closed_days": 0},
+        {"closed": 12, "last_closed_days": 214},
+        {"closed": 2, "last_closed_days": None},
+    ):
+        for line in views._support_history_lines({"support_tickets": tickets}):
+            assert arabic.search(line)
+            assert not latin_or_digit.search(line), line

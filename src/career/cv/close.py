@@ -18,7 +18,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from career.db.models import (
@@ -596,7 +596,7 @@ _WA_KIND_BY_CATEGORY = {"utility": "wa_utility", "marketing": "wa_marketing"}
 def _wa_price(kind: str) -> Decimal:
     """The configured per-message price. §06 keeps provider list prices in the
     settings, not the code, so the operator can correct them without a deploy —
-    and on 2026-08-08 they need correcting.
+    and on 2026-08-08 they needed correcting.
 
     Meta's live Saudi Arabia rate card, read the same day the categories were:
 
@@ -607,10 +607,22 @@ def _wa_price(kind: str) -> Decimal:
     predate it, so the true multiple is ~4.7×, not the ~2.4× the old comments
     around here assumed. Utility also has VOLUME TIERS in KSA (stepping to
     $0.0080) and marketing has none — one more reason the category matters.
-    Correcting the defaults is `career/config.py`, which this change does not
-    own; the report carries the patch, and
-    ``WHATSAPP_USD_PER_{UTILITY,MARKETING}_MESSAGE`` in `.env` fixes it today
-    with no deploy at all.
+
+    CLOSED 2026-08-10, MARKED IN PLACE rather than deleted. The two parenthesised
+    defaults above are HISTORY: `career/config.py` now ships 0.0107 and 0.0501
+    and carries the measurement note, so this docstring no longer describes a
+    live drift. It is kept because the drift is the argument — it is why the
+    band is recorded on the row (0030) instead of assumed, and a reader who
+    finds only today's correct numbers cannot see that a third party's price
+    moved under a default for four months without anything noticing. Deleting
+    the paragraph would delete the reason.
+
+    The remaining live half is unchanged and is the part to act on: these are a
+    third party's numbers and they move again. ``WHATSAPP_USD_PER_{UTILITY,
+    MARKETING}_MESSAGE`` in `.env` corrects a host with no deploy at all, and
+    the three `.env*.example` templates carry the same pair (corrected 2026-08-10;
+    they shipped the old one until then, so a host built from a template silently
+    undid the code fix).
     """
     from career.config import get_settings
 
@@ -705,6 +717,33 @@ def whatsapp_spend(
     that has one is priced at what it was billed at, forever, and only a row
     with none still asks the registry. Same one definition
     (:func:`_wa_kind_of`); it just stopped having to guess.
+
+    ── ``kind == 'template'`` IS LOAD-BEARING FOR CORRECTNESS ─────────────────
+    READ THIS BEFORE WRITING ANY OTHER SPEND QUERY. That line looks like a
+    narrowing to the rows we care about. It is the only thing standing between
+    the bill and the majority of `delivery_messages.category`.
+
+    `worker._handle_status` stamps the band on EVERY row whose wa_message_id
+    matches the receipt, whatever its kind — text, document, template — because
+    the band is a fact about the send. Meta labels the free-form service replies
+    it delivers inside the open 24h window, and charges NOTHING for, with
+    ``pricing.category = 'service'``: measured on staging 2026-08-10, 212 of the
+    230 receipts carrying a band, i.e. ~91% of this column will read `service`.
+
+    `service` is in neither :data:`_WA_KIND_BY_CATEGORY` nor the template
+    registry, so :func:`_wa_kind_of` prices it `wa_unknown` — deliberately the
+    MARKETING rate, because for a TEMPLATE «never measured» must err expensive.
+    Ask the same question without the kind filter and that err-expensive rule
+    lands on the messages Meta billed at zero: every free reply priced at
+    $0.0501, the largest overstatement this file can produce, on the cheapest
+    traffic we have.
+
+    Mapping `service` to a zero price in :data:`_WA_KIND_BY_CATEGORY` is the
+    tempting fix and is rejected: it would make the filter look optional while
+    quietly deciding billability from the BAND, and it is the row's `kind` that
+    says whether Meta billed at all — a template Meta happened to label
+    `service` would then be free. One filter, stated, beats a lookup table that
+    silently means two things.
     """
     query = select(
         DeliveryMessage.template_name, DeliveryMessage.category, func.count(),
@@ -749,6 +788,60 @@ def _upsert_allocation(
     else:
         row.events = events
         row.cost_usd = cost_usd
+
+
+def _retire_allocations(
+    session: Session, *, tenant_id: uuid.UUID, day: date, keep: set[str],
+) -> None:
+    """Drop the kinds this tenant-day no longer has, so a re-run REPLACES the
+    day instead of accumulating over it.
+
+    :func:`_upsert_allocation` is keyed ``(tenant, day, category)`` and
+    :func:`rollup_costs` only ever wrote the kinds that exist NOW, so a kind
+    that stopped being produced kept its row forever and the archive counted
+    the same spend twice. That is not an edge case; since 0030 it is the
+    ORDINARY path. `whatsapp/delivery.py` rolls the day up in the same breath
+    as the send, when the ledger row still carries no band and the kind derives
+    as `wa_marketing`; Meta's receipt lands seconds later and fills it; the next
+    rollup derives `wa_utility` — and the day's archive then claimed two
+    WhatsApp messages at $0.0608 for the one message that was actually sent.
+
+    DELETE, NOT ZERO — the choice matters and the arguments are not symmetric.
+
+    * A zeroed row is a CLAIM, and a false one: «this tenant spent $0 on
+      wa_marketing that day» is a sentence about the day, and the day never had
+      a wa_marketing message. The row is an artifact of the order two of our
+      own writes happened in. An archive that keeps a line for every kind a
+      derivation ever passed through is describing our derivation, not the
+      tenant's day.
+    * There is nothing to preserve by keeping the shell. `cost_allocations`
+      carries no timestamp, no source and no history column, so a zeroed row
+      records no fact about WHEN or WHY it stopped — it is not an audit trail,
+      it is a tombstone with nothing written on it. The real derivation history
+      lives in `usage_events` and `delivery_messages`, which are append-only and
+      still there.
+    * Zero rows accumulate. Every kind any tenant-day ever briefly derived stays
+      forever, and the day's rows stop being readable at a glance — the exact
+      noise that trains a reader to stop reading (the same rule as the seat
+      panel's silent-when-it-changes-nothing offset).
+
+    The one property delete costs us is «a row that once existed still does»,
+    and that is precisely the property that made the double count possible.
+
+    SCOPED to one ``(tenant, day)``, which is the unit :func:`rollup_costs`
+    recomputes in full. Nothing outside that pair may be touched by a re-run of
+    it, and ``keep`` empty deletes the pair's rows honestly: `spend_by_kind`
+    returning nothing means the day cost nothing (or its ledger rows were
+    erased under §12, in which case the archive should follow the evidence it is
+    derived from, not outlive it).
+    """
+    query = delete(CostAllocation).where(
+        CostAllocation.tenant_id == tenant_id,
+        CostAllocation.day == day,
+    )
+    if keep:
+        query = query.where(CostAllocation.category.not_in(keep))
+    session.execute(query)
 
 
 def spend_by_kind(
@@ -824,14 +917,24 @@ def rollup_costs(session: Session, *, tenant_id: uuid.UUID, day: date) -> None:
     removing it is a docs-first decision, not a refactor) — the second
     DEFINITION was. Writer and readers now evaluate the same expression, and
     the table can no longer disagree with the screen about what money is.
+
+    «SET, NOT INCREMENT» WAS ONLY HALF OF IDEMPOTENT, and the missing half was
+    a double count: setting each kind that exists now says nothing about a kind
+    that existed at the last run and does not now, so its row survived every
+    later rollup. :func:`_retire_allocations` is the other half — after it, the
+    rows for a tenant-day are exactly :func:`spend_by_kind`'s answer for that
+    tenant-day, which is what «the whole day's bill lands in one table» has to
+    mean if the sentence is to be true.
     """
-    for kind, (events, cost) in spend_by_kind(
-        session, tenant_id=tenant_id, day=day
-    ).items():
+    fresh = spend_by_kind(session, tenant_id=tenant_id, day=day)
+    for kind, (events, cost) in fresh.items():
         _upsert_allocation(
             session, tenant_id=tenant_id, day=day, category=kind,
             events=events, cost_usd=cost,
         )
+    # After the upserts, never before: a failure between the two must leave the
+    # day OVER-stated rather than missing a kind it really had.
+    _retire_allocations(session, tenant_id=tenant_id, day=day, keep=set(fresh))
     session.flush()
 
 

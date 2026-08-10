@@ -46,8 +46,8 @@ from career.db.models import (
 )
 from career.salla import subscriptions as _sub_states
 from career.support import (
+    CLOSED_STATUSES,
     MUTING_STATUSES,
-    QUEUED_STATUSES,
     RELEASED,
     RESOLVED,
 )
@@ -295,6 +295,21 @@ _TICKET_KIND_AR = {
 #: reaches it. See :func:`_tickets_screen` for why that distinction is worth a
 #: button: the only other route to the eleventh ticket was to make the one
 #: claim in this file that nobody may make on the operator's behalf.
+#:
+#: HOW LONG THIS QUEUE GETS — the number in ROWS, which nobody had written
+#: down. `TICKET_FORGOTTEN_ALERT_AR` bounds the PAGES at «one per customer per
+#: two days» and that bound is right; it is a statement about the operator's
+#: notifications, not about this list. The release is a ONE-WAY edge and a
+#: released ticket stays queued forever (that is the whole point of not
+#: closing it), so one customer who keeps writing and is never closed leaves a
+#: permanent resident behind every 48 hours: ~180 rows a year from one person,
+#: ~18 pages of them — and all of them sorted to the TOP, because the order is
+#: oldest-first. Nothing in this file trims that: only the operator's own
+#: «إغلاق» does, which is the design and is also the whole exposure. Recorded
+#: rather than built for — a cap, an archive or an age cutoff would each drop
+#: a customer nobody answered off the screen, which is the failure this screen
+#: exists to end. The next reader inherits the number instead of rediscovering
+#: it at page eighteen.
 TICKETS_PAGE = 10
 
 #: ── closing a ticket ────────────────────────────────────────────────────────
@@ -325,9 +340,11 @@ _TICKET_ACTION = "ticket_close"
 #: literals in three other modules, which is the shape the note below warns
 #: about, one level down: four copies of the word that decides whether a paying
 #: customer can reach a human. The words now have ONE home and the sets have
-#: names — `QUEUED_STATUSES` is what this screen lists, `MUTING_STATUSES` is
-#: what the dedupes refuse on and what the sweep releases — so a fourth status
-#: is one edit, not four that have to be remembered.
+#: names — `CLOSED_STATUSES` is what this screen lists the NEGATION of,
+#: `MUTING_STATUSES` is what the dedupes refuse on and what the sweep releases
+#: — so a fourth status is one edit, not four that have to be remembered, and
+#: a fourth status nobody made even that one edit for is still on this screen
+#: (`career.support`, «HOW A READER ASKS»).
 TICKET_CONFIRM_AR = (
     "⚠️ تأكيد إغلاق تذكرة العميل:\n{code}\n"
     "الإغلاق يعني أنك تكفّلت بها — ما راح تظهر في القائمة بعدها\n"
@@ -743,6 +760,11 @@ def _tickets_screen(
     its own age, keeps its place at the top of a list ordered oldest-first,
     and keeps waiting for the one button that means a human was dealt with.
 
+    WHAT IS LISTED is «not closed», never «one of the queue words» — see the
+    predicate below and `career.support`'s «HOW A READER ASKS». A status this
+    file has never heard of belongs on this screen, because the alternative is
+    the title line lying about a customer who is waiting.
+
     Each ticket also says WHICH message opened it, in shape only. See
     :data:`_TICKET_OPENER_AR`: with a dedupe upstream, «a customer wrote to
     you» and «a thumb hit a card from three months ago» are the same row
@@ -780,8 +802,33 @@ def _tickets_screen(
         .join(Tenant, Tenant.id == SupportEvent.tenant_id)
         .outerjoin(InboundMessage,
                    InboundMessage.id == SupportEvent.inbound_message_id)
-        .where(SupportEvent.status.in_(sorted(QUEUED_STATUSES)))
-        .order_by(SupportEvent.created_at)
+        # NEGATION of the closed set, never a positive list of queue words.
+        # `status.in_(sorted(QUEUED_STATUSES))` read the same way to a human
+        # and did the opposite thing to the one author it was written for: a
+        # fourth status invented without an edit to `career.support` is in
+        # neither set, so his ticket was filtered out HERE, never swept (the
+        # sweep selects the muting set) and told «مغلقة أصلًا» by its own close
+        # button — while this screen printed «🟢 لا توجد تذاكر مفتوحة» over the
+        # customer waiting behind it, the one sentence the clamp below says it
+        # must never say untruthfully. Asked negatively, an unknown word is
+        # noise on the operator's screen instead of a customer nobody is told
+        # about. (`status` is NOT NULL, so no row disappears into a NULL
+        # comparison here.)
+        .where(~SupportEvent.status.in_(sorted(CLOSED_STATUSES)))
+        # THE ID IS NOT DECORATION — ties are manufactured, not rare.
+        # `whatsapp.worker.process_pending_whatsapp` captures ONE `now` for a
+        # batch of up to 100 events, and both `promises.career_session.
+        # escalate_direct_message` and `whatsapp.activation_flow` write
+        # `created_at=now`, so two customers escalating in one worker pass get
+        # byte-identical timestamps. With `created_at` alone Postgres is free
+        # to return a tie group in any order, and it does change order after
+        # any UPDATE rewrites one of the tuples (a close, a release) — so the
+        # page-1/page-2 boundary cuts the same tie group in a different place
+        # than the operator saw a moment ago. Nobody has constructed a sequence
+        # where he actually SKIPS a ticket, and this is not that claim; it is
+        # that a total order costs one column and a queue whose pagination is
+        # only probably stable is not worth defending.
+        .order_by(SupportEvent.created_at, SupportEvent.id)
     ).all()
     pages = max(1, (len(rows) + TICKETS_PAGE - 1) // TICKETS_PAGE)
     # CLAMPED, and `render_customers` deliberately not copied here. A «التالي»
@@ -1005,7 +1052,15 @@ def _run_ticket_close(
         # still on the screen, and the button under it has to work — a listed
         # ticket whose own button answers «مغلقة أصلًا» is the contradiction
         # inside one screen that `_transition` was fixed for.
-        if ticket.status not in QUEUED_STATUSES:
+        #
+        # Which is why this asks the SAME question the list asks, in the same
+        # direction: «is it closed», not «is it one of the queue words I know».
+        # `not in QUEUED_STATUSES` was the second half of the D4 contradiction
+        # — a ticket in an unknown status was refused here with «مغلقة أصلًا»,
+        # about a ticket no human had ever dealt with. The gate and the list
+        # have to agree about every possible word, including the ones nobody
+        # has invented yet, or the button under a listed row lies.
+        if ticket.status in CLOSED_STATUSES:
             done = TICKET_ALREADY_AR.format(code=code)
         else:
             ticket.status = RESOLVED
@@ -1014,9 +1069,9 @@ def _run_ticket_close(
             # column nobody fills, and «when was this dealt with» is the first
             # question anyone asks of a closed ticket.
             #
-            # AND NOTHING READS IT YET. Named here rather than left as a
-            # surprise, with the decision that was made about it on 2026-08-08
-            # and the reason it was not «build a screen»:
+            # AND IT IS NOW READ — by `_tenant_card`, one line on the customer
+            # card («تذاكر دعم أغلقناها»), which is the ask this comment used
+            # to make and the reason it was not «build a screen»:
             #
             # A closed ticket leaves the queue by design, so «did anybody ever
             # deal with this customer» has no answer on this console — the
@@ -1031,11 +1086,10 @@ def _run_ticket_close(
             # customer, while looking at HIM, so its honest home is one line
             # on the customer card — the screen the operator already opens —
             # beside the promises `views._promise_lines` already prints there
-            # for exactly that reason. That is `telegram/views.render_tenant_
-            # card`, which this pass may read and not edit; the card owner
-            # gets a one-line reader over an already-written column, not a
-            # feature. Until then the column is an audit trail with a writer,
-            # which is honest, and this comment is the ask.
+            # for exactly that reason. That is `views._support_history_lines`,
+            # fed by the one read in `_tenant_card` above: a one-line reader
+            # over an already-written column, not a feature, and absent on the
+            # cards of the customers who never raised a ticket.
             ticket.resolved_at = now
             session.commit()
             done = TICKET_CLOSED_AR.format(code=code)
@@ -1501,9 +1555,33 @@ def _tenant_card(
         )
     ).scalar_one()
     window = _window_of(channel[0], channel[1], now) if channel else None
+    # «هل تعامل معه أحد من قبل؟» — the one question a closed ticket left with
+    # no answer anywhere on this console. `_run_ticket_close` has written
+    # `resolved_at` since it shipped and nothing read it; `views.
+    # _support_history_lines` is the reader and it renders NOTHING until this
+    # key arrives, so the two halves are only a feature together. COUNT plus
+    # the LATEST closure, never a list: a list of closed tickets is a second
+    # inbox, which is the shape `whatsapp.activation_flow` rejected for this
+    # same table. Counted on `CLOSED_STATUSES` — the enumerated set, because
+    # the question here really is «is it done», the one question that may be
+    # asked positively (`career.support`, «HOW A READER ASKS»).
+    closed = session.execute(
+        select(func.count(), func.max(SupportEvent.resolved_at))
+        .where(SupportEvent.tenant_id == tenant.id,
+               SupportEvent.status.in_(sorted(CLOSED_STATUSES)))
+    ).one()
     promises = _promise_facts(session, tenant_id=tenant.id, now=now)
     return {
         **promises,
+        "support_tickets": {
+            "closed": int(closed[0]),
+            # NULL for every ticket closed before the column started being
+            # written; the view says «تاريخ الإغلاق غير مسجل» rather than
+            # guessing an age, so None travels instead of a zero.
+            "last_closed_days": (
+                (now - closed[1]).days if closed[1] is not None else None
+            ),
+        },
         "support_minutes": int(support_minutes or 0),
         "review_count": int(review_count),
         "code": code,

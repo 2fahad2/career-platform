@@ -161,6 +161,55 @@ classify_alert_hook() {
   pass "$unit: watchdog alert hook armed and non-fatal"
 }
 
+# Is a timer actually going to fire again? — and the case where asking that
+# question about YOURSELF has only one honest answer.
+#
+# THE BUG THIS EXISTS TO END. §6 read `NextElapseUSecRealtime` and called an
+# empty value «it will never fire». systemd does not schedule a timer's next
+# elapse while the unit that timer triggers is still RUNNING — the property is
+# empty for exactly as long as the job takes. So on 2026-08-09 at 04:00:06,
+# career-verify-restore.service, running from career-verify-restore.timer,
+# read its own timer and reported:
+#
+#   ✗ career-verify-restore.timer: enabled/active next='none' — it will never fire
+#
+# `systemctl list-timers` said the same timer's next run was the following
+# Sunday, and it was. **The check could not pass when run by the thing it was
+# checking**, so the one unit that reports host drift sat in `failed` with a
+# false line at the top of eight true ones — and false lines are how an
+# operator learns the whole report is optional.
+#
+# WHY NOT SIMPLY SKIP OURSELF. Because «this timer» is not the only case: any
+# oneshot that outlives its own trigger window looks identical, and a rule
+# written for one unit name would be wrong again the day a second job gets
+# slow. The condition is not «am I me», it is «is this timer's own service
+# running right now» — which is also the only state in which an empty
+# next-elapse is EXPECTED rather than alarming.
+#
+# WHAT IS DELIBERATELY NOT WEAKENED. A timer that is disabled, inactive, or
+# has no next elapse **while its service is not running** still fails, loudly
+# and in the same words. The running case does not become a pass-by-default
+# either: it must still be enabled and active, and the verdict says plainly
+# that the schedule was not read, so nobody mistakes it for proof.
+classify_timer_liveness() {
+  local unit="$1" enabled="$2" active="$3" next="$4" job_state="$5"
+  if [[ "$enabled" != "enabled" || "$active" != "active" ]]; then
+    bad "$unit: $enabled/$active next='${next:-none}' — it will never fire"
+    return
+  fi
+  if [[ -n "$next" && "$next" != "0" ]]; then
+    pass "$unit: enabled/active, next run scheduled"
+    return
+  fi
+  # Empty next-elapse. Two very different worlds.
+  if [[ "$job_state" == "active" || "$job_state" == "activating" \
+        || "$job_state" == "reloading" || "$job_state" == "deactivating" ]]; then
+    pass "$unit: enabled/active; next run not scheduled YET because its own job is running ($job_state) — systemd sets the next elapse when the job ends"
+    return
+  fi
+  bad "$unit: $enabled/$active next='${next:-none}' — it will never fire"
+}
+
 # Sourced by tests/test_verify_restore_alert_hook.py, which wants the functions
 # above and none of the checks below — every one of them reads the live host.
 if [[ -n "${VERIFY_RESTORE_LIB_ONLY:-}" ]]; then
@@ -286,11 +335,12 @@ for unit in career-backup.timer career-engine-nightly.timer \
   enabled=$(systemctl is-enabled "$unit" 2>/dev/null || echo missing)
   active=$(systemctl is-active "$unit" 2>/dev/null || echo inactive)
   next=$(systemctl show "$unit" -p NextElapseUSecRealtime --value 2>/dev/null)
-  if [[ "$enabled" == "enabled" && "$active" == "active" && -n "$next" && "$next" != "0" ]]; then
-    pass "$unit: enabled/active, next run scheduled"
-  else
-    bad "$unit: $enabled/$active next='${next:-none}' — it will never fire"
-  fi
+  # The unit this timer triggers. Read from systemd rather than derived by
+  # swapping the suffix: `Unit=` is the property that decides it, and a timer
+  # may name a service that is not its own basename.
+  triggers=$(systemctl show "$unit" -p Unit --value 2>/dev/null)
+  job_state=$(systemctl is-active "${triggers:-$unit}" 2>/dev/null || echo inactive)
+  classify_timer_liveness "$unit" "$enabled" "$active" "$next" "$job_state"
 done
 # A timer that fires a unit which has been failing since the last rebuild is
 # the quietest failure of all; check the actual results too.

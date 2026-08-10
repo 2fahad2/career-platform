@@ -529,6 +529,95 @@ def _promise_lines(card: dict[str, Any]) -> list[str]:
     return lines
 
 
+#: Past this many days a closed ticket stops being counted in days and starts
+#: being counted in months. Not a policy — a READING rule: «منذ ٢١٤ يوم» is a
+#: number the eye has to convert before it means anything, and the operator is
+#: reading this card mid-conversation with a customer. Thirty days is also
+#: where the answer changes character: a ticket closed inside the last month is
+#: plausibly about what he is complaining about right now, and one closed seven
+#: months ago is history that must not read as coverage of today.
+_TICKET_MONTHS_AFTER_DAYS = 30
+
+
+def _support_history_lines(card: dict[str, Any]) -> list[str]:
+    """«هل تعامل معه أحد من قبل؟» — answered on the customer's own card.
+
+    THE GAP THIS CLOSES. A closed ticket leaves the queue by design
+    (`support.CLOSED_STATUSES`), which is right: the tickets screen is what is
+    still OWED and an inbox that keeps everything is an inbox nobody empties.
+    But it left «did anybody ever deal with this customer» with no answer
+    anywhere on this console — the operator hears «راسلتكم وما رد أحد», opens
+    the card, and cannot tell a ticket he closed last week from one that was
+    never raised. `support_events.resolved_at` has held that answer since
+    `console._run_ticket_close` started writing it and nothing read it.
+
+    NOT A CLOSED-TICKETS SCREEN, and the argument is not mine — it is
+    `whatsapp.activation_flow._raise_opted_out_ticket`'s, about this same
+    table: «a second inbox is a second thing to forget». A watchtower screen
+    nobody opens is worse than an absent one because it looks like coverage.
+    The question is asked about ONE customer while looking at HIM, so it is one
+    line on the screen the operator already has open, beside the promises
+    :func:`_promise_lines` prints there for exactly the same reason.
+
+    ABSENT WHEN THERE IS NOTHING TO SAY. Most customers never raise a ticket,
+    so on most cards this renders nothing at all — which is what makes it worth
+    reading on the cards where it does. A line that is always present is a line
+    that stops being read, and the card is long already.
+
+    WHAT IT SAYS, and the two decisions the shape forced:
+
+    * **Several closures** — the COUNT plus the age of the LATEST one, never a
+      list. «twice, the last one two days ago» is the whole of what changes the
+      operator's next sentence; a list of ticket ids is a screen, and it is the
+      screen this is instead of.
+    * **A closure long ago** — said in months past
+      :data:`_TICKET_MONTHS_AFTER_DAYS`, so an ancient closure reads as history
+      rather than as an answer to today. A resolved ticket whose ``resolved_at``
+      is NULL — every one closed before the column started being written — says
+      so instead of guessing an age.
+
+    ── THE CONSOLE SIDE, WHICH THIS PASS DOES NOT OWN ──────────────────────
+    Views are pure: no session, no clock (module docstring). The fact has to
+    arrive in the card, and `telegram/console._tenant_card` is the only builder
+    of that dict. It is one read there, beside `_promise_facts`:
+
+        closed = session.execute(
+            select(func.count(), func.max(SupportEvent.resolved_at))
+            .where(SupportEvent.tenant_id == tenant.id,
+                   SupportEvent.status.in_(sorted(CLOSED_STATUSES)))
+        ).one()
+        ...
+        "support_tickets": {
+            "closed": int(closed[0]),
+            "last_closed_days": (
+                (now - closed[1]).days if closed[1] is not None else None
+            ),
+        },
+
+    Until that key is passed this renders nothing, which is the honest state of
+    a half nobody has wired — and is why the shape is a dict rather than two
+    loose keys: the console owner adds one entry, and an ``open`` count can
+    join it later without a third key or a second decision about the line.
+    """
+    tickets = card.get("support_tickets") or {}
+    closed = int(tickets.get("closed") or 0)
+    if closed <= 0:
+        return []
+    days = tickets.get("last_closed_days")
+    if days is None:
+        when = "تاريخ الإغلاق غير مسجل"
+    else:
+        days = max(0, int(days))
+        if days == 0:
+            when = "آخرها اليوم"
+        elif days < _TICKET_MONTHS_AFTER_DAYS:
+            when = f"آخرها منذ {_ar_digits(days)} يوم"
+        else:
+            months = days // _TICKET_MONTHS_AFTER_DAYS
+            when = f"آخرها منذ {_ar_digits(months)} شهر"
+    return [f"🎫 تذاكر دعم أغلقناها: {_ar_digits(closed)} · {when}"]
+
+
 def render_tenant_card(card: dict[str, Any]) -> tuple[str, Keyboard]:
     """One customer, zero PII: TEN code + plan + states + counters only."""
     code = str(card.get("code"))
@@ -597,6 +686,10 @@ def render_tenant_card(card: dict[str, Any]) -> tuple[str, Keyboard]:
             f" · 👁 مراجعات بشرية: {_ar_digits(review_count or 0)}"
         )
     lines.extend(_promise_lines(card))
+    # …and, beside them, whether anyone has ever dealt with this customer —
+    # the same «is something owed to HIM» question, asked of a table whose
+    # closed rows leave the queue on purpose.
+    lines.extend(_support_history_lines(card))
     # a held bundle is reported whether or not it can be re-attempted right
     # now — and when it cannot, the card says why instead of hiding the fact
     if card.get("held_bundles"):

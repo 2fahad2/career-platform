@@ -1423,3 +1423,47 @@ def test_an_unreachable_meta_still_never_stops_the_night(
         chosen = cli._preferred_daily(_wa_settings())
     assert chosen.name == "subscription_daily_report"
     assert any("falling back" in r.getMessage() for r in caplog.records)
+
+
+# ── the seat-supply check, and the docstring that outlived its facts ─────────
+
+
+def test_the_seat_supply_note_rests_on_facts_that_are_still_true() -> None:
+    """A comment that quietly becomes right is how the next one quietly
+    becomes wrong.
+
+    `_report_seat_supply` led with «ما نبيع الكرسي رقم ٣١» and reported that
+    the store «was configured to sell forty seats against a page that says
+    thirty». Both were true when written; neither survived the owner's
+    2026-08-08 decision to move the wave to forty, after which the store and
+    the cap AGREE and the number-versus-number sentence has nothing to report.
+    The residual is +1, from a seat held on the retired `basic` pass that no
+    product maps to any more.
+
+    The check is not on the prose — a test that greps English rots faster than
+    the comment does. It is on the two facts the prose now rests on, so that
+    the next move of either one fails HERE and summons the edit, which is the
+    only mechanism that has ever kept a docstring true. The retired sentence
+    is kept as marked history and this pins that too: erasing it is how the
+    same reasoning gets rediscovered from scratch in six months.
+    """
+    from career.salla.seats import _SEAT_PLANS, FOUNDING_SEATS_CAP
+
+    doc = cli._report_seat_supply.__doc__ or ""
+
+    assert FOUNDING_SEATS_CAP == 40, (
+        "the wave moved again — _report_seat_supply's note still says forty "
+        "and that the store agrees with it"
+    )
+    assert "basic" in _SEAT_PLANS, (
+        "the note explains the +1 residual as a seat held on `basic`; if that "
+        "pass stopped holding a seat the residual explanation is now wrong"
+    )
+    assert "+1" in doc, "the note no longer states the residual it exists for"
+    # …and the superseded claim is present, but only under its own marker
+    retired = "ما نبيع الكرسي رقم ٣١"
+    assert retired in doc, "the record of what changed was erased, not marked"
+    assert doc.index("UNTIL 2026-08-10") < doc.index(retired), (
+        "the retired claim reads as current — it must sit under the marker "
+        "that dates it"
+    )

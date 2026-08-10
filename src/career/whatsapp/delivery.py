@@ -11,16 +11,16 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import String, select
+from sqlalchemy import String, select, update
 from sqlalchemy.orm import Session
 
 from career.db.models import CustomerChannel, Delivery, DeliveryMessage
 from career.whatsapp.adaptive import DeliveryAction, plan_delivery
 from career.whatsapp.client import WhatsAppClient
-from career.whatsapp.templates import TemplateSpec
+from career.whatsapp.templates import REGISTRY, TemplateSpec, billed_category
 from career.whatsapp.window import WindowState, window_state
 
 logger = logging.getLogger("career.whatsapp")
@@ -114,6 +114,121 @@ def usable_message_id(value: object, *, what: str) -> str | None:
     return mid
 
 
+#: How long a template send stays eligible for Meta's own price band before we
+#: stop waiting for one and write ours. Meta's status callbacks arrive in
+#: seconds and its redeliveries in minutes; forty-eight hours is not an
+#: estimate of that latency but a margin wide enough to cover a webhook outage,
+#: a deferred `webhook_events` row working through its retries, and a night the
+#: worker spent down. The cost of waiting too long is one more day of a NULL
+#: that already prices correctly (`close._wa_kind_of` step 2); the cost of not
+#: waiting long enough is writing a belief over a measurement that was on its
+#: way. The two are not symmetric, so this is generous on purpose.
+RECEIPT_SETTLES_AFTER = timedelta(hours=48)
+
+
+def freeze_unmeasured_categories(
+    session: Session, *, now: datetime,
+    settles_after: timedelta = RECEIPT_SETTLES_AFTER,
+) -> int:
+    """Write OUR billing category onto template sends Meta never priced for us.
+    Returns how many rows were stamped.
+
+    ── MEASUREMENT AND BELIEF, SAID PLAINLY ────────────────────────────────
+    `delivery_messages.category` holds one of two different kinds of fact and
+    the column cannot tell them apart, so the rule has to:
+
+    * **Measurement.** ``statuses[].pricing.category`` — what Meta CHARGED for
+      this exact message. Written by `worker._handle_status` the moment the
+      receipt lands. It is the authority and nothing here may overwrite it.
+    * **Belief.** :func:`templates.billed_category` — today's best reading of
+      what Meta charges for that TEMPLATE (the dated snapshot, or a fresher
+      `template_category_update` push), MARKETING whenever nothing has ever
+      measured it, because an unverified category must never make a bill look
+      smaller than it is. That is what this function writes.
+
+    A belief is worth writing at all for one reason, and it is not accuracy —
+    `close._wa_kind_of` already falls back to exactly this value for a NULL
+    row, so the number does not move on the day. It is STABILITY. That
+    fallback re-asks the registry every time the question is asked, and Meta
+    rewrites the registry (five templates on 2026-07-17, five again on
+    2026-08-02), so `rollup_costs` over an old day answered differently
+    depending on the day it was asked. Freezing the belief onto the row ends
+    that: after this runs, a re-run of an old day reproduces the number that
+    day was billed at, whatever Meta decides afterwards.
+
+    ── WHY IT IS NOT ONE LINE IN `record_out` ──────────────────────────────
+    Stamping the belief at SEND time is the obvious shape, it is what
+    migration 0030's own note asked for, and it is wrong as the receipt half
+    is built. `worker._handle_status` fills this column only while it is NULL
+    and logs an ERROR rather than overwriting a value that disagrees — a
+    fill-once rule that is exactly right against a second RECEIPT and blind to
+    the difference between a receipt and a guess. A belief written at send
+    time is always first, so it would win every disagreement, permanently, and
+    the ledger would record what we expected to be charged in the one place
+    built to record what we WERE charged. The whole of 0030 would be undone by
+    a line that looks like a completion of it.
+
+    Waiting removes the conflict instead of arguing with it: the WHERE clause
+    below touches only rows the measurement has already declined to fill, long
+    after any receipt could still arrive, so precedence is a property of the
+    query rather than a rule two modules have to keep agreeing about.
+
+    THE PRICE, because it is not nothing: the belief is read at freeze time
+    and not at send time, so a template Meta re-categorised in between is
+    frozen at the NEW band for an OLD send. That window is bounded by
+    :data:`RECEIPT_SETTLES_AFTER` where the old behaviour was unbounded — the
+    same registry read applied to all of history — and it closes for good the
+    moment the row is stamped. The send-time version becomes strictly better
+    the day `_handle_status` learns to overwrite a belief (a value it can only
+    distinguish with something on the row that says which kind it is); that is
+    a change in `whatsapp/worker.py` and a column, and it belongs to their
+    owners.
+
+    NOT STAMPED, deliberately:
+
+    * anything but ``kind="template"`` — free-form service messages inside the
+      open 24h window are not billed and `close.whatsapp_spend` never counts
+      them; a band on them would be a number about nothing.
+    * a ``template_name`` outside :data:`templates.REGISTRY`. `_wa_kind_of`
+      sorts those into ``wa_unknown``, which is priced at the marketing rate
+      and is NOT a third price band — it is the bucket for «nobody ever
+      measured this». Writing MARKETING onto them would move them into
+      ``wa_marketing`` at exactly the same price while destroying the one
+      signal that says a template nobody recognises is being sent.
+    * a row that already carries a category, whoever wrote it.
+
+    Runs as the owner across every tenant (the nightly's session), like the
+    lifecycle sweep's own listing: this is one estate-wide accounting statement
+    per template, not per-customer work, and it writes nothing a tenant can
+    see differently.
+    """
+    cutoff = now - settles_after
+    frozen = 0
+    # One UPDATE per template name — the band is per NAME, so this is the whole
+    # of the work in nine statements that load no rows, and the sorted() keeps
+    # the emitted SQL stable the way `salla.renewal` sorts before `.in_()`.
+    for name in sorted(REGISTRY):
+        result = session.execute(
+            update(DeliveryMessage)
+            .where(
+                DeliveryMessage.kind == "template",
+                DeliveryMessage.template_name == name,
+                DeliveryMessage.category.is_(None),
+                DeliveryMessage.created_at < cutoff,
+            )
+            .values(category=str(billed_category(name)))
+            .execution_options(synchronize_session=False),
+        )
+        frozen += int(result.rowcount or 0)  # type: ignore[attr-defined]
+    if frozen:
+        logger.info(
+            "froze the billed category of %d template sends Meta never "
+            "priced for us — the bill for those days stops moving",
+            frozen,
+        )
+    return frozen
+
+
 @dataclass(frozen=True)
 class ResendResult:
     """What the resend did — never just «a Delivery or None».
@@ -195,6 +310,15 @@ def record_out(
     The failure this module actually suffered was not «a row failed», it was
     «a row failed AVOIDABLY, from a value nobody checked». That is what the
     check above removes; wrapping every row would have hidden the rest.
+
+    ``category`` IS NOT WRITTEN HERE, and that is a decision rather than an
+    omission — :func:`freeze_unmeasured_categories` is the other half and the
+    argument for where it lives is written out there. In one sentence: this
+    function knows only what we BELIEVE the send will be billed at, Meta's
+    receipt carries what it WAS billed at, and the handler that records the
+    receipt (`worker._handle_status`) fills the column only while it is still
+    NULL — so a belief stamped on the row at this moment would be the value
+    that arrives first and would shut the measurement out for good.
     """
     dm = DeliveryMessage(
         id=uuid.uuid4(), tenant_id=tenant_id, channel_id=channel_id,

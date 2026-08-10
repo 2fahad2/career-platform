@@ -2483,28 +2483,133 @@ def _docstring_nodes(tree: ast.Module) -> set[int]:
     }
 
 
-def _reads_ticket_status(node: ast.AST) -> bool:
-    """Does this expression reach `SupportEvent.status`?"""
+def _class_names(tree: ast.Module) -> frozenset[str]:
+    """Every name in this module that IS `SupportEvent`.
+
+    ``from career.db.models import SupportEvent as SE`` binds the class to a
+    name no scan looking for the eight letters can see, and an alias is not an
+    obfuscation — it is what an author writes when a local name already means
+    something else. The bare name stays in the set whether or not the import
+    is visible: a module that gets the class from anywhere else is still
+    writing this table.
+    """
+    names = {"SupportEvent"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom | ast.Import):
+            for alias in node.names:
+                if alias.name.rsplit(".", 1)[-1] == "SupportEvent":
+                    names.add(alias.asname or "SupportEvent")
+    return frozenset(names)
+
+
+#: Collection literals a name can be bound to and still be READ as its words.
+_LITERAL_COLLECTIONS = (ast.Tuple, ast.List, ast.Set)
+#: Calls that wrap a literal collection without changing what is in it. The
+#: shape `career.support` itself uses (`frozenset({...})`) and the shape every
+#: correct caller uses at the query (`sorted(...)`).
+_TRANSPARENT_CALLS = frozenset({"frozenset", "set", "tuple", "list", "sorted"})
+
+
+def _literal_bindings(tree: ast.Module) -> dict[str, list[str]]:
+    """``name -> the string literals it is bound to``, anywhere in the module.
+
+    THE SHAPE THAT WALKED PAST THE GUARD, and it is the shape this very
+    codebase teaches: constants first, sets derived from them, then the query.
+
+        _MUTING = ('open', 'escalated')
+        ...
+        SupportEvent.status.in_(_MUTING)
+
+    Scanning the argument for string constants sees a `Name` and stops, so the
+    fifth dedupe with its own private copy of the muting set — the exact thing
+    `career.support` exists to make impossible — was invisible. Resolving the
+    name first is what closes it.
+
+    SCOPE-BLIND, deliberately and with the cost stated: module-level and
+    function-local assignments go into one map, so a local ``done = 'resolved'``
+    in one function is resolved for ``x.status = done`` in another. That can
+    OVER-report, and over-reporting here costs an author one import; the other
+    error costs a customer his line. Re-binding (a name assigned twice) keeps
+    both values for the same reason.
+    """
+    bound: dict[str, list[str]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign | ast.AnnAssign):
+            continue
+        value = node.value
+        while (isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
+               and value.func.id in _TRANSPARENT_CALLS and value.args):
+            value = value.args[0]
+        literals: list[str] = []
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            literals = [value.value]
+        elif isinstance(value, _LITERAL_COLLECTIONS):
+            literals = [
+                element.value for element in value.elts
+                if isinstance(element, ast.Constant)
+                and isinstance(element.value, str)
+            ]
+        if not literals:
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        for target in targets:
+            if isinstance(target, ast.Name):
+                bound.setdefault(target.id, []).extend(literals)
+    return bound
+
+
+def _reads_ticket_status(node: ast.AST, classes: frozenset[str]) -> bool:
+    """Does this expression reach `SupportEvent.status`, under any of its names?"""
     return any(
         isinstance(child, ast.Attribute) and child.attr == "status"
-        and isinstance(child.value, ast.Name) and child.value.id == "SupportEvent"
+        and isinstance(child.value, ast.Name) and child.value.id in classes
         for child in ast.walk(node)
     )
 
 
-def _names_support_event(node: ast.AST) -> bool:
+def _names_support_event(node: ast.AST, classes: frozenset[str]) -> bool:
     return any(
-        isinstance(child, ast.Name) and child.id == "SupportEvent"
+        isinstance(child, ast.Name) and child.id in classes
         for child in ast.walk(node)
     )
 
 
-def _string_constants(node: ast.AST, prose: set[int]) -> list[str]:
-    return [
-        child.value for child in ast.walk(node)
-        if isinstance(child, ast.Constant) and isinstance(child.value, str)
-        and id(child) not in prose
-    ]
+def _string_constants(
+    node: ast.AST, prose: set[int], bound: dict[str, list[str]]
+) -> list[str]:
+    """The words this expression puts in front of the column — literal or named.
+
+    A `Name` is resolved through :func:`_literal_bindings`, which is what makes
+    the indirection above visible; anything the module does not bind to a
+    literal resolves to nothing, so `sorted(MUTING_STATUSES)` — the correct
+    call, importing the set — stays silent.
+    """
+    found: list[str] = []
+    for child in ast.walk(node):
+        if (isinstance(child, ast.Constant) and isinstance(child.value, str)
+                and id(child) not in prose):
+            found.append(child.value)
+        elif isinstance(child, ast.Name) and child.id in bound:
+            found.extend(bound[child.id])
+    return found
+
+
+def _sql_text(node: ast.JoinedStr, bound: dict[str, list[str]]) -> str:
+    """An f-string flattened back into the SQL it will actually be.
+
+    ``f"UPDATE {TABLE} SET status = 'resolved'"`` is three constants none of
+    which names both the table and the column, so the raw-SQL shape saw
+    nothing. Interpolated names are substituted from the same bindings; an
+    expression this scan cannot resolve becomes an empty slot, which loses the
+    case rather than inventing one.
+    """
+    parts: list[str] = []
+    for value in node.values:
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            parts.append(value.value)
+        elif isinstance(value, ast.FormattedValue):
+            parts.extend(_string_constants(value.value, set(), bound))
+    return "".join(parts)
 
 
 def _status_literal_sites(
@@ -2519,6 +2624,42 @@ def _status_literal_sites(
     «open» in a module that happens to import `SupportEvent`: `telegram.console`
     reads a WhatsApp WINDOW state spelled with the same three letters, and a
     guard that demands unrelated edits is a guard somebody deletes.
+
+    THE INDIRECTION PASS, added 2026-08-10 after an adversarial review walked
+    five shapes straight through it. The five shapes above all read the words
+    SYNTACTICALLY beside the column, and a name is not a literal: a module
+    constant (``SNOOZED = 'snoozed'``), a private copy of a set
+    (``_MUTING = ('open', 'escalated')``), a local (``done = 'resolved'``), an
+    f-string built from a table name, and the class under an alias were each
+    invisible. :func:`_literal_bindings` and :func:`_class_names` resolve those
+    before the shapes run — the first of them being precisely the shape this
+    codebase itself models, constants then derived sets then the query.
+
+    ── WHAT IT STILL CANNOT SEE ──────────────────────────────────────────────
+    An AST guard is not a proof, and this one closes no door completely. It
+    reads ONE file at a time with no imports followed, no types, and no values,
+    so all of these pass it today:
+
+    * a word imported from a module that is not `career.support` — a second
+      vocabulary file, or a constant borrowed out of a sibling package;
+    * a status computed rather than written: ``"resol" + "ved"``,
+      ``"%s" % word``, ``.format()``, ``"".join(...)``, a dict or a config
+      lookup, a value read from the environment or from another table;
+    * ``setattr(ticket, "status", word)``, or a bulk
+      ``.values(**{"status": word})`` — the column named indirectly too;
+    * raw SQL assembled at runtime rather than in one f-string, or spelling
+      the table through a view or a quoted identifier;
+    * a status arriving from OUTSIDE the tree entirely — a migration, a
+      psql session, an ops script under a root this scan does not walk.
+
+    The scan is also scope-blind (see :func:`_literal_bindings`) and so can
+    over-report, which is the direction chosen on purpose. What actually holds
+    the vocabulary together is three things together: this ratchet for the
+    shapes an author reaches for by habit,
+    `test_the_vocabulary_the_guard_polices_is_the_one_the_code_imports` for the
+    invariants no syntax check can state, and the fact that every reader now
+    asks the QUEUE question negatively — so a word that does slip past all of
+    this lands on the operator's screen instead of hiding a waiting customer.
     """
     found: set[tuple[str, int, str, str]] = set()
 
@@ -2529,6 +2670,8 @@ def _status_literal_sites(
         source = path.read_text(encoding="utf-8")
         tree = ast.parse(source, filename=str(path))
         prose = _docstring_nodes(tree)
+        classes = _class_names(tree)
+        bound = _literal_bindings(tree)
         # the assignment shape is only meaningful where the class is in scope
         imports_it = any(
             isinstance(node, ast.ImportFrom)
@@ -2539,21 +2682,21 @@ def _status_literal_sites(
         for node in ast.walk(tree):
             # 1. `SupportEvent(status="open")`, and the Core form
             #    `update(SupportEvent).values(status="resolved")`
-            if isinstance(node, ast.Call) and _names_support_event(node):
+            if isinstance(node, ast.Call) and _names_support_event(node, classes):
                 for kw in node.keywords:
                     if kw.arg == "status":
-                        for literal in _string_constants(kw.value, prose):
+                        for literal in _string_constants(kw.value, prose, bound):
                             found.add((rel, node.lineno, "status=", literal))
             # 2. `SupportEvent.status == "open"` (either way round)
-            if isinstance(node, ast.Compare) and _reads_ticket_status(node):
-                for literal in _string_constants(node, prose):
+            if isinstance(node, ast.Compare) and _reads_ticket_status(node, classes):
+                for literal in _string_constants(node, prose, bound):
                     found.add((rel, node.lineno, "comparison", literal))
             # 3. `SupportEvent.status.in_(("open", "released"))`, `.notin_`, …
             if (isinstance(node, ast.Call)
                     and isinstance(node.func, ast.Attribute)
-                    and _reads_ticket_status(node.func.value)):
+                    and _reads_ticket_status(node.func.value, classes)):
                 for argument in [*node.args, *(kw.value for kw in node.keywords)]:
-                    for literal in _string_constants(argument, prose):
+                    for literal in _string_constants(argument, prose, bound):
                         found.add((rel, node.lineno, f".{node.func.attr}()", literal))
             # 4. `ticket.status = "resolved"` — the write the console makes,
             #    through a local name no AST can resolve back to the class. Only
@@ -2566,15 +2709,23 @@ def _status_literal_sites(
                 )
                 for target in targets:
                     if isinstance(target, ast.Attribute) and target.attr == "status":
-                        for literal in _string_constants(node.value or tree, prose):
+                        for literal in _string_constants(
+                            node.value or tree, prose, bound
+                        ):
                             if literal in _TICKET_STATUSES:
                                 found.add((rel, node.lineno, "assignment", literal))
-            # 5. raw SQL that never mentions the class at all
+            # 5. raw SQL that never mentions the class at all — as one string,
+            #    or as an f-string whose halves each name only part of it
             if (isinstance(node, ast.Constant) and isinstance(node.value, str)
                     and id(node) not in prose):
                 text = node.value.lower()
                 if "support_events" in text and "status" in text:
                     found.add((rel, node.lineno, "raw SQL", node.value.strip()[:60]))
+            if isinstance(node, ast.JoinedStr):
+                sql = _sql_text(node, bound)
+                text = sql.lower()
+                if "support_events" in text and "status" in text:
+                    found.add((rel, node.lineno, "raw SQL", sql.strip()[:60]))
 
     return found
 
@@ -2662,6 +2813,69 @@ def test_the_vocabulary_the_guard_polices_is_the_one_the_code_imports() -> None:
     assert not support.QUEUED_STATUSES & support.CLOSED_STATUSES
     assert support.OPEN in support.MUTING_STATUSES
     assert support.RESOLVED in support.CLOSED_STATUSES
+    # The one that actually decides whether an unknown word can silence a
+    # customer: the muting set is enumerated and the queue is asked negatively,
+    # so a muting status must never be a CLOSED one — a mute the screen filters
+    # out is the D4 failure with a different word in it.
+    assert not support.MUTING_STATUSES & support.CLOSED_STATUSES
+
+
+#: The two sets that are DERIVED from `ALL_STATUSES` and therefore cannot
+#: answer a question about a word nobody added to it.
+_DERIVED_SETS = ("QUEUED_STATUSES", "ALL_STATUSES")
+
+
+def test_no_reader_asks_the_queue_question_with_a_derived_set() -> None:
+    """D4, ratcheted: `status.in_(sorted(QUEUED_STATUSES))` may not come back.
+
+    It read correctly to every human who saw it and did the opposite thing to
+    the one author `career/support.py` was written for. A fourth status invented
+    without an edit to that file is in neither `ALL_STATUSES` nor anything
+    derived from it, so the tickets screen filtered his ticket out, the sweep
+    (which selects the muting set) never touched it, and its own close button
+    answered «مغلقة أصلًا» — one page at write time and then invisible to every
+    reader, over a customer waiting.
+
+    The check is deliberately blunt: production code may not NAME the derived
+    sets at all. A subtler rule («not inside a where clause») is a rule about
+    syntax, and the reason this one is safe to state bluntly is that there is
+    no honest production use left — «is it done» is `CLOSED_STATUSES`, «is it
+    still owed» is the negation of it, «does it mute» is `MUTING_STATUSES`.
+    The derived sets stay in `career.support` for display and for the invariant
+    above, which is what this file asserts them against.
+    """
+    offenders: list[str] = []
+    for root in _SCAN_ROOTS:
+        for path in sorted((_REPO / root).rglob("*.py")):
+            if "__pycache__" in path.parts:
+                continue
+            rel = path.relative_to(_REPO).as_posix()
+            if rel == _TICKET_VOCABULARY:
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom):
+                    offenders += [
+                        f"{rel}:{node.lineno} imports {alias.name}"
+                        for alias in node.names if alias.name in _DERIVED_SETS
+                    ]
+                if isinstance(node, ast.Attribute) and node.attr in _DERIVED_SETS:
+                    offenders.append(f"{rel}:{node.lineno} reads .{node.attr}")
+    assert not offenders, (
+        "a reader is asking the queue question with a set derived from "
+        f"ALL_STATUSES: {offenders}\n"
+        "\n"
+        "WHAT TO DO: ask it negatively —\n"
+        "    ~SupportEvent.status.in_(sorted(CLOSED_STATUSES))   # still owed\n"
+        "    ticket.status in CLOSED_STATUSES                    # already done\n"
+        "    SupportEvent.status.in_(sorted(MUTING_STATUSES))    # silences him\n"
+        "\n"
+        "WHY: a fourth status invented by an author who never opened "
+        "career/support.py is in neither ALL_STATUSES nor anything derived "
+        "from it. Asked positively, his ticket disappears from every screen "
+        "while a paying customer waits behind it; asked negatively it is one "
+        "row of noise the operator can see and close."
+    )
 
 
 #: One synthetic module per way a status literal can come back, written the way
@@ -2726,6 +2940,52 @@ _STATUS_LITERAL_SHAPES: tuple[tuple[str, str], ...] = (
         "def park(session, tenant_id, channel_id):\n"
         "    session.add(SupportEvent(tenant_id=tenant_id,\n"
         "                             channel_id=channel_id, status='snoozed'))\n",
+    ),
+    # ── the five an adversarial review walked through, 2026-08-10 ────────────
+    # None of them is obscure and none is malicious. Every one writes the words
+    # through a NAME instead of beside the column, which is what an author does
+    # when he is being tidy — and the first is the tidiest of all: it is the
+    # shape `career/support.py` itself models, constants then a derived set
+    # then the query. That is the sixth private copy of the muting set this
+    # guard exists to refuse, and it was invisible.
+    (
+        "a fifth dedupe with its own copy of the muting set",
+        "from sqlalchemy import select\n"
+        "from career.db.models import SupportEvent\n"
+        "_MUTING = ('open', 'escalated')\n"
+        "def muted(session, tenant_id):\n"
+        "    return session.execute(select(SupportEvent.id).where(\n"
+        "        SupportEvent.tenant_id == tenant_id,\n"
+        "        SupportEvent.status.in_(_MUTING))).first()\n",
+    ),
+    (
+        "a fourth status written through a module constant",
+        "from career.db.models import SupportEvent\n"
+        "SNOOZED = 'snoozed'\n"
+        "def park(session, tenant_id, channel_id):\n"
+        "    session.add(SupportEvent(tenant_id=tenant_id,\n"
+        "                             channel_id=channel_id, status=SNOOZED))\n",
+    ),
+    (
+        "the close written through a local name",
+        "from career.db.models import SupportEvent\n"
+        "def close(ticket):\n"
+        "    done = 'resolved'\n"
+        "    ticket.status = done\n",
+    ),
+    (
+        "raw SQL assembled from an f-string",
+        "from sqlalchemy import text\n"
+        "TABLE = 'support_events'\n"
+        "def close_all(session):\n"
+        "    session.execute(text(f\"UPDATE {TABLE} SET status = 'resolved'\"))\n",
+    ),
+    (
+        "the class imported under another name",
+        "from career.db.models import SupportEvent as SE\n"
+        "def escalate(session, tenant_id, channel_id):\n"
+        "    session.add(SE(tenant_id=tenant_id, channel_id=channel_id,\n"
+        "                   status='open'))\n",
     ),
 )
 
