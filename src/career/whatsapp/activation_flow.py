@@ -26,6 +26,7 @@ from career.db.models import (
     Tenant,
 )
 from career.salla import subscriptions as sub_states
+from career.support import MUTING_STATUSES, OPEN
 from career.telegram import messages as admin_msg
 from career.telegram.admin import TelegramAdminClient
 from career.tokens import hash_token
@@ -216,14 +217,14 @@ def _raise_opted_out_ticket(
         select(SupportEvent.id).where(
             SupportEvent.channel_id == channel.id,
             SupportEvent.kind == OPTED_OUT_TICKET_KIND,
-            SupportEvent.status == "open",
+            SupportEvent.status.in_(sorted(MUTING_STATUSES)),
         ).limit(1)
     ).first()
     if already_open is not None:
         return False
     owner_session.add(SupportEvent(
         id=uuid.uuid4(), tenant_id=channel.tenant_id, channel_id=channel.id,
-        kind=OPTED_OUT_TICKET_KIND, status="open", created_at=now,
+        kind=OPTED_OUT_TICKET_KIND, status=OPEN, created_at=now,
     ))
     owner_session.flush()
     # The ticket is the record; the page is the courtesy. Same ordering, and

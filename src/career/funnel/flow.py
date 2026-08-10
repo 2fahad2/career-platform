@@ -47,6 +47,7 @@ from career.onboarding.orchestrator import (
 )
 from career.onboarding.upload import process_cv_upload
 from career.storage import tenant_key
+from career.support import MUTING_STATUSES, OPEN
 
 logger = logging.getLogger("career.funnel")
 
@@ -229,13 +230,13 @@ def _escalate_consent(
         select(SupportEvent.id).where(
             SupportEvent.tenant_id == row.tenant_id,
             SupportEvent.kind == CONSENT_STUCK_KIND,
-            SupportEvent.status == "open",
+            SupportEvent.status.in_(sorted(MUTING_STATUSES)),
         ).limit(1)
     ).scalar_one_or_none()
     if already_open is None:
         session.add(SupportEvent(
             id=uuid.uuid4(), tenant_id=row.tenant_id, channel_id=channel.id,
-            kind=CONSENT_STUCK_KIND, status="open",
+            kind=CONSENT_STUCK_KIND, status=OPEN,
         ))
         tenant = session.get(Tenant, row.tenant_id)
         code = tenant.code if tenant is not None else "unknown tenant"

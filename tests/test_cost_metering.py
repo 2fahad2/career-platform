@@ -569,14 +569,20 @@ def _seed_channel(owner_session: Session, tid: uuid.UUID) -> uuid.UUID:
 def _seed_message(
     owner_session: Session, tid: uuid.UUID, cid: uuid.UUID, *,
     kind: str, template_name: str | None, status: str = "delivered",
+    category: str | None = None,
 ) -> None:
+    """One ledger row. ``category`` is the band Meta's receipt reported for
+    that send (0030); NULL — the default, and the state of every row written
+    before 0030 — means no receipt ever said, and the price falls back to
+    today's reading of the template registry."""
     owner_session.execute(
         sql_text("INSERT INTO delivery_messages (id, tenant_id, channel_id,"
-                 " wa_message_id, kind, template_name, status, created_at)"
-                 " VALUES (:i, :t, :c, :w, :k, :n, :s, :d)"),
+                 " wa_message_id, kind, template_name, status, category,"
+                 " created_at)"
+                 " VALUES (:i, :t, :c, :w, :k, :n, :s, :g, :d)"),
         {"i": str(uuid.uuid4()), "t": str(tid), "c": str(cid),
          "w": f"wamid.{uuid.uuid4().hex}", "k": kind, "n": template_name,
-         "s": status, "d": NOW},
+         "s": status, "g": category, "d": NOW},
     )
 
 
@@ -639,6 +645,103 @@ def test_the_bill_follows_metas_category_not_the_templates_name(
         spend = close.whatsapp_spend(owner_session, tenant_id=tid, day=DAY)
         assert "wa_utility" not in spend, spend
         assert spend["wa_marketing"] == (5, Decimal("0.1920"))
+    finally:
+        _cleanup(owner_session, tid)
+
+
+def test_the_band_on_the_row_outranks_todays_reading_of_the_registry(
+    owner_session: Session,
+) -> None:
+    """The bill follows what Meta CHARGED for that send, not what Meta would
+    charge for that template today.
+
+    Both directions in one test, because a fix that only ever moved rows into
+    the expensive bucket would pass a one-sided version of this by accident:
+    `subscription_daily_report` is UTILITY at Meta today and
+    `daily_service_update` is MARKETING, and a receipt saying otherwise about
+    a particular send wins in both directions.
+    """
+    tid = _seed_tenant(owner_session)
+    try:
+        cid = _seed_channel(owner_session, tid)
+        _seed_message(owner_session, tid, cid, kind="template",
+                      template_name="subscription_daily_report",
+                      category="marketing")
+        _seed_message(owner_session, tid, cid, kind="template",
+                      template_name="daily_service_update",
+                      category="utility")
+        owner_session.commit()
+
+        spend = close.whatsapp_spend(owner_session, tenant_id=tid, day=DAY)
+        assert spend["wa_marketing"] == (1, Decimal("0.0384"))
+        assert spend["wa_utility"] == (1, Decimal("0.0157"))
+    finally:
+        _cleanup(owner_session, tid)
+
+
+def test_a_day_already_billed_stops_moving_when_meta_changes_its_mind(
+    owner_session: Session,
+) -> None:
+    """The defect this column exists for, reproduced end to end.
+
+    `rollup_costs` is idempotent in its WRITE (SET, not increment) and was
+    never stable in its VALUE: the category came from a registry Meta
+    re-writes — five templates on 2026-07-17, five again on 2026-08-02 — so
+    re-running an old day priced it at a band that day was not billed at, and
+    nothing on the row said which reading it was. A ledger whose past changes
+    when a third party changes its mind is not a ledger.
+
+    Two identical sends, one with Meta's receipt on it and one without. Meta
+    then re-categorises the template. Only the row that never got a receipt
+    moves.
+    """
+    from career.whatsapp import templates as tmpl
+
+    tid = _seed_tenant(owner_session)
+    try:
+        cid = _seed_channel(owner_session, tid)
+        _seed_message(owner_session, tid, cid, kind="template",
+                      template_name="subscription_daily_report",
+                      category="utility")
+        _seed_message(owner_session, tid, cid, kind="template",
+                      template_name="subscription_daily_report")
+        owner_session.commit()
+
+        before = close.whatsapp_spend(owner_session, tenant_id=tid, day=DAY)
+        assert before["wa_utility"] == (2, Decimal("0.0314"))
+
+        # …and now Meta moves it, exactly as it moved the other five.
+        tmpl.record_observed_category(
+            "subscription_daily_report", "marketing",
+            observed_on=date(2026, 8, 9), source="test",
+        )
+        after = close.whatsapp_spend(owner_session, tenant_id=tid, day=DAY)
+
+        assert after["wa_utility"] == (1, Decimal("0.0157")), \
+            "a send Meta had already priced was re-priced by a later decision"
+        assert after["wa_marketing"] == (1, Decimal("0.0384"))
+    finally:
+        tmpl.forget_live_observations()
+        _cleanup(owner_session, tid)
+
+
+def test_a_band_we_have_no_price_for_is_still_priced_the_expensive_way(
+    owner_session: Session,
+) -> None:
+    """Meta's vocabulary is wider than our two words — `authentication` and
+    `referral_conversion` are both real. A band we cannot price must never
+    make the bill look smaller than it is, which is the rule an unrecognised
+    template name has always followed."""
+    tid = _seed_tenant(owner_session)
+    try:
+        cid = _seed_channel(owner_session, tid)
+        _seed_message(owner_session, tid, cid, kind="template",
+                      template_name="subscription_daily_report",
+                      category="authentication")
+        owner_session.commit()
+
+        spend = close.whatsapp_spend(owner_session, tenant_id=tid, day=DAY)
+        assert spend["wa_unknown"] == (1, Decimal("0.0384"))
     finally:
         _cleanup(owner_session, tid)
 

@@ -56,6 +56,7 @@ from career.db.models import (
 )
 from career.salla import subscriptions as sub_states
 from career.salla.renewal import current_subscription
+from career.support import MUTING_STATUSES, OPEN
 
 logger = logging.getLogger("career.promises")
 
@@ -483,7 +484,7 @@ def escalate_overdue(
             continue
         session.add(SupportEvent(
             id=uuid.uuid4(), tenant_id=row.tenant_id, channel_id=channel.id,
-            kind=OVERDUE_TICKET_KIND, status="open",
+            kind=OVERDUE_TICKET_KIND, status=OPEN,
         ))
         row.escalated_at = now
         counts["escalated"] += 1
@@ -913,7 +914,7 @@ def escalate_direct_message(
         select(SupportEvent.id).where(
             SupportEvent.tenant_id == tenant_id,
             SupportEvent.kind == DIRECT_MESSAGE_TICKET_KIND,
-            SupportEvent.status == "open",
+            SupportEvent.status.in_(sorted(MUTING_STATUSES)),
         ).limit(1)
     ).scalars().first()
     if already_open is not None:
@@ -921,7 +922,7 @@ def escalate_direct_message(
     session.add(SupportEvent(
         id=uuid.uuid4(), tenant_id=tenant_id, channel_id=channel_id,
         inbound_message_id=inbound_message_id,
-        kind=DIRECT_MESSAGE_TICKET_KIND, status="open", created_at=now,
+        kind=DIRECT_MESSAGE_TICKET_KIND, status=OPEN, created_at=now,
     ))
     session.flush()
     code = _tenant_code(session, tenant_id)

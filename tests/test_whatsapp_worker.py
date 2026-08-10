@@ -761,9 +761,14 @@ def _seed_outbound(owner_session: Session, phone: str, wamid: str, *,
 
 
 def _receipt(owner_session: Session, wamid: str, status: str, *,
-             now: datetime = NOW) -> None:
+             now: datetime = NOW, extra: dict[str, Any] | None = None) -> None:
+    """One status callback. ``extra`` carries the parts of Meta's status object
+    that are not the status word — `pricing`, `errors`, `conversation` — so a
+    test can send the shape Meta actually sends rather than the subset the
+    handler used to read."""
     _insert_event(owner_session, _payload(statuses=[
-        {"id": wamid, "status": status, "recipient_id": "966500000000"},
+        {"id": wamid, "status": status, "recipient_id": "966500000000",
+         **(extra or {})},
     ]))
     _run(owner_session, FakeWhatsAppClient(), FakeTelegramAdminClient(), now=now)
 
@@ -2498,6 +2503,348 @@ def test_the_error_array_is_read_whatever_shape_meta_sends() -> None:
     assert status_error_codes({"errors": [{"code": "131049"}]}) == [131049]
     assert status_error_codes(
         {"errors": [{"code": 131049}, {"code": 131050}]}) == [131049, 131050]
+
+
+# ── the two facts on the receipt that now reach the row (0030) ──────────────
+#
+# The log line above reaches the operator TONIGHT and is gone tomorrow, and
+# `webhook_events.payload` — the other place the `errors` array lives — is
+# REDACTED after 30 days (0024). So «how many of our expiries were Meta
+# refusing rather than the customer going quiet» has a fuse on it, and that
+# count is what the 72-hour start guarantee is priced from. Two of the six
+# historical expiries were refusals.
+#
+# The second fact rides the same callback: `pricing.category` is the band Meta
+# BILLED this message at. `cv/close.whatsapp_spend` used to answer that
+# question by looking up today's measurement of the template — and Meta
+# re-categorised five of the eight live templates on 2026-07-17 and again on
+# 2026-08-02, so the same historical day priced differently depending on when
+# it was asked.
+
+
+def _receipt_facts(owner_session: Session, wamid: str) -> Any:
+    return owner_session.execute(text(
+        "SELECT status, meta_error_code, category FROM delivery_messages"
+        " WHERE wa_message_id = :w"), {"w": wamid}).one()
+
+
+def test_the_refusal_code_outlives_the_line_that_announced_it(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """The durable half. The ERROR line is the operator's tonight; the column
+    is the analyst's after the payload has been redacted."""
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    phone = _activate_phone(owner_session, wa, admin)
+    wamid = f"wamid-{uuid.uuid4()}"
+    _seed_outbound(owner_session, phone, wamid, template="daily_opportunities")
+
+    _refusal(owner_session, wamid, 131049)
+
+    row = _receipt_facts(owner_session, wamid)
+    assert row.meta_error_code == 131049, \
+        "the reason is still only in a log line and a payload with a fuse on it"
+    # and the status word — which `close.whatsapp_spend` bills from — is
+    # untouched by any of this
+    assert row.status == "failed"
+
+
+def test_the_code_belongs_to_the_receipt_that_won(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """A `read` outranking an earlier `failed` is positive proof that THIS
+    wa_message_id arrived, so the 131049 that failure carried belonged to a
+    different send attempt. Leaving it on the row would say «Meta refused
+    this» about a message the customer demonstrably opened — and that is the
+    exact misreading this column exists to end."""
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    phone = _activate_phone(owner_session, wa, admin)
+    wamid = f"wamid-{uuid.uuid4()}"
+    _seed_outbound(owner_session, phone, wamid)
+
+    _refusal(owner_session, wamid, 131049)
+    assert _receipt_facts(owner_session, wamid).meta_error_code == 131049
+
+    _receipt(owner_session, wamid, "read", now=LATER)
+
+    row = _receipt_facts(owner_session, wamid)
+    assert row.status == "read"
+    assert row.meta_error_code is None, \
+        "a refusal stayed on a row that was proven to have arrived"
+
+
+def test_a_receipt_that_lost_the_ladder_never_writes_its_reason(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """The other order, which Meta's retries make just as common. A `failed`
+    arriving after a `read` is a claim about a send attempt that is not this
+    one; it may not repaint the status and it may not repaint the reason."""
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    phone = _activate_phone(owner_session, wa, admin)
+    wamid = f"wamid-{uuid.uuid4()}"
+    _seed_outbound(owner_session, phone, wamid)
+
+    _receipt(owner_session, wamid, "read", now=NOW)
+    _refusal(owner_session, wamid, 131049, now=LATER)
+
+    row = _receipt_facts(owner_session, wamid)
+    assert row.status == "read"
+    assert row.meta_error_code is None
+
+
+def test_the_billed_band_is_metas_answer_not_our_registry_lookup(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """`subscription_daily_report` is the one template Meta calls UTILITY
+    today, so a registry lookup prices it utility for all of history. If Meta's
+    receipt says this particular send was billed MARKETING, that is what it
+    cost — and the row now says so, permanently, whatever the registry says
+    next month."""
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    phone = _activate_phone(owner_session, wa, admin)
+    wamid = f"wamid-{uuid.uuid4()}"
+    _seed_outbound(owner_session, phone, wamid,
+                   template="subscription_daily_report")
+
+    _receipt(owner_session, wamid, "delivered", extra={
+        "pricing": {"billable": True, "pricing_model": "PMP",
+                    "category": "MARKETING"},
+    })
+
+    row = _receipt_facts(owner_session, wamid)
+    assert row.category == "marketing", "Meta's own price band was discarded"
+
+
+def test_the_price_band_is_not_on_the_receipt_ladder(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """The decision that is easy to get backwards. Meta hangs `pricing` on the
+    `sent`/`delivered` receipt — exactly the receipts that LOSE the rank
+    comparison when they arrive after a `read`, which its retry behaviour
+    makes routine. The band is a fact about the MESSAGE, not a position on the
+    status ladder, so it is recorded even by a receipt that changes nothing
+    else."""
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    phone = _activate_phone(owner_session, wa, admin)
+    wamid = f"wamid-{uuid.uuid4()}"
+    _seed_outbound(owner_session, phone, wamid, template="welcome_activation")
+
+    _receipt(owner_session, wamid, "read", now=NOW)
+    _receipt(owner_session, wamid, "delivered", now=LATER,
+             extra={"pricing": {"category": "utility"}})
+
+    row = _receipt_facts(owner_session, wamid)
+    assert row.status == "read", "a losing receipt walked the delivery back"
+    assert row.category == "utility", \
+        "the billed band was thrown away because its receipt lost the ladder"
+
+
+def test_a_second_receipt_never_repaints_the_band_and_says_so(
+    owner_session: Session, clean_billing: None, caplog: Any
+) -> None:
+    """Fill-once. Two receipts disagreeing about what one message cost is
+    either Meta re-pricing a send or us reading the wrong row; last-writer-wins
+    would make it invisible, and the bill would quietly follow whichever
+    callback happened to arrive last."""
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    phone = _activate_phone(owner_session, wa, admin)
+    wamid = f"wamid-{uuid.uuid4()}"
+    _seed_outbound(owner_session, phone, wamid, template="welcome_activation")
+
+    _receipt(owner_session, wamid, "sent", extra={"pricing": {"category": "utility"}})
+    with caplog.at_level("ERROR"):
+        _receipt(owner_session, wamid, "delivered", now=LATER,
+                 extra={"pricing": {"category": "marketing"}})
+
+    assert _receipt_facts(owner_session, wamid).category == "utility"
+    assert [r for r in caplog.records if "already recorded" in r.getMessage()], \
+        "one message billed two ways, and nobody was told"
+
+
+def test_a_band_too_wide_for_the_column_costs_only_itself(
+    owner_session: Session, clean_billing: None, caplog: Any
+) -> None:
+    """`delivery_messages.category` is varchar(32) and Meta's vocabulary is
+    wider than our two words. A value that would not fit is refused, not
+    truncated — a truncated band is a DIFFERENT band — and refusing it must
+    not cost the rest of the callback, because a DataError here would take the
+    refusal code and the status down with it."""
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    phone = _activate_phone(owner_session, wa, admin)
+    wamid = f"wamid-{uuid.uuid4()}"
+    _seed_outbound(owner_session, phone, wamid, template="welcome_activation")
+
+    with caplog.at_level("ERROR"):
+        _receipt(owner_session, wamid, "failed", extra={
+            "pricing": {"category": "a" * 64},
+            "errors": [{"code": 131047, "title": "…"}],
+        })
+
+    row = _receipt_facts(owner_session, wamid)
+    assert row.category is None
+    assert row.status == "failed"
+    assert row.meta_error_code == 131047, \
+        "an unstorable price band swallowed the refusal code beside it"
+    assert [r for r in caplog.records if "too long for the column" in r.getMessage()]
+
+
+# ── the backfill, which is a script and not a migration ─────────────────────
+#
+# 0030 adds the column and fills nothing. A migration that also backfills
+# cannot be re-run (alembic will not visit 0030 twice) and cannot be reviewed
+# as data (the DDL and the UPDATE commit together, so «show me the rows you
+# are about to change» is not a question it can answer). The recovery is a
+# script, dry-run by default, and these are the two halves of it.
+
+
+def _backfill() -> Any:
+    """The script, imported by path — it lives in `scripts/`, which is not a
+    package. Registered in ``sys.modules`` under its spec name before it is
+    executed, because `dataclasses` resolves `from __future__` string
+    annotations through ``sys.modules[cls.__module__]`` and a module that is
+    not there yet raises while its own decorators are running."""
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    name = "career_backfill_codes"
+    if name in sys.modules:
+        return sys.modules[name]
+    path = Path(__file__).resolve().parents[1] / "scripts" / "backfill_meta_error_codes.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_backfill_reads_the_same_payload_the_handler_would_have(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """The scan half. It imports the worker's own two parsers rather than
+    carrying a second copy — `scripts/replay_lost_events.py` shipped its own
+    receipt ladder once and it disagreed with the worker's."""
+    backfill = _backfill()
+    wamid = f"wamid-{uuid.uuid4()}"
+    _insert_event(owner_session, _payload(statuses=[{
+        "id": wamid, "status": "failed", "recipient_id": "966500000000",
+        "errors": [{"code": 131050, "title": "…"}],
+        "pricing": {"category": "marketing"},
+    }]))
+
+    scan = backfill.scan_payloads(owner_session)
+
+    assert scan.codes[wamid] == 131050
+    assert scan.categories[wamid] == "marketing"
+
+
+def test_the_backfill_writes_nothing_until_it_is_told_to(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """Dry run is a property of the code path, not a rollback somebody
+    remembered to issue: on a dry run not one attribute is assigned."""
+    backfill = _backfill()
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    phone = _activate_phone(owner_session, wa, admin)
+    wamid = f"wamid-{uuid.uuid4()}"
+    _seed_outbound(owner_session, phone, wamid, status="failed")
+
+    scan = backfill.Scan(codes={wamid: 131049})
+    applied = backfill.apply_codes(owner_session, scan)
+    owner_session.commit()
+
+    assert (applied.matched, applied.filled) == (1, 1)
+    assert _receipt_facts(owner_session, wamid).meta_error_code is None
+
+
+def test_the_backfill_fills_the_gap_and_the_second_run_does_nothing(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """Re-runnable is the property a migration could not have had."""
+    backfill = _backfill()
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    phone = _activate_phone(owner_session, wa, admin)
+    wamid = f"wamid-{uuid.uuid4()}"
+    _seed_outbound(owner_session, phone, wamid, status="failed")
+
+    scan = backfill.Scan(codes={wamid: 131049})
+    first = backfill.apply_codes(owner_session, scan, apply=True)
+    owner_session.commit()
+    assert _receipt_facts(owner_session, wamid).meta_error_code == 131049
+
+    second = backfill.apply_codes(owner_session, scan, apply=True)
+    owner_session.commit()
+
+    assert (first.filled, first.already) == (1, 0)
+    assert (second.filled, second.already) == (0, 1)
+
+
+def test_the_backfill_never_overrules_the_live_handler(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """History fills gaps; it does not correct the present. The value on the
+    row was written by the handler that saw which receipt won the ladder — a
+    JSON scan over stored payloads cannot know that, so a disagreement is
+    reported and the row is left alone."""
+    backfill = _backfill()
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    phone = _activate_phone(owner_session, wa, admin)
+    wamid = f"wamid-{uuid.uuid4()}"
+    _seed_outbound(owner_session, phone, wamid)
+
+    _refusal(owner_session, wamid, 131047)
+    applied = backfill.apply_codes(
+        owner_session, backfill.Scan(codes={wamid: 131050}), apply=True)
+    owner_session.commit()
+
+    assert applied.conflicting == 1
+    assert applied.filled == 0
+    assert _receipt_facts(owner_session, wamid).meta_error_code == 131047
+
+
+def test_the_backfill_measures_the_recoverable_bands_and_writes_none(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """One script, one write. Whether the billed categories are recoverable
+    from the same payloads is a NUMBER the operator needs before deciding to
+    fill them — which is exactly the review a backfill inside a migration
+    cannot get."""
+    backfill = _backfill()
+    wa, admin = FakeWhatsAppClient(), FakeTelegramAdminClient()
+    phone = _activate_phone(owner_session, wa, admin)
+    wamid = f"wamid-{uuid.uuid4()}"
+    _seed_outbound(owner_session, phone, wamid, status="failed",
+                   template="welcome_activation")
+
+    scan = backfill.Scan(codes={wamid: 131049}, categories={wamid: "marketing"})
+    applied = backfill.apply_codes(owner_session, scan, apply=True)
+    owner_session.commit()
+
+    assert applied.category_recoverable == 1
+    assert _receipt_facts(owner_session, wamid).category is None
+
+
+def test_a_redacted_payload_is_counted_rather_than_parsed(
+    owner_session: Session, clean_billing: None
+) -> None:
+    """0024 replaces the body with a PII-free skeleton after 30 days, and the
+    `errors` array goes with it. Those rows are unrecoverable, and the count
+    is how the operator sees the fuse burning."""
+    backfill = _backfill()
+    wamid = f"wamid-{uuid.uuid4()}"
+    _insert_event(owner_session, _payload(statuses=[{
+        "id": wamid, "status": "failed",
+        "errors": [{"code": 131049, "title": "…"}],
+    }]))
+    owner_session.execute(text(
+        "UPDATE webhook_events SET payload_redacted_at = now()"
+        " WHERE payload::text LIKE :w"), {"w": f"%{wamid}%"})
+    owner_session.commit()
+
+    scan = backfill.scan_payloads(owner_session)
+
+    assert wamid not in scan.codes
+    assert scan.redacted >= 1
 
 
 # ── the events nobody was subscribed to (2026-08-08) ─────────────────────────

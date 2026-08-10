@@ -34,6 +34,7 @@ from sqlalchemy import text as sql_text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
+from career import support
 from career.db.models import CareerSession, DeliveryGuarantee
 from career.promises import career_session, guarantee
 from career.salla import subscriptions as sub_states
@@ -2422,6 +2423,370 @@ def test_the_guard_does_not_flag_a_reader(tmp_path: pathlib.Path) -> None:
         encoding="utf-8",
     )
     assert _flip_sites([module], tmp_path) == set()
+
+
+# ── the OTHER vocabulary the same customer's line depends on ────────────────
+#
+# `support_events.status` decides the same thing `opt_out_at` decides, from the
+# other end: an OPEN ticket MUTES a customer's channel, because all three
+# escalation paths refuse to raise a second one while a row for him says
+# «open». So the word is not a label on a state — it is the switch between «a
+# paying customer who asked for a human reaches one» and «he writes into
+# silence and nobody is paged».
+#
+# It was written as a bare literal in FIVE places that had to agree from
+# memory: three dedupes (`promises.career_session`, `funnel.flow`,
+# `whatsapp.activation_flow`), the console's own `TICKET_OPEN = "open"` beside
+# the queue / sweep / close, and `whatsapp.worker`'s «دعم» ticket. Nothing
+# breaks loudly when they disagree: a sixth caller that spells it differently,
+# or a fourth status added to four of the five, silences one customer with no
+# exception, no failing test and no log line.
+#
+# `career.support` is now the one home. This is what stops a sixth copy.
+
+#: The words themselves, read from the module under test and never retyped —
+#: the `_STOP` / `_RESUME` rule above, for the same reason.
+_TICKET_STATUSES: frozenset[str] = frozenset(support.ALL_STATUSES)
+
+#: The one file allowed to spell them: their home.
+_TICKET_VOCABULARY = "src/career/support.py"
+
+#: Files that still write a status literal of their own, with the reason.
+#: **This list may shrink and must never grow.** Ratcheted in both directions
+#: by `test_the_ticket_status_escape_list_still_earns_its_place`.
+_STATUS_LITERAL_ALLOWED: dict[str, str] = {
+    # EMPTY, and that is the finished state rather than an absence.
+    # `whatsapp/worker` was the one entry — `status="open"` on the «دعم»
+    # SupportEvent, the single most-used writer of this table — exempted on
+    # ownership and never on merit. Its owner took the handoff and it now
+    # writes `status=OPEN` from `career.support`, so the escape came out with
+    # it, as `test_the_ticket_status_escape_list_still_earns_its_place` says it
+    # must. Nothing may be added here: a new entry is a sixth spelling of the
+    # word that decides whether a paying customer reaches a human.
+}
+
+
+def _docstring_nodes(tree: ast.Module) -> set[int]:
+    """Every string that is PROSE rather than code.
+
+    The scan below reads raw SQL out of string constants, and this file's
+    subjects are heavily commented ones: `console.release_forgotten_tickets`
+    explains itself with the words ``FOR UPDATE OF support_events`` and
+    ``status = 'open'`` inside ONE docstring. Describing the hole is how the
+    next reader learns why the guard exists (`test_rls_runtime_role`'s own
+    rule), so prose is excluded by position — a bare string expression — and
+    never by pattern-matching what it says.
+    """
+    return {
+        id(node.value) for node in ast.walk(tree)
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
+    }
+
+
+def _reads_ticket_status(node: ast.AST) -> bool:
+    """Does this expression reach `SupportEvent.status`?"""
+    return any(
+        isinstance(child, ast.Attribute) and child.attr == "status"
+        and isinstance(child.value, ast.Name) and child.value.id == "SupportEvent"
+        for child in ast.walk(node)
+    )
+
+
+def _names_support_event(node: ast.AST) -> bool:
+    return any(
+        isinstance(child, ast.Name) and child.id == "SupportEvent"
+        for child in ast.walk(node)
+    )
+
+
+def _string_constants(node: ast.AST, prose: set[int]) -> list[str]:
+    return [
+        child.value for child in ast.walk(node)
+        if isinstance(child, ast.Constant) and isinstance(child.value, str)
+        and id(child) not in prose
+    ]
+
+
+def _status_literal_sites(
+    paths: list[pathlib.Path], root: pathlib.Path
+) -> set[tuple[str, int, str, str]]:
+    """Every place in `paths` that spells a ticket status instead of importing it.
+
+    Returns ``(file, line, shape, literal)``. Five shapes, because a status
+    reaches the column in five plausible ways and a guard that only knows the
+    one in front of it is a guard the next author walks past without meaning
+    to. What it deliberately does NOT do is flag every occurrence of the word
+    «open» in a module that happens to import `SupportEvent`: `telegram.console`
+    reads a WhatsApp WINDOW state spelled with the same three letters, and a
+    guard that demands unrelated edits is a guard somebody deletes.
+    """
+    found: set[tuple[str, int, str, str]] = set()
+
+    for path in paths:
+        rel = path.relative_to(root).as_posix()
+        if rel == _TICKET_VOCABULARY:
+            continue
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(path))
+        prose = _docstring_nodes(tree)
+        # the assignment shape is only meaningful where the class is in scope
+        imports_it = any(
+            isinstance(node, ast.ImportFrom)
+            and any(alias.name == "SupportEvent" for alias in node.names)
+            for node in ast.walk(tree)
+        )
+
+        for node in ast.walk(tree):
+            # 1. `SupportEvent(status="open")`, and the Core form
+            #    `update(SupportEvent).values(status="resolved")`
+            if isinstance(node, ast.Call) and _names_support_event(node):
+                for kw in node.keywords:
+                    if kw.arg == "status":
+                        for literal in _string_constants(kw.value, prose):
+                            found.add((rel, node.lineno, "status=", literal))
+            # 2. `SupportEvent.status == "open"` (either way round)
+            if isinstance(node, ast.Compare) and _reads_ticket_status(node):
+                for literal in _string_constants(node, prose):
+                    found.add((rel, node.lineno, "comparison", literal))
+            # 3. `SupportEvent.status.in_(("open", "released"))`, `.notin_`, …
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and _reads_ticket_status(node.func.value)):
+                for argument in [*node.args, *(kw.value for kw in node.keywords)]:
+                    for literal in _string_constants(argument, prose):
+                        found.add((rel, node.lineno, f".{node.func.attr}()", literal))
+            # 4. `ticket.status = "resolved"` — the write the console makes,
+            #    through a local name no AST can resolve back to the class. Only
+            #    checked where SupportEvent is imported, and only for the three
+            #    words: `subscriptions` writes `row.status` in this same tree
+            #    and its vocabulary is a different (upper-case) one.
+            if imports_it and isinstance(node, ast.Assign | ast.AnnAssign):
+                targets = (
+                    node.targets if isinstance(node, ast.Assign) else [node.target]
+                )
+                for target in targets:
+                    if isinstance(target, ast.Attribute) and target.attr == "status":
+                        for literal in _string_constants(node.value or tree, prose):
+                            if literal in _TICKET_STATUSES:
+                                found.add((rel, node.lineno, "assignment", literal))
+            # 5. raw SQL that never mentions the class at all
+            if (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                    and id(node) not in prose):
+                text = node.value.lower()
+                if "support_events" in text and "status" in text:
+                    found.add((rel, node.lineno, "raw SQL", node.value.strip()[:60]))
+
+    return found
+
+
+def _production_status_literals() -> set[tuple[str, int, str, str]]:
+    files = [
+        p
+        for root in _SCAN_ROOTS
+        for p in sorted((_REPO / root).rglob("*.py"))
+        if "__pycache__" not in p.parts
+    ]
+    return _status_literal_sites(files, _REPO)
+
+
+def test_no_module_spells_a_support_ticket_status_for_itself() -> None:
+    """The sixth copy, refused.
+
+    An OPEN ticket mutes a customer's channel. Three dedupes read the word to
+    decide whether he may reach a human, the sweep reads it to decide whose
+    line to reopen, and the console writes the word that closes it — and while
+    each of them spelled it out for itself, «they agree» was a property of
+    nobody's memory in particular.
+    """
+    offenders = sorted(
+        site for site in _production_status_literals()
+        if site[0] not in _STATUS_LITERAL_ALLOWED
+    )
+    assert not offenders, (
+        "support_events.status is spelled out here instead of imported: "
+        f"{offenders}\n"
+        "\n"
+        "WHAT TO DO: import the word from its one home and use it —\n"
+        "    from career.support import MUTING_STATUSES, OPEN\n"
+        "    SupportEvent(..., status=OPEN)                       # writing\n"
+        "    SupportEvent.status.in_(sorted(MUTING_STATUSES))     # deduping\n"
+        "and `QUEUED_STATUSES` for «still owed, still on the operator's "
+        "screen». Ask for the SET, not the word, wherever the question is "
+        "«does this status mute / is this ticket still owed» — that is the "
+        "half a fourth status would otherwise break.\n"
+        "\n"
+        "WHY: an open ticket MUTES that customer's channel — "
+        "promises.career_session, funnel.flow and whatsapp.activation_flow "
+        "all refuse to raise a new one while a row says open, and "
+        "telegram.console.release_forgotten_tickets is the only way back out. "
+        "So these three strings jointly decide whether a paying customer can "
+        "reach a human, and a copy that disagrees silences him with no "
+        "exception, no red test and no log line.\n"
+        "\n"
+        "IF A NEW STATUS IS REALLY NEEDED: add it to career.support and to "
+        "the set it belongs in there. That is one edit and every reader "
+        "inherits it; four edits made from memory is the failure this guard "
+        "exists to end."
+    )
+
+
+def test_the_ticket_status_escape_list_still_earns_its_place() -> None:
+    """An allow-list nobody re-checks stops being an exception and becomes
+    permission. `whatsapp/worker` is on it for one reason — it was another
+    owner's file on the day the vocabulary was built — and that reason expires
+    the moment somebody with the file writes `status=OPEN`."""
+    offending_files = {site[0] for site in _production_status_literals()}
+    stale = sorted(set(_STATUS_LITERAL_ALLOWED) - offending_files)
+    assert not stale, (
+        f"these files no longer spell a status for themselves: {stale} — "
+        "delete them from _STATUS_LITERAL_ALLOWED, the ratchet only counts if "
+        "it tightens"
+    )
+
+
+def test_the_vocabulary_the_guard_polices_is_the_one_the_code_imports() -> None:
+    """The link an AST cannot see: the three words this guard looks for have
+    to be the three the readers actually branch on, and the SETS have to say
+    what their names claim. The invariants are small and each one is a way a
+    customer goes silent:
+
+    * a muting status that is not on the queue would be a mute the operator
+      cannot see, let alone close;
+    * RELEASED inside the muting set would make the sweep release the tickets
+      it has already released, forever, and page him every hour for each;
+    * a status in neither the closed nor the queued set would simply vanish.
+    """
+    assert support.MUTING_STATUSES <= support.QUEUED_STATUSES
+    assert support.RELEASED not in support.MUTING_STATUSES
+    assert support.QUEUED_STATUSES | support.CLOSED_STATUSES == support.ALL_STATUSES
+    assert not support.QUEUED_STATUSES & support.CLOSED_STATUSES
+    assert support.OPEN in support.MUTING_STATUSES
+    assert support.RESOLVED in support.CLOSED_STATUSES
+
+
+#: One synthetic module per way a status literal can come back, written the way
+#: a real author would write it — hurried, not malicious. Kept here rather than
+#: tried once by hand, because «somebody checked in August» is not a property
+#: the next edit of the guard preserves.
+_STATUS_LITERAL_SHAPES: tuple[tuple[str, str], ...] = (
+    (
+        "a fourth escalation path writing its own ticket",
+        "from career.db.models import SupportEvent\n"
+        "def escalate(session, tenant_id, channel_id):\n"
+        "    session.add(SupportEvent(tenant_id=tenant_id,\n"
+        "                             channel_id=channel_id, status='open'))\n",
+    ),
+    (
+        "a fourth dedupe comparing the word",
+        "from sqlalchemy import select\n"
+        "from career.db.models import SupportEvent\n"
+        "def muted(session, tenant_id):\n"
+        "    return session.execute(select(SupportEvent.id).where(\n"
+        "        SupportEvent.tenant_id == tenant_id,\n"
+        "        SupportEvent.status == 'open')).first()\n",
+    ),
+    (
+        "the comparison written the other way round",
+        "from career.db.models import SupportEvent\n"
+        "def muted(session):\n"
+        "    return session.query(SupportEvent).filter('open' == SupportEvent.status)\n",
+    ),
+    (
+        "a second screen listing its own idea of the queue",
+        "from sqlalchemy import select\n"
+        "from career.db.models import SupportEvent\n"
+        "def screen(session):\n"
+        "    return session.execute(select(SupportEvent).where(\n"
+        "        SupportEvent.status.in_(('open', 'released')))).all()\n",
+    ),
+    (
+        "a closer writing the word through a local name",
+        "from career.db.models import SupportEvent\n"
+        "def close(session, ticket):\n"
+        "    ticket.status = 'resolved'\n"
+        "    session.commit()\n",
+    ),
+    (
+        "a bulk update that never mentions the class",
+        "from sqlalchemy import update\n"
+        "from career.db.models import SupportEvent\n"
+        "def close_all(session):\n"
+        "    session.execute(update(SupportEvent).values(status='resolved'))\n",
+    ),
+    (
+        "raw SQL — a sweep nobody can grep for",
+        "from sqlalchemy import text\n"
+        "def close_all(session):\n"
+        "    session.execute(text(\n"
+        "        \"UPDATE support_events SET status = 'resolved'\"))\n",
+    ),
+    (
+        "a fourth status invented in passing, in nobody's vocabulary",
+        "from career.db.models import SupportEvent\n"
+        "def park(session, tenant_id, channel_id):\n"
+        "    session.add(SupportEvent(tenant_id=tenant_id,\n"
+        "                             channel_id=channel_id, status='snoozed'))\n",
+    ),
+)
+
+
+@pytest.mark.parametrize(("label", "source"), _STATUS_LITERAL_SHAPES,
+                         ids=lambda v: v[:44])
+def test_each_way_a_status_literal_comes_back_is_seen(
+    tmp_path: pathlib.Path, label: str, source: str
+) -> None:
+    module = tmp_path / "sixth_copy.py"
+    module.write_text(source, encoding="utf-8")
+    assert _status_literal_sites([module], tmp_path), (
+        f"the ticket-status guard does not see: {label}"
+    )
+
+
+def test_the_status_guard_accepts_the_vocabulary_used_correctly(
+    tmp_path: pathlib.Path
+) -> None:
+    """The other half of «does it work». A guard that flags the correct code
+    too is deleted by the first author it inconveniences, and then nothing is
+    guarded at all. This is the shape all four call sites now have."""
+    module = tmp_path / "correct.py"
+    module.write_text(
+        "from sqlalchemy import select\n"
+        "from career.db.models import SupportEvent\n"
+        "from career.support import MUTING_STATUSES, OPEN, RESOLVED\n"
+        "def escalate(session, tenant_id, channel_id, kind):\n"
+        "    muted = session.execute(select(SupportEvent.id).where(\n"
+        "        SupportEvent.tenant_id == tenant_id,\n"
+        "        SupportEvent.kind == kind,\n"
+        "        SupportEvent.status.in_(sorted(MUTING_STATUSES)))).first()\n"
+        "    if muted is None:\n"
+        "        session.add(SupportEvent(tenant_id=tenant_id,\n"
+        "                                 channel_id=channel_id, status=OPEN))\n"
+        "def close(ticket):\n"
+        "    ticket.status = RESOLVED\n",
+        encoding="utf-8",
+    )
+    assert _status_literal_sites([module], tmp_path) == set()
+
+
+def test_the_status_guard_leaves_the_other_open_alone(
+    tmp_path: pathlib.Path
+) -> None:
+    """«open» is also a WhatsApp window state, and `telegram.console` reads
+    both in one file. A guard that made the console rewrite an unrelated
+    vocabulary to go green would be noise, and noise is what teaches people to
+    add allow-list entries instead of fixing anything."""
+    module = tmp_path / "window_reader.py"
+    module.write_text(
+        "from career.db.models import SupportEvent\n"
+        "from career.support import QUEUED_STATUSES\n"
+        "def card(session, window, card_row):\n"
+        "    if window != 'open':\n"
+        "        return None\n"
+        "    marks = {'open': '💬', 'closed': '🌙'}\n"
+        "    return marks[str(card_row.get('window'))], QUEUED_STATUSES\n",
+        encoding="utf-8",
+    )
+    assert _status_literal_sites([module], tmp_path) == set()
 
 
 def test_the_direct_message_alerts_do_not_reverse_for_the_operator() -> None:

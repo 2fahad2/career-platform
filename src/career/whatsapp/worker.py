@@ -31,7 +31,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import String, func, or_, select
 from sqlalchemy.orm import Session
 
 from career.db.models import (
@@ -44,6 +44,7 @@ from career.db.models import (
     WebhookEvent,
 )
 from career.onboarding import orchestrator
+from career.support import OPEN
 from career.telegram import messages as admin_msg
 from career.telegram.admin import TelegramAdminClient
 from career.whatsapp import webhook as webhook_intake
@@ -628,7 +629,11 @@ def _handle_message(
         )
         session.add(SupportEvent(
             id=uuid.uuid4(), tenant_id=channel.tenant_id, channel_id=channel.id,
-            inbound_message_id=inbound.id, kind="support_request", status="open",
+            # `career.support.OPEN`, not the word: this is the most-used writer
+            # of the table, and an OPEN row MUTES this customer's channel —
+            # three dedupes refuse to raise a second ticket while it stands. A
+            # spelling of my own here would be the one that silences somebody.
+            inbound_message_id=inbound.id, kind="support_request", status=OPEN,
         ))
         # Local import, like the other call site in this module: the salla
         # package imports back into whatsapp at module scope.
@@ -1101,30 +1106,90 @@ def status_error_codes(st: dict[str, Any]) -> list[int]:
     return codes
 
 
+#: The widest category string `delivery_messages.category` can store, read off
+#: the model rather than typed here — the same rule `delivery.usable_message_id`
+#: applies to the id column, and for the same reason: a migration that widens
+#: the column widens this guard with it.
+_CATEGORY_COLUMN = DeliveryMessage.__table__.c.category.type
+_CATEGORY_MAX: int = (
+    _CATEGORY_COLUMN.length
+    if isinstance(_CATEGORY_COLUMN, String) and _CATEGORY_COLUMN.length
+    else 32
+)
+
+
+def status_billed_category(st: dict[str, Any]) -> str | None:
+    """The price band Meta says it BILLED this message at, or None.
+
+    Meta puts a ``pricing`` object on the status callback — ``billable``,
+    ``pricing_model``, and the ``category`` that decides the rate. That last
+    field is the answer `cv/close.whatsapp_spend` has been guessing at: it is
+    what Meta CHARGED, where `templates.billed_category` is our own dated
+    measurement of what Meta would charge, re-read at reporting time and
+    therefore wrong for every row sent before a re-categorisation.
+
+    Total, like :func:`status_error_codes`, and for the same reason — this is
+    somebody else's HTTP body and the caller's job is to stop throwing it away,
+    not to raise on a shape nobody anticipated. Every failure mode answers
+    None, which leaves the column NULL and the bill exactly where it was.
+
+    A value the column could not hold is refused rather than truncated: a
+    truncated category is not a damaged category, it is a DIFFERENT one, and
+    the write would otherwise raise DataError and cost the whole callback —
+    including the refusal code alongside it. ERROR and not silence, because a
+    provider whose vocabulary outgrew our column is a thing to hear about the
+    first time.
+
+    ``billable`` is deliberately NOT read here. Meta bills some categories at
+    zero (a utility template inside an open service window since 2025-07-01),
+    and netting those out would CHANGE the definition of spend — a separate
+    decision, needing its own evidence, and over-reporting is the safe
+    direction meanwhile. This function answers «which band», never «how much».
+    """
+    pricing = st.get("pricing")
+    if not isinstance(pricing, dict):
+        return None
+    raw = pricing.get("category")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    category = raw.strip().lower()
+    if len(category) > _CATEGORY_MAX:
+        logger.error(
+            "whatsapp pricing category too long for the column (%d > %d) — "
+            "the send's billed category is NOT recorded and the bill falls "
+            "back to today's measurement of the template",
+            len(category), _CATEGORY_MAX,
+        )
+        return None
+    return category
+
+
 def _report_refusal(
     session: Session, *, codes: list[int], status: str,
     tenant_id: uuid.UUID | None, template_name: str | None,
 ) -> None:
     """Put Meta's reason where the operator will actually meet it.
 
-    ── WHY A LOG LINE AND NOT A COLUMN ──────────────────────────────────────
-    A `meta_error_code` column on `delivery_messages` is the obvious shape and
-    it is the THIRD choice, not the first:
+    ── A LOG LINE **AND** A COLUMN, AND THEY ARE NOT REDUNDANT ──────────────
+    ``ERROR:`` lines from this unit are harvested by the admin bot
+    (`run_admin_bot._HealthProbes.error_lines`) straight onto «🧾 آخر الأخطاء
+    المسجلة», so this line is on the operator's phone TONIGHT — no query, no
+    report, no one having to think to look. That is what a log is for and it
+    is why this stayed after 0030 added the column.
 
-    * the reason is not lost without it — the whole status callback, `errors`
-      array included, is already durable on `webhook_events.payload`, which is
-      how the six historical expiries were attributed at all;
-    * ``ERROR:`` lines from this unit are harvested by the admin bot
-      (`run_admin_bot._HealthProbes.error_lines`) straight onto «🧾 آخر الأخطاء
-      المسجلة», so this reaches the operator's screen TODAY, with no migration,
-      no deploy ordering and no backfill;
-    * a column needs a migration, and a migration is the one thing that cannot
-      be shipped by the process that discovered the problem.
+    The column is the other half and answers a question a log cannot: «how
+    many of our expiries were REFUSALS», in a join, months later. The two do
+    not overlap in time either — the journal rotates, and
+    `webhook_events.payload`, which carries the same `errors` array, is
+    REDACTED after 30 days (0024). After that window `delivery_messages
+    .meta_error_code` is the only place the answer still exists, and it is the
+    number the 72-hour start guarantee is priced from.
 
-    What a column WOULD buy is the join — «show me every expiry that was
-    actually a refusal» as one query instead of a JSON scan — and that is a
-    real report, worth writing the day the count stops being six. The
-    migration is described in this change's report and deliberately not run.
+    The column also reaches rows this line never can, in one direction only:
+    it is written on the TRANSITION, so a refusal whose ledger row does not
+    exist has a log line and no column, and a refusal recovered later from a
+    stored payload (`scripts/backfill_meta_error_codes.py`) has a column and
+    no log line.
 
     ── AND WHY NOT A NEW STATUS WORD ────────────────────────────────────────
     Putting «refused» into `delivery_messages.status` looks cheapest of all
@@ -1190,18 +1255,64 @@ def _handle_status(session: Session, st: dict[str, Any], *, now: datetime) -> No
     # never recorded. That is a hole in the ledger and the only way anyone
     # learns of it is the line below.
     codes = status_error_codes(st)
+    # The other half of the same callback, and it is NOT on the ladder — see
+    # the loop below.
+    category = status_billed_category(st)
     reported = False
     matched = False
     for dm in session.execute(
         select(DeliveryMessage).where(DeliveryMessage.wa_message_id == wamid)
     ).scalars():
         matched = True
+        # WRITTEN BEFORE THE RANK GATE, and that is the decision. The price
+        # band is a fact about the MESSAGE, not a position on the receipt
+        # ladder: Meta attaches `pricing` to the `sent`/`delivered` receipt,
+        # and those are exactly the receipts that LOSE the rank comparison
+        # when they arrive after a `read` — which Meta's own retry behaviour
+        # makes routine. Gating this on rank would have discarded the billed
+        # category precisely on the messages that were read fastest.
+        #
+        # Fill-once, never overwrite. A second receipt reporting a DIFFERENT
+        # band for one message is either Meta re-pricing a single send or us
+        # reading the wrong row, and both are worth a line rather than a
+        # silent last-writer-wins.
+        if category is not None:
+            if dm.category is None:
+                dm.category = category
+            elif dm.category != category:
+                logger.error(
+                    "whatsapp receipt reports billed category %r for a send "
+                    "already recorded as %r — the FIRST is kept; the bill for "
+                    "this send may be wrong either way",
+                    category, dm.category,
+                )
         if rank <= receipt_rank(dm.status):
             continue  # out of order, or the same receipt twice — a no-op
         dm.status = str(status)
         # the stamp belongs to the receipt that actually WON, so a superseded
         # duplicate never makes a row look freshly updated
         dm.status_updated_at = now
+        # …and so does the reason. Assigned unconditionally, including to
+        # None: a `read` that outranks an earlier `failed` is positive proof
+        # this exact wa_message_id arrived, so the 131049 that failure carried
+        # belonged to a different send attempt and must not stay on a row that
+        # demonstrably reached the customer. The column always describes the
+        # receipt the status came from — never a mixture of two.
+        #
+        # This is the durable half of `_report_refusal`: the log line reaches
+        # the operator tonight, and `webhook_events.payload` holds the same
+        # array for thirty days (0024 redacts it after that). After that
+        # window this column is the only place the answer to «how many of our
+        # expiries were REFUSALS» still exists — and that count is what the
+        # 72-hour start guarantee is priced from.
+        #
+        # ONE code, in a column, out of an array that is almost always one
+        # element long: the leading entry is the reason Meta led with, and a
+        # column that answered «did Meta refuse this, and why» in a JOIN is
+        # the whole point — a second table for the rare multi-error receipt
+        # would buy nothing the log line and the payload do not already hold,
+        # and `_report_refusal` names every code in the array.
+        dm.meta_error_code = codes[0] if codes else None
         # Reported on the TRANSITION and not on arrival, so a redelivered
         # webhook — Meta retries them freely — cannot fill the operator's
         # error screen with the same refusal ten times. A receipt that loses

@@ -620,8 +620,26 @@ def _wa_price(kind: str) -> Decimal:
     return Decimal(str(settings.whatsapp_usd_per_marketing_message))
 
 
-def _wa_kind_of(template_name: str | None) -> str:
+def _wa_kind_of(template_name: str | None, category: str | None = None) -> str:
     """The billing kind for one template send.
+
+    ONE definition, one precedence, most-specific-first — and the order is the
+    contract, because this function is the only place «what did this send
+    cost» is decided (see :func:`spend_by_kind` for what happened the last time
+    there were two):
+
+    1. ``category`` — what Meta's own delivery receipt said it BILLED this
+       exact message at, recorded on the row at receipt time (0030). A
+       measurement of THIS send.
+    2. today's :func:`templates.billed_category` for the template name — a
+       measurement of the ACCOUNT, correct for a send that happened close
+       enough to it.
+    3. ``wa_unknown`` — no measurement of any kind, priced at the marketing
+       rate, which is the err-expensive rule this function has always used.
+
+    A recorded category is therefore never overridden by a name: `wa_unknown`
+    is not a third price band, it is the bucket for «nobody ever measured
+    this», and a row Meta itself priced has been measured.
 
     AUDIT 2026-08-08 — this read ``spec.category``, the category we SUBMITTED
     the template under, and priced the bill from it. Meta had re-categorised
@@ -639,16 +657,20 @@ def _wa_kind_of(template_name: str | None) -> str:
     measurement of the live account and falls back to MARKETING — the same
     err-expensive rule ``wa_unknown`` already followed.
 
-    THE LIMIT, because it is real: the snapshot is TODAY's category applied to
-    every historical row, and Meta moves categories. Re-running
-    :func:`rollup_costs` over a day from before a re-categorisation will now
-    price it at the new category. The alternative — stamping the category on
-    `delivery_messages` at send time — needs a column and therefore a
-    migration, and is the right long-term fix; until then the error is bounded,
-    dated, and points the safe way (up).
+    THE LIMIT IS NOW BOUNDED TO ROWS THAT CARRY NO CATEGORY. It used to be
+    every row: the registry snapshot is TODAY's category applied to all of
+    history, and Meta moves categories (five templates on 2026-07-17, again on
+    2026-08-02), so re-running :func:`rollup_costs` over an old day priced it
+    at a band that day was not billed at — the same input producing a
+    different number depending on when it was asked. 0030 put the band on the
+    row, filled from Meta's receipt by `worker._handle_status`, and step 1
+    above reads it. A row with no recorded band still takes step 2, with the
+    old limit unchanged: bounded, dated, and pointing the safe way (up).
     """
     from career.whatsapp.templates import REGISTRY, billed_category
 
+    if category:
+        return _WA_KIND_BY_CATEGORY.get(str(category).strip().lower(), "wa_unknown")
     name = str(template_name or "")
     if name not in REGISTRY:
         return "wa_unknown"
@@ -674,8 +696,19 @@ def whatsapp_spend(
     those live in ``whatsapp/delivery.py`` and ``salla/`` (see the report), and
     the ledger row is written in the same transaction as every send, so it is
     the same truth — and staying derived keeps this idempotent for free.
+
+    Idempotent in its WRITE was never the same as stable in its VALUE, and
+    until 0030 it was not stable: the category came from a registry Meta
+    re-writes, so this function answered differently about the same historical
+    day depending on the day it was asked. The grouping now carries
+    ``category`` — the band Meta's receipt reported for that send — so a row
+    that has one is priced at what it was billed at, forever, and only a row
+    with none still asks the registry. Same one definition
+    (:func:`_wa_kind_of`); it just stopped having to guess.
     """
-    query = select(DeliveryMessage.template_name, func.count()).where(
+    query = select(
+        DeliveryMessage.template_name, DeliveryMessage.category, func.count(),
+    ).where(
         DeliveryMessage.kind == "template",
         DeliveryMessage.status != "failed",
     )
@@ -687,10 +720,10 @@ def whatsapp_spend(
         query = query.where(DeliveryMessage.created_at >= since)
 
     out: dict[str, tuple[int, Decimal]] = {}
-    for template_name, count in session.execute(
-        query.group_by(DeliveryMessage.template_name)
+    for template_name, category, count in session.execute(
+        query.group_by(DeliveryMessage.template_name, DeliveryMessage.category)
     ).all():
-        kind = _wa_kind_of(template_name)
+        kind = _wa_kind_of(template_name, category)
         events, cost = out.get(kind, (0, Decimal("0")))
         out[kind] = (events + int(count), cost + _wa_price(kind) * int(count))
     return out

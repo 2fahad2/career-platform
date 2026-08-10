@@ -45,6 +45,12 @@ from career.db.models import (
     UsageEvent,
 )
 from career.salla import subscriptions as _sub_states
+from career.support import (
+    MUTING_STATUSES,
+    QUEUED_STATUSES,
+    RELEASED,
+    RESOLVED,
+)
 from career.telegram import views
 from career.telegram.admin import Keyboard
 from career.whatsapp.client import WhatsAppClient
@@ -285,7 +291,10 @@ _TICKET_KIND_AR = {
 }
 #: How many tickets one screen shows. A watchtower screen the operator has to
 #: scroll is a screen they stop reading; the count line stays truthful about
-#: the rest.
+#: the rest, and «التالي» — not «close one to see the next» — is how he
+#: reaches it. See :func:`_tickets_screen` for why that distinction is worth a
+#: button: the only other route to the eleventh ticket was to make the one
+#: claim in this file that nobody may make on the operator's behalf.
 TICKETS_PAGE = 10
 
 #: ── closing a ticket ────────────────────────────────────────────────────────
@@ -306,12 +315,19 @@ TICKETS_PAGE = 10
 #: every other mutating action; it keeps its own callback names because the
 #: `_ACTIONS` table is keyed by TEN code and a ticket is not a tenant.
 _TICKET_ACTION = "ticket_close"
-#: `support_events.status`. «open» is written by ``whatsapp.worker`` and by the
-#: funnel's consent stall; «resolved» is written HERE and nowhere else, which
-#: is why the tests may no longer conjure it with raw SQL — a state only a test
-#: can produce is a state that was never really tested.
-TICKET_OPEN = "open"
-TICKET_RESOLVED = "resolved"
+#: `support_events.status` is `career.support` and is no longer restated here.
+#: «open» is written by ``whatsapp.worker``, the funnel's consent stall, the
+#: لمّاح+ direct line and the session SLA; «resolved» is written HERE and
+#: nowhere else, which is why the tests may no longer conjure it with raw SQL —
+#: a state only a test can produce is a state that was never really tested.
+#:
+#: This screen used to keep its own `TICKET_OPEN = "open"` beside three bare
+#: literals in three other modules, which is the shape the note below warns
+#: about, one level down: four copies of the word that decides whether a paying
+#: customer can reach a human. The words now have ONE home and the sets have
+#: names — `QUEUED_STATUSES` is what this screen lists, `MUTING_STATUSES` is
+#: what the dedupes refuse on and what the sweep releases — so a fourth status
+#: is one edit, not four that have to be remembered.
 TICKET_CONFIRM_AR = (
     "⚠️ تأكيد إغلاق تذكرة العميل:\n{code}\n"
     "الإغلاق يعني أنك تكفّلت بها — ما راح تظهر في القائمة بعدها\n"
@@ -373,9 +389,10 @@ TICKET_FORGOTTEN_AFTER = timedelta(hours=48)
 #: `support_events.status`, third value: open, then RELEASED, then resolved.
 #: Not a closure — a released ticket is still owed, still on the screen below,
 #: still carrying its original age, and still waiting for the operator's own
-#: button. What it stops being is a MUTE. The dedupes above all read «status =
-#: open», so this one word is what lets the customer's next message raise a
-#: ticket of its own, with its own age and its own message id.
+#: button. What it stops being is a MUTE. The dedupes above all ask
+#: `career.support.MUTING_STATUSES`, which RELEASED is not in, so this one word
+#: is what lets the customer's next message raise a ticket of its own, with its
+#: own age and its own message id.
 #:
 #: Auto-CLOSING was the alternative, and it is the one thing this screen must
 #: never do: «resolved» is a claim that a human was dealt with, and a claim
@@ -388,7 +405,10 @@ TICKET_FORGOTTEN_AFTER = timedelta(hours=48)
 #: THAN THIS — that stays true when a fifth dedupe is written tomorrow. A list
 #: of kinds copied from four other modules is a list that rots silently, which
 #: is the failure this sweep exists to end, rebuilt one level up.
-TICKET_RELEASED = "released"
+#:
+#: And the word itself now lives one level up too: `career.support.RELEASED`,
+#: beside `MUTING_STATUSES` — the set this sweep selects on, so the invariant
+#: above is enforced by an import rather than by four authors agreeing.
 #: The storm the dedupe exists to prevent is NOT rebuilt, and the arithmetic
 #: is the same as `scripts/alert_unit_failure.sh`'s: a release is a one-way
 #: edge written once per ticket, so it pages at most once per ticket, ever —
@@ -529,12 +549,20 @@ def _screen(
     if name == "menu":
         return _menu_screen()
     if name == "tickets":
-        return _tickets_screen(session, now=now)
+        # v1|tickets  or  v1|tickets|<page>. A bare name still means page one,
+        # so every «↩️ إلغاء» and menu button already written keeps working.
+        try:
+            return _tickets_screen(session, now=now,
+                                   page=max(0, int(arg or "0")))
+        except ValueError:
+            return None
     if name == "promises":
         return _promises_screen(session, now=now)
     if name == "tclose":
-        # v1|tclose|<ticket uuid> → the confirm card carrying a one-shot nonce
-        return _ticket_close_card(session, ticket_id=arg, now=now)
+        # v1|tclose|<ticket uuid>|<page> → the confirm card carrying a
+        # one-shot nonce. The page rides along so the refreshed list after the
+        # close is the page he was reading.
+        return _ticket_close_card(session, subject=arg, now=now)
     if name == "tdone":
         # v1|tdone|<nonce> → the close itself, then the refreshed list
         return _run_ticket_close(session, nonce=arg, now=now)
@@ -692,7 +720,7 @@ def _opener_lines(opener_type: str | None) -> list[str]:
 
 
 def _tickets_screen(
-    session: Session, *, now: datetime
+    session: Session, *, now: datetime, page: int = 0
 ) -> tuple[str, Keyboard]:
     """Every open support ticket, oldest first — the table's first reader.
 
@@ -719,6 +747,31 @@ def _tickets_screen(
     :data:`_TICKET_OPENER_AR`: with a dedupe upstream, «a customer wrote to
     you» and «a thumb hit a card from three months ago» are the same row
     otherwise, and they are not the same thing to answer.
+
+    PAGED, since 2026-08-08, and the reason is not the number of rows.
+
+    The screen shipped showing the oldest ten with «أغلق الظاهرة ليطلع اللي
+    بعدها» under them, which was true and was also the only route to the
+    eleventh: to SEE a ticket you had to CLOSE one. And closing is not a
+    neutral act here — `resolved` is the operator's claim that he dealt with
+    a human, made deliberately unavailable to every automatic path in this
+    file precisely because nobody may make it on his behalf. A screen whose
+    only way forward is that claim is a screen that asks him to make it
+    falsely, about a customer he has not answered, in order to look at the
+    queue.
+
+    That pressure is not hypothetical at ten. RELEASED tickets stay listed
+    (the release takes the mute, not the place in the queue) and the order is
+    oldest-first, so every ticket he could not close in 48 hours becomes a
+    PERMANENT resident at the top. Ten of those and the list is frozen exactly
+    as it was before the close button existed — with the newest ticket, the
+    customer writing into silence right now, on the other side of it.
+
+    So the page stays at ten (a watchtower screen he has to scroll is a screen
+    he stops reading) and «التالي» is added beside it, the same shape
+    `views.render_customers` already has. The numbering runs across pages, not
+    within one, because the number's only job is to tie a body line to the
+    button under it.
     """
     rows = session.execute(
         select(SupportEvent.id, Tenant.code, SupportEvent.kind,
@@ -727,14 +780,25 @@ def _tickets_screen(
         .join(Tenant, Tenant.id == SupportEvent.tenant_id)
         .outerjoin(InboundMessage,
                    InboundMessage.id == SupportEvent.inbound_message_id)
-        .where(SupportEvent.status.in_((TICKET_OPEN, TICKET_RELEASED)))
+        .where(SupportEvent.status.in_(sorted(QUEUED_STATUSES)))
         .order_by(SupportEvent.created_at)
     ).all()
+    pages = max(1, (len(rows) + TICKETS_PAGE - 1) // TICKETS_PAGE)
+    # CLAMPED, and `render_customers` deliberately not copied here. A «التالي»
+    # tapped on a screen drawn before somebody closed the last ticket on the
+    # next page lands past the end, and an empty customers page is merely
+    # empty — an empty TICKETS page would print «🟢 لا توجد تذاكر مفتوحة» over
+    # a queue that still has people waiting in it, which is the one sentence
+    # this screen must never say untruthfully.
+    page = min(max(0, page), pages - 1)
+    start = page * TICKETS_PAGE
     lines = [f"{TICKETS_TITLE_AR}: {_ar_digits(len(rows))}"]
+    if pages > 1:
+        lines.append(f"صفحة {_ar_digits(page + 1)} من {_ar_digits(pages)}")
     if not rows:
         lines.append(TICKETS_NONE_AR)
     close_buttons: list[tuple[str, str]] = []
-    for number, row in enumerate(rows[:TICKETS_PAGE], start=1):
+    for number, row in enumerate(rows[start:start + TICKETS_PAGE], start=start + 1):
         ticket_id, code, kind, created_at, status, opener_type = row
         marker = _ar_digits(number)
         lines.append("")
@@ -745,23 +809,37 @@ def _tickets_screen(
         lines.append(str(code))
         lines.append(_age_ar(created_at, now))
         lines.extend(_opener_lines(opener_type))
-        if status == TICKET_RELEASED:
+        if status == RELEASED:
             lines.append(TICKET_RELEASED_MARK_AR)
-        close_buttons.append((f"✅ إغلاق {marker}", f"v1|tclose|{ticket_id}"))
-    if len(rows) > TICKETS_PAGE:
+        # the page travels with the ticket so the close can come BACK here —
+        # `_run_ticket_close` reads it out of the nonce it mints
+        close_buttons.append(
+            (f"✅ إغلاق {marker}", f"v1|tclose|{ticket_id}|{page}")
+        )
+    if pages > 1:
         lines.append("")
         lines.append(
-            f"وأقدم {_ar_digits(TICKETS_PAGE)} معروضة من أصل "
-            f"{_ar_digits(len(rows))}"
+            f"معروضة {_ar_digits(len(rows[start:start + TICKETS_PAGE]))} "
+            f"من أصل {_ar_digits(len(rows))}"
         )
-        # The count line was already honest about the number hidden; what it
-        # could not say, before there was any way to close one, was that the
-        # rest were unreachable rather than merely next.
-        lines.append("أغلق الظاهرة ليطلع اللي بعدها")
+        # The count line was already honest about the number hidden. What it
+        # said NEXT was «أغلق الظاهرة ليطلع اللي بعدها» — true, and the whole
+        # problem: it made closing a ticket the price of reading the queue.
+        lines.append("والباقي بزر «التالي» تحت")
     keyboard: Keyboard = [
         close_buttons[i:i + 3] for i in range(0, len(close_buttons), 3)
     ]
-    keyboard.append([("🔄 تحديث", "v1|tickets"), ("🏠 الرئيسية", "v1|menu")])
+    nav: list[tuple[str, str]] = []
+    if page > 0:
+        nav.append(("⬅️ السابق", f"v1|tickets|{page - 1}"))
+    if page + 1 < pages:
+        nav.append(("التالي ➡️", f"v1|tickets|{page + 1}"))
+    if nav:
+        keyboard.append(nav)
+    # «تحديث» redraws THIS page, not the first one: the operator working
+    # through page three is the operator most likely to press it.
+    keyboard.append([("🔄 تحديث", f"v1|tickets|{page}"),
+                     ("🏠 الرئيسية", "v1|menu")])
     return "\n".join(lines), keyboard
 
 
@@ -837,19 +915,38 @@ def _promises_screen(
     return views.render_promises(breaches, sessions)
 
 
+def _ticket_subject(subject: str) -> tuple[str, int]:
+    """``"<uuid>|<page>"`` → the two halves, with page 0 for anything else.
+
+    The page is carried inside the nonce's SUBJECT rather than as a fourth
+    field on ``_pending_actions``, because that tuple is shared with every
+    other confirmed action in this file and «which screen was he on» is not a
+    fact any of them has. A malformed or missing page is not an error worth a
+    refusal — it costs the operator his place in a list, never a ticket — so
+    it degrades to the first page; a malformed ticket id still answers «gone»,
+    which is :func:`_ticket_row`'s job and not this one's.
+    """
+    ticket_id, _, raw_page = subject.partition("|")
+    try:
+        return ticket_id, max(0, int(raw_page))
+    except ValueError:
+        return ticket_id, 0
+
+
 def _ticket_close_card(
-    session: Session, *, ticket_id: str, now: datetime
+    session: Session, *, subject: str, now: datetime
 ) -> tuple[str, Keyboard] | None:
     """The confirm card for one ticket — same shape as ``v1|act``'s."""
+    ticket_id, page = _ticket_subject(subject)
     row = _ticket_row(session, ticket_id)
     if row is None:
         return None
     _ticket, code = row
-    nonce = _new_nonce(_TICKET_ACTION, ticket_id, now)
+    nonce = _new_nonce(_TICKET_ACTION, f"{ticket_id}|{page}", now)
     return (
         TICKET_CONFIRM_AR.format(code=code),
         [[("✅ تأكيد نهائي", f"v1|tdone|{nonce}")],
-         [("↩️ إلغاء", "v1|tickets")]],
+         [("↩️ إلغاء", f"v1|tickets|{page}")]],
     )
 
 
@@ -879,16 +976,25 @@ def _run_ticket_close(
     Returns None for an expired or forged nonce so the caller answers with
     ACTION_EXPIRED_AR, exactly like every other confirmed action. The answer
     is prepended to a FRESHLY read list rather than to the stale one the
-    operator tapped: closing the top ticket is what lets the eleventh appear,
-    and a screen that still shows the ticket you just closed is the same
-    silence in a new place.
+    operator tapped: a screen that still shows the ticket you just closed is
+    the same silence in a new place.
+
+    The fresh list is the PAGE he was on, carried through the nonce's subject.
+    Closing a ticket on page three used to be impossible and is now merely a
+    reason to redraw page three: the rows below it shuffle up by one, which is
+    the truth, and sending him back to page one after every close would make
+    the queue drainable only from the top all over again — the exact habit
+    :func:`_tickets_screen` was paged to end. If the close emptied the last
+    page, the screen clamps to the new last one rather than printing «🟢 لا
+    توجد تذاكر مفتوحة» over a queue that still has people in it.
     """
     entry = _pending_actions.pop(nonce, None)
     if entry is None:
         return None
-    action, ticket_id, expiry = entry
+    action, subject, expiry = entry
     if action != _TICKET_ACTION or expiry < now:
         return None
+    ticket_id, page = _ticket_subject(subject)
     row = _ticket_row(session, ticket_id)
     if row is None:
         done = TICKET_GONE_AR
@@ -899,18 +1005,41 @@ def _run_ticket_close(
         # still on the screen, and the button under it has to work — a listed
         # ticket whose own button answers «مغلقة أصلًا» is the contradiction
         # inside one screen that `_transition` was fixed for.
-        if ticket.status not in (TICKET_OPEN, TICKET_RELEASED):
+        if ticket.status not in QUEUED_STATUSES:
             done = TICKET_ALREADY_AR.format(code=code)
         else:
-            ticket.status = TICKET_RESOLVED
+            ticket.status = RESOLVED
             # `resolved_at` has existed on the model since C4 and had never
             # been written by anything — an SLA cannot be measured from a
             # column nobody fills, and «when was this dealt with» is the first
             # question anyone asks of a closed ticket.
+            #
+            # AND NOTHING READS IT YET. Named here rather than left as a
+            # surprise, with the decision that was made about it on 2026-08-08
+            # and the reason it was not «build a screen»:
+            #
+            # A closed ticket leaves the queue by design, so «did anybody ever
+            # deal with this customer» has no answer on this console — the
+            # operator hears «راسلتكم وما رد أحد», opens the card, and cannot
+            # tell a ticket he closed last week from one that was never
+            # raised. That gap is real. What it is NOT is a screen: a list of
+            # closed tickets is a second inbox, which is the shape
+            # `whatsapp.activation_flow` explicitly rejected for this same
+            # table («a second inbox is a second thing to forget»), and a
+            # watchtower screen nobody opens is worse than an absent one
+            # because it looks like coverage. The question is asked about ONE
+            # customer, while looking at HIM, so its honest home is one line
+            # on the customer card — the screen the operator already opens —
+            # beside the promises `views._promise_lines` already prints there
+            # for exactly that reason. That is `telegram/views.render_tenant_
+            # card`, which this pass may read and not edit; the card owner
+            # gets a one-line reader over an already-written column, not a
+            # feature. Until then the column is an audit trail with a writer,
+            # which is honest, and this comment is the ask.
             ticket.resolved_at = now
             session.commit()
             done = TICKET_CLOSED_AR.format(code=code)
-    text, keyboard = _tickets_screen(session, now=now)
+    text, keyboard = _tickets_screen(session, now=now, page=page)
     return f"{done}\n\n{text}", keyboard
 
 
@@ -984,7 +1113,13 @@ def release_forgotten_tickets(
     rows = session.execute(
         select(SupportEvent, Tenant.code)
         .join(Tenant, Tenant.id == SupportEvent.tenant_id)
-        .where(SupportEvent.status == TICKET_OPEN,
+        # `in_(MUTING_STATUSES)` and not `== OPEN`: the invariant this sweep
+        # states is «NO TICKET MUTES ANYTHING FOR LONGER THAN THIS», so what
+        # it selects is the set of muting statuses itself. A fourth status
+        # that silences a customer is covered the day it is added to
+        # `career.support`, without an edit here — and it cannot be a status
+        # this loop then writes, because RELEASED is not in that set.
+        .where(SupportEvent.status.in_(sorted(MUTING_STATUSES)),
                SupportEvent.created_at <= now - TICKET_FORGOTTEN_AFTER)
         .order_by(SupportEvent.created_at)
         .with_for_update(skip_locked=True, of=SupportEvent)
@@ -994,7 +1129,7 @@ def release_forgotten_tickets(
     ).all()
     alerts: list[str] = []
     for ticket, code in rows:
-        ticket.status = TICKET_RELEASED
+        ticket.status = RELEASED
         # AUDIT 2026-08-07 — the ticket's OWN opening message has to be taken
         # out by ID, and `received_at > created_at` does not do it. The two
         # stamps come from two different clocks: the ticket carries the `now`

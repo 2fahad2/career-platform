@@ -13,6 +13,7 @@ from sqlalchemy import text as sql_text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
+from career import support
 from career.telegram import console, views
 from career.telegram.console import EXPIRED_BUTTON_AR, handle_update
 
@@ -2090,11 +2091,32 @@ def _drop_tickets(session: Session, *tenant_ids: str) -> None:
     session.commit()
 
 
-def _tickets(session: Session, **kw: Any) -> Any:
+def _tickets(session: Session, page: int | None = None, **kw: Any) -> Any:
+    """The tickets screen as the operator reaches it.
+
+    `page=None` is the bare `v1|tickets` every menu button and «إلغاء» in the
+    file already sends — kept as the default so these tests keep proving that
+    the un-paged callback still means «the first page».
+    """
+    data = "v1|tickets" if page is None else f"v1|tickets|{page}"
     return handle_update(
-        session, _cbq(ADMIN, "v1|tickets"), admin_chat_id=ADMIN,
+        session, _cbq(ADMIN, data), admin_chat_id=ADMIN,
         probes=FakeProbes(), now=NOW, **kw,
     )[1]
+
+
+def _listed(outcome: Any) -> list[str]:
+    """The ticket ids this screen is actually offering to close.
+
+    Read off the close buttons rather than off the text, because the ids are
+    what the buttons carry and the body deliberately prints TEN codes only —
+    with two tenants and fifteen tickets, the text cannot tell one row from
+    another and the keyboard can.
+    """
+    return [
+        data.split("|")[2] for row in outcome.keyboard for _label, data in row
+        if data.startswith("v1|tclose|")
+    ]
 
 
 def test_open_tickets_are_visible_with_their_age_and_whose_they_are(
@@ -2209,6 +2231,122 @@ def test_the_eleventh_ticket_is_reachable_at_all(
         _clear_delivery(owner_session, t2)
 
 
+def test_the_eleventh_ticket_is_reachable_without_closing_anybodys_ticket(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """The freeze above was fixed with the wrong key, and this is the right one.
+
+    Closing the oldest DOES let the eleventh through — and closing is the
+    operator's claim that he dealt with a human, the one claim this whole file
+    refuses to let anything make on his behalf. A screen whose only route to
+    the next ticket is that claim is a screen that asks him to make it falsely
+    about a customer he has not answered, in order to look at his own queue.
+
+    And it is not a corner: RELEASED tickets stay listed, oldest-first, so ten
+    tickets he could not honestly close in 48 hours freeze the list exactly as
+    it was before the button existed — with the newest ticket, the customer
+    writing into silence right now, behind them.
+    """
+    t1, t2 = two_tenants
+    code2 = _code_of(owner_session, t2)
+    channel1 = _seed_channel(owner_session, t1)
+    channel2 = _seed_channel(owner_session, t2)
+    try:
+        oldest = [
+            _seed_ticket(owner_session, t1, channel1, age_hours=100 - n)
+            for n in range(console.TICKETS_PAGE)
+        ]
+        eleventh = _seed_ticket(owner_session, t2, channel2, age_hours=1)
+
+        first = _tickets(owner_session)
+        assert code2 not in first.text
+        assert any(data == "v1|tickets|1"
+                   for row in first.keyboard for _label, data in row)
+
+        second = _tickets(owner_session, page=1)
+        assert _listed(second) == [eleventh]
+        assert code2 in second.text
+        assert "صفحة ٢ من ٢" in second.text
+        # and NOTHING was claimed about a human to get here. The ten oldest
+        # are past TICKET_FORGOTTEN_AFTER, so the sweep on the operator's own
+        # tap has RELEASED them — which is the freeze in its worst form (ten
+        # rows he could not honestly close, permanently at the top) and still
+        # not a claim that anybody was dealt with.
+        assert all(_ticket_status(owner_session, t) in support.QUEUED_STATUSES
+                   for t in [*oldest, eleventh])
+    finally:
+        _drop_tickets(owner_session, t1, t2)
+        _clear_delivery(owner_session, t1)
+        _clear_delivery(owner_session, t2)
+
+
+def test_closing_a_ticket_from_a_later_page_redraws_that_page(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """Sending him back to page one after every close would rebuild the same
+    habit one level up: the queue drainable only from the top, and the work he
+    was doing on page two lost every time he finishes a piece of it."""
+    t1, _t2 = two_tenants
+    channel1 = _seed_channel(owner_session, t1)
+    try:
+        tickets = [
+            _seed_ticket(owner_session, t1, channel1, age_hours=100 - n)
+            for n in range(console.TICKETS_PAGE + 5)
+        ]
+        second = _tickets(owner_session, page=1)
+        assert _listed(second) == tickets[console.TICKETS_PAGE:]
+
+        answer = _close_ticket(owner_session, f"{tickets[10]}|1")
+
+        assert console.TICKET_CLOSED_AR.split("\n")[0] in answer
+        assert "صفحة ٢ من ٢" in answer            # still where he was
+        assert _ticket_status(owner_session, tickets[10]) == support.RESOLVED
+    finally:
+        _drop_tickets(owner_session, t1)
+        _clear_delivery(owner_session, t1)
+
+
+def test_a_page_that_emptied_underneath_him_lands_on_the_last_one(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """«التالي» tapped on a screen drawn before somebody drained the queue —
+    or a close that took the last ticket off the last page. An empty customers
+    page is merely empty; an empty TICKETS page would print «🟢 لا توجد تذاكر
+    مفتوحة» over a queue that still has people waiting in it, which is the one
+    sentence this screen may never say untruthfully."""
+    t1, _t2 = two_tenants
+    channel1 = _seed_channel(owner_session, t1)
+    try:
+        for n in range(console.TICKETS_PAGE + 1):
+            _seed_ticket(owner_session, t1, channel1, age_hours=100 - n)
+
+        far_past_the_end = _tickets(owner_session, page=9)
+
+        assert console.TICKETS_NONE_AR not in far_past_the_end.text
+        assert "صفحة ٢ من ٢" in far_past_the_end.text
+        assert len(_listed(far_past_the_end)) == 1
+    finally:
+        _drop_tickets(owner_session, t1)
+        _clear_delivery(owner_session, t1)
+
+
+def test_an_empty_queue_still_says_so_and_offers_no_page_buttons(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """The other direction of the clamp: with nothing to show, the screen has
+    to keep saying the good news, and a «التالي» to nowhere would be a button
+    that answers «انتهت صلاحية الزر» — a broken control on the watchtower."""
+    t1, _t2 = two_tenants
+    try:
+        empty = _tickets(owner_session)
+        assert console.TICKETS_NONE_AR in empty.text
+        assert "صفحة" not in empty.text
+        assert not [data for row in empty.keyboard for _label, data in row
+                    if data in ("v1|tickets|1", "v1|tickets|-1")]
+    finally:
+        _drop_tickets(owner_session, t1)
+
+
 def test_a_ticket_cannot_be_closed_twice_or_by_a_stale_button(
     owner_session: Session, two_tenants: tuple[str, str]
 ) -> None:
@@ -2283,7 +2421,7 @@ def test_closing_a_ticket_takes_the_mute_off_the_customers_line(
         owner_session.rollback()
 
         assert "أغلقنا التذكرة" in _close_ticket(owner_session, ticket)
-        assert _ticket_status(owner_session, ticket) == console.TICKET_RESOLVED
+        assert _ticket_status(owner_session, ticket) == support.RESOLVED
 
         # after: the same message raises a ticket of its own — with its own
         # age, so the queue says how long THIS person has waited, not how long
@@ -2351,7 +2489,7 @@ def test_two_confirm_cards_for_one_ticket_close_it_once_and_say_so(
         row = owner_session.execute(sql_text(
             "SELECT status, resolved_at FROM support_events WHERE id = :i"),
             {"i": ticket}).one()
-        assert row.status == console.TICKET_RESOLVED
+        assert row.status == support.RESOLVED
         assert row.resolved_at == NOW
     finally:
         _drop_tickets(owner_session, t1)
@@ -2627,7 +2765,7 @@ def test_a_forgotten_ticket_stops_silencing_the_customers_direct_line(
                 assert not re.search(r"[A-Za-z0-9]", line), line
 
         # the ticket is released — not closed, not hidden
-        assert _ticket_status(owner_session, ticket) == console.TICKET_RELEASED
+        assert _ticket_status(owner_session, ticket) == support.RELEASED
         screen = _tickets(owner_session).text
         assert code in screen
         assert console.TICKET_RELEASED_MARK_AR in screen
@@ -2646,7 +2784,7 @@ def test_a_forgotten_ticket_stops_silencing_the_customers_direct_line(
 
         # the operator's own button still closes it
         assert "أغلقنا التذكرة" in _close_ticket(owner_session, ticket)
-        assert _ticket_status(owner_session, ticket) == console.TICKET_RESOLVED
+        assert _ticket_status(owner_session, ticket) == support.RESOLVED
     finally:
         _drop_tickets(owner_session, t1)
         _drop_inbound(owner_session, t1)
@@ -2786,7 +2924,7 @@ def test_a_release_the_operators_own_tap_rolled_back_is_never_paged(
                  if o.kind == "send" and "🔁" in o.text]
         assert len(paged) == 1, [o.text for o in (*first, *second)]
         # …and what he was told is TRUE of the ledger he acts on.
-        assert _ticket_status(owner_session, ticket) == console.TICKET_RELEASED
+        assert _ticket_status(owner_session, ticket) == support.RELEASED
 
         # the mute is really gone: his next message reaches a human
         assert _direct_line(owner_session, t1, channel) == "escalated"
@@ -2857,7 +2995,7 @@ def test_two_concurrent_sweeps_page_one_forgotten_ticket_exactly_once(
             other.close()
 
         # the release itself is untouched by the skip: exactly once, one-way.
-        assert _ticket_status(owner_session, ticket) == console.TICKET_RELEASED
+        assert _ticket_status(owner_session, ticket) == support.RELEASED
         # …and once A has committed, B's next sweep has genuinely nothing to
         # do — the skip deferred no work, because the row is no longer open.
         assert console.release_forgotten_tickets(

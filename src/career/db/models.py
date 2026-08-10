@@ -399,6 +399,14 @@ class DeliveryMessage(Base):
     __tablename__ = "delivery_messages"
     __table_args__ = (
         Index("ix_delivery_messages_wa_message_id", "wa_message_id"),
+        # PARTIAL, and that is the whole design of it (0030): a refusal is
+        # rare, so this indexes only the rows that carry a Meta code and the
+        # ordinary send — almost all of them — writes no index entry at all.
+        # Declared here as well as in the migration because `alembic check`
+        # compares the model to the database and an index in one and not the
+        # other is drift, which is how the gate goes permanently red.
+        Index("ix_delivery_messages_meta_error_code", "meta_error_code",
+              postgresql_where=text("meta_error_code IS NOT NULL")),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -430,6 +438,58 @@ class DeliveryMessage(Base):
     status_updated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # ── the two facts Meta's delivery receipt already carried (0030) ─────────
+    #
+    # Both arrive on the SAME status callback, on the same wa_message_id, and
+    # both were read and dropped. `status` keeps one word — `failed` — for
+    # every reason a send can not arrive, and the bill keeps re-deriving a
+    # category from a template registry that Meta re-writes without asking.
+    #
+    #: Meta's reason code for a status that carried an ``errors`` array:
+    #: 131049 (per-user marketing cap), 131050 (recipient switched «Offers and
+    #: announcements» off), 131047 (re-engagement required), and whatever
+    #: number Meta invents next — the code is stored as it arrives, never
+    #: mapped to a word here, because a code we have no words for is still a
+    #: refusal and is still countable.
+    #:
+    #: NULL is NOT «no error». It is «this row was never told one», which is
+    #: the state of every send that simply worked, of every row written before
+    #: 0030, and of every refusal whose payload has since been redacted. There
+    #: is no default and none is wanted: 0 would read as a Meta code.
+    #:
+    #: WHY IT IS A COLUMN and not only the ERROR log line that
+    #: `worker._report_refusal` already writes: the log is ephemeral and
+    #: `webhook_events.payload` — where the same `errors` array also lives —
+    #: is REDACTED after 30 days (0024). «How many of our expiries were Meta
+    #: refusing rather than the customer going quiet» is the number the
+    #: 72-hour start guarantee is priced from, and after 30 days this column
+    #: is the only place it can still be answered from.
+    meta_error_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    #: The category this send was BILLED at, recorded on the row instead of
+    #: re-derived from a registry every time someone asks.
+    #:
+    #: `cv/close.whatsapp_spend` prices a historical row by looking up TODAY's
+    #: measurement of the template's category. Meta re-categorised five of the
+    #: eight live templates on 2026-07-17 and again on 2026-08-02, so every row
+    #: sent before those dates is now priced at a category it was not billed
+    #: at, and re-running `rollup_costs` over an old day writes a DIFFERENT
+    #: number than it wrote that day. A ledger whose past changes when a third
+    #: party changes its mind is not a ledger. The category of a send is a fact
+    #: ABOUT THAT SEND, exactly like `status`, and belongs on the row.
+    #:
+    #: Filled from Meta's own receipt (``statuses[].pricing.category``) by
+    #: `worker._handle_status`, which is the authority: it is what Meta
+    #: charged, not what we believed we would be charged. NULL means no
+    #: receipt has told us, and `close._wa_kind_of` then falls back to
+    #: `templates.billed_category` exactly as before — so a NULL here is the
+    #: old behaviour and never a worse one.
+    #:
+    #: 32 characters because Meta's own vocabulary is wider than ours:
+    #: `authentication_international` is 28. Values are stored verbatim and
+    #: lower-cased; an unrecognised one prices as `wa_unknown` (i.e. at the
+    #: marketing rate), the same err-expensive rule an unknown template name
+    #: has always followed.
+    category: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
