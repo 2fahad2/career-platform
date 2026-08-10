@@ -1,4 +1,16 @@
+"""WhatsApp template categories — what we asked for, what Meta answered.
 
+The category is Meta's answer and not our claim: five approved templates were
+moved from UTILITY to MARKETING after approval, and the last section pins what
+the code does with a measurement that arrives after this file was written.
+"""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Iterator
+
+import pytest
 
 # ── the cheapest APPROVED daily template wins (2 August) ────────────────────
 
@@ -242,3 +254,164 @@ def test_divergence_from_the_live_account_is_detectable() -> None:
     assert category_divergences(gone) == {
         "renewal_reminder": ("marketing", "absent")
     }
+
+
+# ── a measurement newer than the file (2026-08-08, the receiving half) ───────
+#
+# Meta PUSHES `template_category_update` the moment it moves a template. The
+# app was never subscribed to that field — `GET /{app_id}/subscriptions`
+# answered `fields: ['messages']` and nothing else — so the five that moved
+# from UTILITY to MARKETING were found by a hand audit weeks later. Once the
+# owner subscribes, the push is a measurement NEWER than this file, and the
+# file cannot write itself. These pin what the code does with it.
+
+@pytest.fixture(autouse=True)
+def _no_leaked_observations() -> Iterator[None]:
+    """The overlay is module state. A test that records into it and walks away
+    would silently re-price another test's WhatsApp bill."""
+    from career.whatsapp.templates import forget_live_observations
+
+    forget_live_observations()
+    yield
+    forget_live_observations()
+
+
+def test_a_pushed_category_outranks_the_dated_constant() -> None:
+    """`META_CATEGORY_OBSERVED` is dated 2026-08-08 and that date is the point.
+    A push that arrives afterwards is a newer reading of the same fact, and a
+    process that has just been TOLD `welcome_activation` is UTILITY again and
+    goes on billing it as MARKETING is preferring a constant to evidence."""
+    from datetime import date
+
+    from career.whatsapp.templates import (
+        TemplateCategory,
+        billed_category,
+        observed_category,
+        record_observed_category,
+    )
+
+    assert observed_category("welcome_activation") is TemplateCategory.MARKETING
+
+    # an appeal succeeded and Meta pushed the reversal
+    assert record_observed_category(
+        "welcome_activation", "UTILITY",
+        observed_on=date(2026, 8, 20), source="webhook",
+    )
+    assert observed_category("welcome_activation") is TemplateCategory.UTILITY
+    assert billed_category("welcome_activation") is TemplateCategory.UTILITY
+
+    # and the daily chooser sees it too — same door, no second reader
+    from career.whatsapp.templates import META_CATEGORY_OBSERVED
+
+    # the FILE is untouched: it is not a cache, it is the durable record, and
+    # nothing here may make it claim a measurement it did not take
+    assert META_CATEGORY_OBSERVED["welcome_activation"] is (
+        TemplateCategory.MARKETING
+    )
+
+
+def test_a_divergent_push_names_the_exact_edit_that_fixes_the_file() -> None:
+    """«A divergence was detected» is not something anyone can act on at 6am.
+    The line has to carry the constant, the value and the date, because the
+    only thing that makes the file true again is a human typing them."""
+    from datetime import date
+
+    from career.whatsapp.templates import record_observed_category
+
+    logger = logging.getLogger("career.whatsapp")
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append  # type: ignore[method-assign]
+    logger.addHandler(handler)
+    try:
+        record_observed_category(
+            "subscription_daily_report", "MARKETING",
+            observed_on=date(2026, 8, 20), source="webhook",
+        )
+    finally:
+        logger.removeHandler(handler)
+
+    loud = [r for r in records if r.levelno >= logging.ERROR]
+    assert loud, "a divergence the operator never hears about is the old defect"
+    msg = loud[0].getMessage()
+    assert "subscription_daily_report" in msg
+    assert "META_CATEGORY_OBSERVED" in msg
+    assert "MARKETING" in msg
+    assert "2026-08-20" in msg
+
+
+def test_the_overlay_never_claims_a_template_we_do_not_send() -> None:
+    """The live account carries Meta's own `hello_world` and `jaspers_market_*`
+    samples. This module saying anything at all about a template we never send
+    is the same unearned claim in a new place, so the overlay is bounded by
+    REGISTRY exactly as the file is."""
+    from datetime import date
+
+    from career.whatsapp.templates import (
+        META_CATEGORY_OBSERVED,
+        observed_category,
+        record_observed_category,
+    )
+
+    assert not record_observed_category(
+        "hello_world", "UTILITY", observed_on=date(2026, 8, 20), source="probe",
+    )
+    assert observed_category("hello_world") is None
+    assert "hello_world" not in META_CATEGORY_OBSERVED
+
+
+def test_a_stale_redelivery_cannot_undo_a_fresher_reading() -> None:
+    """Meta redelivers webhooks freely and out of order, and the nightly probe
+    runs beside them. A measurement is only allowed to win on its DATE."""
+    from datetime import date
+
+    from career.whatsapp.templates import (
+        TemplateCategory,
+        observed_category,
+        record_observed_category,
+    )
+
+    record_observed_category("renewal_reminder", "UTILITY",
+                             observed_on=date(2026, 9, 1), source="probe")
+    # a webhook from three weeks earlier arrives late
+    assert not record_observed_category(
+        "renewal_reminder", "MARKETING",
+        observed_on=date(2026, 8, 10), source="webhook",
+    )
+    assert observed_category("renewal_reminder") is TemplateCategory.UTILITY
+
+    # and nothing older than the file may speak at all
+    assert not record_observed_category(
+        "recovery", "UTILITY", observed_on=date(2026, 8, 1), source="webhook",
+    )
+    assert observed_category("recovery") is TemplateCategory.MARKETING
+
+
+def test_a_category_word_meta_invents_is_not_guessed_at() -> None:
+    """AUTHENTICATION exists at Meta and has no member here. Coercing it into
+    one of the two we know would put a fabricated category into the bill."""
+    from datetime import date
+
+    from career.whatsapp.templates import (
+        TemplateCategory,
+        billed_category,
+        record_observed_category,
+    )
+
+    assert not record_observed_category(
+        "recovery", "AUTHENTICATION",
+        observed_on=date(2026, 8, 20), source="webhook",
+    )
+    assert billed_category("recovery") is TemplateCategory.MARKETING
+
+
+def test_no_spec_can_answer_a_category_from_what_we_merely_requested() -> None:
+    """The `TemplateSpec.category` shim resolved to `requested_category` when
+    Meta had never been asked — i.e. it could answer «utility» about a template
+    nobody had ever measured. That is the exact claim this module exists to
+    stop making, and its last two readers (`engine/cli.py`) now go through
+    `billed_category`."""
+    from career.whatsapp.templates import ZERO_DAY_REPORT, TemplateSpec
+
+    assert not hasattr(TemplateSpec, "category")
+    assert ZERO_DAY_REPORT.requested_category is not None

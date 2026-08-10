@@ -4,7 +4,10 @@ Runs as the owner role (routes by phone before the tenant is known, spans
 tenants). For each received webhook_events row it parses the Meta payload and:
 - routes inbound messages: activation, STOP (opt-out, immediate), support
   (escalate to admin), or OTHER (opens the window → descend a pending delivery);
-- applies delivery status callbacks to delivery_messages.
+- applies delivery status callbacks to delivery_messages;
+- routes the ACCOUNT-level pushes — a template re-categorised, paused, disabled
+  or downgraded, the number's limit, the WABA itself. They are not about a
+  customer and they used to fall through the loop into `processed` in silence.
 
 Per-message idempotency is by wa_message_id (inbound_messages unique); a
 redelivered message is a no-op.
@@ -25,7 +28,7 @@ import dataclasses
 import logging
 import re
 import uuid
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import func, or_, select
@@ -43,6 +46,7 @@ from career.db.models import (
 from career.onboarding import orchestrator
 from career.telegram import messages as admin_msg
 from career.telegram.admin import TelegramAdminClient
+from career.whatsapp import webhook as webhook_intake
 from career.whatsapp.activation_flow import (
     ActivationStatus,
     activate,
@@ -1221,6 +1225,356 @@ def _handle_status(session: Session, st: dict[str, Any], *, now: datetime) -> No
         )
 
 
+# ── THE EVENTS THAT ARE NOT A CONVERSATION ───────────────────────────────────
+#
+# Everything above this line is about a customer. Everything below is about the
+# ACCOUNT: a template's category, its status, its quality, the number's limit,
+# the WABA itself. They arrive on the same POST, on the same signed URL, and
+# until now they arrived nowhere at all — the app is subscribed to `messages`
+# and to nothing else (`GET /{app_id}/subscriptions`, 2026-08-08), so the push
+# that would have caught five templates moving from UTILITY to MARKETING was
+# never sent to us.
+#
+# The owner subscribes; this is the half that has to be ready when he does.
+#
+# WHY THEY ARE NOT ONE ALERT. A category change, a pause and a disable are
+# three different things for the operator to DO, on three different clocks:
+#
+#   category change — the template still sends. What changed is who receives it
+#       (a MARKETING template is not delivered at all to a recipient who has
+#       switched «Offers and announcements» off — HTTP 200, nothing sent) and
+#       what it costs (~4.7× in KSA). The action is an APPEAL, and for an
+#       impending change the appeal window closes at a timestamp Meta hands us
+#       in the payload. Urgent, reversible, deadline-bound.
+#   pause — the template does NOT send; every attempt fails with 132015. It is
+#       a QUALITY verdict: recipients blocked or reported it. The action is to
+#       fix the content and cut the volume, and waiting is part of the fix.
+#       Nothing to appeal, and no amount of retrying helps.
+#   disable — 132016, and it is PERMANENT. The send path is gone and no appeal
+#       exists. The action is to author a NEW template and get it approved,
+#       which takes review time the product does not have if the disabled one
+#       was `welcome_activation`.
+#
+# Collapsing them into «⚠️ مشكلة في قالب» would tell the operator to look, on
+# three occasions that need three different answers within three different
+# deadlines, which is the same defect as `delivery_messages.status` having one
+# word for five refusal codes (see :data:`META_REFUSAL_CODES`).
+#
+# NO PHONE NUMBER EVER LEAVES HERE. `phone_number_quality_update` carries
+# `display_phone_number` — ours, but a phone number is a phone number and the
+# operator channel is TEN codes and opaque status only (§15.13). It is read,
+# recognised, and deliberately not printed.
+
+#: The Arabic sentence each direction of a category change earns. Constants and
+#: not f-strings: an operator line that mixes Arabic with Latin is REVERSED on
+#: Fahad's client (§16, `tests/test_alert_direction_purity.py`), so every line
+#: below is either pure Arabic or pure Latin, never both.
+_CAT_NOW_MARKETING_AR = (
+    "صار تسويقيًا: ما يوصل لمن أوقف «العروض والإعلانات» عندنا، وسعره أعلى"
+)
+_CAT_NOW_UTILITY_AR = "صار خدميًا: يوصل للكل، وسعره أقل"
+_CAT_APPEAL_AR = "الإجراء: راجع التصنيف في مدير واتساب، واعترض إن كان خطأ"
+_CAT_PENDING_AR = "التغيير مجدول ولم يقع بعد — والاعتراض ممكن قبل موعده فقط"
+
+#: `message_template_status_update.event` values that CLOSE a send path. Meta's
+#: documented set is APPROVED, ARCHIVED, UNARCHIVED, DELETED, DISABLED,
+#: FLAGGED, IN_APPEAL, LIMIT_EXCEEDED, LOCKED, PAUSED, PENDING, REINSTATED,
+#: PENDING_DELETION, REJECTED. Only PAUSED and DISABLED get their own routing,
+#: because only those two are a live send path going away for a reason the
+#: operator has to answer differently; the rest are reported by name.
+_TEMPLATE_PAUSED = "PAUSED"
+_TEMPLATE_DISABLED = "DISABLED"
+
+
+def _notify(admin_client: Any, text: str) -> None:
+    """Say it on the operator's channel; never let saying it break the event.
+
+    Same swallow as :func:`_dead_letter`'s — a Telegram outage must not turn a
+    template alert into a poisoned webhook — and the ERROR line has already
+    been written by the caller, so the fact survives the swallow.
+    """
+    try:
+        admin_client.send_admin(text)
+    except Exception:  # noqa: BLE001
+        logger.warning("admin note failed", exc_info=True)
+
+
+def _template_of(value: dict[str, Any]) -> str:
+    """The template name on an account-level payload, or a placeholder.
+
+    A template NAME is not PII — it is ours, it is on the wire in every send,
+    and without it every alert here would be «a template» and unactionable.
+    """
+    name = value.get("message_template_name")
+    return str(name) if isinstance(name, str) and name else "(unnamed)"
+
+
+def _handle_template_category(
+    value: dict[str, Any], *, admin_client: Any, now: datetime,
+) -> None:
+    """`template_category_update` — the push that would have caught the five.
+
+    TWO SHAPES, and reading them the same way is a bug Meta's own field names
+    invite (verified against the documented examples, 2026-08-08):
+
+    * **impending** — ``new_category`` is the category the template has RIGHT
+      NOW, ``correct_category`` is what Meta will move it to, and
+      ``category_update_timestamp`` is when. Reading ``new_category`` as «the
+      new one» here gets it exactly backwards, and the whole value of this
+      payload is the lead time it gives: this is the only moment an appeal is
+      possible.
+    * **completed** — ``previous_category`` and ``new_category``, both
+      meaning what they say, and it has already happened.
+
+    The measurement is recorded either way, and in both shapes the template's
+    category AT THIS INSTANT is ``new_category``.
+    """
+    name = _template_of(value)
+    current = str(value.get("new_category") or "").upper()
+    upcoming = str(value.get("correct_category") or "").upper()
+    previous = str(value.get("previous_category") or "").upper()
+
+    from career.whatsapp.templates import record_observed_category
+
+    record_observed_category(
+        name, current, observed_on=now.date(), source="webhook",
+    )
+
+    if upcoming:
+        when = _unix_date(value.get("category_update_timestamp"))
+        logger.error(
+            "meta will re-categorise template %s: %s -> %s on %s — appeal "
+            "before then or it happens", name, current or "?", upcoming, when,
+        )
+        _notify(
+            admin_client,
+            "⏳ ميتا بتغيّر تصنيف قالب في موعد محدد\n"
+            f"{name}\n"
+            f"{current or '?'} → {upcoming}\n"
+            f"{when}\n"
+            f"{_CAT_PENDING_AR}\n"
+            f"{_CAT_APPEAL_AR}"
+        )
+        return
+
+    logger.error(
+        "meta re-categorised approved template %s: %s -> %s",
+        name, previous or "?", current or "?",
+    )
+    consequence = (
+        _CAT_NOW_MARKETING_AR if current == "MARKETING" else _CAT_NOW_UTILITY_AR
+    )
+    _notify(
+        admin_client,
+        "⚠️ ميتا غيّرت تصنيف قالب بعد اعتماده\n"
+        f"{name}\n"
+        f"{previous or '?'} → {current or '?'}\n"
+        f"{consequence}\n"
+        f"{_CAT_APPEAL_AR}"
+    )
+
+
+def _handle_template_status(
+    value: dict[str, Any], *, admin_client: Any, now: datetime,
+) -> None:
+    """`message_template_status_update` — a send path opening or closing.
+
+    PAUSED and DISABLED are split out because they are the two that stop sends,
+    and they stop them differently: a pause lifts, a disable never does.
+    """
+    name = _template_of(value)
+    event = str(value.get("event") or "").upper()
+    reason = str(value.get("reason") or "")
+
+    # `message_template_category` rides along on every one of these, so the
+    # status push is a category measurement too — free, and it is the one that
+    # arrives when a template is REINSTATED under a category nobody re-checked.
+    from career.whatsapp.templates import record_observed_category
+
+    record_observed_category(
+        name, str(value.get("message_template_category") or ""),
+        observed_on=now.date(), source="webhook",
+    )
+
+    if event == _TEMPLATE_PAUSED:
+        # 132015 at send time. A quality verdict: recipients blocked it or
+        # reported it, and Meta's pacing stopped it. Retrying is not a fix and
+        # the retry budget must never be spent on it.
+        logger.error(
+            "template PAUSED by meta for quality: %s (132015) — every send "
+            "with it fails until the pause lifts", name,
+        )
+        _notify(
+            admin_client,
+            "⏸️ ميتا أوقفت قالبًا مؤقتًا بسبب الجودة\n"
+            f"{name}\n"
+            "132015\n"
+            "أي إرسال بهذا القالب يفشل الآن حتى يُرفع الإيقاف\n"
+            "السبب بلاغات أو حظر من المستلمين — والإعادة ما تنفع\n"
+            "الإجراء: راجع نصّه وقلّل الإرسال، وانتظر رفع الإيقاف"
+        )
+        return
+
+    if event == _TEMPLATE_DISABLED:
+        # 132016, and permanent: Meta disables a template that has been paused
+        # too often. There is no appeal and no un-disabling — the only exit is
+        # a NEW template, which costs review time.
+        when = _unix_date((value.get("disable_info") or {}).get("disable_date")
+                          if isinstance(value.get("disable_info"), dict)
+                          else None)
+        logger.error(
+            "template DISABLED by meta: %s (132016, %s) — permanent; this "
+            "send path is gone until a replacement is approved", name, when,
+        )
+        _notify(
+            admin_client,
+            "⛔ ميتا عطّلت قالبًا نهائيًا\n"
+            f"{name}\n"
+            "132016\n"
+            f"{when}\n"
+            "ما يرجع أبدًا ولا فيه اعتراض — لازم قالب جديد بنص مختلف\n"
+            "الإجراء: جهّز البديل وقدّمه للمراجعة، وشوف وش انكسر بدونه"
+        )
+        return
+
+    # Everything else Meta names — APPROVED, REJECTED, FLAGGED, IN_APPEAL,
+    # LIMIT_EXCEEDED, LOCKED, PENDING_DELETION … — is reported BY NAME rather
+    # than swallowed. An approval is what lets the daily chooser move to a
+    # utility template; a rejection is a submission that quietly did not land.
+    logger.info("template status at meta: %s -> %s (%s)",
+                name, event or "?", reason or "-")
+    _notify(
+        admin_client,
+        "ℹ️ ميتا غيّرت حالة قالب\n"
+        f"{name}\n"
+        f"{event or '?'}\n"
+        f"{reason or '-'}"
+    )
+
+
+def _handle_template_quality(
+    value: dict[str, Any], *, admin_client: Any,
+) -> None:
+    """`message_template_quality_update` — the warning BEFORE the pause.
+
+    GREEN → YELLOW → RED is the ladder a template walks down before Meta pauses
+    it. It is not a pause and must not read like one: nothing is broken yet,
+    and this is the only notice that arrives while there is still time to act.
+    """
+    name = _template_of(value)
+    previous = str(value.get("previous_quality_score") or "").upper()
+    current = str(value.get("new_quality_score") or "").upper()
+    if current == "RED":
+        logger.error("template quality fell to RED at meta: %s — a pause "
+                     "(132015) is what comes next", name)
+    else:
+        logger.info("template quality at meta: %s %s -> %s",
+                    name, previous or "?", current or "?")
+    _notify(
+        admin_client,
+        "📉 ميتا غيّرت تقييم جودة قالب\n"
+        f"{name}\n"
+        f"{previous or '?'} → {current or '?'}\n"
+        "الأحمر يسبق الإيقاف — عالجه قبل ما يوقف القالب"
+    )
+
+
+def _handle_phone_quality(
+    value: dict[str, Any], *, admin_client: Any,
+) -> None:
+    """`phone_number_quality_update` — the NUMBER's messaging limit.
+
+    The payload carries `display_phone_number`. It is ours and it is still a
+    phone number, so it is read and never printed (§15.13): the operator has
+    exactly one number and naming it buys nothing.
+    """
+    event = str(value.get("event") or "").upper()
+    limit = str(value.get("current_limit")
+                or value.get("max_daily_messages_limit") or "").upper()
+    logger.info("whatsapp number quality/limit changed at meta: %s (%s)",
+                event or "?", limit or "?")
+    _notify(
+        admin_client,
+        "📶 ميتا غيّرت حد الإرسال لرقمنا\n"
+        f"{event or '?'}\n"
+        f"{limit or '?'}\n"
+        "الحد يحكم عدد المستلمين الجدد يوميًا"
+    )
+
+
+#: `account_update.event` values that are the account itself going wrong.
+#: Everything else on that field is bookkeeping (a partner added, a pricing
+#: tier moved) and is reported quietly.
+_ACCOUNT_ALARMS = frozenset({
+    "ACCOUNT_VIOLATION", "ACCOUNT_RESTRICTION", "ACCOUNT_DELETED",
+    "DISABLED_UPDATE", "ACCOUNT_OFFBOARDED",
+})
+
+
+def _handle_account_update(
+    value: dict[str, Any], *, admin_client: Any,
+) -> None:
+    """`account_update` — the WABA. A restriction here stops EVERY send."""
+    event = str(value.get("event") or "").upper()
+    if event in _ACCOUNT_ALARMS:
+        logger.error("whatsapp business account event at meta: %s — sending "
+                     "may be restricted or stopped", event)
+        _notify(
+            admin_client,
+            "🚨 ميتا أصدرت إجراءً على حساب واتساب بيزنس\n"
+            f"{event}\n"
+            "قد يتوقف الإرسال كليًا — راجع مدير الحساب فورًا"
+        )
+        return
+    logger.info("whatsapp business account update at meta: %s", event or "?")
+    _notify(
+        admin_client,
+        "ℹ️ تحديث على حساب واتساب بيزنس\n"
+        f"{event or '?'}"
+    )
+
+
+def _unix_date(raw: Any) -> str:
+    """A Meta unix timestamp as an ISO date, or ``"-"``. Never raises.
+
+    Printed on its own line in the alerts above, which is not cosmetic: a date
+    on a line with Arabic is reversed on the operator's client (§16).
+    """
+    try:
+        return datetime.fromtimestamp(int(raw), tz=UTC).date().isoformat()
+    except (TypeError, ValueError, OSError, OverflowError):
+        return "-"
+
+
+#: The account-level fields this worker routes. It is `webhook`'s list, not a
+#: second copy: a field the intake names and the worker cannot handle is a row
+#: that looks processed and is not, which is the exact defect being closed.
+ACCOUNT_EVENT_FIELDS = webhook_intake.ACCOUNT_EVENT_FIELDS
+
+
+def _handle_account_event(
+    change: dict[str, Any], *, admin_client: Any, now: datetime,
+) -> bool:
+    """Route one non-conversation change. True when it was ours to handle."""
+    field = str(change.get("field") or "")
+    value = change.get("value") or {}
+    if not isinstance(value, dict):
+        return False
+    if field == "template_category_update":
+        _handle_template_category(value, admin_client=admin_client, now=now)
+    elif field == "message_template_status_update":
+        _handle_template_status(value, admin_client=admin_client, now=now)
+    elif field == "message_template_quality_update":
+        _handle_template_quality(value, admin_client=admin_client)
+    elif field == "phone_number_quality_update":
+        _handle_phone_quality(value, admin_client=admin_client)
+    elif field == "account_update":
+        _handle_account_update(value, admin_client=admin_client)
+    else:
+        return False
+    return True
+
+
 #: How many times ONE event may be attempted before the worker stops trying.
 #: Five is the first attempt plus the whole ladder below: a Meta 5xx or a
 #: Claude timeout still failing forty minutes later is not a blip, and going on
@@ -1552,7 +1906,12 @@ def process_pending_whatsapp(
     deps = (None if onboarding is None
             else dataclasses.replace(onboarding, whatsapp_client=ledger))
 
-    counts = {"messages": 0, "statuses": 0, "failed": 0, "deferred": 0}
+    # "account" counts the non-conversation changes — a category move, a pause,
+    # a disable, a quality drop, a limit change. A new key and not a share of
+    # "messages": `run_worker_loop` logs the batch only when a customer was
+    # involved, and a template alert must not start reporting phantom traffic.
+    counts = {"messages": 0, "statuses": 0, "account": 0,
+              "failed": 0, "deferred": 0}
     for ev in events:
         # audit fix: one poisoned event must never wedge the whole queue —
         # without this isolation a single raise left the event 'received'
@@ -1579,6 +1938,27 @@ def process_pending_whatsapp(
                     for st in value.get("statuses", []) or []:
                         _handle_status(owner_session, st, now=now)
                         counts["statuses"] += 1
+                    # Account-level pushes: a template's category, status or
+                    # quality, the number's limit, the WABA itself. They carry
+                    # neither `messages` nor `statuses`, so before this the
+                    # loop fell straight through to `processed` — the row was
+                    # stored, marked done, and the fact inside it discarded.
+                    if _handle_account_event(change, admin_client=admin_client,
+                                             now=now):
+                        counts["account"] += 1
+                    elif (isinstance(change.get("field"), str)
+                            and change["field"]
+                            and change["field"] != "messages"):
+                        # A field Meta added since ACCOUNT_EVENT_FIELDS was
+                        # written. It is NOT silently marked processed: the
+                        # whole point of this change is that nothing arrives
+                        # here and disappears. ERROR, because the operator's
+                        # harvester forwards nothing quieter.
+                        logger.error(
+                            "unrouted whatsapp webhook field %r — stored and "
+                            "not acted on; add it to ACCOUNT_EVENT_FIELDS",
+                            change["field"],
+                        )
             ev.processing_status = "processed"
             ev.processed_at = func.now()
             ev.attempt_count = ev.attempt_count + 1

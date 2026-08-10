@@ -16,12 +16,14 @@ real Postgres, a real rollback, and a real row that is still there afterwards.
 
 from __future__ import annotations
 
+import logging as _logging
 import uuid
 from datetime import date, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from sqlalchemy import select
 from sqlalchemy import text as sql_text
 from sqlalchemy.engine import Engine
@@ -1249,3 +1251,175 @@ def test_the_sweep_reads_its_subscriptions_through_the_orm() -> None:
         "subscriptions with raw SQL, `cli._scope_to_one_customer` no longer "
         "bounds what one transaction touches"
     )
+
+
+# ── the nightly template probe: the poll half of the pair (2026-08-08) ───────
+#
+# `preferred_daily_template` chooses on META'S OWN ANSWER when it is handed a
+# {name: category} mapping — the form its docstring calls «the only form that
+# cannot be wrong» — and falls back to a hand-ordered guess about categories
+# when it is handed a bare set of names. This probe asked Meta for
+# `fields=name,status`, so a set of names was all it could produce, so the
+# guess is the branch that ran every night while Meta had quietly moved five of
+# the eight templates from UTILITY to MARKETING.
+#
+# The rows below are the live account's own shape, read with a read-only GET on
+# 2026-08-08 (`GET /{waba}/message_templates
+# ?fields=name,status,category,previous_category`), Meta's `hello_world` and
+# `jaspers_market_*` samples included — they are on the account and they are
+# not ours.
+
+@pytest.fixture(autouse=True)
+def _no_leaked_template_observations() -> Any:
+    from career.whatsapp.templates import forget_live_observations
+
+    forget_live_observations()
+    yield
+    forget_live_observations()
+
+
+def _meta_rows(**overrides: str) -> list[dict[str, Any]]:
+    live = {
+        "subscription_daily_report": "UTILITY",
+        "daily_service_update": "MARKETING",
+        "daily_opportunities_utility": "MARKETING",
+        "daily_opportunities_marketing": "MARKETING",
+        "welcome_activation": "MARKETING",
+        "onboarding_reminder": "MARKETING",
+        "renewal_reminder": "MARKETING",
+        "recovery": "MARKETING",
+        "hello_world": "UTILITY",
+        "jaspers_market_plain_text_v1": "MARKETING",
+    }
+    live.update(overrides)
+    was_utility = {
+        "daily_service_update", "daily_opportunities_utility",
+        "welcome_activation", "onboarding_reminder", "renewal_reminder",
+    }
+    rows: list[dict[str, Any]] = []
+    for name, category in live.items():
+        row: dict[str, Any] = {
+            "name": name, "status": "APPROVED", "category": category,
+        }
+        if name in was_utility:
+            row["previous_category"] = "UTILITY"
+        rows.append(row)
+    return rows
+
+
+def _wire_meta(monkeypatch: Any, rows: list[dict[str, Any]],
+               ) -> list[dict[str, Any]]:
+    """Answer the probe's GET and record what it ASKED for."""
+    import httpx
+
+    asked: list[dict[str, Any]] = []
+
+    class _Response:
+        status_code = 200
+
+        @staticmethod
+        def json() -> dict[str, Any]:
+            return {"data": rows, "paging": {}}
+
+    def _get(url: str, params: Any = None, headers: Any = None,
+             timeout: float = 0.0) -> Any:
+        asked.append(dict(params or {}))
+        return _Response()
+
+    monkeypatch.setattr(httpx, "get", _get)
+    return asked
+
+
+def _wa_settings() -> Any:
+    return SimpleNamespace(whatsapp_access_token="tok",
+                           whatsapp_waba_id="222233339830714")
+
+
+def test_the_nightly_probe_asks_meta_for_the_category(
+    monkeypatch: Any
+) -> None:
+    """One missing field is the whole defect: without `category` the chooser
+    cannot take the branch that cannot be wrong, and `previous_category` is the
+    column that proves a template was ACCEPTED as utility and moved
+    afterwards rather than submitted wrong."""
+    asked = _wire_meta(monkeypatch, _meta_rows())
+    cli._preferred_daily(_wa_settings())
+
+    assert asked, "the probe never called Meta"
+    fields = str(asked[0].get("fields", ""))
+    assert "category" in fields
+    assert "previous_category" in fields
+    assert "status" in fields and "name" in fields
+
+
+def test_the_probe_obeys_metas_category_over_our_hand_ordered_guess(
+    monkeypatch: Any
+) -> None:
+    """The two disagree here on purpose: our preference order puts
+    `subscription_daily_report` first, and Meta says it is MARKETING today
+    while `daily_service_update` is UTILITY. A marketing template is ~4.7×
+    the price in KSA and is not delivered AT ALL to a recipient who switched
+    «Offers and announcements» off — so the day must follow Meta."""
+    _wire_meta(monkeypatch, _meta_rows(
+        subscription_daily_report="MARKETING",
+        daily_service_update="UTILITY",
+    ))
+    assert cli._preferred_daily(_wa_settings()).name == "daily_service_update"
+
+    # and when Meta agrees with the order, the order is what runs
+    _wire_meta(monkeypatch, _meta_rows())
+    assert cli._preferred_daily(_wa_settings()).name == "subscription_daily_report"
+
+
+def test_the_probe_says_a_divergence_out_loud(
+    monkeypatch: Any, caplog: Any
+) -> None:
+    """`category_divergences` existed with zero production callers. A drift
+    nobody compares is the defect it replaced, one week older — and the level
+    is ERROR because the operator's harvester forwards nothing quieter."""
+    _wire_meta(monkeypatch, _meta_rows(subscription_daily_report="MARKETING"))
+    with caplog.at_level(_logging.ERROR, logger="career.engine"):
+        cli._preferred_daily(_wa_settings())
+
+    loud = [r.getMessage() for r in caplog.records
+            if r.levelno >= _logging.ERROR]
+    assert any("DIVERGED" in m and "subscription_daily_report" in m
+               for m in loud), loud
+
+
+def test_the_probe_prices_tonight_on_what_it_read_tonight(
+    monkeypatch: Any
+) -> None:
+    """The probe is a measurement, so the rest of the process must use it. The
+    file is dated and cannot write itself; the alternative is billing tonight's
+    sends at last week's categories, which is how five templates were recorded
+    at 21% of their real price."""
+    from career.whatsapp.templates import TemplateCategory, billed_category
+
+    assert billed_category("recovery") is TemplateCategory.MARKETING
+    _wire_meta(monkeypatch, _meta_rows(recovery="UTILITY"))
+    cli._preferred_daily(_wa_settings())
+    assert billed_category("recovery") is TemplateCategory.UTILITY
+
+    # …and never about a template that is not ours, however loudly Meta
+    # reports it: `hello_world` is Meta's own sample and we never send it
+    from career.whatsapp.templates import observed_category
+
+    assert observed_category("hello_world") is None
+
+
+def test_an_unreachable_meta_still_never_stops_the_night(
+    monkeypatch: Any, caplog: Any
+) -> None:
+    """The probe is advisory. It may cost the day the cheaper template; it may
+    never cost the day."""
+    import httpx
+
+    def _boom(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("graph unreachable")
+
+    monkeypatch.setattr(httpx, "get", _boom)
+    with caplog.at_level(_logging.ERROR, logger="career.engine"):
+        chosen = cli._preferred_daily(_wa_settings())
+    assert chosen.name == "subscription_daily_report"
+    assert any("falling back" in r.getMessage() for r in caplog.records)

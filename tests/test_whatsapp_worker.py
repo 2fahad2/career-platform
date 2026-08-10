@@ -7,11 +7,13 @@ channel.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
+import pytest
 from sqlalchemy import select, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
@@ -21,6 +23,8 @@ from career.salla import subscriptions as st
 from career.salla.client import FakeSallaClient, SallaOrder
 from career.salla.provisioning import provision_order
 from career.telegram.admin import FakeTelegramAdminClient
+from career.whatsapp import webhook as wa_webhook
+from career.whatsapp import worker as wa_worker
 from career.whatsapp.activation_flow import activate
 from career.whatsapp.client import FakeWhatsAppClient
 from career.whatsapp.delivery import DELIVERY_COMPLETED, deliver_adaptive
@@ -1248,7 +1252,8 @@ def test_a_meta_5xx_leaves_the_message_alive_behind_a_clock(
 
     counts = _run(owner_session, _MetaRefusingWithStatus(), admin)
 
-    assert counts == {"messages": 0, "statuses": 0, "failed": 0, "deferred": 1}
+    assert counts == {"messages": 0, "statuses": 0, "account": 0,
+                      "failed": 0, "deferred": 1}
     row = _ev_row(owner_engine, ev_id)
     assert row.processing_status == "received"   # still the worker's to do
     assert row.attempt_count == 1
@@ -1273,7 +1278,8 @@ def test_a_deferred_event_is_invisible_until_its_clock_runs_out(
     _run(owner_session, _MetaRefusingWithStatus(), admin)
 
     early = _run(owner_session, wa, admin, now=NOW + timedelta(seconds=29))
-    assert early == {"messages": 0, "statuses": 0, "failed": 0, "deferred": 0}
+    assert early == {"messages": 0, "statuses": 0, "account": 0,
+                     "failed": 0, "deferred": 0}
     assert wa.sent == []                         # not even looked at
 
     late = _run(owner_session, wa, admin, now=NOW + timedelta(seconds=31))
@@ -2492,3 +2498,335 @@ def test_the_error_array_is_read_whatever_shape_meta_sends() -> None:
     assert status_error_codes({"errors": [{"code": "131049"}]}) == [131049]
     assert status_error_codes(
         {"errors": [{"code": 131049}, {"code": 131050}]}) == [131049, 131050]
+
+
+# ── the events nobody was subscribed to (2026-08-08) ─────────────────────────
+#
+# Meta re-categorised FIVE approved templates from UTILITY to MARKETING and
+# nobody found out until a manual audit. Meta pushes a notification when it
+# does that — we never asked for it. A read-only
+# `GET /{app_id}/subscriptions` on 2026-08-08 answered
+# `object: whatsapp_business_account`, `fields: ['messages']`, and nothing
+# else, so `message_template_status_update` and `template_category_update` were
+# not being classified as "other" and dropped: they had never been SENT.
+#
+# The owner subscribes. This is the half that has to be ready when he does, and
+# every payload below is Meta's own documented example shape (verified against
+# developers.facebook.com → whatsapp → webhooks → reference, 2026-08-08), not
+# an invented one.
+
+_WABA = "102290129340398"
+
+#: These pushes are dated AFTER `templates.META_CATEGORY_OBSERVED_AT`, which is
+#: not decoration: a measurement older than the file is refused on purpose, so
+#: a late webhook redelivery cannot undo a fresher reading.
+ACCOUNT_NOW = datetime(2026, 8, 20, 9, 0, tzinfo=UTC)
+
+
+def _account_payload(field: str, value: dict[str, Any],
+                     *, when: int = 1751247548) -> dict[str, Any]:
+    """Meta's account-level envelope: `entry[].changes[].{field,value}` and NO
+    `messages`/`statuses` key at all — which is exactly why the worker loop
+    used to fall straight through it to `processed`."""
+    return {
+        "object": "whatsapp_business_account",
+        "entry": [{"id": _WABA, "time": when,
+                   "changes": [{"field": field, "value": value}]}],
+    }
+
+
+#: Meta's documented COMPLETED category change. `previous_category` and
+#: `new_category` both mean what they say.
+_CATEGORY_COMPLETED = _account_payload("template_category_update", {
+    "message_template_id": 278077987957091,
+    "message_template_name": "welcome_activation",
+    "message_template_language": "ar",
+    "previous_category": "UTILITY",
+    "new_category": "MARKETING",
+}, when=1746169200)
+
+#: Meta's documented IMPENDING category change — and the trap. `new_category`
+#: here is the category the template has RIGHT NOW; `correct_category` is what
+#: Meta will move it to, at `category_update_timestamp`. This is the ONLY
+#: notice that arrives while an appeal is still possible.
+_CATEGORY_IMPENDING = _account_payload("template_category_update", {
+    "message_template_id": 278077987957091,
+    "message_template_name": "subscription_daily_report",
+    "message_template_language": "ar",
+    "new_category": "UTILITY",
+    "correct_category": "MARKETING",
+    "category_update_timestamp": 1746169200,
+}, when=1746082800)
+
+#: 132015 at send time: paused for quality.
+_TEMPLATE_PAUSED = _account_payload("message_template_status_update", {
+    "event": "PAUSED",
+    "message_template_id": 1689556908129832,
+    "message_template_name": "daily_service_update",
+    "message_template_language": "ar",
+    "reason": "NONE",
+    "message_template_category": "MARKETING",
+})
+
+#: 132016: disabled, and there is no way back.
+_TEMPLATE_DISABLED = _account_payload("message_template_status_update", {
+    "event": "DISABLED",
+    "message_template_id": 1689556908129832,
+    "message_template_name": "renewal_reminder",
+    "message_template_language": "ar",
+    "reason": "NONE",
+    "message_template_category": "MARKETING",
+    "disable_info": {"disable_date": 1751247548},
+})
+
+_TEMPLATE_REJECTED = _account_payload("message_template_status_update", {
+    "event": "REJECTED",
+    "message_template_id": 1689556908129835,
+    "message_template_name": "onboarding_reminder",
+    "message_template_language": "ar",
+    "reason": "INVALID_FORMAT",
+    "message_template_category": "MARKETING",
+    "rejection_info": {
+        "reason": "Your template has parameters placed next to each other.",
+        "recommendation": "Separate parameters with descriptive text.",
+    },
+})
+
+_QUALITY_DROP = _account_payload("message_template_quality_update", {
+    "previous_quality_score": "GREEN",
+    "new_quality_score": "RED",
+    "message_template_id": 806312974732579,
+    "message_template_name": "daily_opportunities_marketing",
+    "message_template_language": "ar",
+}, when=1674864290)
+
+_PHONE_QUALITY = _account_payload("phone_number_quality_update", {
+    "display_phone_number": "15550783881",
+    "event": "THROUGHPUT_UPGRADE",
+    "current_limit": "TIER_UNLIMITED",
+}, when=1748454394)
+
+_ACCOUNT_RESTRICTED = _account_payload("account_update", {
+    "country": "SA",
+    "event": "ACCOUNT_RESTRICTION",
+    "restriction_info": [
+        {"restriction_type": "RESTRICTED_BIZ_INITIATED_MESSAGING",
+         "expiration": 1751247548},
+    ],
+})
+
+
+@pytest.fixture(autouse=True)
+def _no_leaked_template_observations() -> Any:
+    """The category overlay is module state — a push recorded here must not
+    re-price another test file's WhatsApp bill."""
+    from career.whatsapp.templates import forget_live_observations
+
+    forget_live_observations()
+    yield
+    forget_live_observations()
+
+
+def test_the_account_fields_are_named_at_intake_not_lumped_into_other() -> None:
+    """`event_type` is the only column an operator can query without reading
+    JSONB, and it is what `replay_lost_events --event-type` selects on. Every
+    one of these used to land as "other", indistinguishable from a shape Meta
+    invented last week."""
+    derive = wa_webhook._derive_event_type
+
+    assert derive(_CATEGORY_COMPLETED) == "template_category_update"
+    assert derive(_CATEGORY_IMPENDING) == "template_category_update"
+    assert derive(_TEMPLATE_PAUSED) == "message_template_status_update"
+    assert derive(_TEMPLATE_DISABLED) == "message_template_status_update"
+    assert derive(_QUALITY_DROP) == "message_template_quality_update"
+    assert derive(_PHONE_QUALITY) == "phone_number_quality_update"
+    assert derive(_ACCOUNT_RESTRICTED) == "account_update"
+
+    # the hot path is untouched: a customer message in the batch still names
+    # the row, because that is what the replay tool's safety rules key on
+    assert derive(_payload(messages=[_text_msg("wamid.1", "+966500000000",
+                                               "مرحبا")])) == "messages"
+    assert derive(_payload(statuses=[{"id": "wamid.1",
+                                      "status": "delivered"}])) == "statuses"
+    # and a field Meta adds tomorrow is still honestly unknown
+    assert derive(_account_payload("smb_app_state_sync", {})) == "other"
+
+
+def _run_account(owner_session: Session, payload: dict[str, Any],
+                 ) -> tuple[dict[str, int], FakeTelegramAdminClient, WebhookEvent]:
+    _insert_event(owner_session, payload)
+    admin = FakeTelegramAdminClient()
+    counts = process_pending_whatsapp(
+        owner_session, whatsapp_client=FakeWhatsAppClient(),
+        admin_client=admin, now=ACCOUNT_NOW,
+    )
+    event = owner_session.execute(
+        select(WebhookEvent).order_by(WebhookEvent.received_at.desc())
+    ).scalars().first()
+    assert event is not None
+    return counts, admin, event
+
+
+def test_a_category_push_is_no_longer_stored_and_discarded(
+    owner_session: Session, owner_engine: Engine
+) -> None:
+    """WHAT "other" COST. The row was written, the worker walked its
+    entry/changes, found neither `messages` nor `statuses`, counted nothing and
+    set `processing_status = 'processed'` with a `processed_at` stamp. Not
+    retried, not dead-lettered, not logged, not alerted — on disk it is
+    indistinguishable from an event that was handled, and thirty days later the
+    retention sweep replaces the body with a PII-free skeleton. The category
+    change was in there the whole time."""
+    counts, admin, event = _run_account(owner_session, _CATEGORY_COMPLETED)
+
+    assert counts["account"] == 1
+    assert counts["messages"] == 0 and counts["statuses"] == 0
+    assert event.processing_status == "processed"   # still not a failure
+    assert admin.messages, "the push arrived and nobody was told"
+    said = admin.messages[0]
+    assert "welcome_activation" in said
+    assert "UTILITY" in said and "MARKETING" in said
+
+
+def test_a_category_change_a_pause_and_a_disable_are_three_alerts(
+    owner_session: Session, owner_engine: Engine
+) -> None:
+    """Three different operator actions on three different clocks: appeal a
+    category (reversible, deadline-bound), fix content and wait out a pause
+    (132015, no appeal), author a replacement for a disable (132016,
+    permanent). One «⚠️ مشكلة في قالب» for all three would tell him to look and
+    nothing more."""
+    _, cat_admin, _ = _run_account(owner_session, _CATEGORY_COMPLETED)
+    _, pause_admin, _ = _run_account(owner_session, _TEMPLATE_PAUSED)
+    _, kill_admin, _ = _run_account(owner_session, _TEMPLATE_DISABLED)
+
+    cat, pause, kill = (cat_admin.messages[0], pause_admin.messages[0],
+                        kill_admin.messages[0])
+    heads = {m.splitlines()[0] for m in (cat, pause, kill)}
+    assert len(heads) == 3, f"collapsed into one alert: {heads}"
+
+    # the pause is a quality verdict and retrying is not a fix
+    assert "132015" in pause and "132015" not in cat and "132015" not in kill
+    # the disable is permanent and needs a NEW template
+    assert "132016" in kill and "132016" not in cat and "132016" not in pause
+    # only the category change is appealable
+    assert "اعترض" in cat
+    assert "renewal_reminder" in kill and "daily_service_update" in pause
+
+
+def test_an_impending_category_change_is_not_read_as_a_completed_one(
+    owner_session: Session, owner_engine: Engine
+) -> None:
+    """The trap in Meta's own field names: on the IMPENDING payload
+    `new_category` is what the template is NOW and `correct_category` is what
+    it will become. Reading `new_category` as «the new one» gets it exactly
+    backwards and throws away the only notice that arrives while an appeal is
+    still possible."""
+    from career.whatsapp.templates import TemplateCategory, observed_category
+
+    _, admin, _ = _run_account(owner_session, _CATEGORY_IMPENDING)
+    said = admin.messages[0]
+
+    assert "subscription_daily_report" in said
+    # the direction is stated the right way round …
+    assert said.index("UTILITY") < said.index("MARKETING")
+    # … the deadline is on the line, because the appeal window closes at it …
+    assert "2025-05-02" in said     # Meta's own example timestamp
+    # … and it is not reported as something that has already happened
+    assert "مجدول" in said
+    # the template is STILL utility today, and the measurement says so
+    assert observed_category("subscription_daily_report") is (
+        TemplateCategory.UTILITY
+    )
+
+
+def test_a_pushed_category_is_recorded_as_a_measurement(
+    owner_session: Session, owner_engine: Engine
+) -> None:
+    """A push is a newer reading than `META_CATEGORY_OBSERVED`'s dated
+    snapshot, and the process that received it must price on it immediately —
+    it cannot write the constant, and waiting for a human to do so is the
+    window in which the five templates were billed at 21% of their true
+    price."""
+    from career.whatsapp.templates import TemplateCategory, billed_category
+
+    reversal = _account_payload("template_category_update", {
+        "message_template_id": 278077987957091,
+        "message_template_name": "renewal_reminder",
+        "message_template_language": "ar",
+        "previous_category": "MARKETING",
+        "new_category": "UTILITY",
+    })
+    assert billed_category("renewal_reminder") is TemplateCategory.MARKETING
+    _run_account(owner_session, reversal)
+    assert billed_category("renewal_reminder") is TemplateCategory.UTILITY
+
+
+def test_a_quality_drop_is_the_warning_before_the_pause(
+    owner_session: Session, owner_engine: Engine
+) -> None:
+    """GREEN → YELLOW → RED is the ladder a template walks down before Meta
+    pauses it. Nothing is broken yet, and this is the only notice that arrives
+    while there is still time to act — so it must not read like a pause."""
+    _, admin, _ = _run_account(owner_session, _QUALITY_DROP)
+    said = admin.messages[0]
+    assert "daily_opportunities_marketing" in said
+    assert "GREEN" in said and "RED" in said
+    assert "132015" not in said
+
+
+def test_a_rejection_is_reported_by_name_rather_than_swallowed(
+    owner_session: Session, owner_engine: Engine
+) -> None:
+    """A submission that quietly did not land is a template the daily chooser
+    will wait for forever."""
+    _, admin, _ = _run_account(owner_session, _TEMPLATE_REJECTED)
+    said = admin.messages[0]
+    assert "onboarding_reminder" in said and "REJECTED" in said
+
+
+def test_the_account_and_number_pushes_never_print_a_phone_number(
+    owner_session: Session, owner_engine: Engine
+) -> None:
+    """`phone_number_quality_update` carries `display_phone_number`. It is our
+    own number and it is still a phone number — the operator channel is TEN
+    codes, counts and opaque status only (§15.13)."""
+    _, phone_admin, _ = _run_account(owner_session, _PHONE_QUALITY)
+    _, acct_admin, _ = _run_account(owner_session, _ACCOUNT_RESTRICTED)
+
+    said = phone_admin.messages[0]
+    assert "15550783881" not in said
+    assert "TIER_UNLIMITED" in said
+
+    alarm = acct_admin.messages[0]
+    assert "ACCOUNT_RESTRICTION" in alarm
+
+
+def test_a_field_meta_adds_later_is_not_marked_processed_in_silence(
+    owner_session: Session, owner_engine: Engine, caplog: Any
+) -> None:
+    """The permanent form of the fix. A field we do not route is still stored
+    and still returns 200 — but it says so at ERROR, which is the only level
+    the operator's harvester forwards, so the next un-named push costs one
+    night instead of a quarter."""
+    with caplog.at_level(logging.ERROR, logger="career.whatsapp"):
+        counts, admin, event = _run_account(
+            owner_session, _account_payload("user_preferences", {"x": 1}),
+        )
+    assert counts["account"] == 0
+    assert event.processing_status == "processed"
+    assert any("user_preferences" in r.getMessage() for r in caplog.records)
+
+
+def test_the_worker_routes_exactly_what_the_intake_names(
+    owner_session: Session
+) -> None:
+    """One list, two readers. A field the intake names and the worker cannot
+    handle is a row that looks processed and is not — the exact defect being
+    closed here."""
+    assert wa_worker.ACCOUNT_EVENT_FIELDS is wa_webhook.ACCOUNT_EVENT_FIELDS
+    for field in wa_webhook.ACCOUNT_EVENT_FIELDS:
+        assert wa_worker._handle_account_event(
+            {"field": field, "value": {}},
+            admin_client=FakeTelegramAdminClient(), now=NOW,
+        ), field

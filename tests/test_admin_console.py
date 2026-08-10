@@ -2255,6 +2255,146 @@ def test_a_ticket_cannot_be_closed_twice_or_by_a_stale_button(
         _clear_delivery(owner_session, t1)
 
 
+def test_closing_a_ticket_takes_the_mute_off_the_customers_line(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """THE POINT OF CLOSING, and the half `release_forgotten_tickets` refuses
+    to make.
+
+    Three separate dedupes — the لمّاح+ direct line, the funnel's consent
+    stall and the paid-while-opted-out alert — all key on «status = open», so
+    an open ticket does not merely sit in a queue: it SILENCES that customer's
+    channel until something moves the row. The 48-hour sweep is the safety
+    net and says out loud that it is not a closure. The button is the real
+    exit, and «the operator's tap unmutes the line» is a claim that spans the
+    console and a module it does not own, so it is asserted end to end here:
+    if `_run_ticket_close` ever wrote some other word than the one the dedupes
+    read, every test above would still pass and the customer would stay muted
+    with his ticket off the screen — the original silence, made permanent.
+    """
+    t1, _ = two_tenants
+    channel = _seed_channel(owner_session, t1)
+    _seed_subscription(owner_session, t1, "ACTIVE", plan="executive")
+    try:
+        ticket = _seed_ticket(owner_session, t1, channel,
+                              kind="executive_direct_message")
+        # before: his next message reaches nobody
+        assert _direct_line(owner_session, t1, channel) == "already_open"
+        owner_session.rollback()
+
+        assert "أغلقنا التذكرة" in _close_ticket(owner_session, ticket)
+        assert _ticket_status(owner_session, ticket) == console.TICKET_RESOLVED
+
+        # after: the same message raises a ticket of its own — with its own
+        # age, so the queue says how long THIS person has waited, not how long
+        # ago the one the operator already dealt with arrived.
+        assert _direct_line(owner_session, t1, channel) == "escalated"
+        owner_session.commit()
+        fresh = owner_session.execute(sql_text(
+            "SELECT id FROM support_events WHERE tenant_id = :t"
+            " AND status = 'open'"), {"t": t1}).scalars().all()
+        assert len(fresh) == 1 and str(fresh[0]) != ticket
+    finally:
+        _drop_tickets(owner_session, t1)
+        _drop_subscriptions(owner_session, t1)
+        _clear_delivery(owner_session, t1)
+
+
+def test_two_confirm_cards_for_one_ticket_close_it_once_and_say_so(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """The one-shot nonce proves a BUTTON cannot be tapped twice; it says
+    nothing about the write, because two taps on «إغلاق ١» mint two different
+    nonces and both are live for five minutes. At fifty tickets that is the
+    ordinary case, not an exotic one: the queue is open on the phone and on
+    the laptop, and the operator closes the same ticket from whichever is in
+    his hand.
+
+    So the second confirmation must refuse OUT LOUD — «مغلقة أصلًا» — and must
+    not restamp `resolved_at`. The stamp answers «when was this human dealt
+    with», and a stamp that moves to whenever a stale card was last tapped is
+    a worse answer than none: it reads as a fresh closure of a ticket nobody
+    touched since morning. Silence here would be the incident this file keeps
+    re-learning, in its cheapest form — a ✅ over a write that did not happen.
+    """
+    t1, _ = two_tenants
+    code = _code_of(owner_session, t1)
+    channel = _seed_channel(owner_session, t1)
+    try:
+        ticket = _seed_ticket(owner_session, t1, channel)
+        nonces = []
+        for _ in range(2):     # two screens open at once
+            card = handle_update(
+                owner_session, _cbq(ADMIN, f"v1|tclose|{ticket}"),
+                admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+            )[1]
+            nonces.append([d for row in card.keyboard for _l, d in row
+                           if d.startswith("v1|tdone|")][0])
+        assert nonces[0] != nonces[1]
+
+        first = handle_update(
+            owner_session, _cbq(ADMIN, nonces[0]), admin_chat_id=ADMIN,
+            probes=FakeProbes(), now=NOW,
+        )[1]
+        assert console.TICKET_CLOSED_AR.format(code=code) in first.text
+
+        # the other card, still live, three minutes later
+        later = NOW + timedelta(minutes=3)
+        second = handle_update(
+            owner_session, _cbq(ADMIN, nonces[1]), admin_chat_id=ADMIN,
+            probes=FakeProbes(), now=later,
+        )[1]
+        assert console.TICKET_ALREADY_AR.format(code=code) in second.text
+        # …and the refusal is a refusal: the record still says when it was
+        # actually dealt with, and the queue is not lying about a second one
+        assert console.TICKETS_NONE_AR in second.text
+        row = owner_session.execute(sql_text(
+            "SELECT status, resolved_at FROM support_events WHERE id = :i"),
+            {"i": ticket}).one()
+        assert row.status == console.TICKET_RESOLVED
+        assert row.resolved_at == NOW
+    finally:
+        _drop_tickets(owner_session, t1)
+        _clear_delivery(owner_session, t1)
+
+
+def test_a_ticket_that_vanishes_between_the_card_and_the_confirm_says_so(
+    owner_session: Session, two_tenants: tuple[str, str]
+) -> None:
+    """The last close branch, and the only one nothing reached: the ticket is
+    gone by the time the confirmation lands — its customer's channel purged,
+    or the row removed underneath. The operator gets a sentence and a redrawn
+    queue, never a traceback and never a ✅ over nothing.
+
+    ``expunge_all`` models what production already is: ``run_admin_bot``
+    opens a FRESH ``Session`` per update, so the confirmation tap never
+    inherits the card tap's identity map.
+    """
+    t1, _ = two_tenants
+    channel = _seed_channel(owner_session, t1)
+    try:
+        ticket = _seed_ticket(owner_session, t1, channel)
+        card = handle_update(
+            owner_session, _cbq(ADMIN, f"v1|tclose|{ticket}"),
+            admin_chat_id=ADMIN, probes=FakeProbes(), now=NOW,
+        )[1]
+        nonce = [d for row in card.keyboard for _l, d in row
+                 if d.startswith("v1|tdone|")][0]
+
+        _drop_tickets(owner_session, t1)
+        owner_session.expunge_all()
+
+        answer = handle_update(
+            owner_session, _cbq(ADMIN, nonce), admin_chat_id=ADMIN,
+            probes=FakeProbes(), now=NOW,
+        )[1]
+        assert console.TICKET_GONE_AR in answer.text
+        assert console.TICKETS_NONE_AR in answer.text
+    finally:
+        _drop_tickets(owner_session, t1)
+        _clear_delivery(owner_session, t1)
+
+
 def test_an_unknown_ticket_button_answers_instead_of_raising(
     owner_session: Session
 ) -> None:

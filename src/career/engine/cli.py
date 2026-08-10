@@ -95,22 +95,88 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+#: What the nightly probe asks Meta for.
+#:
+#: `category` is the field this probe went a month without asking for, and its
+#: absence is why the run kept taking the wrong branch:
+#: `preferred_daily_template` chooses on Meta's own answer when it is handed a
+#: ``{name: category}`` MAPPING — the form its docstring calls «the only form
+#: that cannot be wrong» — and falls back to our hand-ordered guess about
+#: categories when it is handed a bare set of names. A set of names is all this
+#: function could produce, so the guess is the branch that ran every night,
+#: while Meta had quietly moved five of the eight templates to MARKETING.
+#:
+#: `previous_category` costs nothing extra and is the evidence: it is the
+#: column that proves a template was ACCEPTED as UTILITY and moved afterwards,
+#: rather than submitted wrong.
+_TEMPLATE_FIELDS = "name,status,category,previous_category"
+
+
+def _report_template_categories(live: dict[str, str],
+                                previously: dict[str, str]) -> None:
+    """Compare the live account against the dated snapshot, loudly.
+
+    THIS IS THE POLL, AND THE POLL IS NOT THE WEBHOOK. Both are wired and both
+    are needed, for opposite reasons:
+
+    * the **push** (`template_category_update`, routed in `whatsapp.worker`) is
+      IMMEDIATE — Meta tells us the hour it re-categorises something, and for a
+      scheduled change it tells us BEFORE, which is the only moment an appeal
+      is possible. It is also MISSABLE: it goes to one URL, once; a webhook
+      delivered while the box is down, a signature that fails, an app that is
+      not subscribed to the field (which is exactly what
+      ``GET /{app_id}/subscriptions`` showed on 2026-08-08) and the notice
+      simply never existed.
+    * this **poll** is SLOW — up to a day late, and it says nothing about a
+      change that has already been reverted — and it CANNOT BE MISSED. It
+      re-reads the whole list from scratch every night, so a fact that no
+      webhook ever delivered is still true here, and one missed push costs a
+      day rather than a quarter.
+
+    Neither substitutes for the other: the push without the poll is a system
+    that is correct until the one night it isn't and never finds out, and the
+    poll without the push is a system that always finds out — after the invoice
+    and after the appeal window.
+    """
+    from career.whatsapp.templates import category_divergences
+
+    for name, (recorded, actual) in sorted(
+            category_divergences(live).items()):
+        logger.error(
+            "TEMPLATE CATEGORY DIVERGED — %s is %s at meta, this tree records "
+            "%s (previous_category: %s). Marketing costs ~4.7x utility in KSA "
+            "and is not delivered at all to a recipient who switched «Offers "
+            "and announcements» off",
+            name, actual, recorded, previously.get(name) or "-",
+        )
+
+
 def _preferred_daily(settings: Any) -> Any:
-    """The cheapest APPROVED daily template, asked at run time.
+    """The cheapest, most DELIVERABLE approved daily template, asked at run time.
 
     Never blocks or fails the run — but the FALLBACK is the expensive part, so
     it is chosen deliberately rather than by accident. When Meta cannot be
-    reached we cannot know what is approved, and the long-standing name Meta
-    classified MARKETING is the only one we have ever seen it accept. A slow
-    Meta at eleven in the morning therefore bills the whole day at roughly
-    three times the utility rate AND exposes it to per-user marketing caps, so
-    the fallback is announced loudly instead of taken in silence.
+    reached we cannot know what is approved, so the run takes
+    `templates.FALLBACK_DAILY` and says so.
+
+    Since 2026-08-08 the probe asks for the CATEGORY as well as the status, and
+    that is the whole change in this function: it hands
+    `preferred_daily_template` a ``{name: category}`` mapping instead of a set
+    of names, which switches the chooser off its hand-ordered guess and onto
+    Meta's own answer. It also feeds every row to
+    `templates.record_observed_category`, so the rest of THIS process — the
+    WhatsApp bill in `cv/close`, above all — prices tonight on a category read
+    tonight rather than on a constant typed a week ago.
 
     The listing is PAGINATED. Reading only the first page silently drops
     templates once the account grows past a page — including, eventually, the
     utility one this function exists to find.
     """
-    from career.whatsapp.templates import preferred_daily_template
+    from career.whatsapp.templates import (
+        billed_category,
+        preferred_daily_template,
+        record_observed_category,
+    )
 
     if not (settings.whatsapp_access_token and settings.whatsapp_waba_id):
         return preferred_daily_template(None)
@@ -119,20 +185,27 @@ def _preferred_daily(settings: Any) -> Any:
         chosen = preferred_daily_template(None)
         logger.error(
             "could not confirm approved templates (%s) — falling back to %s "
-            "(%s), which bills at the marketing rate", why, chosen.name,
-            chosen.category,
+            "(%s)", why, chosen.name, billed_category(chosen.name),
         )
         return chosen
 
     try:
         import httpx
 
-        approved: set[str] = set()
+        #: {name: category} for the APPROVED rows — what the chooser reads.
+        approved: dict[str, str] = {}
+        #: {name: category} for EVERY row Meta reports — what the divergence
+        #: check reads. A template that stopped being approved must still be
+        #: compared, or a suspension reads as «absent» and hides a category.
+        live: dict[str, str] = {}
+        previously: dict[str, str] = {}
         url: str | None = (
             f"https://graph.facebook.com/v21.0/{settings.whatsapp_waba_id}"
             "/message_templates"
         )
-        params: dict[str, Any] | None = {"fields": "name,status", "limit": 100}
+        params: dict[str, Any] | None = {
+            "fields": _TEMPLATE_FIELDS, "limit": 100,
+        }
         headers = {"Authorization": f"Bearer {settings.whatsapp_access_token}"}
         for _ in range(10):          # a page cap, not a trust boundary
             if url is None:
@@ -142,18 +215,32 @@ def _preferred_daily(settings: Any) -> Any:
             if response.status_code != 200:
                 return _fallback(f"HTTP {response.status_code}")
             body = response.json()
-            approved |= {
-                row.get("name") for row in body.get("data", [])
-                if row.get("status") == "APPROVED"
-            }
+            for row in body.get("data", []) or []:
+                name = row.get("name")
+                if not isinstance(name, str) or not name:
+                    continue
+                category = str(row.get("category") or "").lower()
+                live[name] = category
+                previous = row.get("previous_category")
+                if isinstance(previous, str) and previous:
+                    previously[name] = previous.lower()
+                if row.get("status") == "APPROVED":
+                    approved[name] = category
+                # The measurement, taken here and used for the rest of tonight.
+                record_observed_category(
+                    name, category,
+                    observed_on=datetime.now(UTC).date(), source="probe",
+                )
             url = ((body.get("paging") or {}).get("next"))
             params = None            # the `next` URL already carries them
     except Exception:  # noqa: BLE001 — a template probe never stops delivery
         logger.warning("template probe failed", exc_info=True)
         return _fallback("probe raised")
 
+    _report_template_categories(live, previously)
     chosen = preferred_daily_template(approved)
-    logger.info("daily template: %s (%s)", chosen.name, chosen.category)
+    logger.info("daily template: %s (%s)",
+                chosen.name, billed_category(chosen.name))
     return chosen
 
 

@@ -43,6 +43,16 @@ The field is therefore split in two, and neither half pretends to be the other:
   calls this endpoint; :func:`category_divergences` is what makes a drift loud
   instead of a thing discovered in an invoice.
 
+BOTH DIRECTIONS ARE WIRED, and they are not redundant. Meta PUSHES
+`template_category_update` the moment it moves a template — immediate, and
+missable: it goes to one URL, once, and an app that is not subscribed (which
+this one was not, verified 2026-08-08) never receives it at all. The nightly
+GET is slow — up to a day late — and cannot be missed: it re-reads the whole
+list from scratch every night whatever happened to any webhook. The push
+tells you tonight; the poll guarantees you find out. :func:`record_observed_category`
+is the one door both come through, so a measurement arriving either way
+outranks the constant in this file and says so at ERROR.
+
 WHAT META'S RULE ACTUALLY IS, checked against the live documentation on
 2026-08-08 rather than remembered (developers.facebook.com → business-messaging
 → whatsapp → templates/template-categorization). UTILITY needs BOTH halves:
@@ -130,22 +140,14 @@ class TemplateSpec:
     buttons: tuple[str, ...] = ()
     variables: tuple[str, ...] = field(default_factory=tuple)
 
-    @property
-    def category(self) -> TemplateCategory:
-        """COMPATIBILITY SHIM — Meta's category when we have measured it.
-
-        Two log lines in ``engine/cli.py`` (a module this change does not own)
-        still read ``spec.category``, and leaving them reading the REQUESTED
-        value would keep the nightly journal printing «utility» about a
-        template Meta bills as marketing — the exact sentence that made this
-        wrong for weeks. So the shim resolves to the observed category first
-        and only falls back to the request when Meta has never been asked.
-
-        Delete it together with the two-line `engine/cli.py` patch in the
-        report; new code reads :func:`observed_category` (which can answer
-        «I do not know») or :func:`billed_category` (which errs expensive).
-        """
-        return observed_category(self.name) or self.requested_category
+    # `TemplateSpec.category` IS GONE, on purpose. It was a shim that resolved
+    # to the observed category and fell back to `requested_category` when Meta
+    # had never been asked — i.e. it could answer «utility» about a template
+    # nobody had ever measured, which is precisely the claim this module exists
+    # to stop making. Its only two readers were the log lines in
+    # `engine/cli.py`, and they now read :func:`billed_category`. New code
+    # reads :func:`observed_category` (which can answer «I do not know») or
+    # :func:`billed_category` (which errs expensive).
 
 
 #: Strictly transactional wording — and, on 2026-08-08, THE ONLY ONE OF THE
@@ -314,12 +316,128 @@ META_CATEGORY_OBSERVED: dict[str, TemplateCategory] = {
 }
 
 
+#: ── A MEASUREMENT NEWER THAN THIS FILE ──────────────────────────────────────
+#:
+#: :data:`META_CATEGORY_OBSERVED` is dated, and the date is the point: it was
+#: true on 2026-08-08. Meta then PUSHES `template_category_update` the moment
+#: it moves a template, and the nightly probe GETs the same fact — both are
+#: measurements, both are newer than the file, and neither can edit it. A
+#: running process that has just been TOLD `welcome_activation` is MARKETING
+#: and goes on answering UTILITY from a week-old constant is making exactly the
+#: claim this module was rewritten to stop making.
+#:
+#: WHAT WAS REJECTED, and why:
+#:
+#: * **Alert only, leave the constant.** The operator learns; the code does
+#:   not. Between the alert and the hand edit — hours at best, and the five
+#:   proved it can be weeks — every bill and every daily-template choice is
+#:   made from a value we know to be wrong. The alert is necessary and it is
+#:   not sufficient.
+#: * **Rewrite the source file.** A process that edits its own module is a
+#:   deploy nobody reviewed, it is lost on the next `git checkout`, and it puts
+#:   a write into a path that must never fail. Refused outright.
+#: * **A new table.** The right long-term shape and it needs a migration —
+#:   the one thing the change that DISCOVERS a problem cannot ship. Named in
+#:   the report, deliberately not run.
+#:
+#: WHAT THIS IS. An in-memory overlay, per process, holding measurements
+#: carrying THEIR OWN date, and read only when that date is not older than the
+#: file's. It is a BRIDGE, not a store, and its three limits are stated rather
+#: than discovered:
+#:
+#: 1. it dies with the process, so the worker's knowledge does not reach the
+#:    nightly run — which is why `engine/cli._preferred_daily` records the
+#:    same fact from its own GET at the start of every night;
+#: 2. it never becomes the file, so the durable record is the `webhook_events`
+#:    row, the ERROR line below, and the operator's hand;
+#: 3. it holds only names in :data:`REGISTRY`. The live account also carries
+#:    Meta's own `hello_world` and `jaspers_market_*` samples, and this module
+#:    saying anything at all about a template we never send would be the same
+#:    unearned claim in a new place.
+_LIVE_OBSERVED: dict[str, tuple[TemplateCategory, date]] = {}
+
+
+def record_observed_category(
+    name: str, category: str, *, observed_on: date, source: str,
+) -> bool:
+    """Record what Meta just said about ``name``. True if it changed anything.
+
+    Callers: the webhook push (`whatsapp.worker`) and the nightly poll
+    (`engine.cli`). Both hand over Meta's own words and the date Meta said
+    them; neither passes a guess.
+
+    A measurement that CONTRADICTS the file is logged at ERROR with the exact
+    edit that would make the file true again — ERROR because the operator's
+    harvester (`run_admin_bot._HealthProbes.error_lines`) forwards ERROR lines
+    and nothing quieter, and with the edit spelled out because «a divergence
+    was detected» is not something anyone can act on at 6am.
+
+    Refuses, silently and by design: an unparseable category (we do not guess
+    at a word Meta did not send), a name outside :data:`REGISTRY`, and a
+    measurement older than the file — a late webhook redelivery must not undo
+    a fresher reading.
+    """
+    try:
+        measured = TemplateCategory(str(category).lower())
+    except ValueError:
+        logger.error(
+            "meta reported an unknown template category %r for %s — not "
+            "recorded; add it to TemplateCategory or the pricing stays blind",
+            category, name,
+        )
+        return False
+    if name not in REGISTRY:
+        return False
+    if observed_on < META_CATEGORY_OBSERVED_AT:
+        return False
+    previous = _LIVE_OBSERVED.get(name)
+    if previous is not None and previous[1] > observed_on:
+        return False
+    _LIVE_OBSERVED[name] = (measured, observed_on)
+    on_file = META_CATEGORY_OBSERVED.get(name)
+    changed = on_file != measured or (previous or (None, None))[0] != measured
+    if on_file is not None and on_file != measured:
+        logger.error(
+            "template category DIVERGED from this file (%s): meta says %s is "
+            "%s, META_CATEGORY_OBSERVED says %s — edit "
+            "whatsapp/templates.py to '\"%s\": TemplateCategory.%s,' and move "
+            "META_CATEGORY_OBSERVED_AT to %s",
+            source, name, measured, on_file, name, measured.name,
+            observed_on.isoformat(),
+        )
+    elif on_file is None:
+        logger.error(
+            "meta reports a category for %s (%s), a template this file has "
+            "never measured — %s; record it in META_CATEGORY_OBSERVED",
+            name, source, measured,
+        )
+    return changed
+
+
+def live_observations() -> dict[str, tuple[TemplateCategory, date]]:
+    """A copy of the overlay — for tests and for anyone reporting on it."""
+    return dict(_LIVE_OBSERVED)
+
+
+def forget_live_observations() -> None:
+    """Drop every runtime observation. Tests use it; nothing in `src/` does."""
+    _LIVE_OBSERVED.clear()
+
+
 def observed_category(name: str) -> TemplateCategory | None:
     """Meta's category for ``name``, or None when we have never measured it.
 
     None is a real answer and callers must handle it. It is what a hand-typed
     ``category`` field could never say, and saying it is most of the fix.
+
+    The NEWEST measurement wins: a `template_category_update` push or tonight's
+    probe outranks the dated constant, and the constant answers whenever
+    nothing fresher has arrived in this process. Neither half ever invents an
+    answer — a name measured by nobody still returns None.
     """
+    live = _LIVE_OBSERVED.get(name)
+    if live is not None:
+        return live[0]
     return META_CATEGORY_OBSERVED.get(name)
 
 
